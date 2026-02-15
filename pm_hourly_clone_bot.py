@@ -150,8 +150,32 @@ def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 def write_jsonl(event: dict) -> None:
     event["ts"] = iso_z(utc_now())
+    line = json.dumps(event, ensure_ascii=False)
     with open(LOG_JSONL, "a", encoding="utf-8") as f:
-        f.write(json.dumps(event, ensure_ascii=False) + "\n")
+        f.write(line + "\n")
+    # Console output — show key events in a readable format
+    etype = event.get("type", "")
+    if etype == "SNAPSHOT":
+        print(f"  {event.get('crypto',''):4s}  delta={event.get('delta_bps',0):+7.1f}bps  "
+              f"vel={event.get('vel_bps_per_min',0):+6.1f}  "
+              f"up_ask={event.get('up',{}).get('ask',0):.3f}  "
+              f"dn_ask={event.get('down',{}).get('ask',0):.3f}  "
+              f"t={event.get('t_min',0):.1f}m")
+    elif etype == "ORDER_INTENT":
+        print(f"  >>> {event.get('engine','')} {event.get('action','')} {event.get('crypto','')}"
+              f" {event.get('outcome','')} qty={event.get('qty',0):.1f}"
+              f" px={event.get('price', event.get('ask',0)):.3f}"
+              f" clip=${event.get('clip_usdc',0):.2f}")
+    elif etype in ("PAPER_BUY", "PAPER_SELL"):
+        print(f"  {'BUY' if 'BUY' in etype else 'SELL'} {event.get('outcome','')}"
+              f" qty={event.get('qty',0):.1f} px={event.get('price',0):.3f}"
+              f" pnl={event.get('pnl','')}")
+    elif etype == "LOOP_ERROR":
+        print(f"  ERROR: {event.get('err','')}")
+    elif etype == "SKIP_NO_PRICE":
+        print(f"  SKIP {event.get('crypto','')}: no price data")
+    elif etype not in ("SNAPSHOT",):  # all other events (START, NEW_MARKET_STATE, etc.)
+        print(f"[{etype}] {json.dumps({k:v for k,v in event.items() if k not in ('type','ts')})}")
 def append_csv_row(row: dict) -> None:
     exists = os.path.exists(LOG_CSV)
     with open(LOG_CSV, "a", encoding="utf-8") as f:
