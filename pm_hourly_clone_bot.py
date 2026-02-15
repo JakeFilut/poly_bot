@@ -535,30 +535,31 @@ class PolymarketClient:
         "BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana", "XRP": "ripple",
     }
 
+    # Binance data API — the public mirror Polymarket hourly markets resolve against.
+    # api.binance.com is geo-blocked in the US; data-api.binance.vision is not.
+    BINANCE_BASE = "https://data-api.binance.vision"
+
     def get_binance_spot_and_hour_open(self, crypto: str) -> Tuple[float, float]:
         """
-        Return (spot, hour_open) from Binance public API.
+        Return (spot, hour_open) from Binance data API.
+        Uses data-api.binance.vision (same source Polymarket resolves against).
         Falls back to CoinGecko if Binance is unreachable.
-        spot  = latest trade price
-        hour_open = open price of the current 1h candle
         """
         sym = self.BINANCE_SYMBOLS[crypto]
 
-        # --- spot via Binance ---
+        # --- spot ---
         spot = 0.0
-        for base_url in ("https://api.binance.com", "https://api.binance.us"):
-            try:
-                r = self.session.get(
-                    f"{base_url}/api/v3/ticker/price",
-                    params={"symbol": sym}, timeout=5,
-                )
-                if r.status_code == 200:
-                    spot = float(r.json()["price"])
-                    break
-            except Exception:
-                continue
+        try:
+            r = self.session.get(
+                f"{self.BINANCE_BASE}/api/v3/ticker/price",
+                params={"symbol": sym}, timeout=5,
+            )
+            if r.status_code == 200:
+                spot = float(r.json()["price"])
+        except Exception:
+            pass
 
-        # --- spot via CoinGecko fallback ---
+        # --- CoinGecko fallback ---
         if spot == 0.0:
             cg_id = self.COINGECKO_IDS.get(crypto)
             if cg_id:
@@ -580,19 +581,19 @@ class PolymarketClient:
             return (spot if spot > 0 else cached[0], cached[0])
 
         hour_open = spot  # fallback if kline fetch fails
-        for base_url in ("https://api.binance.com", "https://api.binance.us"):
-            try:
-                r = self.session.get(
-                    f"{base_url}/api/v3/klines",
-                    params={"symbol": sym, "interval": "1h", "limit": 1},
-                    timeout=5,
-                )
-                if r.status_code == 200:
-                    kline = r.json()[0]
-                    hour_open = float(kline[1])  # index 1 = candle open
-                    break
-            except Exception:
-                continue
+        try:
+            hour_ms = current_hour_ts * 1000
+            r = self.session.get(
+                f"{self.BINANCE_BASE}/api/v3/klines",
+                params={"symbol": sym, "interval": "1h",
+                        "startTime": hour_ms, "limit": 1},
+                timeout=5,
+            )
+            if r.status_code == 200:
+                kline = r.json()[0]
+                hour_open = float(kline[1])  # index 1 = candle open
+        except Exception:
+            pass
 
         if hour_open > 0:
             self._hour_open_cache[crypto] = (hour_open, current_hour_ts)
