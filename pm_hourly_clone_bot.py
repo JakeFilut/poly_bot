@@ -26,6 +26,7 @@ import math
 import signal
 import random
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
@@ -166,10 +167,25 @@ def write_jsonl(event: dict) -> None:
               f" {event.get('outcome','')} qty={event.get('qty',0):.1f}"
               f" px={event.get('price', event.get('ask',0)):.3f}"
               f" clip=${event.get('clip_usdc',0):.2f}")
-    elif etype in ("PAPER_BUY", "PAPER_SELL"):
-        print(f"  {'BUY' if 'BUY' in etype else 'SELL'} {event.get('outcome','')}"
-              f" qty={event.get('qty',0):.1f} px={event.get('price',0):.3f}"
-              f" pnl={event.get('pnl','')}")
+    elif etype == "PAPER_BUY":
+        print(f"  $$$ BUY  {event.get('crypto',''):4s} {event.get('outcome',''):4s}"
+              f" qty={event.get('qty',0):.1f} @ ${event.get('price',0):.3f}"
+              f"  cost=${event.get('cost',0):.2f}"
+              f"  bal=${event.get('balance',0):.2f}")
+    elif etype == "PAPER_SELL":
+        pnl = event.get('pnl', 0)
+        pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
+        print(f"  $$$ SELL {event.get('crypto', event.get('slug','')):4s}"
+              f" {event.get('outcome',''):4s}"
+              f" qty={event.get('qty',0):.1f} @ ${event.get('price',0):.3f}"
+              f"  pnl={pnl_str}  reason={event.get('reason','')}"
+              f"  bal=${event.get('balance',0):.2f}")
+    elif etype == "HOUR_RESOLVED":
+        print(f"\n  === HOUR RESOLVED: {event.get('crypto','')} {event.get('slug','')} ===")
+        print(f"      Winner: {event.get('winner','')}  |  spot={event.get('spot',0):.2f}  open={event.get('hour_open',0):.2f}")
+        for pos_info in event.get("positions", []):
+            print(f"      {pos_info['outcome']}: qty={pos_info['qty']:.1f}  payout=${pos_info['payout']:.2f}  pnl={'+' if pos_info['pnl']>=0 else ''}{pos_info['pnl']:.2f}")
+        print(f"      Balance: ${event.get('balance',0):.2f}\n")
     elif etype == "LOOP_ERROR":
         print(f"  ERROR: {event.get('err','')}")
     elif etype == "SKIP_NO_PRICE":
@@ -811,8 +827,10 @@ class Bot:
         pos.last_trade_ts = iso_z(utc_now())
         if pos.opened_at is None:
             pos.opened_at = pos.last_trade_ts
-        # bankroll decrease
         self.bankroll_usdc -= usdc_cost
+        write_jsonl({"type": "PAPER_BUY", "slug": st.slug, "crypto": st.crypto,
+                     "outcome": outcome, "qty": round(qty, 2), "price": round(price, 3),
+                     "cost": round(usdc_cost, 2), "balance": round(self.bankroll_usdc, 2)})
     def _paper_sell(self, st: MarketState, outcome: str, price: float, qty: float):
         pos = st.positions[outcome]
         qty = min(qty, pos.qty)
@@ -850,21 +868,109 @@ class Bot:
     # -----------------------------
     # Main loop
     # -----------------------------
+    def _prefetch_market_data(self, m: MarketRef) -> dict:
+        """Fetch all HTTP data for one market (runs in thread)."""
+        spot, hour_open = self.client.get_binance_spot_and_hour_open(m.crypto)
+        up_book = self.client.get_top_of_book(m.outcome_up_id, levels=IMB_LEVELS)
+        dn_book = self.client.get_top_of_book(m.outcome_down_id, levels=IMB_LEVELS)
+        return {"market": m, "spot": spot, "hour_open": hour_open,
+                "up_book": up_book, "dn_book": dn_book}
+
     def run(self):
         write_jsonl({"type": "START", "mode": MODE, "profile": PROFILE, "bankroll": self.bankroll_usdc})
+        self._last_balance_print = 0.0
         while self.running:
             self._reset_daily_if_needed()
             try:
                 markets = self._get_markets()
                 for m in markets:
                     self._ensure_market_state(m)
-                    self._step_market(m)
+                # Check for hour-end resolution on stale markets
+                self._resolve_ended_hours(markets)
+                # Fetch all market data in parallel (all HTTP calls at once)
+                prefetched = []
+                if markets:
+                    with ThreadPoolExecutor(max_workers=len(markets)) as pool:
+                        futures = {pool.submit(self._prefetch_market_data, m): m for m in markets}
+                        for fut in as_completed(futures):
+                            try:
+                                prefetched.append(fut.result())
+                            except Exception as e:
+                                m = futures[fut]
+                                write_jsonl({"type": "PREFETCH_ERROR", "slug": m.slug, "err": str(e)})
+                # Process results sequentially (safe for shared state)
+                for data in prefetched:
+                    self._step_market_with_data(data)
                 self._save_state()
+                # Print balance summary periodically (every 30s)
+                now = time.time()
+                if now - self._last_balance_print >= 30.0:
+                    self._print_balance_summary()
+                    self._last_balance_print = now
             except Exception as e:
                 write_jsonl({"type": "LOOP_ERROR", "err": str(e)})
             time.sleep(EVAL_EVERY_SEC)
         write_jsonl({"type": "STOPPED", "bankroll": self.bankroll_usdc, "daily_pnl": self.daily_pnl_usdc})
         self._save_state()
+    def _print_balance_summary(self):
+        """Print balance and open positions to console."""
+        total_cost = 0.0
+        pos_parts = []
+        for slug, st in self.market_states.items():
+            for outcome in ["Up", "Down"]:
+                pos = st.positions[outcome]
+                if pos.qty > 0:
+                    total_cost += pos.cost_usdc
+                    pos_parts.append(f"{st.crypto} {outcome}:{pos.qty:.0f}@{pos.vwap:.3f}")
+        pos_str = "  ".join(pos_parts) if pos_parts else "none"
+        pnl_str = f"+${self.daily_pnl_usdc:.2f}" if self.daily_pnl_usdc >= 0 else f"-${abs(self.daily_pnl_usdc):.2f}"
+        print(f"\n  --- Balance: ${self.bankroll_usdc:.2f}  |  Invested: ${total_cost:.2f}"
+              f"  |  Day P&L: {pnl_str}  |  Positions: {pos_str} ---\n")
+    def _resolve_ended_hours(self, current_markets: List[MarketRef]):
+        """
+        Resolve positions for hours that have ended.
+        Winner pays $1/share, loser pays $0. Then remove old market state.
+        """
+        current_slugs = {m.slug for m in current_markets}
+        ended = [slug for slug in list(self.market_states.keys()) if slug not in current_slugs]
+        for slug in ended:
+            st = self.market_states[slug]
+            has_positions = any(st.positions[o].qty > 0 for o in ["Up", "Down"])
+            if not has_positions:
+                # No positions — just clean up
+                self.market_states.pop(slug, None)
+                self.signal_hist.pop(slug, None)
+                self.last_book.pop(slug, None)
+                self.recent_extreme_price.pop(slug, None)
+                continue
+            # Determine winner by checking final Binance price vs hour open
+            spot, _ = self.client.get_binance_spot_and_hour_open(st.crypto)
+            winner = "Up" if spot >= st.hour_open else "Down"
+            pos_details = []
+            for outcome in ["Up", "Down"]:
+                pos = st.positions[outcome]
+                if pos.qty <= 0:
+                    continue
+                # Winner resolves at $1, loser at $0
+                payout_price = 1.0 if outcome == winner else 0.0
+                payout = payout_price * pos.qty
+                pnl = payout - pos.cost_usdc
+                self.bankroll_usdc += payout
+                self.daily_pnl_usdc += pnl
+                pos_details.append({"outcome": outcome, "qty": round(pos.qty, 2),
+                                    "payout": round(payout, 2), "pnl": round(pnl, 2)})
+                pos.qty = 0.0
+                pos.cost_usdc = 0.0
+            write_jsonl({"type": "HOUR_RESOLVED", "slug": slug, "crypto": st.crypto,
+                         "winner": winner, "spot": round(spot, 2),
+                         "hour_open": round(st.hour_open, 2),
+                         "positions": pos_details,
+                         "balance": round(self.bankroll_usdc, 2)})
+            # Clean up ended market
+            self.market_states.pop(slug, None)
+            self.signal_hist.pop(slug, None)
+            self.last_book.pop(slug, None)
+            self.recent_extreme_price.pop(slug, None)
     def _get_markets(self) -> List[MarketRef]:
         # In practice: discover the current hour markets
         return self.client.get_current_hour_markets()
@@ -881,36 +987,33 @@ class Bot:
         self.signal_hist.setdefault(m.slug, [])
         self.last_book.setdefault(m.slug, {})
         self.recent_extreme_price.setdefault(m.slug, {"Up": None, "Down": None})
-    def _step_market(self, m: MarketRef):
+    def _step_market_with_data(self, data: dict):
+        """Process a market using pre-fetched HTTP data."""
+        m = data["market"]
+        spot, hour_open = data["spot"], data["hour_open"]
+        up_book, dn_book = data["up_book"], data["dn_book"]
         st = self.market_states[m.slug]
         now = utc_now()
         hour_start = datetime.strptime(st.hour_start_utc, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
         t_min = minutes_into_hour(hour_start, now)
-        # stop logic
         if t_min >= TRADE_HARD_STOP_MIN:
+            self.last_book[m.slug]["Up"] = up_book
+            self.last_book[m.slug]["Down"] = dn_book
             self._cleanup_market(m, st, t_min)
             return
-        # fetch spot/open
-        spot, hour_open = self.client.get_binance_spot_and_hour_open(m.crypto)
         if hour_open <= 0 or spot <= 0:
             write_jsonl({"type": "SKIP_NO_PRICE", "slug": m.slug, "crypto": m.crypto,
                          "spot": spot, "hour_open": hour_open})
             return
-        st.hour_open = hour_open  # keep updated
+        st.hour_open = hour_open
         delta_bps = (spot - hour_open) / hour_open * 10000.0
         abs_delta_bps = abs(delta_bps)
         st.peak_abs_delta_bps = max(st.peak_abs_delta_bps, abs_delta_bps)
         st.delta_hist.append((iso_z(now), delta_bps))
-        # trim history
         st.delta_hist = st.delta_hist[-2000:]
-        # compute velocity/z
         vel = delta_velocity_bps_per_min(st.delta_hist, lookback_sec=30.0)
         z = zscore(st.delta_hist) if Z_ENTRY_ENABLED else 0.0
-        # determine drift_dir / which outcome is "with drift"
         drift_dir = "Up" if delta_bps >= 0 else "Down"
-        # orderbooks (top) for both outcomes so we can choose best execution
-        up_book = self.client.get_top_of_book(m.outcome_up_id, levels=IMB_LEVELS)
-        dn_book = self.client.get_top_of_book(m.outcome_down_id, levels=IMB_LEVELS)
         self.last_book[m.slug]["Up"] = up_book
         self.last_book[m.slug]["Down"] = dn_book
         # update recent extreme prices (for pullbacks)
@@ -1175,7 +1278,10 @@ class Bot:
         write_jsonl({"type": "ORDER_INTENT", **intent})
         if MODE == "LOG":
             pnl = self._paper_sell(st, outcome, price, qty)
-            write_jsonl({"type": "PAPER_SELL", "slug": m.slug, "outcome": outcome, "qty": qty, "price": price, "pnl": pnl})
+            write_jsonl({"type": "PAPER_SELL", "slug": m.slug, "outcome": outcome,
+                         "qty": round(qty, 2), "price": round(price, 3),
+                         "pnl": round(pnl, 2), "balance": round(self.bankroll_usdc, 2),
+                         "reason": reason})
             return
         # live sell
         self.client.place_limit_order(token_id, "SELL", price, qty, post_only=False)
