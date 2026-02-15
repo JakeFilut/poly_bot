@@ -26,6 +26,7 @@ import math
 import signal
 import random
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
@@ -850,6 +851,14 @@ class Bot:
     # -----------------------------
     # Main loop
     # -----------------------------
+    def _prefetch_market_data(self, m: MarketRef) -> dict:
+        """Fetch all HTTP data for one market (runs in thread)."""
+        spot, hour_open = self.client.get_binance_spot_and_hour_open(m.crypto)
+        up_book = self.client.get_top_of_book(m.outcome_up_id, levels=IMB_LEVELS)
+        dn_book = self.client.get_top_of_book(m.outcome_down_id, levels=IMB_LEVELS)
+        return {"market": m, "spot": spot, "hour_open": hour_open,
+                "up_book": up_book, "dn_book": dn_book}
+
     def run(self):
         write_jsonl({"type": "START", "mode": MODE, "profile": PROFILE, "bankroll": self.bankroll_usdc})
         while self.running:
@@ -858,7 +867,19 @@ class Bot:
                 markets = self._get_markets()
                 for m in markets:
                     self._ensure_market_state(m)
-                    self._step_market(m)
+                # Fetch all market data in parallel (all HTTP calls at once)
+                prefetched = []
+                with ThreadPoolExecutor(max_workers=len(markets) or 1) as pool:
+                    futures = {pool.submit(self._prefetch_market_data, m): m for m in markets}
+                    for fut in as_completed(futures):
+                        try:
+                            prefetched.append(fut.result())
+                        except Exception as e:
+                            m = futures[fut]
+                            write_jsonl({"type": "PREFETCH_ERROR", "slug": m.slug, "err": str(e)})
+                # Process results sequentially (safe for shared state)
+                for data in prefetched:
+                    self._step_market_with_data(data)
                 self._save_state()
             except Exception as e:
                 write_jsonl({"type": "LOOP_ERROR", "err": str(e)})
@@ -881,36 +902,33 @@ class Bot:
         self.signal_hist.setdefault(m.slug, [])
         self.last_book.setdefault(m.slug, {})
         self.recent_extreme_price.setdefault(m.slug, {"Up": None, "Down": None})
-    def _step_market(self, m: MarketRef):
+    def _step_market_with_data(self, data: dict):
+        """Process a market using pre-fetched HTTP data."""
+        m = data["market"]
+        spot, hour_open = data["spot"], data["hour_open"]
+        up_book, dn_book = data["up_book"], data["dn_book"]
         st = self.market_states[m.slug]
         now = utc_now()
         hour_start = datetime.strptime(st.hour_start_utc, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
         t_min = minutes_into_hour(hour_start, now)
-        # stop logic
         if t_min >= TRADE_HARD_STOP_MIN:
+            self.last_book[m.slug]["Up"] = up_book
+            self.last_book[m.slug]["Down"] = dn_book
             self._cleanup_market(m, st, t_min)
             return
-        # fetch spot/open
-        spot, hour_open = self.client.get_binance_spot_and_hour_open(m.crypto)
         if hour_open <= 0 or spot <= 0:
             write_jsonl({"type": "SKIP_NO_PRICE", "slug": m.slug, "crypto": m.crypto,
                          "spot": spot, "hour_open": hour_open})
             return
-        st.hour_open = hour_open  # keep updated
+        st.hour_open = hour_open
         delta_bps = (spot - hour_open) / hour_open * 10000.0
         abs_delta_bps = abs(delta_bps)
         st.peak_abs_delta_bps = max(st.peak_abs_delta_bps, abs_delta_bps)
         st.delta_hist.append((iso_z(now), delta_bps))
-        # trim history
         st.delta_hist = st.delta_hist[-2000:]
-        # compute velocity/z
         vel = delta_velocity_bps_per_min(st.delta_hist, lookback_sec=30.0)
         z = zscore(st.delta_hist) if Z_ENTRY_ENABLED else 0.0
-        # determine drift_dir / which outcome is "with drift"
         drift_dir = "Up" if delta_bps >= 0 else "Down"
-        # orderbooks (top) for both outcomes so we can choose best execution
-        up_book = self.client.get_top_of_book(m.outcome_up_id, levels=IMB_LEVELS)
-        dn_book = self.client.get_top_of_book(m.outcome_down_id, levels=IMB_LEVELS)
         self.last_book[m.slug]["Up"] = up_book
         self.last_book[m.slug]["Down"] = dn_book
         # update recent extreme prices (for pullbacks)
