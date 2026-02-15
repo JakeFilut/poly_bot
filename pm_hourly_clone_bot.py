@@ -98,7 +98,7 @@ PULLBACK_LOOKBACK_SEC = 90.0
 ENTRY_COOLDOWN_SEC = 20.0
 REENTRY_COOLDOWN_SEC = 10.0
 # Base clip sizing (USDC cost) as % of bankroll
-BASE_CLIP_PCT = 0.00020  # 0.02% bankroll per tick
+BASE_CLIP_PCT = 0.0020  # 0.2% bankroll per tick
 EARLY_SIZE_MULT = 0.60   # reduce size when t < 10
 # Size multipliers by abs_delta_bps
 SIZING_MULTIPLIERS = [
