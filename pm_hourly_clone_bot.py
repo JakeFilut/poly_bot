@@ -195,13 +195,26 @@ def write_jsonl(event: dict) -> None:
 CSV_COLUMNS = [
     "mode", "engine", "action", "ts", "crypto", "slug", "t_min",
     "outcome", "qty", "price", "clip_usdc", "reason", "vwap",
+    "spot", "hour_open", "delta_bps", "thr", "cap",
+    "bid", "ask", "spread",
+    "cash", "equity",
+    "payload_json",
 ]
+def _csv_escape(val: str) -> str:
+    """Quote a CSV field if it contains commas, quotes, or newlines."""
+    if "," in val or '"' in val or "\n" in val:
+        return '"' + val.replace('"', '""') + '"'
+    return val
 def append_csv_row(row: dict) -> None:
     exists = os.path.exists(LOG_CSV)
     with open(LOG_CSV, "a", encoding="utf-8") as f:
         if not exists:
             f.write(",".join(CSV_COLUMNS) + "\n")
-        f.write(",".join(str(row.get(k, "")) for k in CSV_COLUMNS) + "\n")
+        vals = []
+        for k in CSV_COLUMNS:
+            v = row.get(k, "")
+            vals.append(_csv_escape(str(v)) if v != "" else "")
+        f.write(",".join(vals) + "\n")
 def safe_float(x, default=None):
     try:
         return float(x)
@@ -1064,6 +1077,8 @@ class Bot:
         st.peak_abs_delta_bps = max(st.peak_abs_delta_bps, abs_delta_bps)
         st.delta_hist.append((iso_z(now), delta_bps))
         st.delta_hist = st.delta_hist[-2000:]
+        st.price_hist.append((iso_z(now), spot))
+        st.price_hist = st.price_hist[-2000:]
         vel = delta_velocity_bps_per_min(st.delta_hist, lookback_sec=30.0)
         z = zscore(st.delta_hist) if Z_ENTRY_ENABLED else 0.0
         drift_dir = "Up" if delta_bps >= 0 else "Down"
@@ -1100,10 +1115,10 @@ class Bot:
         if not self._risk_ok(st):
             return
         # Core engine: drift-direction entries
-        self._core_entries(m, st, t_min, delta_bps, abs_delta_bps, vel, z, drift_dir, up_book, dn_book)
+        self._core_entries(m, st, t_min, delta_bps, abs_delta_bps, vel, z, drift_dir, up_book, dn_book, spot)
         # Late scalp engine: cheap side scalps
         if LATE_SCALP_ENABLED:
-            self._late_scalps(m, st, t_min, delta_bps, abs_delta_bps, up_book, dn_book)
+            self._late_scalps(m, st, t_min, delta_bps, abs_delta_bps, up_book, dn_book, spot)
     def _update_extremes(self, slug: str, up_book: BookTop, dn_book: BookTop):
         # Use mid price extremes to detect pullbacks
         for outcome, book in [("Up", up_book), ("Down", dn_book)]:
@@ -1116,7 +1131,7 @@ class Bot:
                 self.recent_extreme_price[slug][outcome] = max(prev, mid)
     def _core_entries(self, m: MarketRef, st: MarketState, t_min: float, delta_bps: float, abs_delta_bps: float,
                      vel_bps_per_min: float, z: float, drift_dir: str,
-                     up_book: BookTop, dn_book: BookTop):
+                     up_book: BookTop, dn_book: BookTop, spot: float):
         # Build valid signal (time + threshold)
         thr = entry_threshold_bps(t_min)
         cap = price_cap(t_min)
@@ -1193,23 +1208,30 @@ class Bot:
             "crypto": m.crypto,
             "slug": m.slug,
             "t_min": round(t_min, 3),
-            "hour_open": st.hour_open,
+            "outcome": outcome,
+            "qty": round(qty, 6),
+            "price": book.ask,
+            "clip_usdc": round(clip, 6),
+            "spot": round(spot, 2),
+            "hour_open": round(st.hour_open, 2),
             "delta_bps": round(delta_bps, 3),
+            "thr": thr,
+            "cap": cap,
+            "bid": book.bid,
+            "ask": book.ask,
+            "spread": round(book.spread, 4),
+            "cash": round(self.cash_usdc, 2),
+            "equity": round(self._equity(), 2),
+            # Extra detail stays in JSONL; also packed into payload_json for CSV
             "abs_delta_bps": round(abs_delta_bps, 3),
             "vel_bps_per_min": round(vel_bps_per_min, 3),
             "z": round(z, 3),
-            "outcome": outcome,
-            "price": book.ask,
-            "ask": book.ask,
-            "bid": book.bid,
-            "spread": book.spread,
             "imb": book.imb,
-            "cap": cap,
-            "thr": thr,
-            "clip_usdc": round(clip, 6),
-            "qty": round(qty, 6),
             "layered": LAYER_ORDERS,
         }
+        # Build payload_json: all extras that don't fit in the flat CSV columns
+        _extras = {k: intent[k] for k in ("abs_delta_bps", "vel_bps_per_min", "z", "imb", "layered")}
+        intent["payload_json"] = json.dumps(_extras, separators=(",", ":"))
         append_csv_row(intent)
         write_jsonl({"type": "ORDER_INTENT", **intent})
         # Execute order(s)
@@ -1220,7 +1242,7 @@ class Bot:
             return
         self._place_layered_buy(m, outcome, qty, book.ask)
     def _late_scalps(self, m: MarketRef, st: MarketState, t_min: float, delta_bps: float, abs_delta_bps: float,
-                     up_book: BookTop, dn_book: BookTop):
+                     up_book: BookTop, dn_book: BookTop, spot: float):
         if not (LATE_SCALP_T_START <= t_min <= LATE_SCALP_T_END):
             return
         if abs_delta_bps < LATE_SCALP_ABSDELTA_MIN or abs_delta_bps > LATE_SCALP_ABSDELTA_MAX:
@@ -1247,6 +1269,7 @@ class Bot:
         if clip < MIN_ORDER_USDC:
             return
         qty = clip / max(1e-9, book.ask)
+        target_sell = round(min(0.999, book.ask + LATE_SCALP_TP_CENTS), 3)
         intent = {
             "mode": MODE,
             "engine": "LATE_SCALP",
@@ -1255,17 +1278,24 @@ class Bot:
             "crypto": m.crypto,
             "slug": m.slug,
             "t_min": round(t_min, 3),
-            "delta_bps": round(delta_bps, 3),
-            "abs_delta_bps": round(abs_delta_bps, 3),
             "outcome": outcome,
-            "price": book.ask,
-            "ask": book.ask,
-            "bid": book.bid,
-            "spread": book.spread,
-            "clip_usdc": round(clip, 6),
             "qty": round(qty, 6),
-            "target_sell": round(min(0.999, book.ask + LATE_SCALP_TP_CENTS), 3),
+            "price": book.ask,
+            "clip_usdc": round(clip, 6),
+            "spot": round(spot, 2),
+            "hour_open": round(st.hour_open, 2),
+            "delta_bps": round(delta_bps, 3),
+            "bid": book.bid,
+            "ask": book.ask,
+            "spread": round(book.spread, 4),
+            "cash": round(self.cash_usdc, 2),
+            "equity": round(self._equity(), 2),
+            # Extras
+            "abs_delta_bps": round(abs_delta_bps, 3),
+            "target_sell": target_sell,
         }
+        _extras = {k: intent[k] for k in ("abs_delta_bps", "target_sell")}
+        intent["payload_json"] = json.dumps(_extras, separators=(",", ":"))
         append_csv_row(intent)
         write_jsonl({"type": "ORDER_INTENT", **intent})
         st.last_reentry_ts = now_iso
@@ -1332,6 +1362,8 @@ class Bot:
         if qty <= 0:
             return
         token_id = m.outcome_up_id if outcome == "Up" else m.outcome_down_id
+        pos = st.positions[outcome]
+        book = self.last_book.get(m.slug, {}).get(outcome)
         intent = {
             "mode": MODE,
             "engine": "EXIT",
@@ -1344,8 +1376,16 @@ class Bot:
             "qty": round(qty, 6),
             "price": round(price, 3),
             "reason": reason,
-            "vwap": round(st.positions[outcome].vwap, 6),
+            "vwap": round(pos.vwap, 6),
+            "hour_open": round(st.hour_open, 2),
+            "bid": round(book.bid, 4) if book else "",
+            "ask": round(book.ask, 4) if book else "",
+            "spread": round(book.spread, 4) if book else "",
+            "cash": round(self.cash_usdc, 2),
+            "equity": round(self._equity(), 2),
         }
+        _extras = {"cost_basis": round(pos.vwap * qty, 2)}
+        intent["payload_json"] = json.dumps(_extras, separators=(",", ":"))
         append_csv_row(intent)
         write_jsonl({"type": "ORDER_INTENT", **intent})
         if MODE == "LOG":
