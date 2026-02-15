@@ -54,7 +54,7 @@ LOG_JSONL  = os.getenv("LOG_JSONL",  os.path.join(_LOG_DIR, "bot_events.jsonl"))
 # Markets / coins
 CRYPTOS = ["BTC", "ETH", "SOL", "XRP"]
 # Polling / evaluation
-EVAL_EVERY_SEC = float(os.getenv("EVAL_EVERY_SEC", "3.0"))
+EVAL_EVERY_SEC = float(os.getenv("EVAL_EVERY_SEC", "1.0"))
 ORDER_REPRICE_SEC = float(os.getenv("ORDER_REPRICE_SEC", "10.0"))
 # Time window within each hour (minutes)
 TRADE_START_MIN = 2.0
