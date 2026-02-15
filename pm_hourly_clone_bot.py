@@ -54,7 +54,7 @@ LOG_JSONL  = os.getenv("LOG_JSONL",  os.path.join(_LOG_DIR, "bot_events.jsonl"))
 # Markets / coins
 CRYPTOS = ["BTC", "ETH", "SOL", "XRP"]
 # Polling / evaluation
-EVAL_EVERY_SEC = float(os.getenv("EVAL_EVERY_SEC", "6.0"))
+EVAL_EVERY_SEC = float(os.getenv("EVAL_EVERY_SEC", "3.0"))
 ORDER_REPRICE_SEC = float(os.getenv("ORDER_REPRICE_SEC", "10.0"))
 # Time window within each hour (minutes)
 TRADE_START_MIN = 2.0
@@ -66,9 +66,9 @@ TRADE_HARD_STOP_MIN = 59.25
 # Switch to MAX_EV by setting PROFILE=MAX_EV.
 # -----------------------------------------------------------------------------
 PROFILE = os.getenv("PROFILE", "CLONE").upper()   # CLONE or MAX_EV
-THR_EARLY_5_15 = 10
-THR_MID_15_45  = 15
-THR_LATE_45_57 = 8
+THR_EARLY_5_15 = 6
+THR_MID_15_45  = 10
+THR_LATE_45_57 = 6
 THR_EARLY_5_15_MAXEV = 12
 THR_MID_15_45_MAXEV  = 18
 THR_LATE_45_57_MAXEV = 10
@@ -91,7 +91,7 @@ IMB_LEVELS = 5
 IMB_MIN = 1.15                  # bidDepth/askDepth must exceed this for with-drift buys
 IMB_MAX_SPREAD = 0.06           # skip if spread too wide (6c)
 # Pullback entry
-PULLBACK_ENABLED = True
+PULLBACK_ENABLED = False
 PULLBACK_CENTS = 0.02           # wait for 2c pullback from recent extreme
 PULLBACK_LOOKBACK_SEC = 90.0
 # Cooldowns
@@ -292,6 +292,7 @@ def entry_threshold_bps(t_min: float) -> float:
         if 45 <= t_min <= 57: return THR_LATE_45_57_MAXEV
         return 10_000
     else:  # CLONE
+        if TRADE_START_MIN <= t_min < 5: return THR_EARLY_5_15
         if 5 <= t_min < 15: return THR_EARLY_5_15
         if 15 <= t_min < 45: return THR_MID_15_45
         if 45 <= t_min <= 57: return THR_LATE_45_57
