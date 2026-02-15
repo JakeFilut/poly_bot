@@ -37,6 +37,7 @@ import requests
 # =============================================================================
 MODE = os.getenv("MODE", "LOG").upper()         # LOG or LIVE
 BANKROLL_START_USDC = float(os.getenv("BANKROLL_START_USDC", "1000.0"))  # only used in LOG
+RUN_ID = uuid.uuid4().hex[:12]  # unique per run — included in all logs + file names
 
 # ---------------------------------------------------------------------------
 # Paths — resolved relative to this file's location
@@ -50,8 +51,10 @@ _LOG_DIR     = os.path.join(os.path.dirname(_PROJECT_DIR), "logs", "poly_bot")
 os.makedirs(_LOG_DIR, exist_ok=True)
 
 STATE_FILE = os.getenv("STATE_FILE", os.path.join(_LOG_DIR, "state.json"))
-LOG_CSV    = os.getenv("LOG_CSV",    os.path.join(_LOG_DIR, "bot_log.csv"))
-LOG_JSONL  = os.getenv("LOG_JSONL",  os.path.join(_LOG_DIR, "bot_events.jsonl"))
+LOG_CSV    = os.getenv("LOG_CSV",    os.path.join(_LOG_DIR, f"bot_log_{RUN_ID}.csv"))
+LOG_JSONL  = os.getenv("LOG_JSONL",  os.path.join(_LOG_DIR, f"bot_events_{RUN_ID}.jsonl"))
+# Schema version — bump when CSV columns change
+SCHEMA_VERSION = 5
 # Markets / coins
 CRYPTOS = ["BTC", "ETH", "SOL", "XRP"]
 # Polling / evaluation
@@ -117,6 +120,8 @@ CORE_KEEP_FRAC = 0.25
 # De-risk on drift reversal (bps)
 DERISK_CROSS_BPS = 5.0
 DERISK_SELL_FRAC_PER_TICK = 0.35
+DERISK_COOLDOWN_SEC = 10.0      # min seconds between DERISK actions on same position
+DERISK_MID_CHANGE_CENTS = 0.01  # or mid must move >= 1c since last derisk
 # Late scalp engine
 LATE_SCALP_ENABLED = True
 LATE_SCALP_T_START = 40.0
@@ -154,6 +159,7 @@ def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 def write_jsonl(event: dict) -> None:
     event["ts"] = iso_z(utc_now())
+    event["run_id"] = RUN_ID
     line = json.dumps(event, ensure_ascii=False)
     with open(LOG_JSONL, "a", encoding="utf-8") as f:
         f.write(line + "\n")
@@ -197,7 +203,7 @@ def write_jsonl(event: dict) -> None:
     elif etype not in ("SNAPSHOT", "DECISION", "PAPER_FILL", "PAPER_BUY", "ORDER_INTENT"):
         print(f"[{etype}] {json.dumps({k:v for k,v in event.items() if k not in ('type','ts')})}")
 CSV_COLUMNS = [
-    "ts", "mode", "profile", "decision_id", "trade_id", "entry_decision_id",
+    "ts", "run_id", "mode", "profile", "decision_id", "trade_id", "entry_decision_id",
     "event_type", "engine", "crypto", "slug",
     "hour_start_utc", "hour_label_et", "hour_index", "t_min",
     "phase", "seconds_to_close",
@@ -266,6 +272,7 @@ def _csv_fmt(key: str, val) -> str:
     return s
 def log_csv(row: dict) -> None:
     """Write one row to bot_log.csv with the fixed schema. Missing keys → blank."""
+    row.setdefault("run_id", RUN_ID)
     exists = os.path.exists(LOG_CSV)
     with open(LOG_CSV, "a", encoding="utf-8") as f:
         if not exists:
@@ -378,6 +385,8 @@ class Position:
     entry_mid: float = 0.0                   # mid price at entry time
     max_favorable_mid: float = 0.0           # best mid seen while holding
     max_adverse_mid: float = 1.0             # worst mid seen while holding
+    last_derisk_ts: Optional[str] = None     # ISO timestamp of last DERISK sell
+    last_derisk_mid: float = 0.0             # mid price at last DERISK action
 @dataclass
 class MarketState:
     slug: str
@@ -962,23 +971,37 @@ class Bot:
             self.daily_pnl_usdc = float(raw.get("daily_pnl_usdc", self.daily_pnl_usdc))
             self.day_start_equity = float(raw.get("day_start_equity", self.day_start_equity))
             ms = raw.get("market_states", {})
+            pos_fields = {f.name for f in Position.__dataclass_fields__.values()}
+            ms_fields = {f.name for f in MarketState.__dataclass_fields__.values()}
             for slug, st_dict in ms.items():
-                # Reconstruct Position objects from raw dicts
+                # Reconstruct Position objects from raw dicts (filter unknown keys)
                 pos_raw = st_dict.get("positions")
                 if isinstance(pos_raw, dict):
                     st_dict["positions"] = {
-                        k: Position(**v) if isinstance(v, dict) else v
+                        k: Position(**{pk: pv for pk, pv in v.items() if pk in pos_fields})
+                            if isinstance(v, dict) else v
                         for k, v in pos_raw.items()
                     }
+                # Filter unknown keys from MarketState too
+                st_dict = {k: v for k, v in st_dict.items() if k in ms_fields}
                 self.market_states[slug] = MarketState(**st_dict)
+            # Hard-zero any dust positions loaded from state
+            for st in self.market_states.values():
+                for outcome in ["Up", "Down"]:
+                    self._clean_dust(st.positions[outcome])
+            loaded_schema = raw.get("schema_version", "unknown")
             write_jsonl({"type": "STATE_LOADED", "cash": self.cash_usdc,
-                         "realized_pnl": self.realized_pnl_usdc})
+                         "realized_pnl": self.realized_pnl_usdc,
+                         "loaded_schema_version": loaded_schema,
+                         "current_schema_version": SCHEMA_VERSION})
         except Exception as e:
             write_jsonl({"type": "STATE_LOAD_ERROR", "err": str(e)})
     def _save_state(self):
         try:
             ms = {slug: asdict(st) for slug, st in self.market_states.items()}
             raw = {
+                "schema_version": SCHEMA_VERSION,
+                "run_id": RUN_ID,
                 "cash_usdc": self.cash_usdc,
                 "realized_pnl_usdc": self.realized_pnl_usdc,
                 "daily_pnl_usdc": self.daily_pnl_usdc,
@@ -1061,6 +1084,8 @@ class Bot:
             pos.entry_mid = 0.0
             pos.max_favorable_mid = 0.0
             pos.max_adverse_mid = 1.0
+            pos.last_derisk_ts = None
+            pos.last_derisk_mid = 0.0
     # -----------------------------
     # Risk checks
     # -----------------------------
@@ -1093,8 +1118,10 @@ class Bot:
                 "up_book": up_book, "dn_book": dn_book}
 
     def run(self):
-        write_jsonl({"type": "START", "mode": MODE, "profile": PROFILE,
-                     "cash": self.cash_usdc, "realized_pnl": self.realized_pnl_usdc})
+        write_jsonl({"type": "START", "run_id": RUN_ID, "schema_version": SCHEMA_VERSION,
+                     "mode": MODE, "profile": PROFILE,
+                     "cash": self.cash_usdc, "realized_pnl": self.realized_pnl_usdc,
+                     "log_csv": LOG_CSV, "log_jsonl": LOG_JSONL})
         self._last_balance_print = 0.0
         while self.running:
             self._reset_daily_if_needed()
@@ -1760,6 +1787,7 @@ class Bot:
         for outcome in ["Up", "Down"]:
             pos = st.positions[outcome]
             if pos.qty < MIN_QTY:
+                self._clean_dust(pos)  # hard-zero any ghost positions
                 continue
             book = self.last_book[m.slug].get(outcome)
             if not book:
@@ -1776,34 +1804,60 @@ class Bot:
                               max(book.bid, book.ask - MAX_CROSS_SLIPPAGE),
                               reason="HARD_STOP", leg="STOP", ctx=ctx)
                 continue
+            # --- DERISK with cooldown + change detection ---
+            derisk_triggered = False
             if outcome == "Up" and delta_bps < +DERISK_CROSS_BPS:
+                derisk_triggered = True
+            elif outcome == "Down" and delta_bps > -DERISK_CROSS_BPS:
+                derisk_triggered = True
+            if derisk_triggered:
                 qty = pos.qty * DERISK_SELL_FRAC_PER_TICK
-                self._do_sell(m, st, outcome, qty, book.bid,
-                              reason="DERISK_REVERSAL", leg="DERISK", ctx=ctx)
+                if qty >= MIN_QTY:
+                    # Check cooldown: only fire if enough time passed OR mid moved meaningfully
+                    should_derisk = False
+                    now_t = utc_now()
+                    if pos.last_derisk_ts is None:
+                        should_derisk = True  # first derisk for this position
+                    else:
+                        try:
+                            last_dt = datetime.strptime(pos.last_derisk_ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                            elapsed = (now_t - last_dt).total_seconds()
+                        except Exception:
+                            elapsed = 999.0
+                        mid_moved = abs(book.mid - pos.last_derisk_mid) >= DERISK_MID_CHANGE_CENTS
+                        if elapsed >= DERISK_COOLDOWN_SEC or mid_moved:
+                            should_derisk = True
+                    if should_derisk:
+                        self._do_sell(m, st, outcome, qty, book.bid,
+                                      reason="DERISK_REVERSAL", leg="DERISK", ctx=ctx)
+                        pos.last_derisk_ts = iso_z(now_t)
+                        pos.last_derisk_mid = book.mid
                 continue
-            if outcome == "Down" and delta_bps > -DERISK_CROSS_BPS:
-                qty = pos.qty * DERISK_SELL_FRAC_PER_TICK
-                self._do_sell(m, st, outcome, qty, book.bid,
-                              reason="DERISK_REVERSAL", leg="DERISK", ctx=ctx)
-                continue
+            # --- Take-profit ladder (only if qty after TP is meaningful) ---
             if (not pos.tp1_done) and book.bid >= pos.vwap + TP1:
-                tp_target = pos.vwap + TP1
-                self._do_sell(m, st, outcome, pos.qty * TP1_SELL_FRAC, book.bid,
-                              reason="TP1", leg="TP1", target_price=tp_target, ctx=ctx)
+                tp_qty = pos.qty * TP1_SELL_FRAC
+                if tp_qty >= MIN_QTY:
+                    tp_target = pos.vwap + TP1
+                    self._do_sell(m, st, outcome, tp_qty, book.bid,
+                                  reason="TP1", leg="TP1", target_price=tp_target, ctx=ctx)
                 pos.tp1_done = True
             if (not pos.tp2_done) and book.bid >= pos.vwap + TP2:
-                tp_target = pos.vwap + TP2
-                self._do_sell(m, st, outcome, pos.qty * TP2_SELL_FRAC, book.bid,
-                              reason="TP2", leg="TP2", target_price=tp_target, ctx=ctx)
+                tp_qty = pos.qty * TP2_SELL_FRAC
+                if tp_qty >= MIN_QTY:
+                    tp_target = pos.vwap + TP2
+                    self._do_sell(m, st, outcome, tp_qty, book.bid,
+                                  reason="TP2", leg="TP2", target_price=tp_target, ctx=ctx)
                 pos.tp2_done = True
             if (not pos.tp3_done) and book.bid >= pos.vwap + TP3:
-                tp_target = pos.vwap + TP3
-                self._do_sell(m, st, outcome, pos.qty * TP3_SELL_FRAC, book.bid,
-                              reason="TP3", leg="TP3", target_price=tp_target, ctx=ctx)
+                tp_qty = pos.qty * TP3_SELL_FRAC
+                if tp_qty >= MIN_QTY:
+                    tp_target = pos.vwap + TP3
+                    self._do_sell(m, st, outcome, tp_qty, book.bid,
+                                  reason="TP3", leg="TP3", target_price=tp_target, ctx=ctx)
                 pos.tp3_done = True
             if pos.scalp_mode:
                 target = min(0.999, pos.vwap + LATE_SCALP_TP_CENTS)
-                if book.bid >= target:
+                if book.bid >= target and pos.qty >= MIN_QTY:
                     self._do_sell(m, st, outcome, pos.qty, book.bid,
                                   reason="SCALP_TP", leg="SCALP_TP", target_price=target, ctx=ctx)
                     pos.scalp_mode = False
