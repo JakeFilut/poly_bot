@@ -35,9 +35,21 @@ import requests
 # =============================================================================
 MODE = os.getenv("MODE", "LOG").upper()         # LOG or LIVE
 BANKROLL_START_USDC = float(os.getenv("BANKROLL_START_USDC", "1000.0"))  # only used in LOG
-STATE_FILE = os.getenv("STATE_FILE", "state.json")
-LOG_CSV = os.getenv("LOG_CSV", "bot_log.csv")
-LOG_JSONL = os.getenv("LOG_JSONL", "bot_events.jsonl")
+
+# ---------------------------------------------------------------------------
+# Paths — resolved relative to this file's location
+#   poly_bot/          <- _PROJECT_DIR
+#   ../keys/.env       <- where your private key lives
+#   ../logs/poly_bot/  <- where all logs go
+# ---------------------------------------------------------------------------
+_PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+_KEYS_DIR    = os.path.join(os.path.dirname(_PROJECT_DIR), "keys")
+_LOG_DIR     = os.path.join(os.path.dirname(_PROJECT_DIR), "logs", "poly_bot")
+os.makedirs(_LOG_DIR, exist_ok=True)
+
+STATE_FILE = os.getenv("STATE_FILE", os.path.join(_LOG_DIR, "state.json"))
+LOG_CSV    = os.getenv("LOG_CSV",    os.path.join(_LOG_DIR, "bot_log.csv"))
+LOG_JSONL  = os.getenv("LOG_JSONL",  os.path.join(_LOG_DIR, "bot_events.jsonl"))
 # Markets / coins
 CRYPTOS = ["BTC", "ETH", "SOL", "XRP"]
 # Polling / evaluation
@@ -348,7 +360,12 @@ class PolymarketClient:
 
     def __init__(self):
         from dotenv import load_dotenv
-        load_dotenv()
+        # Try keys dir first (../keys/.env), then repo root (.env)
+        _env_keys = os.path.join(_KEYS_DIR, ".env")
+        if os.path.exists(_env_keys):
+            load_dotenv(_env_keys)
+        else:
+            load_dotenv()  # fallback: searches CWD and parents
 
         self.session = requests.Session()
         self.gamma_url = "https://gamma-api.polymarket.com"

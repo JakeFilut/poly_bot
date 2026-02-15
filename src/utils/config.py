@@ -20,7 +20,8 @@ _PROJECT_DIR = _SRC_DIR.parent  # poly_bot/
 KEYS_DIR = os.getenv("KEYS_DIR", str(_PROJECT_DIR.parent / "keys"))
 
 # Log directory
-LOG_DIR = os.getenv("LOG_DIR", str(_PROJECT_DIR / "logs"))
+# Default: ../logs/poly_bot (sibling of poly_bot/, under logs/)
+LOG_DIR = os.getenv("LOG_DIR", str(_PROJECT_DIR.parent / "logs" / "poly_bot"))
 
 # =============================================================================
 # LOAD .env
