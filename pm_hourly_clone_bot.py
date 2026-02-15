@@ -1228,9 +1228,9 @@ class Bot:
         abs_delta_bps = abs(delta_bps)
         st.peak_abs_delta_bps = max(st.peak_abs_delta_bps, abs_delta_bps)
         st.delta_hist.append((iso_z(now), delta_bps))
-        st.delta_hist = st.delta_hist[-2000:]
+        st.delta_hist = st.delta_hist[-STATE_HIST_MAX:]
         st.price_hist.append((iso_z(now), spot))
-        st.price_hist = st.price_hist[-2000:]
+        st.price_hist = st.price_hist[-STATE_HIST_MAX:]
         vel = delta_velocity_bps_per_min(st.delta_hist, lookback_sec=30.0)
         z = zscore(st.delta_hist) if Z_ENTRY_ENABLED else 0.0
         self.last_book[m.slug]["Up"] = up_book
