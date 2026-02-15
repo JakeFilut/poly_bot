@@ -530,46 +530,72 @@ class PolymarketClient:
     # ================================================================== #
     #  2.  BINANCE SPOT & HOUR-OPEN
     # ================================================================== #
+    # CoinGecko IDs for fallback price fetching
+    COINGECKO_IDS = {
+        "BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana", "XRP": "ripple",
+    }
+
     def get_binance_spot_and_hour_open(self, crypto: str) -> Tuple[float, float]:
         """
         Return (spot, hour_open) from Binance public API.
+        Falls back to CoinGecko if Binance is unreachable.
         spot  = latest trade price
         hour_open = open price of the current 1h candle
         """
         sym = self.BINANCE_SYMBOLS[crypto]
 
-        # --- spot ---
+        # --- spot via Binance ---
         spot = 0.0
-        try:
-            r = self.session.get(
-                "https://api.binance.com/api/v3/ticker/price",
-                params={"symbol": sym}, timeout=5,
-            )
-            if r.status_code == 200:
-                spot = float(r.json()["price"])
-        except Exception:
-            pass
+        for base_url in ("https://api.binance.com", "https://api.binance.us"):
+            try:
+                r = self.session.get(
+                    f"{base_url}/api/v3/ticker/price",
+                    params={"symbol": sym}, timeout=5,
+                )
+                if r.status_code == 200:
+                    spot = float(r.json()["price"])
+                    break
+            except Exception:
+                continue
+
+        # --- spot via CoinGecko fallback ---
+        if spot == 0.0:
+            cg_id = self.COINGECKO_IDS.get(crypto)
+            if cg_id:
+                try:
+                    r = self.session.get(
+                        "https://api.coingecko.com/api/v3/simple/price",
+                        params={"ids": cg_id, "vs_currencies": "usd"},
+                        timeout=5,
+                    )
+                    if r.status_code == 200:
+                        spot = float(r.json()[cg_id]["usd"])
+                except Exception:
+                    pass
 
         # --- hour open (cached per hour boundary) ---
         current_hour_ts = int(utc_now().timestamp()) // 3600 * 3600
         cached = self._hour_open_cache.get(crypto)
         if cached and cached[1] == current_hour_ts:
-            return (spot, cached[0])
+            return (spot if spot > 0 else cached[0], cached[0])
 
         hour_open = spot  # fallback if kline fetch fails
-        try:
-            r = self.session.get(
-                "https://api.binance.com/api/v3/klines",
-                params={"symbol": sym, "interval": "1h", "limit": 1},
-                timeout=5,
-            )
-            if r.status_code == 200:
-                kline = r.json()[0]
-                hour_open = float(kline[1])  # index 1 = candle open
-        except Exception:
-            pass
+        for base_url in ("https://api.binance.com", "https://api.binance.us"):
+            try:
+                r = self.session.get(
+                    f"{base_url}/api/v3/klines",
+                    params={"symbol": sym, "interval": "1h", "limit": 1},
+                    timeout=5,
+                )
+                if r.status_code == 200:
+                    kline = r.json()[0]
+                    hour_open = float(kline[1])  # index 1 = candle open
+                    break
+            except Exception:
+                continue
 
-        self._hour_open_cache[crypto] = (hour_open, current_hour_ts)
+        if hour_open > 0:
+            self._hour_open_cache[crypto] = (hour_open, current_hour_ts)
         return (spot, hour_open)
 
     # ================================================================== #
@@ -833,6 +859,10 @@ class Bot:
             return
         # fetch spot/open
         spot, hour_open = self.client.get_binance_spot_and_hour_open(m.crypto)
+        if hour_open <= 0 or spot <= 0:
+            write_jsonl({"type": "SKIP_NO_PRICE", "slug": m.slug, "crypto": m.crypto,
+                         "spot": spot, "hour_open": hour_open})
+            return
         st.hour_open = hour_open  # keep updated
         delta_bps = (spot - hour_open) / hour_open * 10000.0
         abs_delta_bps = abs(delta_bps)
