@@ -192,12 +192,16 @@ def write_jsonl(event: dict) -> None:
         print(f"  SKIP {event.get('crypto','')}: no price data")
     elif etype not in ("SNAPSHOT",):  # all other events (START, NEW_MARKET_STATE, etc.)
         print(f"[{etype}] {json.dumps({k:v for k,v in event.items() if k not in ('type','ts')})}")
+CSV_COLUMNS = [
+    "mode", "engine", "action", "ts", "crypto", "slug", "t_min",
+    "outcome", "qty", "price", "clip_usdc", "reason", "vwap",
+]
 def append_csv_row(row: dict) -> None:
     exists = os.path.exists(LOG_CSV)
     with open(LOG_CSV, "a", encoding="utf-8") as f:
         if not exists:
-            f.write(",".join(row.keys()) + "\n")
-        f.write(",".join(str(row[k]) for k in row.keys()) + "\n")
+            f.write(",".join(CSV_COLUMNS) + "\n")
+        f.write(",".join(str(row.get(k, "")) for k in CSV_COLUMNS) + "\n")
 def safe_float(x, default=None):
     try:
         return float(x)
@@ -763,9 +767,11 @@ class Bot:
     def __init__(self):
         self.client = PolymarketClient()
         self.running = True
-        self.bankroll_usdc = BANKROLL_START_USDC
+        self.cash_usdc = BANKROLL_START_USDC
+        self.realized_pnl_usdc = 0.0  # cumulative realized P&L (sells + settlements)
         self.day_start = utc_now().date()
-        self.daily_pnl_usdc = 0.0  # paper-mode tracked; live mode you can compute from fills
+        self.day_start_equity = BANKROLL_START_USDC  # equity at start of day for daily P&L
+        self.daily_pnl_usdc = 0.0  # daily P&L = current equity - day_start_equity
         self.market_states: Dict[str, MarketState] = {}   # slug -> MarketState
         self.signal_hist: Dict[str, List[Tuple[str, bool]]] = {}  # slug -> [(ts, valid_signal)]
         self.last_book: Dict[str, Dict[str, BookTop]] = {}  # slug -> outcome -> BookTop
@@ -782,8 +788,11 @@ class Bot:
         try:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
                 raw = json.load(f)
-            self.bankroll_usdc = float(raw.get("bankroll_usdc", self.bankroll_usdc))
+            # Support both old ("bankroll_usdc") and new ("cash_usdc") state files
+            self.cash_usdc = float(raw.get("cash_usdc", raw.get("bankroll_usdc", self.cash_usdc)))
+            self.realized_pnl_usdc = float(raw.get("realized_pnl_usdc", self.realized_pnl_usdc))
             self.daily_pnl_usdc = float(raw.get("daily_pnl_usdc", self.daily_pnl_usdc))
+            self.day_start_equity = float(raw.get("day_start_equity", self.day_start_equity))
             ms = raw.get("market_states", {})
             for slug, st_dict in ms.items():
                 # Reconstruct Position objects from raw dicts
@@ -794,27 +803,44 @@ class Bot:
                         for k, v in pos_raw.items()
                     }
                 self.market_states[slug] = MarketState(**st_dict)
-            write_jsonl({"type": "STATE_LOADED", "bankroll": self.bankroll_usdc})
+            write_jsonl({"type": "STATE_LOADED", "cash": self.cash_usdc,
+                         "realized_pnl": self.realized_pnl_usdc})
         except Exception as e:
             write_jsonl({"type": "STATE_LOAD_ERROR", "err": str(e)})
     def _save_state(self):
         try:
             ms = {slug: asdict(st) for slug, st in self.market_states.items()}
             raw = {
-                "bankroll_usdc": self.bankroll_usdc,
+                "cash_usdc": self.cash_usdc,
+                "realized_pnl_usdc": self.realized_pnl_usdc,
                 "daily_pnl_usdc": self.daily_pnl_usdc,
+                "day_start_equity": self.day_start_equity,
+                "equity_usdc": self._equity(),
                 "market_states": ms,
             }
             with open(STATE_FILE, "w", encoding="utf-8") as f:
                 json.dump(raw, f, indent=2)
         except Exception as e:
             write_jsonl({"type": "STATE_SAVE_ERROR", "err": str(e)})
+    def _equity(self) -> float:
+        """Mark-to-market equity: cash + sum(pos.qty * mid_price) for all open positions."""
+        mtm = 0.0
+        for slug, st in self.market_states.items():
+            for outcome in ["Up", "Down"]:
+                pos = st.positions[outcome]
+                if pos.qty < 1e-9:
+                    continue
+                book = self.last_book.get(slug, {}).get(outcome)
+                mid = book.mid if book else pos.vwap  # fallback to vwap if no book yet
+                mtm += pos.qty * mid
+        return self.cash_usdc + mtm
     def _reset_daily_if_needed(self):
         today = utc_now().date()
         if today != self.day_start:
             self.day_start = today
+            self.day_start_equity = self._equity()
             self.daily_pnl_usdc = 0.0
-            write_jsonl({"type": "NEW_DAY_RESET"})
+            write_jsonl({"type": "NEW_DAY_RESET", "day_start_equity": round(self.day_start_equity, 2)})
     # -----------------------------
     # Position helpers (paper-mode)
     # -----------------------------
@@ -828,10 +854,10 @@ class Bot:
         pos.last_trade_ts = iso_z(utc_now())
         if pos.opened_at is None:
             pos.opened_at = pos.last_trade_ts
-        self.bankroll_usdc -= usdc_cost
+        self.cash_usdc -= usdc_cost
         write_jsonl({"type": "PAPER_BUY", "slug": st.slug, "crypto": st.crypto,
                      "outcome": outcome, "qty": round(qty, 2), "price": round(price, 3),
-                     "cost": round(usdc_cost, 2), "balance": round(self.bankroll_usdc, 2)})
+                     "cost": round(usdc_cost, 2), "balance": round(self.cash_usdc, 2)})
     def _paper_sell(self, st: MarketState, outcome: str, price: float, qty: float):
         pos = st.positions[outcome]
         qty = min(qty, pos.qty)
@@ -843,9 +869,25 @@ class Bot:
         pos.qty -= qty
         pos.cost_usdc = max(0.0, pos.cost_usdc - cost_basis)
         pos.last_trade_ts = iso_z(utc_now())
-        self.bankroll_usdc += proceeds
+        self.cash_usdc += proceeds
+        self.realized_pnl_usdc += pnl
         self.daily_pnl_usdc += pnl
+        self._clean_dust(pos)
         return pnl
+    @staticmethod
+    def _clean_dust(pos: Position):
+        """Zero out positions that are floating-point dust (< 1e-9 qty)."""
+        if abs(pos.qty) < 1e-9:
+            pos.qty = 0.0
+            pos.cost_usdc = 0.0
+            pos.vwap = 0.0
+            pos.opened_at = None
+            pos.last_trade_ts = None
+            pos.tp1_done = False
+            pos.tp2_done = False
+            pos.tp3_done = False
+            pos.scalp_mode = False
+            pos.scalp_open_ts = None
     # -----------------------------
     # Risk checks
     # -----------------------------
@@ -859,11 +901,11 @@ class Bot:
                 s += sum(p.cost_usdc for p in st.positions.values())
         return s
     def _risk_ok(self, st: MarketState) -> bool:
-        if self.daily_pnl_usdc < -self.bankroll_usdc * DAILY_STOP_LOSS_PCT:
+        if self.daily_pnl_usdc < -self.cash_usdc * DAILY_STOP_LOSS_PCT:
             return False
-        if self._market_cost_usdc(st) > self.bankroll_usdc * MAX_COST_PER_MARKET_PCT:
+        if self._market_cost_usdc(st) > self.cash_usdc * MAX_COST_PER_MARKET_PCT:
             return False
-        if self._crypto_cost_usdc(st.crypto) > self.bankroll_usdc * MAX_COST_PER_CRYPTO_PCT:
+        if self._crypto_cost_usdc(st.crypto) > self.cash_usdc * MAX_COST_PER_CRYPTO_PCT:
             return False
         return True
     # -----------------------------
@@ -878,7 +920,8 @@ class Bot:
                 "up_book": up_book, "dn_book": dn_book}
 
     def run(self):
-        write_jsonl({"type": "START", "mode": MODE, "profile": PROFILE, "bankroll": self.bankroll_usdc})
+        write_jsonl({"type": "START", "mode": MODE, "profile": PROFILE,
+                     "cash": self.cash_usdc, "realized_pnl": self.realized_pnl_usdc})
         self._last_balance_print = 0.0
         while self.running:
             self._reset_daily_if_needed()
@@ -911,7 +954,10 @@ class Bot:
             except Exception as e:
                 write_jsonl({"type": "LOOP_ERROR", "err": str(e)})
             time.sleep(EVAL_EVERY_SEC)
-        write_jsonl({"type": "STOPPED", "bankroll": self.bankroll_usdc, "daily_pnl": self.daily_pnl_usdc})
+        write_jsonl({"type": "STOPPED", "cash": self.cash_usdc,
+                     "realized_pnl": self.realized_pnl_usdc,
+                     "equity": round(self._equity(), 2),
+                     "daily_pnl": self.daily_pnl_usdc})
         self._save_state()
     def _print_balance_summary(self):
         """Print balance and open positions to console."""
@@ -920,13 +966,16 @@ class Bot:
         for slug, st in self.market_states.items():
             for outcome in ["Up", "Down"]:
                 pos = st.positions[outcome]
-                if pos.qty > 0:
+                if pos.qty > 1e-9:
                     total_cost += pos.cost_usdc
                     pos_parts.append(f"{st.crypto} {outcome}:{pos.qty:.0f}@{pos.vwap:.3f}")
         pos_str = "  ".join(pos_parts) if pos_parts else "none"
-        pnl_str = f"+${self.daily_pnl_usdc:.2f}" if self.daily_pnl_usdc >= 0 else f"-${abs(self.daily_pnl_usdc):.2f}"
-        print(f"\n  --- Balance: ${self.bankroll_usdc:.2f}  |  Invested: ${total_cost:.2f}"
-              f"  |  Day P&L: {pnl_str}  |  Positions: {pos_str} ---\n")
+        equity = self._equity()
+        daily_pnl = equity - self.day_start_equity
+        pnl_str = f"+${daily_pnl:.2f}" if daily_pnl >= 0 else f"-${abs(daily_pnl):.2f}"
+        rpnl_str = f"+${self.realized_pnl_usdc:.2f}" if self.realized_pnl_usdc >= 0 else f"-${abs(self.realized_pnl_usdc):.2f}"
+        print(f"\n  --- Cash: ${self.cash_usdc:.2f}  |  Equity: ${equity:.2f}  |  Invested: ${total_cost:.2f}"
+              f"  |  Day P&L: {pnl_str}  |  Total P&L: {rpnl_str}  |  Positions: {pos_str} ---\n")
     def _resolve_ended_hours(self, current_markets: List[MarketRef]):
         """
         Resolve positions for hours that have ended.
@@ -936,7 +985,7 @@ class Bot:
         ended = [slug for slug in list(self.market_states.keys()) if slug not in current_slugs]
         for slug in ended:
             st = self.market_states[slug]
-            has_positions = any(st.positions[o].qty > 0 for o in ["Up", "Down"])
+            has_positions = any(st.positions[o].qty > 1e-9 for o in ["Up", "Down"])
             if not has_positions:
                 # No positions — just clean up
                 self.market_states.pop(slug, None)
@@ -950,13 +999,15 @@ class Bot:
             pos_details = []
             for outcome in ["Up", "Down"]:
                 pos = st.positions[outcome]
-                if pos.qty <= 0:
+                if pos.qty < 1e-9:
+                    self._clean_dust(pos)
                     continue
                 # Winner resolves at $1, loser at $0
                 payout_price = 1.0 if outcome == winner else 0.0
                 payout = payout_price * pos.qty
                 pnl = payout - pos.cost_usdc
-                self.bankroll_usdc += payout
+                self.cash_usdc += payout
+                self.realized_pnl_usdc += pnl
                 self.daily_pnl_usdc += pnl
                 pos_details.append({"outcome": outcome, "qty": round(pos.qty, 2),
                                     "payout": round(payout, 2), "pnl": round(pnl, 2)})
@@ -966,7 +1017,8 @@ class Bot:
                          "winner": winner, "spot": round(spot, 2),
                          "hour_open": round(st.hour_open, 2),
                          "positions": pos_details,
-                         "balance": round(self.bankroll_usdc, 2)})
+                         "cash": round(self.cash_usdc, 2),
+                         "equity": round(self._equity(), 2)})
             # Clean up ended market
             self.market_states.pop(slug, None)
             self.signal_hist.pop(slug, None)
@@ -1034,7 +1086,9 @@ class Bot:
             "down": asdict(dn_book),
             "market_cost": self._market_cost_usdc(st),
             "crypto_cost": self._crypto_cost_usdc(m.crypto),
-            "bankroll": self.bankroll_usdc,
+            "cash": self.cash_usdc,
+            "equity": round(self._equity(), 2),
+            "realized_pnl": self.realized_pnl_usdc,
             "daily_pnl": self.daily_pnl_usdc,
         })
         # manage exits first (inventory recycling)
@@ -1122,7 +1176,7 @@ class Bot:
             btc_cost = self._crypto_cost_usdc("BTC")
             if btc_cost > 0:
                 # reduce others proportionally up to 50%
-                reduce = clamp(btc_cost / (self.bankroll_usdc * MAX_COST_PER_CRYPTO_PCT), 0.0, 1.0)
+                reduce = clamp(btc_cost / (self.cash_usdc * MAX_COST_PER_CRYPTO_PCT), 0.0, 1.0)
                 clip *= (1.0 - BTC_EXPOSURE_REDUCE_OTHERS * reduce)
         if clip < MIN_ORDER_USDC:
             print(f"  [CLIP_FAIL] {m.crypto:5s} clip=${clip:.2f} < min=${MIN_ORDER_USDC}")
@@ -1145,6 +1199,7 @@ class Bot:
             "vel_bps_per_min": round(vel_bps_per_min, 3),
             "z": round(z, 3),
             "outcome": outcome,
+            "price": book.ask,
             "ask": book.ask,
             "bid": book.bid,
             "spread": book.spread,
@@ -1155,7 +1210,7 @@ class Bot:
             "qty": round(qty, 6),
             "layered": LAYER_ORDERS,
         }
-        append_csv_row({k: intent[k] for k in intent.keys()})
+        append_csv_row(intent)
         write_jsonl({"type": "ORDER_INTENT", **intent})
         # Execute order(s)
         st.last_entry_ts = now_iso
@@ -1203,6 +1258,7 @@ class Bot:
             "delta_bps": round(delta_bps, 3),
             "abs_delta_bps": round(abs_delta_bps, 3),
             "outcome": outcome,
+            "price": book.ask,
             "ask": book.ask,
             "bid": book.bid,
             "spread": book.spread,
@@ -1296,7 +1352,7 @@ class Bot:
             pnl = self._paper_sell(st, outcome, price, qty)
             write_jsonl({"type": "PAPER_SELL", "slug": m.slug, "outcome": outcome,
                          "qty": round(qty, 2), "price": round(price, 3),
-                         "pnl": round(pnl, 2), "balance": round(self.bankroll_usdc, 2),
+                         "pnl": round(pnl, 2), "balance": round(self.cash_usdc, 2),
                          "reason": reason})
             return
         # live sell
@@ -1312,7 +1368,7 @@ class Bot:
             px = max(0.01, ask - i * LAYER_STEP)
             self.client.place_limit_order(token_id, "BUY", px, per, post_only=POST_ONLY_WHEN_POSSIBLE)
     def _calc_clip(self, crypto: str, t_min: float, abs_delta_bps: float) -> float:
-        base = self.bankroll_usdc * BASE_CLIP_PCT
+        base = self.cash_usdc * BASE_CLIP_PCT
         mult = sizing_mult(abs_delta_bps)
         if t_min < 10:
             mult *= EARLY_SIZE_MULT
