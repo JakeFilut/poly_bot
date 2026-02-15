@@ -744,8 +744,15 @@ class Bot:
             self.bankroll_usdc = float(raw.get("bankroll_usdc", self.bankroll_usdc))
             self.daily_pnl_usdc = float(raw.get("daily_pnl_usdc", self.daily_pnl_usdc))
             ms = raw.get("market_states", {})
-            for slug, st in ms.items():
-                self.market_states[slug] = MarketState(**st)
+            for slug, st_dict in ms.items():
+                # Reconstruct Position objects from raw dicts
+                pos_raw = st_dict.get("positions")
+                if isinstance(pos_raw, dict):
+                    st_dict["positions"] = {
+                        k: Position(**v) if isinstance(v, dict) else v
+                        for k, v in pos_raw.items()
+                    }
+                self.market_states[slug] = MarketState(**st_dict)
             write_jsonl({"type": "STATE_LOADED", "bankroll": self.bankroll_usdc})
         except Exception as e:
             write_jsonl({"type": "STATE_LOAD_ERROR", "err": str(e)})
@@ -845,10 +852,11 @@ class Bot:
                 hour_open=m.hour_open,
                 hour_start_utc=iso_z(m.hour_start_utc),
             )
-            self.signal_hist[m.slug] = []
-            self.last_book[m.slug] = {}
-            self.recent_extreme_price[m.slug] = {"Up": None, "Down": None}
             write_jsonl({"type": "NEW_MARKET_STATE", "slug": m.slug, "crypto": m.crypto})
+        # Always ensure companion dicts exist (may be missing after state reload)
+        self.signal_hist.setdefault(m.slug, [])
+        self.last_book.setdefault(m.slug, {})
+        self.recent_extreme_price.setdefault(m.slug, {"Up": None, "Down": None})
     def _step_market(self, m: MarketRef):
         st = self.market_states[m.slug]
         now = utc_now()
