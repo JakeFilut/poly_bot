@@ -51,10 +51,13 @@ _LOG_DIR     = os.path.join(os.path.dirname(_PROJECT_DIR), "logs", "poly_bot")
 os.makedirs(_LOG_DIR, exist_ok=True)
 
 STATE_FILE = os.getenv("STATE_FILE", os.path.join(_LOG_DIR, "state.json"))
-LOG_CSV    = os.getenv("LOG_CSV",    os.path.join(_LOG_DIR, f"bot_log_{RUN_ID}.csv"))
-LOG_JSONL  = os.getenv("LOG_JSONL",  os.path.join(_LOG_DIR, f"bot_events_{RUN_ID}.jsonl"))
-# Schema version — bump when CSV columns change
-SCHEMA_VERSION = 5
+# Import the new Logger (replaces old write_jsonl / log_csv)
+from logger import (
+    Logger, SCHEMA_VERSION, BOT_VERSION, MIN_QTY as _LOG_MIN_QTY,
+    STATE_HIST_MAX,
+    build_book_fields, new_decision_id, new_order_id, new_position_id,
+    infer_maker_taker, spread_capture_fields,
+)
 # Markets / coins
 CRYPTOS = ["BTC", "ETH", "SOL", "XRP"]
 # Polling / evaluation
@@ -141,150 +144,35 @@ MAX_CROSS_SLIPPAGE = 0.01         # cross at most 1c if absolutely needed
 LAYER_ORDERS = True
 LAYER_COUNT = 3
 LAYER_STEP = 0.01                 # 1c ladder
-# History caps — state.json only keeps N most recent points;
-# full history lives in JSONL snapshots for backtesting
-STATE_HIST_MAX = 120              # ~2 min at 1s eval
 MIN_ORDER_USDC = 1.0
-MIN_QTY = 0.001  # below this, position is dust — don't sell, don't log
+MIN_QTY = _LOG_MIN_QTY  # from logger — below this, position is dust
 EDGE_K = 0.05    # sigmoid steepness: delta_bps -> P(Up)
 # Correlation exposure scaling (reduces correlated stacking)
 CORR_SCALE_ENABLED = True
 BTC_LEAD = True
 BTC_EXPOSURE_REDUCE_OTHERS = 0.50  # up to 50% size reduction if BTC exposure high
 # =============================================================================
-# UTIL / LOGGING
+# UTIL / LOGGING — thin wrappers around Logger instance
 # =============================================================================
+# The global `_LOGGER` is initialised in Bot.__init__().
+_LOGGER: Optional["Logger"] = None
+
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 def iso_z(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
+
 def write_jsonl(event: dict) -> None:
-    event["ts"] = iso_z(utc_now())
-    event["run_id"] = RUN_ID
-    line = json.dumps(event, ensure_ascii=False)
-    with open(LOG_JSONL, "a", encoding="utf-8") as f:
-        f.write(line + "\n")
-    # Console output — show key events in a readable format
-    etype = event.get("event_type", "")
-    if etype == "SNAPSHOT":
-        print(f"  {event.get('crypto',''):4s}  delta={event.get('delta_bps',0):+7.1f}bps  "
-              f"vel={event.get('vel_bps_per_min',0):+6.1f}  "
-              f"up_ask={event.get('up',{}).get('ask',0):.3f}  "
-              f"dn_ask={event.get('down',{}).get('ask',0):.3f}  "
-              f"t={event.get('t_min',0):.1f}m")
-    elif etype == "ORDER_INTENT":
-        print(f"  >>> {event.get('engine','')} {event.get('side','BUY')} {event.get('crypto','')}"
-              f" {event.get('outcome','')} qty={event.get('qty',0):.1f}"
-              f" px={event.get('price', 0):.3f}"
-              f" ${event.get('usdc_cost', event.get('clip_usdc',0)):.2f}")
-    elif etype == "PAPER_FILL":
-        pnl = event.get('pnl', 0)
-        side = event.get('side', 'BUY')
-        pnl_s = f"pnl={'+' if pnl >= 0 else ''}{pnl:.2f}  " if side == "SELL" else ""
-        print(f"  $$$ FILL {event.get('engine',''):10s} {side:4s} {event.get('crypto',''):4s}"
-              f" {event.get('outcome',''):4s} qty={event.get('qty',0):.1f}"
-              f" @ ${event.get('price',0):.3f}  {pnl_s}"
-              f"slippage={event.get('slippage_to_mid',0):.4f}"
-              f"  bal=${event.get('cash',0):.2f}")
-    elif etype == "DECISION":
-        pass  # DECISION events are JSONL-only, no console spam
-    elif etype == "PAPER_BUY":
-        pass  # now covered by PAPER_FILL event
-    elif etype == "HOUR_RESOLVED":
-        print(f"\n  === HOUR RESOLVED: {event.get('crypto','')} {event.get('slug','')} ===")
-        print(f"      Winner: {event.get('winner','')}  |  close_proxy={event.get('close_proxy',0):.2f}  open={event.get('hour_open',0):.2f}"
-              f"  next_open={event.get('next_hour_open',0):.2f}")
-        for pos_info in event.get("positions", []):
-            print(f"      {pos_info['outcome']}: qty={pos_info['qty']:.1f}  payout=${pos_info['payout']:.2f}  pnl={'+' if pos_info['pnl']>=0 else ''}{pos_info['pnl']:.2f}")
-        print(f"      Cash: ${event.get('cash',0):.2f}  Equity: ${event.get('equity',0):.2f}\n")
-    elif etype == "LOOP_ERROR":
-        print(f"  ERROR: {event.get('err','')}")
-    elif etype == "SKIP_NO_PRICE":
-        print(f"  SKIP {event.get('crypto','')}: no price data")
-    elif etype not in ("SNAPSHOT", "SNAPSHOT_COMPRESSED", "SNAPSHOT_ON_CHANGE",
-                       "DECISION", "PAPER_FILL", "PAPER_BUY", "ORDER_INTENT"):
-        print(f"[{etype}] {json.dumps({k:v for k,v in event.items() if k not in ('event_type','ts','run_id')})}")
-CSV_COLUMNS = [
-    "ts", "run_id", "mode", "profile", "decision_id", "trade_id", "entry_decision_id",
-    "event_type", "engine", "crypto", "slug",
-    "hour_start_utc", "hour_label_et", "hour_index", "t_min",
-    "phase", "seconds_to_close",
-    "spot", "hour_open", "delta_bps", "abs_delta_bps", "delta_vel_bps_per_min", "zscore",
-    "effective_delta", "normalized_delta",
-    "p_up_model", "edge_up", "edge_down",
-    "outcome", "side", "qty", "price", "usdc_cost",
-    "leg", "maker_taker",
-    # Order lifecycle timestamps
-    "ts_snapshot", "ts_decision", "ts_submit",
-    "lat_decision_ms", "lat_submit_ms",
-    # Price targeting
-    "target_price", "mid_at_decision", "mid_at_fill",
-    "book_side_used", "queue_assumption",
-    # Spread capture proof
-    "distance_to_bid", "distance_to_ask", "did_cross",
-    # Edge per trade
-    "edge_bps_entry", "edge_bps_exit",
-    # Position state
-    "unrealized_pnl",
-    "position_qty_before", "position_qty_after",
-    "cash_before", "cash_after", "equity_before", "equity_after",
-    # Book microstructure
-    "up_bid", "up_ask", "up_mid", "up_spread", "up_imb",
-    "dn_bid", "dn_ask", "dn_mid", "dn_spread", "dn_imb",
-    "ref_bid", "ref_ask", "ref_mid", "ref_spread", "ref_imb",
-    "ref_depth_1c_bid", "ref_depth_1c_ask",
-    "ref_depth_2c_bid", "ref_depth_2c_ask",
-    "spread_bucket",
-    "cap_used", "thr_used", "size_mult",
-    "reason", "vwap", "pnl", "slippage_to_mid", "fees_usdc",
-    "cash", "equity",
-    "notes",
-]
-# Float formatting: map column name -> decimal places
-_CSV_PRECISION = {
-    "qty": 8, "price": 6, "usdc_cost": 4, "delta_bps": 3, "abs_delta_bps": 3,
-    "delta_vel_bps_per_min": 3, "zscore": 3, "effective_delta": 3, "normalized_delta": 3,
-    "p_up_model": 4, "edge_up": 4, "edge_down": 4,
-    "distance_to_bid": 6, "distance_to_ask": 6,
-    "edge_bps_entry": 3, "edge_bps_exit": 3,
-    "target_price": 6, "mid_at_decision": 6, "mid_at_fill": 6,
-    "unrealized_pnl": 4,
-    "lat_decision_ms": 1, "lat_submit_ms": 1,
-    "position_qty_before": 8, "position_qty_after": 8,
-    "cash_before": 2, "cash_after": 2, "equity_before": 2, "equity_after": 2,
-    "vwap": 6, "pnl": 4, "slippage_to_mid": 6, "fees_usdc": 4,
-    "up_bid": 4, "up_ask": 4, "up_mid": 4, "up_spread": 4, "up_imb": 3,
-    "dn_bid": 4, "dn_ask": 4, "dn_mid": 4, "dn_spread": 4, "dn_imb": 3,
-    "ref_bid": 4, "ref_ask": 4, "ref_mid": 4, "ref_spread": 4, "ref_imb": 3,
-    "ref_depth_1c_bid": 1, "ref_depth_1c_ask": 1,
-    "ref_depth_2c_bid": 1, "ref_depth_2c_ask": 1,
-    "spot": 2, "hour_open": 2, "t_min": 3, "seconds_to_close": 1,
-    "cap_used": 4, "size_mult": 2,
-    "cash": 2, "equity": 2,
-}
-def _csv_fmt(key: str, val) -> str:
-    """Format a value for CSV: apply precision for floats, quote if needed."""
-    if val is None or val == "":
-        return ""
-    prec = _CSV_PRECISION.get(key)
-    if prec is not None and isinstance(val, (int, float)):
-        s = f"{val:.{prec}f}"
+    """Legacy shim — delegates to _LOGGER.log_jsonl if available."""
+    if _LOGGER is not None:
+        _LOGGER.log_jsonl(event)
     else:
-        s = str(val)
-    # Quote if contains comma, quote, or newline
-    if "," in s or '"' in s or "\n" in s:
-        return '"' + s.replace('"', '""') + '"'
-    return s
-def log_csv(row: dict) -> None:
-    """Write one row to bot_log.csv with the fixed schema. Missing keys → blank."""
-    row.setdefault("run_id", RUN_ID)
-    exists = os.path.exists(LOG_CSV)
-    with open(LOG_CSV, "a", encoding="utf-8") as f:
-        if not exists:
-            f.write(",".join(CSV_COLUMNS) + "\n")
-        f.write(",".join(_csv_fmt(k, row.get(k, "")) for k in CSV_COLUMNS) + "\n")
+        event["ts"] = iso_z(utc_now())
+        event["run_id"] = RUN_ID
+        print(f"[{event.get('event_type','')}] (pre-logger)")
+
 def _hour_label_et(hour_start_utc_str: str) -> str:
     """Convert '2026-02-14T18:00:00Z' -> '2026-02-14 13:00 ET'."""
     try:
@@ -295,8 +183,6 @@ def _hour_label_et(hour_start_utc_str: str) -> str:
         return dt_et.strftime("%Y-%m-%d %H:%M ET")
     except Exception:
         return hour_start_utc_str
-def _new_decision_id() -> str:
-    return uuid.uuid4().hex
 def _p_up_model(delta_bps: float) -> float:
     """Implied probability of Up outcome via sigmoid on delta_bps."""
     return 1.0 / (1.0 + math.exp(-EDGE_K * delta_bps))
@@ -307,54 +193,6 @@ def _phase(t_min: float) -> str:
     if t_min < 50.0:
         return "MID"
     return "CLOSING"
-def _infer_maker_taker(side: str, fill_price: float, book: BookTop) -> str:
-    """Infer maker/taker from fill price relative to book."""
-    if side == "BUY":
-        if fill_price <= book.bid + 1e-6:
-            return "maker"
-        if fill_price >= book.ask - 1e-6:
-            return "taker"
-        return "mid"
-    else:  # SELL
-        if fill_price >= book.ask - 1e-6:
-            return "maker"
-        if fill_price <= book.bid + 1e-6:
-            return "taker"
-        return "mid"
-def _spread_capture_fields(side: str, fill_price: float, book: BookTop) -> dict:
-    """Compute spread capture proof fields for a fill."""
-    dist_bid = fill_price - book.bid
-    dist_ask = fill_price - book.ask
-    if side == "BUY":
-        did_cross = fill_price >= book.ask - 1e-6  # bought at or above ask = crossed
-    else:
-        did_cross = fill_price <= book.bid + 1e-6  # sold at or below bid = crossed
-    return {
-        "distance_to_bid": dist_bid,
-        "distance_to_ask": dist_ask,
-        "did_cross": did_cross,
-    }
-def _spread_bucket(spread: float) -> str:
-    """Categorize spread into buckets."""
-    if spread <= 0.01 + 1e-9:
-        return "1c"
-    if spread <= 0.02 + 1e-9:
-        return "2c"
-    return "3c+"
-def _queue_assumption(side: str, fill_price: float, book: BookTop) -> str:
-    """Infer queue assumption from fill price vs book."""
-    if side == "BUY":
-        if fill_price <= book.bid + 1e-6:
-            return "JOIN_BID"
-        if fill_price >= book.ask - 1e-6:
-            return "CROSS_SPREAD"
-        return "MID_FILL"
-    else:
-        if fill_price >= book.ask - 1e-6:
-            return "JOIN_ASK"
-        if fill_price <= book.bid + 1e-6:
-            return "CROSS_SPREAD"
-        return "MID_FILL"
 def safe_float(x, default=None):
     try:
         return float(x)
@@ -400,13 +238,15 @@ class Position:
     last_trade_ts: Optional[str] = None
     scalp_mode: bool = False
     scalp_open_ts: Optional[str] = None
-    trade_id: Optional[str] = None  # persistent across entry → TP1 → TP2 → cleanup
-    entry_decision_id: Optional[str] = None  # decision_id of original entry (parent)
-    entry_mid: float = 0.0                   # mid price at entry time
-    max_favorable_mid: float = 0.0           # best mid seen while holding
-    max_adverse_mid: float = 1.0             # worst mid seen while holding
-    last_derisk_ts: Optional[str] = None     # ISO timestamp of last DERISK sell
-    last_derisk_mid: float = 0.0             # mid price at last DERISK action
+    position_id: Optional[str] = None       # UUID lifecycle: first entry → fully flat
+    trade_id: Optional[str] = None          # persistent across entry → TP1 → TP2 → cleanup
+    entry_decision_id: Optional[str] = None # decision_id of original entry (parent)
+    parent_order_id: Optional[str] = None   # client_order_id of entry order (for exit legs)
+    entry_mid: float = 0.0                  # mid price at entry time
+    max_favorable_mid: float = 0.0          # best mid seen while holding
+    max_adverse_mid: float = 1.0            # worst mid seen while holding
+    last_derisk_ts: Optional[str] = None    # ISO timestamp of last DERISK sell
+    last_derisk_mid: float = 0.0            # mid price at last DERISK action
 @dataclass
 class MarketState:
     slug: str
@@ -957,6 +797,7 @@ class PolymarketClient:
 # =============================================================================
 class Bot:
     def __init__(self):
+        global _LOGGER
         self.client = PolymarketClient()
         self.running = True
         self.cash_usdc = BANKROLL_START_USDC
@@ -969,11 +810,14 @@ class Bot:
         self.last_book: Dict[str, Dict[str, BookTop]] = {}  # slug -> outcome -> BookTop
         self.recent_extreme_price: Dict[str, Dict[str, float]] = {} # slug->outcome->extreme
         self.hour_index_counters: Dict[str, int] = {c: 0 for c in CRYPTOS}  # crypto -> monotonic index
-        # Snapshot control: track last compressed snapshot time and last mid values for change detection
-        self._last_compressed_snapshot: Dict[str, float] = {}   # slug -> time.time()
-        self._last_snapshot_mids: Dict[str, Dict[str, float]] = {}  # slug -> {Up: mid, Down: mid}
-        self._last_snapshot_delta: Dict[str, float] = {}  # slug -> delta_bps
-        self._last_pos_snapshot: Dict[str, float] = {}  # slug -> time.time()
+        # Initialise new Logger (replaces old write_jsonl / log_csv)
+        self.logger = Logger(
+            run_id=RUN_ID,
+            log_dir=_LOG_DIR,
+            mode=MODE,
+            profile=PROFILE,
+        )
+        _LOGGER = self.logger  # expose globally for write_jsonl shim
         self._load_state()
         signal.signal(signal.SIGINT, self._handle_stop)
         signal.signal(signal.SIGTERM, self._handle_stop)
@@ -1073,9 +917,6 @@ class Bot:
         if pos.opened_at is None:
             pos.opened_at = pos.last_trade_ts
         self.cash_usdc -= usdc_cost
-        write_jsonl({"event_type":"PAPER_BUY", "slug": st.slug, "crypto": st.crypto,
-                     "outcome": outcome, "qty": round(qty, 2), "price": round(price, 3),
-                     "cost": round(usdc_cost, 2), "balance": round(self.cash_usdc, 2)})
     def _paper_sell(self, st: MarketState, outcome: str, price: float, qty: float):
         pos = st.positions[outcome]
         qty = min(qty, pos.qty)
@@ -1106,8 +947,10 @@ class Bot:
             pos.tp3_done = False
             pos.scalp_mode = False
             pos.scalp_open_ts = None
+            pos.position_id = None
             pos.trade_id = None
             pos.entry_decision_id = None
+            pos.parent_order_id = None
             pos.entry_mid = 0.0
             pos.max_favorable_mid = 0.0
             pos.max_adverse_mid = 1.0
@@ -1145,10 +988,10 @@ class Bot:
                 "up_book": up_book, "dn_book": dn_book}
 
     def run(self):
-        write_jsonl({"event_type":"START", "run_id": RUN_ID, "schema_version": SCHEMA_VERSION,
-                     "mode": MODE, "profile": PROFILE,
-                     "cash": self.cash_usdc, "realized_pnl": self.realized_pnl_usdc,
-                     "log_csv": LOG_CSV, "log_jsonl": LOG_JSONL})
+        self.logger.log_event({"event_type": "START", "mode": MODE, "profile": PROFILE,
+                               "cash": self.cash_usdc, "realized_pnl": self.realized_pnl_usdc,
+                               "csv_path": self.logger._csv_path,
+                               "jsonl_path": self.logger._jsonl_path})
         self._last_balance_print = 0.0
         while self.running:
             self._reset_daily_if_needed()
@@ -1156,9 +999,7 @@ class Bot:
                 markets = self._get_markets()
                 for m in markets:
                     self._ensure_market_state(m)
-                # Check for hour-end resolution on stale markets
                 self._resolve_ended_hours(markets)
-                # Fetch all market data in parallel (all HTTP calls at once)
                 prefetched = []
                 if markets:
                     with ThreadPoolExecutor(max_workers=len(markets)) as pool:
@@ -1168,24 +1009,26 @@ class Bot:
                                 prefetched.append(fut.result())
                             except Exception as e:
                                 m = futures[fut]
-                                write_jsonl({"event_type":"PREFETCH_ERROR", "slug": m.slug, "err": str(e)})
-                # Process results sequentially (safe for shared state)
+                                self.logger.log_event({"event_type": "PREFETCH_ERROR",
+                                                       "slug": m.slug, "err": str(e)})
                 for data in prefetched:
                     self._step_market_with_data(data)
                 self._save_state()
-                # Print balance summary periodically (every 30s)
+                # Rotate log files if they exceed size limits
+                self.logger.rotate_files_if_needed()
                 now = time.time()
                 if now - self._last_balance_print >= 30.0:
                     self._print_balance_summary()
                     self._last_balance_print = now
             except Exception as e:
-                write_jsonl({"event_type":"LOOP_ERROR", "err": str(e)})
+                self.logger.log_event({"event_type": "LOOP_ERROR", "err": str(e)})
             time.sleep(EVAL_EVERY_SEC)
-        write_jsonl({"event_type":"STOPPED", "cash": self.cash_usdc,
-                     "realized_pnl": self.realized_pnl_usdc,
-                     "equity": round(self._equity(), 2),
-                     "daily_pnl": self.daily_pnl_usdc})
+        self.logger.log_event({"event_type": "STOPPED", "cash": self.cash_usdc,
+                               "realized_pnl": self.realized_pnl_usdc,
+                               "equity": round(self._equity(), 2),
+                               "daily_pnl": self.daily_pnl_usdc})
         self._save_state()
+        self.logger.close()
     def _print_balance_summary(self):
         """Print balance and open positions to console."""
         total_cost = 0.0
@@ -1247,34 +1090,15 @@ class Bot:
             close_proxy = spot  # spot at transition ≈ open(H+1) ≈ close(H)
             winner = "Up" if close_proxy >= st.hour_open else "Down"
             settlement_delta_bps = (close_proxy - st.hour_open) / max(st.hour_open, 1e-9) * 10000.0
-            # WINDOW_SETTLED event — records settlement price and delta at hour close
-            write_jsonl({
+            self.logger.log_event({
                 "event_type": "WINDOW_SETTLED", "slug": slug, "crypto": st.crypto,
                 "hour_start_utc": st.hour_start_utc,
-                "hour_label_et": _hour_label_et(st.hour_start_utc),
-                "hour_index": st.hour_index,
                 "settlement_price": round(close_proxy, 2),
                 "hour_open": round(st.hour_open, 2),
                 "settlement_delta_bps": round(settlement_delta_bps, 3),
                 "winner": winner,
                 "next_hour_open": round(next_hour_open, 2),
-            })
-            # CSV row for WINDOW_SETTLED
-            log_csv({
-                "ts": iso_z(utc_now()), "mode": MODE, "profile": PROFILE,
-                "event_type": "WINDOW_SETTLED", "engine": "SETTLE",
-                "crypto": st.crypto, "slug": slug,
-                "hour_start_utc": st.hour_start_utc,
-                "hour_label_et": _hour_label_et(st.hour_start_utc),
-                "hour_index": st.hour_index, "t_min": 60.0,
-                "phase": "SETTLED", "seconds_to_close": 0.0,
-                "spot": close_proxy, "hour_open": st.hour_open,
-                "delta_bps": settlement_delta_bps,
-                "abs_delta_bps": abs(settlement_delta_bps),
-                "reason": winner,
-                "cash": self.cash_usdc, "equity": self._equity(),
-                "notes": f"next_open={next_hour_open:.2f}",
-            })
+            }, also_csv=True)
             pos_details = []
             for outcome in ["Up", "Down"]:
                 pos = st.positions[outcome]
@@ -1291,16 +1115,11 @@ class Bot:
                                     "payout": payout, "pnl": pnl})
                 pos.qty = 0.0
                 pos.cost_usdc = 0.0
-            write_jsonl({
+            self.logger.log_event({
                 "event_type": "HOUR_RESOLVED", "slug": slug, "crypto": st.crypto,
                 "hour_start_utc": st.hour_start_utc,
-                "hour_label_et": _hour_label_et(st.hour_start_utc),
-                "hour_index": st.hour_index,
                 "winner": winner,
                 "close_proxy": round(close_proxy, 2),
-                "next_hour_open": round(next_hour_open, 2),
-                "effective_hour_close": round(next_hour_open, 2),
-                "hour_close_source": "NEXT_HOUR_OPEN",
                 "hour_open": round(st.hour_open, 2),
                 "positions": pos_details,
                 "cash": round(self.cash_usdc, 2),
@@ -1383,26 +1202,11 @@ class Bot:
             "hour_index": st.hour_index,
         }
     def _book_fields(self, up_book: BookTop, dn_book: BookTop, outcome: Optional[str] = None) -> dict:
-        """Return flat dict with up_*/dn_*/ref_* book fields for CSV."""
-        d = {
-            "up_bid": up_book.bid, "up_ask": up_book.ask, "up_mid": up_book.mid,
-            "up_spread": up_book.spread, "up_imb": up_book.imb,
-            "dn_bid": dn_book.bid, "dn_ask": dn_book.ask, "dn_mid": dn_book.mid,
-            "dn_spread": dn_book.spread, "dn_imb": dn_book.imb,
-        }
-        if outcome:
-            ref = up_book if outcome == "Up" else dn_book
-            d.update({
-                "ref_bid": ref.bid, "ref_ask": ref.ask, "ref_mid": ref.mid,
-                "ref_spread": ref.spread, "ref_imb": ref.imb,
-                "ref_depth_1c_bid": ref.depth_1c_bid, "ref_depth_1c_ask": ref.depth_1c_ask,
-                "ref_depth_2c_bid": ref.depth_2c_bid, "ref_depth_2c_ask": ref.depth_2c_ask,
-                "spread_bucket": _spread_bucket(ref.spread),
-            })
-        return d
+        """Return flat dict with up_*/dn_*/ref_* book fields for CSV/JSONL."""
+        return build_book_fields(up_book, dn_book, outcome)
     def _step_market_with_data(self, data: dict):
         """Process a market using pre-fetched HTTP data."""
-        ts_snapshot = time.time()  # when we read the book data
+        ts_snapshot = time.time()
         m = data["market"]
         spot, hour_open = data["spot"], data["hour_open"]
         up_book, dn_book = data["up_book"], data["dn_book"]
@@ -1416,8 +1220,8 @@ class Bot:
             self._cleanup_market(m, st, t_min)
             return
         if hour_open <= 0 or spot <= 0:
-            write_jsonl({"event_type":"SKIP_NO_PRICE", "slug": m.slug, "crypto": m.crypto,
-                         "spot": spot, "hour_open": hour_open})
+            self.logger.log_event({"event_type": "SKIP_NO_PRICE", "slug": m.slug,
+                                   "crypto": m.crypto, "spot": spot, "hour_open": hour_open})
             return
         st.hour_open = hour_open
         delta_bps = (spot - hour_open) / hour_open * 10000.0
@@ -1432,120 +1236,51 @@ class Bot:
         self.last_book[m.slug]["Up"] = up_book
         self.last_book[m.slug]["Down"] = dn_book
         self._update_extremes(m.slug, up_book, dn_book)
-        # Track max_favorable / max_adverse for open positions
         for outcome in ["Up", "Down"]:
             pos = st.positions[outcome]
             if pos.qty >= MIN_QTY and pos.entry_mid > 0:
                 bk = up_book if outcome == "Up" else dn_book
                 pos.max_favorable_mid = max(pos.max_favorable_mid, bk.mid)
                 pos.max_adverse_mid = min(pos.max_adverse_mid, bk.mid)
-        # Build shared tick context (includes ts_snapshot for latency tracking)
         ctx = self._make_tick_ctx(m, st, spot, hour_open, t_min, delta_bps, abs_delta_bps,
                                   vel, z, up_book, dn_book)
         ctx["ts_snapshot"] = ts_snapshot
-        # Derived metrics
-        effective_delta = ctx["effective_delta"]
-        normalized_delta = ctx["normalized_delta"]
-        # --- Smart snapshot logic ---
-        # Full SNAPSHOT (raw forensics — every tick)
-        write_jsonl({
-            "event_type": "SNAPSHOT",
-            "slug": m.slug, "crypto": m.crypto,
-            "hour_start_utc": st.hour_start_utc,
-            "hour_label_et": ctx["hour_label_et"],
-            "hour_index": st.hour_index,
-            "t_min": round(t_min, 3),
-            "spot": spot, "hour_open": hour_open,
-            "delta_bps": round(delta_bps, 3),
-            "abs_delta_bps": round(abs_delta_bps, 3),
-            "vel_bps_per_min": round(vel, 3),
-            "z": round(z, 3),
-            "effective_delta": round(effective_delta, 3),
-            "normalized_delta": round(normalized_delta, 3),
-            "up": asdict(up_book), "down": asdict(dn_book),
-            "market_cost": self._market_cost_usdc(st),
-            "crypto_cost": self._crypto_cost_usdc(m.crypto),
-            "cash": self.cash_usdc,
-            "equity": round(self._equity(), 2),
-            "realized_pnl": self.realized_pnl_usdc,
-            "daily_pnl": self.daily_pnl_usdc,
-        })
-        # SNAPSHOT_COMPRESSED — every 5s, key backtesting fields only
-        last_comp = self._last_compressed_snapshot.get(m.slug, 0.0)
-        if ts_snapshot - last_comp >= 5.0:
-            self._last_compressed_snapshot[m.slug] = ts_snapshot
-            write_jsonl({
-                "event_type": "SNAPSHOT_COMPRESSED",
-                "slug": m.slug, "crypto": m.crypto,
-                "t_min": round(t_min, 3), "phase": ctx["phase"],
-                "spot": spot, "hour_open": hour_open,
-                "delta_bps": round(delta_bps, 3), "vel": round(vel, 3),
-                "up_mid": round(up_book.mid, 4), "up_spread": round(up_book.spread, 4),
-                "dn_mid": round(dn_book.mid, 4), "dn_spread": round(dn_book.spread, 4),
-                "up_imb": round(up_book.imb, 3), "dn_imb": round(dn_book.imb, 3),
-                "p_up_model": round(ctx["p_up_model"], 4),
-                "edge_up": round(ctx["edge_up"], 4), "edge_down": round(ctx["edge_down"], 4),
-                "cash": round(self.cash_usdc, 2), "equity": round(self._equity(), 2),
-            })
-        # SNAPSHOT_ON_CHANGE — when significant state changes
-        prev_mids = self._last_snapshot_mids.get(m.slug, {})
-        prev_delta = self._last_snapshot_delta.get(m.slug, 0.0)
-        up_mid_moved = abs(up_book.mid - prev_mids.get("Up", up_book.mid)) * 10000 > 20  # >20bps
-        dn_mid_moved = abs(dn_book.mid - prev_mids.get("Down", dn_book.mid)) * 10000 > 20
-        thr_check = entry_threshold_bps(t_min)
-        delta_crossed_thr = (abs(prev_delta) < thr_check) != (abs_delta_bps < thr_check)
-        if up_mid_moved or dn_mid_moved or delta_crossed_thr:
-            self._last_snapshot_mids[m.slug] = {"Up": up_book.mid, "Down": dn_book.mid}
-            self._last_snapshot_delta[m.slug] = delta_bps
-            write_jsonl({
-                "event_type": "SNAPSHOT_ON_CHANGE",
-                "slug": m.slug, "crypto": m.crypto,
-                "trigger": ("mid_move" if (up_mid_moved or dn_mid_moved) else "thr_cross"),
-                "t_min": round(t_min, 3),
-                "delta_bps": round(delta_bps, 3),
-                "up_mid": round(up_book.mid, 4), "dn_mid": round(dn_book.mid, 4),
-                "up_spread": round(up_book.spread, 4), "dn_spread": round(dn_book.spread, 4),
-                "up_imb": round(up_book.imb, 3), "dn_imb": round(dn_book.imb, 3),
-            })
-        # --- Periodic position snapshot (every 15s per market) ---
-        last_ps = self._last_pos_snapshot.get(m.slug, 0.0)
-        if ts_snapshot - last_ps >= 15.0:
-            self._last_pos_snapshot[m.slug] = ts_snapshot
-            for outcome in ["Up", "Down"]:
-                pos = st.positions[outcome]
-                if pos.qty >= MIN_QTY:
-                    bk = up_book if outcome == "Up" else dn_book
-                    upl = (bk.bid - pos.vwap) * pos.qty if pos.vwap > 0 else 0.0
-                    log_csv({
-                        "ts": iso_z(now), "run_id": RUN_ID, "mode": MODE, "profile": PROFILE,
-                        "event_type": "POSITION_SNAPSHOT",
-                        "engine": "MONITOR", "crypto": m.crypto, "slug": m.slug,
-                        "hour_start_utc": ctx["hour_start_utc"],
-                        "hour_label_et": ctx["hour_label_et"],
-                        "hour_index": ctx["hour_index"], "t_min": t_min,
-                        "phase": ctx["phase"], "seconds_to_close": ctx["seconds_to_close"],
-                        "spot": spot, "hour_open": hour_open,
-                        "delta_bps": delta_bps, "abs_delta_bps": abs_delta_bps,
-                        "outcome": outcome,
-                        "trade_id": pos.trade_id or "",
-                        "qty": pos.qty, "vwap": pos.vwap,
-                        "usdc_cost": pos.cost_usdc,
-                        "unrealized_pnl": upl,
-                        "ref_bid": bk.bid, "ref_ask": bk.ask, "ref_mid": bk.mid,
-                        "ref_spread": bk.spread,
-                        "reason": "POSITION_MONITOR",
-                        "cash": self.cash_usdc, "equity": self._equity(),
-                    })
-                    write_jsonl({
-                        "event_type": "POSITION_SNAPSHOT",
-                        "slug": m.slug, "crypto": m.crypto, "outcome": outcome,
-                        "trade_id": pos.trade_id, "qty": round(pos.qty, 4),
-                        "vwap": round(pos.vwap, 6), "cost_usdc": round(pos.cost_usdc, 4),
-                        "unrealized_pnl": round(upl, 4),
-                        "ref_mid": round(bk.mid, 4), "ref_bid": round(bk.bid, 4),
-                        "t_min": round(t_min, 3),
-                        "cash": round(self.cash_usdc, 2), "equity": round(self._equity(), 2),
-                    })
+        # ── SNAPSHOT_COMPACT (every SNAPSHOT_INTERVAL_SEC per market) ──
+        pos_up_qty = st.positions["Up"].qty
+        pos_dn_qty = st.positions["Down"].qty
+        equity = self._equity()
+        if self.logger.should_log_snapshot_compact(ts_snapshot, m.slug):
+            self.logger.log_snapshot_compact(
+                slug=m.slug, crypto=m.crypto, t_min=t_min,
+                spot=spot, hour_open=hour_open,
+                delta_bps=delta_bps, abs_delta_bps=abs_delta_bps,
+                vel=vel, z=z,
+                up_bid=up_book.bid, up_ask=up_book.ask, up_mid=up_book.mid,
+                up_spread=up_book.spread, up_imb=up_book.imb,
+                dn_bid=dn_book.bid, dn_ask=dn_book.ask, dn_mid=dn_book.mid,
+                dn_spread=dn_book.spread, dn_imb=dn_book.imb,
+                pos_qty_up=pos_up_qty, pos_qty_down=pos_dn_qty,
+                cash_usdc=self.cash_usdc, equity_usdc=equity,
+            )
+        # ── SNAPSHOT_ON_CHANGE (only when significant changes happen) ──
+        snap_dict = {
+            "up_mid": up_book.mid, "dn_mid": dn_book.mid,
+            "up_spread": up_book.spread, "dn_spread": dn_book.spread,
+            "up_imb": up_book.imb, "dn_imb": dn_book.imb,
+            "delta_bps": delta_bps,
+            "entry_thr_bps": entry_threshold_bps(t_min),
+            "pos_qty_up": pos_up_qty, "pos_qty_down": pos_dn_qty,
+        }
+        should_change, trigger = self.logger.should_log_snapshot_on_change(m.slug, snap_dict)
+        if should_change:
+            self.logger.log_snapshot_on_change(
+                slug=m.slug, crypto=m.crypto, trigger=trigger,
+                t_min=t_min, delta_bps=delta_bps,
+                up_mid=up_book.mid, up_spread=up_book.spread, up_imb=up_book.imb,
+                dn_mid=dn_book.mid, dn_spread=dn_book.spread, dn_imb=dn_book.imb,
+                pos_qty_up=pos_up_qty, pos_qty_down=pos_dn_qty,
+                cash_usdc=self.cash_usdc, equity_usdc=equity,
+            )
         # manage exits first (inventory recycling)
         self._manage_exits(m, st, t_min, delta_bps, ctx)
         # stop adding risk after minute 57
@@ -1636,9 +1371,8 @@ class Bot:
         # Favored outcome = direction model favors
         favored_outcome = "Up" if ctx["edge_up"] > ctx["edge_down"] else "Down"
         favored_strength_bps = abs_delta_bps
-        write_jsonl({
-            "event_type": "DECISION", "engine": "CORE",
-            "slug": m.slug, "crypto": m.crypto,
+        self.logger.log_decision({
+            "engine": "CORE", "slug": m.slug, "crypto": m.crypto,
             "hour_start_utc": ctx["hour_start_utc"], "hour_index": ctx["hour_index"],
             "t_min": round(t_min, 3),
             "phase": ctx["phase"], "seconds_to_close": round(ctx["seconds_to_close"], 1),
@@ -1652,16 +1386,10 @@ class Bot:
             "clip_usdc": round(clip, 4),
             "will_trade": will_trade, "did_trade": will_trade,
             "skip_reason": skip_reason,
-            "favored_outcome": favored_outcome, "favored_strength_bps": round(favored_strength_bps, 3),
             "spot": spot, "hour_open": ctx["hour_open"],
             "delta_bps": round(delta_bps, 3), "abs_delta_bps": round(abs_delta_bps, 3),
             "vel": round(vel, 3), "z": round(z, 3),
-            "effective_delta": round(ctx["effective_delta"], 3),
-            "normalized_delta": round(ctx["normalized_delta"], 3),
-            "p_up_model": round(ctx["p_up_model"], 4),
-            "edge_up": round(ctx["edge_up"], 4), "edge_down": round(ctx["edge_down"], 4),
         })
-        # Console debug
         if not sig:
             print(f"  [GATE_FAIL] {m.crypto:5s} {skip_reason}")
             return
@@ -1674,82 +1402,57 @@ class Bot:
             print(f"  [CLIP_FAIL] {m.crypto:5s} clip=${clip:.2f} < min=${MIN_ORDER_USDC}")
             return
         # ---- Proceed to trade ----
-        ts_decision = time.time()
-        ts_snapshot = ctx.get("ts_snapshot", ts_decision)
         now_iso = iso_z(utc_now())
         qty = clip / max(1e-9, book.ask)
-        decision_id = _new_decision_id()
+        decision_id = new_decision_id()
+        client_oid = new_order_id()
         pos = st.positions[outcome]
-        # Assign trade_id + entry metadata on first entry for this position lifecycle
-        is_first_entry = pos.trade_id is None
-        if is_first_entry:
+        # Assign position_id + trade_id on first entry for this position lifecycle
+        if pos.position_id is None:
+            pos.position_id = new_position_id()
             pos.trade_id = uuid.uuid4().hex
             pos.entry_decision_id = decision_id
+            pos.parent_order_id = client_oid
             pos.entry_mid = book.mid
             pos.max_favorable_mid = book.mid
             pos.max_adverse_mid = book.mid
-        trade_id = pos.trade_id
-        # Edge at entry: how far is our fill from spot-implied fair value
-        edge_bps_entry = (book.mid - book.ask) * 10000.0 / max(book.mid, 1e-9)
-        ts_submit = time.time()
-        lat_decision_ms = (ts_decision - ts_snapshot) * 1000.0
-        lat_submit_ms = (ts_submit - ts_decision) * 1000.0
+        ctx["cap_used"] = cap
+        ctx["thr_used"] = thr
+        ctx["size_mult"] = mult
+        bk_fields = self._book_fields(up_book, dn_book, outcome)
         print(f"  [TRADE!] {m.crypto:5s} {outcome} clip=${clip:.2f} ask={book.ask:.3f}")
-        # Snapshot before
-        pos_qty_before = pos.qty
-        cash_before = self.cash_usdc
-        equity_before = self._equity()
-        # Common CSV row fields
-        row_base = {
-            "ts": now_iso, "mode": MODE, "profile": PROFILE,
-            "decision_id": decision_id, "trade_id": trade_id,
-            "entry_decision_id": pos.entry_decision_id,
-            "engine": "CORE", "crypto": m.crypto, "slug": m.slug,
-            "hour_start_utc": ctx["hour_start_utc"], "hour_label_et": ctx["hour_label_et"],
-            "hour_index": ctx["hour_index"], "t_min": t_min,
-            "phase": ctx["phase"], "seconds_to_close": ctx["seconds_to_close"],
-            "spot": spot, "hour_open": ctx["hour_open"],
-            "delta_bps": delta_bps, "abs_delta_bps": abs_delta_bps,
-            "delta_vel_bps_per_min": vel, "zscore": z,
-            "effective_delta": ctx["effective_delta"], "normalized_delta": ctx["normalized_delta"],
-            "p_up_model": ctx["p_up_model"], "edge_up": ctx["edge_up"], "edge_down": ctx["edge_down"],
-            "outcome": outcome, "side": "BUY", "qty": qty, "price": book.ask, "usdc_cost": clip,
-            "leg": "ENTRY",
-            "ts_snapshot": iso_z(datetime.fromtimestamp(ts_snapshot, tz=timezone.utc)),
-            "ts_decision": iso_z(datetime.fromtimestamp(ts_decision, tz=timezone.utc)),
-            "ts_submit": iso_z(datetime.fromtimestamp(ts_submit, tz=timezone.utc)),
-            "lat_decision_ms": lat_decision_ms, "lat_submit_ms": lat_submit_ms,
-            "mid_at_decision": book.mid,
-            "edge_bps_entry": edge_bps_entry,
-            "book_side_used": f"{'UP' if outcome == 'Up' else 'DN'}_BOOK",
-            "queue_assumption": _queue_assumption("BUY", book.ask, book),
-            **_spread_capture_fields("BUY", book.ask, book),
-            "reason": "ENTRY_SIGNAL_DELTA",
-            "position_qty_before": pos_qty_before,
-            "cash_before": cash_before, "equity_before": equity_before,
-            "cap_used": cap, "thr_used": thr, "size_mult": mult,
-            "cash": self.cash_usdc, "equity": self._equity(),
-        }
-        row_base.update(self._book_fields(up_book, dn_book, outcome))
-        # ORDER_INTENT row
-        log_csv({**row_base, "event_type": "ORDER_INTENT"})
-        write_jsonl({"event_type":"ORDER_INTENT", **row_base})
-        # Execute order(s)
+        # ORDER_INTENT
+        self.logger.log_order_intent(
+            engine="CORE", reason="ENTRY_DELTA",
+            decision_id=decision_id, position_id=pos.position_id,
+            crypto=m.crypto, slug=m.slug, outcome=outcome,
+            side="BUY", qty=qty, target_price=book.ask,
+            usdc_cost=clip, ctx=ctx, book_fields=bk_fields,
+        )
+        # ORDER_SUBMIT
+        self.logger.log_order_submit(
+            engine="CORE", reason="ENTRY_DELTA",
+            decision_id=decision_id, position_id=pos.position_id,
+            client_order_id=client_oid,
+            crypto=m.crypto, slug=m.slug, outcome=outcome,
+            side="BUY", qty=qty, target_price=book.ask,
+            usdc_cost=clip, ctx=ctx, book_fields=bk_fields,
+        )
         st.last_entry_ts = now_iso
         if MODE == "LOG":
             self._paper_buy(st, outcome, book.ask, qty, clip)
-            mt = _infer_maker_taker("BUY", book.ask, book)
-            sc = _spread_capture_fields("BUY", book.ask, book)
-            # PAPER_FILL row with after snapshots
-            fill_row = {**row_base, "event_type": "PAPER_FILL",
-                        "maker_taker": mt, **sc,
-                        "mid_at_fill": book.mid,
-                        "position_qty_after": pos.qty,
-                        "cash_after": self.cash_usdc, "equity_after": self._equity(),
-                        "slippage_to_mid": book.ask - book.mid, "fees_usdc": 0.0,
-                        "cash": self.cash_usdc, "equity": self._equity()}
-            log_csv(fill_row)
-            write_jsonl({"event_type":"PAPER_FILL", **fill_row})
+            mt = infer_maker_taker("BUY", book.ask, book)
+            sc = spread_capture_fields("BUY", book.ask, book)
+            self.logger.log_order_fill(
+                engine="CORE", reason="ENTRY_DELTA",
+                decision_id=decision_id, client_order_id=client_oid,
+                position_id=pos.position_id,
+                crypto=m.crypto, slug=m.slug, outcome=outcome,
+                side="BUY", qty=qty, fill_price=book.ask,
+                usdc_cost=clip, fees_usdc=0.0,
+                maker_taker=mt, did_cross=sc.get("did_cross", ""),
+                vwap=pos.vwap, ctx=ctx, book_fields=bk_fields,
+            )
             return
         self._place_layered_buy(m, outcome, qty, book.ask)
     def _late_scalps(self, ctx: dict):
@@ -1762,11 +1465,9 @@ class Bot:
             return
         if abs_delta_bps < LATE_SCALP_ABSDELTA_MIN or abs_delta_bps > LATE_SCALP_ABSDELTA_MAX:
             return
-        up_price = up_book.ask
-        dn_price = dn_book.ask
-        if min(up_price, dn_price) > LATE_SCALP_PRICE_MAX:
+        if min(up_book.ask, dn_book.ask) > LATE_SCALP_PRICE_MAX:
             return
-        outcome = "Up" if up_price < dn_price else "Down"
+        outcome = "Up" if up_book.ask < dn_book.ask else "Down"
         book = up_book if outcome == "Up" else dn_book
         if book.spread > IMB_MAX_SPREAD:
             return
@@ -1780,75 +1481,51 @@ class Bot:
             return
         qty = clip / max(1e-9, book.ask)
         target_sell = min(0.999, book.ask + LATE_SCALP_TP_CENTS)
-        ts_decision = time.time()
-        ts_snapshot = ctx.get("ts_snapshot", ts_decision)
-        decision_id = _new_decision_id()
+        decision_id = new_decision_id()
+        client_oid = new_order_id()
         mult = sizing_mult(abs_delta_bps)
         pos = st.positions[outcome]
-        # Assign trade_id + entry metadata on first entry
-        is_first_entry = pos.trade_id is None
-        if is_first_entry:
+        if pos.position_id is None:
+            pos.position_id = new_position_id()
             pos.trade_id = uuid.uuid4().hex
             pos.entry_decision_id = decision_id
+            pos.parent_order_id = client_oid
             pos.entry_mid = book.mid
             pos.max_favorable_mid = book.mid
             pos.max_adverse_mid = book.mid
-        trade_id = pos.trade_id
-        edge_bps_entry = (book.mid - book.ask) * 10000.0 / max(book.mid, 1e-9)
-        ts_submit = time.time()
-        lat_decision_ms = (ts_decision - ts_snapshot) * 1000.0
-        lat_submit_ms = (ts_submit - ts_decision) * 1000.0
-        # Snapshot before
-        pos_qty_before = pos.qty
-        cash_before = self.cash_usdc
-        equity_before = self._equity()
-        row_base = {
-            "ts": now_iso, "mode": MODE, "profile": PROFILE,
-            "decision_id": decision_id, "trade_id": trade_id,
-            "entry_decision_id": pos.entry_decision_id,
-            "engine": "LATE_SCALP", "crypto": m.crypto, "slug": m.slug,
-            "hour_start_utc": ctx["hour_start_utc"], "hour_label_et": ctx["hour_label_et"],
-            "hour_index": ctx["hour_index"], "t_min": t_min,
-            "phase": ctx["phase"], "seconds_to_close": ctx["seconds_to_close"],
-            "spot": spot, "hour_open": ctx["hour_open"],
-            "delta_bps": delta_bps, "abs_delta_bps": abs_delta_bps,
-            "delta_vel_bps_per_min": ctx["vel"], "zscore": ctx["z"],
-            "effective_delta": ctx["effective_delta"], "normalized_delta": ctx["normalized_delta"],
-            "p_up_model": ctx["p_up_model"], "edge_up": ctx["edge_up"], "edge_down": ctx["edge_down"],
-            "outcome": outcome, "side": "BUY", "qty": qty, "price": book.ask, "usdc_cost": clip,
-            "leg": "SCALP_ENTRY", "target_price": target_sell,
-            "ts_snapshot": iso_z(datetime.fromtimestamp(ts_snapshot, tz=timezone.utc)),
-            "ts_decision": iso_z(datetime.fromtimestamp(ts_decision, tz=timezone.utc)),
-            "ts_submit": iso_z(datetime.fromtimestamp(ts_submit, tz=timezone.utc)),
-            "lat_decision_ms": lat_decision_ms, "lat_submit_ms": lat_submit_ms,
-            "mid_at_decision": book.mid,
-            "edge_bps_entry": edge_bps_entry,
-            "book_side_used": f"{'UP' if outcome == 'Up' else 'DN'}_BOOK",
-            "queue_assumption": _queue_assumption("BUY", book.ask, book),
-            **_spread_capture_fields("BUY", book.ask, book),
-            "reason": "REENTRY_SCALP",
-            "position_qty_before": pos_qty_before,
-            "cash_before": cash_before, "equity_before": equity_before,
-            "size_mult": mult,
-            "notes": f"target_sell={target_sell:.3f}",
-            "cash": self.cash_usdc, "equity": self._equity(),
-        }
-        row_base.update(self._book_fields(up_book, dn_book, outcome))
-        log_csv({**row_base, "event_type": "ORDER_INTENT"})
-        write_jsonl({"event_type":"ORDER_INTENT", **row_base, "target_sell": target_sell})
+        ctx["size_mult"] = mult
+        bk_fields = self._book_fields(up_book, dn_book, outcome)
+        self.logger.log_order_intent(
+            engine="LATE_SCALP", reason="ENTRY_SCALP",
+            decision_id=decision_id, position_id=pos.position_id,
+            crypto=m.crypto, slug=m.slug, outcome=outcome,
+            side="BUY", qty=qty, target_price=book.ask,
+            usdc_cost=clip, ctx=ctx, book_fields=bk_fields,
+            extra={"notes": f"target_sell={target_sell:.3f}"},
+        )
+        self.logger.log_order_submit(
+            engine="LATE_SCALP", reason="ENTRY_SCALP",
+            decision_id=decision_id, position_id=pos.position_id,
+            client_order_id=client_oid,
+            crypto=m.crypto, slug=m.slug, outcome=outcome,
+            side="BUY", qty=qty, target_price=book.ask,
+            usdc_cost=clip, ctx=ctx, book_fields=bk_fields,
+        )
         st.last_reentry_ts = now_iso
         if MODE == "LOG":
             self._paper_buy(st, outcome, book.ask, qty, clip)
-            mt = _infer_maker_taker("BUY", book.ask, book)
-            sc = _spread_capture_fields("BUY", book.ask, book)
-            fill_row = {**row_base, "event_type": "PAPER_FILL",
-                        "maker_taker": mt, **sc, "mid_at_fill": book.mid,
-                        "position_qty_after": pos.qty,
-                        "cash_after": self.cash_usdc, "equity_after": self._equity(),
-                        "slippage_to_mid": book.ask - book.mid, "fees_usdc": 0.0,
-                        "cash": self.cash_usdc, "equity": self._equity()}
-            log_csv(fill_row)
-            write_jsonl({"event_type":"PAPER_FILL", **fill_row})
+            mt = infer_maker_taker("BUY", book.ask, book)
+            sc = spread_capture_fields("BUY", book.ask, book)
+            self.logger.log_order_fill(
+                engine="LATE_SCALP", reason="ENTRY_SCALP",
+                decision_id=decision_id, client_order_id=client_oid,
+                position_id=pos.position_id,
+                crypto=m.crypto, slug=m.slug, outcome=outcome,
+                side="BUY", qty=qty, fill_price=book.ask,
+                usdc_cost=clip, fees_usdc=0.0,
+                maker_taker=mt, did_cross=sc.get("did_cross", ""),
+                vwap=pos.vwap, ctx=ctx, book_fields=bk_fields,
+            )
             pos.scalp_mode = True
             pos.scalp_open_ts = now_iso
             return
@@ -1939,94 +1616,64 @@ class Bot:
         qty = max(0.0, qty)
         if qty < MIN_QTY:
             return  # don't sell dust — don't log it either
-        ts_decision = time.time()
-        ts_snapshot = ctx.get("ts_snapshot", ts_decision) if ctx else ts_decision
         token_id = m.outcome_up_id if outcome == "Up" else m.outcome_down_id
         pos = st.positions[outcome]
         up_book = self.last_book.get(m.slug, {}).get("Up")
         dn_book = self.last_book.get(m.slug, {}).get("Down")
         ref_book = up_book if outcome == "Up" else dn_book
-        now_iso = iso_z(utc_now())
-        t_min = minutes_into_hour(
-            datetime.strptime(st.hour_start_utc, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc),
-            utc_now())
-        decision_id = _new_decision_id()
-        trade_id = pos.trade_id or ""
-        entry_decision_id = pos.entry_decision_id or ""
-        usdc_cost = pos.vwap * qty  # cost basis of this tranche
+        decision_id = new_decision_id()
+        client_oid = new_order_id()
+        position_id = pos.position_id or ""
+        parent_oid = pos.parent_order_id or ""
+        usdc_cost = pos.vwap * qty
         unrealized_pnl = (ref_book.bid - pos.vwap) * pos.qty if ref_book and pos.vwap > 0 else 0.0
-        phase = _phase(t_min)
-        seconds_to_close = max(0.0, (60.0 - t_min) * 60.0)
-        # Edge at exit: how far is fill from mid
-        edge_bps_exit = (price - ref_book.mid) * 10000.0 / max(ref_book.mid, 1e-9) if ref_book else 0.0
-        ts_submit = time.time()
-        lat_decision_ms = (ts_decision - ts_snapshot) * 1000.0
-        lat_submit_ms = (ts_submit - ts_decision) * 1000.0
-        # Snapshot before sell
-        pos_qty_before = pos.qty
-        cash_before = self.cash_usdc
-        equity_before = self._equity()
-        row_base = {
-            "ts": now_iso, "mode": MODE, "profile": PROFILE,
-            "decision_id": decision_id, "trade_id": trade_id,
-            "entry_decision_id": entry_decision_id,
-            "engine": "EXIT", "crypto": m.crypto, "slug": m.slug,
-            "hour_start_utc": st.hour_start_utc,
-            "hour_label_et": _hour_label_et(st.hour_start_utc),
-            "hour_index": st.hour_index, "t_min": t_min,
-            "phase": phase, "seconds_to_close": seconds_to_close,
-            "spot": ctx.get("spot", "") if ctx else "",
-            "hour_open": st.hour_open,
-            "delta_bps": ctx.get("delta_bps", "") if ctx else "",
-            "abs_delta_bps": ctx.get("abs_delta_bps", "") if ctx else "",
-            "delta_vel_bps_per_min": ctx.get("vel", "") if ctx else "",
-            "zscore": ctx.get("z", "") if ctx else "",
-            "effective_delta": ctx.get("effective_delta", "") if ctx else "",
-            "normalized_delta": ctx.get("normalized_delta", "") if ctx else "",
-            "p_up_model": ctx.get("p_up_model", "") if ctx else "",
-            "edge_up": ctx.get("edge_up", "") if ctx else "",
-            "edge_down": ctx.get("edge_down", "") if ctx else "",
-            "outcome": outcome, "side": "SELL", "qty": qty, "price": price,
-            "usdc_cost": usdc_cost,
-            "leg": leg, "target_price": target_price or "",
-            "ts_snapshot": iso_z(datetime.fromtimestamp(ts_snapshot, tz=timezone.utc)),
-            "ts_decision": iso_z(datetime.fromtimestamp(ts_decision, tz=timezone.utc)),
-            "ts_submit": iso_z(datetime.fromtimestamp(ts_submit, tz=timezone.utc)),
-            "lat_decision_ms": lat_decision_ms, "lat_submit_ms": lat_submit_ms,
-            "mid_at_decision": ref_book.mid if ref_book else "",
-            "edge_bps_exit": edge_bps_exit,
-            "book_side_used": f"{'UP' if outcome == 'Up' else 'DN'}_BOOK",
-            "queue_assumption": _queue_assumption("SELL", price, ref_book) if ref_book else "",
-            **((_spread_capture_fields("SELL", price, ref_book)) if ref_book else {}),
-            "unrealized_pnl": unrealized_pnl,
-            "position_qty_before": pos_qty_before,
-            "cash_before": cash_before, "equity_before": equity_before,
-            "reason": reason, "vwap": pos.vwap,
-            "cash": self.cash_usdc, "equity": self._equity(),
-        }
-        if up_book and dn_book:
-            row_base.update(self._book_fields(up_book, dn_book, outcome))
-        # SELL_INTENT
-        log_csv({**row_base, "event_type": "ORDER_INTENT"})
-        write_jsonl({"event_type":"ORDER_INTENT", **row_base})
+        # Build a minimal ctx if caller didn't pass one
+        if ctx is None:
+            t_min = minutes_into_hour(
+                datetime.strptime(st.hour_start_utc, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc),
+                utc_now())
+            ctx = {"hour_start_utc": st.hour_start_utc, "hour_open": st.hour_open,
+                   "t_min": t_min, "phase": _phase(t_min),
+                   "seconds_to_close": max(0.0, (60.0 - t_min) * 60.0)}
+        bk_fields = self._book_fields(up_book, dn_book, outcome) if (up_book and dn_book) else {}
+        # ORDER_INTENT
+        self.logger.log_order_intent(
+            engine="EXIT", reason=reason,
+            decision_id=decision_id, position_id=position_id,
+            parent_order_id=parent_oid,
+            crypto=m.crypto, slug=m.slug, outcome=outcome,
+            side="SELL", qty=qty, target_price=target_price or price,
+            usdc_cost=usdc_cost, ctx=ctx, book_fields=bk_fields,
+            extra={"vwap": pos.vwap, "unrealized_pnl_usdc": unrealized_pnl},
+        )
+        # ORDER_SUBMIT
+        self.logger.log_order_submit(
+            engine="EXIT", reason=reason,
+            decision_id=decision_id, position_id=position_id,
+            client_order_id=client_oid, parent_order_id=parent_oid,
+            crypto=m.crypto, slug=m.slug, outcome=outcome,
+            side="SELL", qty=qty, target_price=target_price or price,
+            usdc_cost=usdc_cost, ctx=ctx, book_fields=bk_fields,
+        )
         if MODE == "LOG":
             pnl = self._paper_sell(st, outcome, price, qty)
-            slippage = (ref_book.mid - price) if ref_book else 0.0  # for sells, mid - sell_price
-            mt = _infer_maker_taker("SELL", price, ref_book) if ref_book else ""
-            sc = _spread_capture_fields("SELL", price, ref_book) if ref_book else {}
-            fill_row = {**row_base, "event_type": "PAPER_FILL",
-                        "maker_taker": mt, **sc,
-                        "mid_at_fill": ref_book.mid if ref_book else "",
-                        "pnl": pnl, "slippage_to_mid": slippage, "fees_usdc": 0.0,
-                        "position_qty_after": pos.qty,
-                        "cash_after": self.cash_usdc, "equity_after": self._equity(),
-                        "cash": self.cash_usdc, "equity": self._equity()}
-            log_csv(fill_row)
-            write_jsonl({"event_type":"PAPER_FILL", **fill_row})
+            mt = infer_maker_taker("SELL", price, ref_book) if ref_book else ""
+            sc = spread_capture_fields("SELL", price, ref_book) if ref_book else {}
+            # ORDER_FILL
+            self.logger.log_order_fill(
+                engine="EXIT", reason=reason,
+                decision_id=decision_id, client_order_id=client_oid,
+                position_id=position_id, parent_order_id=parent_oid,
+                crypto=m.crypto, slug=m.slug, outcome=outcome,
+                side="SELL", qty=qty, fill_price=price,
+                usdc_cost=usdc_cost, fees_usdc=0.0,
+                maker_taker=mt, did_cross=sc.get("did_cross", ""),
+                realized_pnl_usdc=pnl, net_pnl_usdc=pnl,
+                unrealized_pnl_usdc=0.0, vwap=pos.vwap,
+                ctx=ctx, book_fields=bk_fields,
+            )
             # ROUND_TRIP_CLOSE when position goes flat
             if pos.qty < MIN_QTY and pos.entry_mid > 0:
-                exit_mid = ref_book.mid if ref_book else price
-                notional = pos_qty_before * pos.entry_mid
                 time_held = 0.0
                 if pos.opened_at:
                     try:
@@ -2034,46 +1681,18 @@ class Bot:
                         time_held = (utc_now() - opened_dt).total_seconds()
                     except Exception:
                         pass
-                max_favorable_bps = (pos.max_favorable_mid - pos.entry_mid) * 10000.0 / max(pos.entry_mid, 1e-9)
-                max_adverse_bps = (pos.entry_mid - pos.max_adverse_mid) * 10000.0 / max(pos.entry_mid, 1e-9)
-                net_edge_bps = pnl / max(notional, 1e-9) * 10000.0
-                write_jsonl({
+                mfe = (pos.max_favorable_mid - pos.entry_mid) * 10000.0 / max(pos.entry_mid, 1e-9)
+                mae = (pos.entry_mid - pos.max_adverse_mid) * 10000.0 / max(pos.entry_mid, 1e-9)
+                self.logger.log_event({
                     "event_type": "ROUND_TRIP_CLOSE",
-                    "trade_id": trade_id, "entry_decision_id": entry_decision_id,
+                    "position_id": position_id,
                     "slug": m.slug, "crypto": m.crypto, "outcome": outcome,
-                    "hour_start_utc": st.hour_start_utc, "hour_index": st.hour_index,
-                    "entry_vwap": round(pos.vwap, 6) if pos.vwap > 0 else round(pos.entry_mid, 6),
-                    "exit_vwap": round(price, 6),
-                    "entry_mid": round(pos.entry_mid, 6),
-                    "exit_mid": round(exit_mid, 6),
-                    "gross_pnl_usdc": round(pnl, 4),
-                    "fees_total_usdc": 0.0,
-                    "net_pnl_usdc": round(pnl, 4),
-                    "net_edge_bps": round(net_edge_bps, 3),
-                    "time_in_position_sec": round(time_held, 1),
-                    "max_favorable_bps": round(max_favorable_bps, 3),
-                    "max_adverse_bps": round(max_adverse_bps, 3),
-                    "exit_reason": reason,
-                })
-                # CSV summary row for round-trip
-                log_csv({
-                    "ts": now_iso, "mode": MODE, "profile": PROFILE,
-                    "event_type": "ROUND_TRIP_CLOSE",
-                    "trade_id": trade_id, "entry_decision_id": entry_decision_id,
-                    "engine": "SUMMARY", "crypto": m.crypto, "slug": m.slug,
                     "hour_start_utc": st.hour_start_utc,
-                    "hour_label_et": _hour_label_et(st.hour_start_utc),
-                    "hour_index": st.hour_index,
-                    "outcome": outcome,
-                    "vwap": pos.vwap if pos.vwap > 0 else pos.entry_mid,
-                    "price": price,
-                    "pnl": pnl, "fees_usdc": 0.0,
-                    "edge_bps_entry": (pos.entry_mid - pos.vwap) * 10000.0 / max(pos.entry_mid, 1e-9) if pos.entry_mid > 0 else 0.0,
-                    "edge_bps_exit": edge_bps_exit,
-                    "reason": reason,
-                    "notes": f"held={time_held:.0f}s mfe={max_favorable_bps:.1f}bps mae={max_adverse_bps:.1f}bps",
-                    "cash": self.cash_usdc, "equity": self._equity(),
-                })
+                    "gross_pnl_usdc": round(pnl, 4), "net_pnl_usdc": round(pnl, 4),
+                    "time_in_position_sec": round(time_held, 1),
+                    "max_favorable_bps": round(mfe, 3), "max_adverse_bps": round(mae, 3),
+                    "exit_reason": reason,
+                }, also_csv=True)
             return
         self.client.place_limit_order(token_id, "SELL", price, qty, post_only=False)
     def _place_layered_buy(self, m: MarketRef, outcome: str, qty: float, ask: float):
