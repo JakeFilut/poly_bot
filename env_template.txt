@@ -1,0 +1,47 @@
+# =============================================================================
+# ENVIRONMENT VARIABLES FOR ARBITRAGE BOT
+# =============================================================================
+# Copy this file to: <your-github-folder>/keys/.env
+# Fill in your actual credentials below
+# ⚠️ NEVER commit .env to git or share it publicly!
+#
+# Expected folder structure (can be anywhere on your system):
+#   <anywhere>/github/
+#     ├── keys/         <- Put .env and kalshi_private_key.pem here
+#     ├── logs/         <- Logs will be written here automatically
+#     └── arb_repo/     <- This codebase
+#
+# Paths are automatically detected relative to the arb_repo folder.
+# Works on Mac, Linux VPS, and Windows.
+
+# -----------------------------------------------------------------------------
+# KALSHI CREDENTIALS (You already have these)
+# -----------------------------------------------------------------------------
+KALSHI_API_KEY_ID=your_kalshi_key_id_here
+# Path to your Kalshi private key file (in the keys folder next to this .env)
+# The path is automatically resolved relative to the keys folder
+KALSHI_PRIVATE_KEY_PATH=kalshi_private_key.pem
+
+# -----------------------------------------------------------------------------
+# POLYMARKET CREDENTIALS (You need to add these)
+# -----------------------------------------------------------------------------
+# Your Ethereum wallet private key (starts with 0x)
+# Get from MetaMask: Settings → Security & Privacy → Show private key
+# ⚠️ KEEP THIS SECRET! Anyone with this can access your funds!
+POLYMARKET_PRIVATE_KEY=0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef
+
+# -----------------------------------------------------------------------------
+# POLYMARKET API CREDENTIALS (OPTIONAL - for better rate limits)
+# -----------------------------------------------------------------------------
+# Get from: https://polymarket.com → Settings → API Keys
+# POLYMARKET_API_KEY=
+# POLYMARKET_API_SECRET=
+# POLYMARKET_API_PASSPHRASE=
+
+# -----------------------------------------------------------------------------
+# NOTES:
+# -----------------------------------------------------------------------------
+# 1. Make sure USDC is on Polygon network, not Ethereum mainnet
+# 2. Start with small amounts for testing ($10-20 per exchange)
+# 3. The bot stops after 5 trades automatically
+# 4. Monitor logs in: ../logs/ (relative to arb_repo)

@@ -1,0 +1,16 @@
+# Python dependencies for Real Arbitrage Bot
+
+# Polymarket client
+py-clob-client>=0.4.0
+
+# HTTP requests
+requests>=2.31.0
+
+# Environment variables
+python-dotenv>=1.0.0
+
+# Cryptography for Kalshi API signing
+cryptography>=41.0.0
+
+# Optional but recommended
+pandas>=2.0.0  # For analyzing trade logs
