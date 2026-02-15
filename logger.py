@@ -36,7 +36,7 @@ IMB_DELTA             = float(os.getenv("IMB_DELTA", "0.15"))
 FLUSH_INTERVAL_SEC    = float(os.getenv("FLUSH_INTERVAL_SEC", "1.0"))
 MAX_JSONL_BYTES       = int(os.getenv("MAX_JSONL_BYTES", str(200 * 1024 * 1024)))
 MAX_CSV_BYTES         = int(os.getenv("MAX_CSV_BYTES",   str(500 * 1024 * 1024)))
-STATE_HIST_MAX        = int(os.getenv("STATE_HIST_MAX", "120"))
+STATE_HIST_MAX        = int(os.getenv("STATE_HIST_MAX", "360"))
 MIN_QTY               = float(os.getenv("MIN_QTY", "0.001"))
 
 # ═══════════════════════════════════════════════════════════════════════════════
