@@ -79,17 +79,17 @@ CAP_15_30 = 0.90
 CAP_30_45 = 0.96
 CAP_45_60 = 0.97
 # Drift persistence & velocity (hidden edge)
-PERSISTENCE_SEC = 20.0          # signal must hold for >= 20s
+PERSISTENCE_SEC = 6.0           # signal must hold for >= 6s (one snapshot)
 MIN_DELTA_VEL_BPS_PER_MIN = 1.0 # require some "push" to scale size (not to enter)
 # Volatility normalization
 Z_WINDOW_SEC = 300.0            # 5 minutes for zscore
 Z_ENTRY_MIN = 1.0               # only enter if zscore >= 1.0 (optional gate)
-Z_ENTRY_ENABLED = True
+Z_ENTRY_ENABLED = False
 # Orderbook imbalance
-IMB_ENABLED = True
+IMB_ENABLED = False
 IMB_LEVELS = 5
 IMB_MIN = 1.15                  # bidDepth/askDepth must exceed this for with-drift buys
-IMB_MAX_SPREAD = 0.03           # skip if spread too wide (3c)
+IMB_MAX_SPREAD = 0.06           # skip if spread too wide (6c)
 # Pullback entry
 PULLBACK_ENABLED = True
 PULLBACK_CENTS = 0.02           # wait for 2c pullback from recent extreme
