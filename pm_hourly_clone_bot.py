@@ -1085,10 +1085,23 @@ class Bot:
                 valid_pullback = (book.mid <= extreme - PULLBACK_CENTS) or (t_min > 45)  # allow chasing late
         # persistence tracking
         sig = bool(valid_time and valid_delta and valid_z and valid_price and valid_spread and valid_imb and valid_pullback)
+        # DEBUG: show which gates fail
+        if not sig:
+            fails = []
+            if not valid_time: fails.append("time")
+            if not valid_delta: fails.append(f"delta({abs_delta_bps:.1f}<{thr})")
+            if not valid_z: fails.append("zscore")
+            if not valid_price: fails.append(f"price({book.ask:.3f}>{cap})")
+            if not valid_spread: fails.append(f"spread({book.spread:.3f}>{IMB_MAX_SPREAD})")
+            if not valid_imb: fails.append("imb")
+            if not valid_pullback: fails.append("pullback")
+            print(f"  [GATE_FAIL] {m.crypto:5s} {' | '.join(fails)}")
         sh = self.signal_hist.setdefault(m.slug, [])
         sh.append((iso_z(utc_now()), sig))
         sh[:] = sh[-500:]
         if not persistence_ok(sh):
+            if sig:
+                print(f"  [PERSIST_FAIL] {m.crypto:5s} sig=True but persistence not met (hist={len(sh)})")
             return
         # cooldown
         now_iso = iso_z(utc_now())
@@ -1111,7 +1124,9 @@ class Bot:
                 reduce = clamp(btc_cost / (self.bankroll_usdc * MAX_COST_PER_CRYPTO_PCT), 0.0, 1.0)
                 clip *= (1.0 - BTC_EXPOSURE_REDUCE_OTHERS * reduce)
         if clip < MIN_ORDER_USDC:
+            print(f"  [CLIP_FAIL] {m.crypto:5s} clip=${clip:.2f} < min=${MIN_ORDER_USDC}")
             return
+        print(f"  [TRADE!] {m.crypto:5s} {outcome} clip=${clip:.2f} ask={book.ask:.3f}")
         # Convert cost clip to contracts at ask price
         qty = clip / max(1e-9, book.ask)
         # Log intent (LOG mode stops right here, per your request)
