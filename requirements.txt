@@ -5,6 +5,10 @@ py-clob-client>=0.4.0
 
 # HTTP requests
 requests>=2.31.0
+httpx>=0.24.0
+
+# CLI dependency required by httpx
+click>=8.1.0
 
 # Environment variables
 python-dotenv>=1.0.0

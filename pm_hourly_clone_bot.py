@@ -451,6 +451,10 @@ class PolymarketClient:
         except ImportError:
             print("ERROR: pip install py-clob-client")
             sys.exit(1)
+        except Exception as e:
+            print(f"ERROR: Failed to import py_clob_client: {e}")
+            print("Try: pip install --upgrade py-clob-client httpx click")
+            sys.exit(1)
 
         self._clob = ClobClient(
             host=self.clob_host,
