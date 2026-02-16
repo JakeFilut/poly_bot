@@ -73,12 +73,12 @@ TRADE_HARD_STOP_MIN = 59.25
 PROFILE = os.getenv("PROFILE", "CLONE").upper()   # CLONE or MAX_EV
 # Coin-specific threshold tables: coin -> {early, mid, late}
 _THR_TABLE = {
-    "BTC": {"early": 8, "mid": 12, "late": 5},
-    "SOL": {"early": 8, "mid": 12, "late": 5},
-    "ETH": {"early": 7, "mid":  8, "late": 7},
-    "XRP": {"early": 7, "mid":  8, "late": 7},
+    "BTC": {"early": 7, "mid": 10, "late": 4},
+    "SOL": {"early": 7, "mid": 10, "late": 4},
+    "ETH": {"early": 6, "mid":  7, "late": 6},
+    "XRP": {"early": 6, "mid":  7, "late": 6},
 }
-# Special rule: XRP min 30-40 reduces threshold by 1 bps (applied in function)
+# Special rule: XRP min 30-40 reduces threshold by 2 bps (applied in function)
 THR_EARLY_5_15_MAXEV = 12
 THR_MID_15_45_MAXEV  = 18
 THR_LATE_45_57_MAXEV = 10
@@ -89,7 +89,7 @@ CAP_15_30 = 0.90
 CAP_30_45 = 0.96
 CAP_45_60 = 0.97
 # Drift persistence & velocity (hidden edge)
-PERSISTENCE_SEC = 1.2           # signal must hold for >= 1.2s (fast entry)
+PERSISTENCE_SEC = 0.6           # signal must hold for >= 0.6s (ultra-fast F247)
 MIN_DELTA_VEL_BPS_PER_MIN = 1.0 # require some "push" to scale size (not to enter)
 # Volatility normalization
 Z_WINDOW_SEC = 300.0            # 5 minutes for zscore
@@ -104,21 +104,14 @@ IMB_MAX_SPREAD = 0.06           # skip if spread too wide (6c)
 PULLBACK_ENABLED = False
 PULLBACK_CENTS = 0.02           # wait for 2c pullback from recent extreme
 PULLBACK_LOOKBACK_SEC = 90.0
-# Cooldowns — dynamic per coin/time (replaces old static ENTRY_COOLDOWN_SEC = 20)
-# Cooldown tables: coin -> {early, mid, late} seconds
-_COOLDOWN_TABLE = {
-    "BTC": {"early": 4.0, "mid": 3.0, "late": 2.0},
-    "SOL": {"early": 4.0, "mid": 3.0, "late": 2.0},
-    "ETH": {"early": 4.0, "mid": 2.0, "late": 3.0},
-    "XRP": {"early": 4.0, "mid": 2.0, "late": 3.0},
-}
+# Cooldowns — ultra-low, just anti-spam (F247 mode)
 def entry_cooldown_sec(coin: str, t_min: float) -> float:
-    tbl = _COOLDOWN_TABLE.get(coin, {"early": 4.0, "mid": 3.0, "late": 3.0})
-    if t_min < 15:
-        return tbl["early"]
-    if t_min < 45:
-        return tbl["mid"]
-    return tbl["late"]
+    """Minimal cooldown: 1-2s depending on time bucket. Coin-agnostic."""
+    if t_min >= 45:
+        return 1.0
+    if 15 <= t_min < 45:
+        return 1.5
+    return 2.0
 REENTRY_COOLDOWN_SEC = 10.0
 # Base clip sizing (USDC cost) as % of bankroll
 BASE_CLIP_PCT = 0.0035  # 0.35% bankroll per tick (~$3.50 on $1k)
@@ -149,7 +142,7 @@ LATE_SCALP_PRICE_MAX = 0.80
 LATE_SCALP_ABSDELTA_MIN = 5.0
 LATE_SCALP_ABSDELTA_MAX = 20.0
 LATE_SCALP_TP_CENTS = 0.03      # aim +3c
-LATE_SCALP_MAX_HOLD_MIN = 8.0   # reduced from 10 min
+LATE_SCALP_MAX_HOLD_MIN = 6.0   # aggressive F247 — flip fast
 # Risk caps
 MAX_COST_PER_MARKET_PCT = 0.015   # 1.5% bankroll per market-hour
 MAX_COST_PER_CRYPTO_PCT = 0.035   # 3.5% bankroll per crypto across markets
@@ -174,25 +167,26 @@ EDGE_K = 0.05    # sigmoid steepness: delta_bps -> P(Up)
 # Probe → Scale state machine
 # -----------------------------------------------------------------------------
 PROBE_SIZE_FRAC = 0.25        # probe = max($1, clip * 0.25)
-PROBE_CONFIRM_SEC = 1.0       # wait 1s after probe for signal confirmation
-# Burst execution engine
-BURST_ORDERS = 8
-BURST_INTERVAL_MS = 200
-BURST_TOTAL_USD_MULT = 1.8    # total burst ≈ base_clip * 1.8
+PROBE_CONFIRM_SEC = 0.3       # 300ms — near-instant confirmation (F247)
+# Burst execution engine — aggressive F247 config
+BURST_ORDERS = 12
+BURST_INTERVAL_MS = 120
+BURST_TOTAL_USD_MULT = 2.5    # total burst ≈ base_clip * 2.5
 BURST_STEP_USD_MIN = 1.00
-BURST_STEP_USD_MAX = 6.00
-BURST_STOP_IF_ASK_JUMPS_CENTS = 0.02   # 2 cents
-BURST_STOP_IF_EDGE_DROPS_BPS = 3.0
+BURST_STEP_USD_MAX = 10.00
+BURST_STOP_IF_ASK_JUMPS_CENTS = 0.03   # 3 cents (relaxed)
+BURST_STOP_IF_EDGE_DROPS_BPS = 6.0     # only stop on hard edge collapse
+BURST_SPREAD_HARD_LIMIT = 0.12         # ignore spread unless > 12c
 # Dynamic price cap boost
 CAP_BOOST_EDGE_THRESHOLD = 10.0  # edge_bps above which cap starts boosting
-CAP_BOOST_MAX = 0.06             # max +6 cents boost
+CAP_BOOST_MAX = 0.08             # max +8 cents boost (aggressive chase)
 CAP_BOOST_EDGE_FULL = 30.0       # edge_bps at which full boost is applied
 # Spread rule relaxation
-SPREAD_RELAXED_MAX = 0.09         # 9 cents (vs default 6c)
-# Fast take-profit
-FAST_TP_AFTER_SEC = 45.0
+SPREAD_RELAXED_MAX = 0.12         # 12 cents during burst (F247 tolerant)
+# Fast take-profit — skim faster than before
+FAST_TP_AFTER_SEC = 25.0
 FAST_TP_CENTS = 0.02
-FAST_TP_SELL_PCT = 0.20           # sell 20%
+FAST_TP_SELL_PCT = 0.30           # sell 30%
 # Inventory pressure controls
 INVENTORY_CAP_SHARES_PER_MARKET = 250
 # Correlation exposure scaling (reduces correlated stacking)
@@ -362,9 +356,9 @@ def entry_threshold_bps(coin: str, t_min: float) -> float:
         thr = tbl["late"]
     else:
         return 10_000
-    # Special rule: XRP min 30-40 reduce by 1 bps
+    # Special rule: XRP min 30-40 reduce by 2 bps (F247 aggressive)
     if coin == "XRP" and 30 <= t_min < 40:
-        thr = max(1, thr - 1)
+        thr = max(1, thr - 2)
     return thr
 def price_cap(t_min: float) -> float:
     if 0 <= t_min < 5:   return CAP_0_5
@@ -383,9 +377,13 @@ def dynamic_cap(t_min: float, abs_edge_bps: float) -> float:
     boost = frac * CAP_BOOST_MAX
     return min(0.99, base + boost)
 def spread_limit(t_min: float, abs_edge_bps: float, coin: str, in_burst: bool = False) -> float:
-    """Return max allowed spread. Relaxed to 9c during PROBING/SCALING if conditions met."""
+    """Return max allowed spread. During burst: spread is NOT a stop condition
+    unless > BURST_SPREAD_HARD_LIMIT (12c). For entry gating outside burst,
+    relax to SPREAD_RELAXED_MAX if late-hour or high edge."""
+    if in_burst:
+        return BURST_SPREAD_HARD_LIMIT  # 12c — spread never stops burst below this
     thr = entry_threshold_bps(coin, t_min)
-    if in_burst and (45 <= t_min <= 57 or abs_edge_bps >= thr + 10):
+    if 45 <= t_min <= 57 or abs_edge_bps >= thr + 10:
         return SPREAD_RELAXED_MAX
     return IMB_MAX_SPREAD
 def sizing_mult(abs_delta_bps: float) -> float:
@@ -743,7 +741,7 @@ class PolymarketClient:
                         depth_5c_bid=0.0, depth_5c_ask=0.0)
         url = f"{self.clob_host}/book"
         try:
-            r = self.session.get(url, params={"token_id": token_id}, timeout=5)
+            r = self.session.get(url, params={"token_id": token_id}, timeout=2)
             if r.status_code != 200:
                 return empty
             data = r.json()
@@ -1348,7 +1346,10 @@ class Bot:
             "jsonl_path": self.logger._jsonl_path,
         })
         self._last_balance_print = 0.0
+        # Target loop interval: 200ms max for F247-grade reaction speed
+        _TARGET_LOOP_MS = 200
         while self.running:
+            loop_start = time.time()
             self._reset_daily_if_needed()
             try:
                 markets = self._get_markets()
@@ -1377,7 +1378,21 @@ class Bot:
                     self._last_balance_print = now
             except Exception as e:
                 self.logger.log_event({"event_type": "LOOP_ERROR", "err": str(e)})
-            time.sleep(EVAL_EVERY_SEC)
+            # Enforce target loop interval — sleep only the remaining time
+            loop_elapsed_ms = (time.time() - loop_start) * 1000
+            sleep_ms = max(0, _TARGET_LOOP_MS - loop_elapsed_ms)
+            if sleep_ms > 0:
+                time.sleep(sleep_ms / 1000.0)
+            # Log loop latency periodically (every 50 loops)
+            if not hasattr(self, '_loop_count'):
+                self._loop_count = 0
+            self._loop_count += 1
+            if self._loop_count % 50 == 0:
+                actual_loop_ms = (time.time() - loop_start) * 1000
+                write_jsonl({"event_type": "LOOP_LATENCY",
+                              "loop_elapsed_ms": round(loop_elapsed_ms, 1),
+                              "actual_loop_ms": round(actual_loop_ms, 1),
+                              "target_ms": _TARGET_LOOP_MS})
         self.logger.log_event({"event_type": "STOPPED", "cash": self.cash_usdc,
                                "realized_pnl": self.realized_pnl_usdc,
                                "equity": round(self._equity(), 2),
@@ -1833,6 +1848,8 @@ class Bot:
                 print(f"  [CLIP_FAIL] {m.crypto:5s} clip=${clip:.2f} < min=${MIN_ORDER_USDC}")
                 return
             # ---- Place PROBE order ----
+            signal_detect_ts = time.time()
+            sm["signal_detect_ts"] = signal_detect_ts
             probe_usd = max(MIN_ORDER_USDC, clip * PROBE_SIZE_FRAC)
             probe_qty = probe_usd / max(1e-9, book.ask)
             edge = ctx["edge_up"] if outcome == "Up" else ctx["edge_down"]
@@ -1852,7 +1869,15 @@ class Bot:
             ctx["thr_used"] = thr
             ctx["size_mult"] = mult
             bk_fields = self._book_fields(up_book, dn_book, outcome)
-            print(f"  [PROBE] {m.crypto:5s} {outcome} probe=${probe_usd:.2f} ask={book.ask:.3f}")
+            order_place_ts = time.time()
+            signal_to_order_ms = (order_place_ts - signal_detect_ts) * 1000
+            print(f"  [PROBE] {m.crypto:5s} {outcome} probe=${probe_usd:.2f} ask={book.ask:.3f} latency={signal_to_order_ms:.0f}ms")
+            write_jsonl({"event_type": "SIGNAL_LATENCY", "slug": m.slug,
+                          "crypto": m.crypto, "outcome": outcome,
+                          "signal_detect_ts": signal_detect_ts,
+                          "order_place_ts": order_place_ts,
+                          "signal_to_order_ms": round(signal_to_order_ms, 1),
+                          "t_min": round(t_min, 3)})
             self.logger.log_order_intent(
                 engine="CORE", reason="ENTRY_PROBE",
                 decision_id=decision_id, position_id=pos.position_id,
@@ -1905,26 +1930,30 @@ class Bot:
             return
 
         elif sm["state"] == "PROBING":
-            # Wait PROBE_CONFIRM_SEC, then check signal still valid
+            # Wait PROBE_CONFIRM_SEC (300ms), then check signal still valid
             elapsed = time.time() - (sm.get("probe_ts") or time.time())
             if elapsed < PROBE_CONFIRM_SEC:
                 return  # still waiting
             if not sig:
                 self._sm_transition(m.slug, "IDLE", "signal_lost_after_probe", ctx)
                 return
-            # Signal still valid → burst scale
+            # Signal still valid → burst scale in background thread
             self._sm_transition(m.slug, "SCALING", "signal_confirmed", ctx)
-            # Execute burst
-            self._execute_burst_buy(m, st, outcome, clip, ctx)
-            # Enter cooldown
-            st.last_entry_ts = iso_z(utc_now())
-            self._sm_transition(m.slug, "COOLDOWN", "burst_complete", ctx)
+            # Launch burst in background thread so signal loop is not blocked
+            burst_ctx = dict(ctx)  # snapshot context
+            burst_clip = clip
+            def _run_burst():
+                try:
+                    self._execute_burst_buy(m, st, outcome, burst_clip, burst_ctx)
+                finally:
+                    st.last_entry_ts = iso_z(utc_now())
+                    self._sm_transition(m.slug, "COOLDOWN", "burst_complete", burst_ctx)
+            t = threading.Thread(target=_run_burst, daemon=True)
+            t.start()
             return
 
         elif sm["state"] == "SCALING":
-            # Should not normally land here (burst is synchronous), fall to COOLDOWN
-            st.last_entry_ts = iso_z(utc_now())
-            self._sm_transition(m.slug, "COOLDOWN", "scaling_fallthrough", ctx)
+            # Burst is running in background thread — don't interrupt
             return
 
         elif sm["state"] == "COOLDOWN":
@@ -1936,7 +1965,10 @@ class Bot:
     # -----------------------------------------------------------------
     def _execute_burst_buy(self, m: MarketRef, st: MarketState, outcome: str,
                            base_clip_usd: float, ctx: dict):
-        """Execute a burst of micro-orders, checking book between each."""
+        """Execute a burst of micro-orders, checking book between each.
+        Spread is NOT a stop condition unless > BURST_SPREAD_HARD_LIMIT.
+        Only stops on: ask jump, hard edge collapse, or bad book."""
+        burst_start_ts = time.time()
         up_book, dn_book = ctx["up_book"], ctx["dn_book"]
         book = up_book if outcome == "Up" else dn_book
         initial_ask = book.ask
@@ -1955,8 +1987,10 @@ class Bot:
                       "initial_ask": initial_ask, "t_min": round(ctx["t_min"], 3)})
 
         for i in range(BURST_ORDERS):
+            order_start_ts = time.time()
             # Re-read order book
             fresh_book = self.client.get_top_of_book(token_id, levels=IMB_LEVELS)
+            book_latency_ms = (time.time() - order_start_ts) * 1000
             if fresh_book.ask <= 0 or fresh_book.bid <= 0:
                 stop_reason = "bad_book"
                 break
@@ -1965,7 +1999,7 @@ class Bot:
             if ask_jump >= BURST_STOP_IF_ASK_JUMPS_CENTS:
                 stop_reason = f"ask_jumped({ask_jump:.3f}c)"
                 break
-            # Recompute edge
+            # Recompute edge every iteration
             p_up = _p_up_model(ctx["delta_bps"])
             if outcome == "Up":
                 cur_edge = (p_up - fresh_book.mid) * 10000.0
@@ -1977,10 +2011,9 @@ class Bot:
             if edge_drop >= BURST_STOP_IF_EDGE_DROPS_BPS:
                 stop_reason = f"edge_dropped({edge_drop:.1f}bps)"
                 break
-            # Check spread
-            max_sp = spread_limit(ctx["t_min"], abs(cur_edge), m.crypto, in_burst=True)
-            if fresh_book.spread > max_sp:
-                stop_reason = f"spread({fresh_book.spread:.3f}>{max_sp:.3f})"
+            # Spread: only hard-stop at 12c — do NOT stop on normal spread widening
+            if fresh_book.spread > BURST_SPREAD_HARD_LIMIT:
+                stop_reason = f"spread_hard({fresh_book.spread:.3f}>{BURST_SPREAD_HARD_LIMIT})"
                 break
             # Size this micro-order
             this_usd = min(step_usd, total_burst_usd - total_filled_usd)
@@ -1995,7 +2028,8 @@ class Bot:
             write_jsonl({"event_type": "BURST_MICRO_ORDER", "slug": m.slug,
                           "burst_idx": i, "usd": round(this_usd, 2),
                           "qty": round(this_qty, 1), "ask": fresh_book.ask,
-                          "edge_bps": round(cur_edge, 2), "spread": round(fresh_book.spread, 4)})
+                          "edge_bps": round(cur_edge, 2), "spread": round(fresh_book.spread, 4),
+                          "book_latency_ms": round(book_latency_ms, 1)})
 
             if MODE == "LOG":
                 self._paper_buy(st, outcome, fresh_book.ask, this_qty, this_usd)
@@ -2035,13 +2069,15 @@ class Bot:
             if total_filled_usd >= total_burst_usd:
                 stop_reason = "budget_exhausted"
                 break
-            # Sleep between micro-orders
+            # Sleep between micro-orders (120ms)
             time.sleep(BURST_INTERVAL_MS / 1000.0)
 
+        burst_duration_ms = (time.time() - burst_start_ts) * 1000
         write_jsonl({"event_type": "BURST_STOP", "slug": m.slug, "crypto": m.crypto,
                       "outcome": outcome, "burst_count": burst_count,
                       "total_filled_usd": round(total_filled_usd, 2),
                       "stop_reason": stop_reason or "all_orders_done",
+                      "burst_duration_ms": round(burst_duration_ms, 1),
                       "t_min": round(ctx["t_min"], 3)})
     def _late_scalps(self, ctx: dict):
         m, st = ctx["m"], ctx["st"]
