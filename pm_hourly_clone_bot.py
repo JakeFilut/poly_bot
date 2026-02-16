@@ -736,13 +736,16 @@ class PolymarketClient:
     #  4.  ORDER PLACEMENT / CANCEL
     # ================================================================== #
     def place_limit_order(self, token_id: str, side: str, price: float,
-                          size: float, post_only: bool = True) -> str:
+                          size: float, post_only: bool = True) -> dict:
         """
         Place a limit order on the CLOB.
-        Returns order_id (str).  In LOG mode returns a paper id.
+        Returns dict with fill info: {order_id, filled, fill_qty, fill_price, status}.
+        In LOG mode returns a paper result.
         """
         if MODE == "LOG":
-            return f"paper_{int(time.time()*1000)}_{random.randint(100,999)}"
+            pid = f"paper_{int(time.time()*1000)}_{random.randint(100,999)}"
+            return {"order_id": pid, "filled": True, "fill_qty": int(float(size)),
+                    "fill_price": price, "status": "matched"}
 
         if not self._clob:
             raise RuntimeError("CLOB client not initialised (missing POLYMARKET_PRIVATE_KEY)")
@@ -752,7 +755,8 @@ class PolymarketClient:
         price = max(0.01, min(0.99, price))
         qty   = int(float(size))
         if qty < 1:
-            return ""
+            return {"order_id": "", "filled": False, "fill_qty": 0,
+                    "fill_price": 0.0, "status": "rejected"}
 
         order_type = OrderType.GTC  # limit / resting order
 
@@ -768,16 +772,52 @@ class PolymarketClient:
 
             if response and isinstance(response, dict):
                 oid = response.get("orderID", "")
+                status = response.get("status", "").lower()
+                size_matched = response.get("size_matched") or 0
+                tx_hashes = (response.get("transactionsHashes", [])
+                             or response.get("transactionHashes", []))
+
+                filled = False
+                fill_qty = 0
+                if status == "matched" or tx_hashes:
+                    filled = True
+                    fill_qty = int(size_matched) if size_matched else qty
+                elif status == "live" and oid:
+                    fill_qty = self._poll_order_fill(oid, qty, timeout=5)
+                    filled = fill_qty > 0
+
                 write_jsonl({"event_type":"ORDER_PLACED", "order_id": oid,
                              "token_id": token_id[-12:], "side": side,
                              "price": price, "qty": qty,
-                             "status": response.get("status")})
-                return oid
+                             "status": status, "filled": filled,
+                             "fill_qty": fill_qty})
+                return {"order_id": oid, "filled": filled, "fill_qty": fill_qty,
+                        "fill_price": price, "status": status}
         except Exception as e:
             write_jsonl({"event_type":"ORDER_ERROR", "err": str(e)[:200],
                          "token_id": token_id[-12:], "side": side,
                          "price": price, "qty": qty})
-        return ""
+        return {"order_id": "", "filled": False, "fill_qty": 0,
+                "fill_price": 0.0, "status": "error"}
+
+    def _poll_order_fill(self, order_id: str, expected_qty: int,
+                         timeout: int = 5) -> int:
+        """Poll CLOB briefly for GTC order fill. Returns filled qty (0 if not filled)."""
+        start = time.time()
+        while time.time() - start < timeout:
+            try:
+                order = self._clob.get_order(order_id)
+                if order and isinstance(order, dict):
+                    status = order.get("status", "").lower()
+                    if status in ("matched", "filled"):
+                        return int(order.get("size_matched", expected_qty)
+                                   or expected_qty)
+                    if status in ("cancelled", "canceled", "expired"):
+                        return 0
+            except Exception:
+                pass
+            time.sleep(1)
+        return 0
 
     def cancel_order(self, order_id: str) -> None:
         """Cancel a single order by id."""
@@ -1032,6 +1072,40 @@ class Bot:
                 sp["cost_usdc"] = max(0.0, sp["cost_usdc"] - sp["vwap"] * sell_qty)
                 self._shadow_cash += shadow_proceeds
         # Hourly stats
+        self._hour_trade_count += 1
+        self._hour_net_pnl += pnl
+        return pnl
+    def _live_buy(self, st: MarketState, outcome: str, price: float,
+                  qty: float, usdc_cost: float):
+        """Update position state after a real buy fill (mirrors _paper_buy)."""
+        pos = st.positions[outcome]
+        new_cost = pos.cost_usdc + usdc_cost
+        new_qty = pos.qty + qty
+        pos.vwap = (pos.vwap * pos.qty + price * qty) / max(1e-12, new_qty)
+        pos.qty = new_qty
+        pos.cost_usdc = new_cost
+        pos.last_trade_ts = iso_z(utc_now())
+        if pos.opened_at is None:
+            pos.opened_at = pos.last_trade_ts
+        self.cash_usdc -= usdc_cost
+        self._hour_trade_count += 1
+    def _live_sell(self, st: MarketState, outcome: str, price: float,
+                   qty: float) -> float:
+        """Update position state after a real sell fill (mirrors _paper_sell). Returns pnl."""
+        pos = st.positions[outcome]
+        qty = min(qty, pos.qty)
+        if qty <= 0:
+            return 0.0
+        proceeds = price * qty
+        cost_basis = pos.vwap * qty
+        pnl = proceeds - cost_basis
+        pos.qty -= qty
+        pos.cost_usdc = max(0.0, pos.cost_usdc - cost_basis)
+        pos.last_trade_ts = iso_z(utc_now())
+        self.cash_usdc += proceeds
+        self.realized_pnl_usdc += pnl
+        self.hourly_pnl_usdc += pnl
+        self._clean_dust(pos)
         self._hour_trade_count += 1
         self._hour_net_pnl += pnl
         return pnl
@@ -1699,7 +1773,24 @@ class Bot:
                 vwap=pos.vwap, ctx=ctx, book_fields=bk_fields,
             )
             return
-        self._place_layered_buy(m, outcome, qty, book.ask)
+        fill = self._place_layered_buy(m, outcome, qty, book.ask)
+        if fill["total_filled"] > 0:
+            actual_qty = fill["total_filled"]
+            actual_price = fill["avg_price"]
+            actual_cost = fill["total_cost"]
+            self._live_buy(st, outcome, actual_price, actual_qty, actual_cost)
+            mt = infer_maker_taker("BUY", actual_price, book)
+            sc = spread_capture_fields("BUY", actual_price, book)
+            self.logger.log_order_fill(
+                engine="CORE", reason="ENTRY_DELTA",
+                decision_id=decision_id, client_order_id=client_oid,
+                position_id=pos.position_id,
+                crypto=m.crypto, slug=m.slug, outcome=outcome,
+                side="BUY", qty=actual_qty, fill_price=actual_price,
+                usdc_cost=actual_cost, fees_usdc=0.0,
+                maker_taker=mt, did_cross=sc.get("did_cross", ""),
+                vwap=pos.vwap, ctx=ctx, book_fields=bk_fields,
+            )
     def _late_scalps(self, ctx: dict):
         m, st = ctx["m"], ctx["st"]
         t_min = ctx["t_min"]
@@ -1774,7 +1865,24 @@ class Bot:
             pos.scalp_mode = True
             pos.scalp_open_ts = now_iso
             return
-        self._place_layered_buy(m, outcome, qty, book.ask)
+        fill = self._place_layered_buy(m, outcome, qty, book.ask)
+        if fill["total_filled"] > 0:
+            actual_qty = fill["total_filled"]
+            actual_price = fill["avg_price"]
+            actual_cost = fill["total_cost"]
+            self._live_buy(st, outcome, actual_price, actual_qty, actual_cost)
+            mt = infer_maker_taker("BUY", actual_price, book)
+            sc = spread_capture_fields("BUY", actual_price, book)
+            self.logger.log_order_fill(
+                engine="LATE_SCALP", reason="ENTRY_SCALP",
+                decision_id=decision_id, client_order_id=client_oid,
+                position_id=pos.position_id,
+                crypto=m.crypto, slug=m.slug, outcome=outcome,
+                side="BUY", qty=actual_qty, fill_price=actual_price,
+                usdc_cost=actual_cost, fees_usdc=0.0,
+                maker_taker=mt, did_cross=sc.get("did_cross", ""),
+                vwap=pos.vwap, ctx=ctx, book_fields=bk_fields,
+            )
         pos.scalp_mode = True
         pos.scalp_open_ts = now_iso
     def _manage_exits(self, m: MarketRef, st: MarketState, t_min: float, delta_bps: float, ctx: dict):
@@ -1939,17 +2047,67 @@ class Bot:
                     "exit_reason": reason,
                 }, also_csv=True)
             return
-        self.client.place_limit_order(token_id, "SELL", price, qty, post_only=False)
-    def _place_layered_buy(self, m: MarketRef, outcome: str, qty: float, ask: float):
+        fill_result = self.client.place_limit_order(token_id, "SELL", price, qty, post_only=False)
+        if fill_result.get("filled"):
+            actual_qty = fill_result["fill_qty"]
+            actual_price = fill_result["fill_price"]
+            pnl = self._live_sell(st, outcome, actual_price, actual_qty)
+            mt = infer_maker_taker("SELL", actual_price, ref_book) if ref_book else ""
+            sc = spread_capture_fields("SELL", actual_price, ref_book) if ref_book else {}
+            self.logger.log_order_fill(
+                engine="EXIT", reason=reason,
+                decision_id=decision_id, client_order_id=client_oid,
+                position_id=position_id, parent_order_id=parent_oid,
+                crypto=m.crypto, slug=m.slug, outcome=outcome,
+                side="SELL", qty=actual_qty, fill_price=actual_price,
+                usdc_cost=usdc_cost, fees_usdc=0.0,
+                maker_taker=mt, did_cross=sc.get("did_cross", ""),
+                realized_pnl_usdc=pnl, net_pnl_usdc=pnl,
+                unrealized_pnl_usdc=0.0, vwap=pos.vwap,
+                ctx=ctx, book_fields=bk_fields,
+            )
+            if pos.qty < MIN_QTY and pos.entry_mid > 0:
+                time_held = 0.0
+                if pos.opened_at:
+                    try:
+                        opened_dt = datetime.strptime(pos.opened_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                        time_held = (utc_now() - opened_dt).total_seconds()
+                    except Exception:
+                        pass
+                mfe = (pos.max_favorable_mid - pos.entry_mid) * 10000.0 / max(pos.entry_mid, 1e-9)
+                mae = (pos.entry_mid - pos.max_adverse_mid) * 10000.0 / max(pos.entry_mid, 1e-9)
+                self.logger.log_event({
+                    "event_type": "ROUND_TRIP_CLOSE",
+                    "position_id": position_id,
+                    "slug": m.slug, "crypto": m.crypto, "outcome": outcome,
+                    "hour_start_utc": st.hour_start_utc,
+                    "gross_pnl_usdc": round(pnl, 4), "net_pnl_usdc": round(pnl, 4),
+                    "time_in_position_sec": round(time_held, 1),
+                    "max_favorable_bps": round(mfe, 3), "max_adverse_bps": round(mae, 3),
+                    "exit_reason": reason,
+                }, also_csv=True)
+    def _place_layered_buy(self, m: MarketRef, outcome: str, qty: float, ask: float) -> dict:
+        """Place layered buy orders. Returns {total_filled, total_cost, avg_price}."""
         token_id = m.outcome_up_id if outcome == "Up" else m.outcome_down_id
+        result = {"total_filled": 0, "total_cost": 0.0, "avg_price": 0.0}
         if not LAYER_ORDERS:
-            self.client.place_limit_order(token_id, "BUY", ask, qty, post_only=POST_ONLY_WHEN_POSSIBLE)
-            return
+            r = self.client.place_limit_order(token_id, "BUY", ask, qty, post_only=POST_ONLY_WHEN_POSSIBLE)
+            if r.get("filled"):
+                result["total_filled"] = r["fill_qty"]
+                result["total_cost"] = r["fill_price"] * r["fill_qty"]
+                result["avg_price"] = r["fill_price"]
+            return result
         # Split qty across layers around ask and slightly below
         per = qty / LAYER_COUNT
         for i in range(LAYER_COUNT):
             px = max(0.01, ask - i * LAYER_STEP)
-            self.client.place_limit_order(token_id, "BUY", px, per, post_only=POST_ONLY_WHEN_POSSIBLE)
+            r = self.client.place_limit_order(token_id, "BUY", px, per, post_only=POST_ONLY_WHEN_POSSIBLE)
+            if r.get("filled"):
+                result["total_filled"] += r["fill_qty"]
+                result["total_cost"] += r["fill_price"] * r["fill_qty"]
+        if result["total_filled"] > 0:
+            result["avg_price"] = result["total_cost"] / result["total_filled"]
+        return result
     def _calc_clip(self, crypto: str, t_min: float, abs_delta_bps: float) -> float:
         base = self.cash_usdc * BASE_CLIP_PCT
         mult = sizing_mult(abs_delta_bps)
