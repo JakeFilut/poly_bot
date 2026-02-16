@@ -2,12 +2,13 @@
 logger.py  --  Forensic-quality, bounded-growth Logger for pm_hourly_clone_bot.
 
 Outputs:
-    bot_log_<run_id>.csv              fills + orders ONLY (fixed schema)
+    bot_log_<run_id>_<hour>.csv       fills + orders ONLY (fixed schema, rotated hourly)
     bot_events_<run_id>_<hour>.jsonl  decisions / boundaries / snapshots (rotated hourly)
 
 Size-control guarantees:
+    * Both CSV and JSONL rotate at each :00 hour boundary
     * JSONL: DECISION deduped via signature hash; SNAPSHOT_COMPACT every 10-15s;
-      SNAPSHOT_ON_CHANGE only on material moves; hourly rotation + gzip on close
+      SNAPSHOT_ON_CHANGE only on material moves; gzip copy on rotation (originals kept)
     * CSV: fills and order lifecycle only (INTENT/SUBMIT/ACK/FILL/CANCEL)
     * run_id / schema_version / bot_version emitted in START event only,
       stripped from every subsequent line
@@ -39,7 +40,6 @@ CHANGE_IMB_DELTA      = float(os.getenv("CHANGE_IMB_DELTA", "0.25"))
 CHANGE_DELTA_BPS      = float(os.getenv("CHANGE_DELTA_BPS", "5.0"))
 CHANGE_COOLDOWN_SEC   = float(os.getenv("CHANGE_COOLDOWN_SEC", "1.5"))
 FLUSH_INTERVAL_SEC    = float(os.getenv("FLUSH_INTERVAL_SEC", "1.0"))
-MAX_CSV_BYTES         = int(os.getenv("MAX_CSV_BYTES", str(500 * 1024 * 1024)))
 STATE_HIST_MAX        = int(os.getenv("STATE_HIST_MAX", "180"))
 MIN_QTY               = float(os.getenv("MIN_QTY", "0.001"))
 GZIP_ON_CLOSE         = os.getenv("GZIP_ON_CLOSE", "1") == "1"
@@ -131,10 +131,10 @@ class Logger:
         self.profile  = profile
         os.makedirs(log_dir, exist_ok=True)
 
-        # CSV: single file per run, rotated on size
+        # CSV: rotated per hour (each hour gets its own file with header)
         self._csv_base  = os.path.join(log_dir, f"bot_log_{run_id}")
-        self._csv_part  = 0
-        self._csv_path  = f"{self._csv_base}.csv"
+        self._csv_hour  = _hour_tag()
+        self._csv_path  = f"{self._csv_base}_{self._csv_hour}.csv"
         self._csv_f: Optional[io.TextIOWrapper] = None
         self._open_csv()
 
@@ -168,17 +168,13 @@ class Logger:
         self._jsonl_f = open(self._jsonl_path, "a", encoding="utf-8", buffering=8192)
 
     def _rotate_csv_if_needed(self):
-        if self._csv_f is None:
-            return
-        try:
-            pos = self._csv_f.tell()
-        except Exception:
-            pos = 0
-        if pos >= MAX_CSV_BYTES:
+        """Rotate CSV on hour change — each hour gets its own file."""
+        cur_hour = _hour_tag()
+        if cur_hour != self._csv_hour and self._csv_f is not None:
             self._csv_f.flush()
             self._csv_f.close()
-            self._csv_part += 1
-            self._csv_path = f"{self._csv_base}_part{self._csv_part:02d}.csv"
+            self._csv_hour = cur_hour
+            self._csv_path = f"{self._csv_base}_{self._csv_hour}.csv"
             self._open_csv()
 
     def _rotate_jsonl_if_needed(self):
@@ -202,7 +198,7 @@ class Logger:
 
     @staticmethod
     def _gzip_file(path: str):
-        """Gzip a file in place (best-effort, non-blocking)."""
+        """Create a .gz copy of the file (keeps the original for easy upload)."""
         try:
             gz_path = path + ".gz"
             with open(path, "rb") as f_in:
@@ -212,7 +208,7 @@ class Logger:
                         if not chunk:
                             break
                         f_out.write(chunk)
-            os.remove(path)
+            # Keep the original — user needs plain files for ChatGPT upload
         except Exception:
             pass  # non-critical
 
