@@ -105,15 +105,15 @@ PULLBACK_LOOKBACK_SEC = 90.0
 ENTRY_COOLDOWN_SEC = 20.0
 REENTRY_COOLDOWN_SEC = 10.0
 # Base clip sizing (USDC cost) as % of bankroll
-BASE_CLIP_PCT = 0.0020  # 0.2% bankroll per tick
-EARLY_SIZE_MULT = 0.60   # reduce size when t < 10
+BASE_CLIP_PCT = 0.0035  # 0.35% bankroll per tick (~$3.50 on $1k)
+EARLY_SIZE_MULT = 0.80   # less timid in first 10 min
 # Size multipliers by abs_delta_bps
 SIZING_MULTIPLIERS = [
-    (8,   15, 1.00),
-    (15,  25, 1.50),
-    (25,  40, 2.00),
-    (40,  75, 2.50),
-    (75,  10_000, 3.00),
+    (8,   15, 1.25),
+    (15,  25, 1.75),
+    (25,  40, 2.25),
+    (40,  75, 2.75),
+    (75,  10_000, 3.50),
 ]
 # Exit ladder (scale out)
 TP1 = 0.03; TP1_SELL_FRAC = 0.25
@@ -135,8 +135,8 @@ LATE_SCALP_ABSDELTA_MAX = 20.0
 LATE_SCALP_TP_CENTS = 0.03      # aim +3c
 LATE_SCALP_MAX_HOLD_MIN = 10.0
 # Risk caps
-MAX_COST_PER_MARKET_PCT = 0.008   # 0.8% bankroll per market-hour
-MAX_COST_PER_CRYPTO_PCT = 0.020   # 2.0% bankroll per crypto across markets
+MAX_COST_PER_MARKET_PCT = 0.015   # 1.5% bankroll per market-hour
+MAX_COST_PER_CRYPTO_PCT = 0.035   # 3.5% bankroll per crypto across markets
 # ---------------------------------------------------------------------------
 # Risk / stop-loss configuration (log-only mode)
 # ---------------------------------------------------------------------------
