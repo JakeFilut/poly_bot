@@ -68,14 +68,17 @@ TRADE_START_MIN = 2.0
 TRADE_STOP_ADD_MIN = 57.0
 TRADE_HARD_STOP_MIN = 59.25
 # -----------------------------------------------------------------------------
-# Entry thresholds (bps) — dynamic time-varying threshold
-# These match the "clone frequency" profile by default.
-# Switch to MAX_EV by setting PROFILE=MAX_EV.
+# Entry thresholds (bps) — coin-specific, time-varying
 # -----------------------------------------------------------------------------
 PROFILE = os.getenv("PROFILE", "CLONE").upper()   # CLONE or MAX_EV
-THR_EARLY_5_15 = 6
-THR_MID_15_45  = 10
-THR_LATE_45_57 = 6
+# Coin-specific threshold tables: coin -> {early, mid, late}
+_THR_TABLE = {
+    "BTC": {"early": 8, "mid": 12, "late": 5},
+    "SOL": {"early": 8, "mid": 12, "late": 5},
+    "ETH": {"early": 7, "mid":  8, "late": 7},
+    "XRP": {"early": 7, "mid":  8, "late": 7},
+}
+# Special rule: XRP min 30-40 reduces threshold by 1 bps (applied in function)
 THR_EARLY_5_15_MAXEV = 12
 THR_MID_15_45_MAXEV  = 18
 THR_LATE_45_57_MAXEV = 10
@@ -86,7 +89,7 @@ CAP_15_30 = 0.90
 CAP_30_45 = 0.96
 CAP_45_60 = 0.97
 # Drift persistence & velocity (hidden edge)
-PERSISTENCE_SEC = 6.0           # signal must hold for >= 6s (one snapshot)
+PERSISTENCE_SEC = 1.2           # signal must hold for >= 1.2s (fast entry)
 MIN_DELTA_VEL_BPS_PER_MIN = 1.0 # require some "push" to scale size (not to enter)
 # Volatility normalization
 Z_WINDOW_SEC = 300.0            # 5 minutes for zscore
@@ -101,8 +104,21 @@ IMB_MAX_SPREAD = 0.06           # skip if spread too wide (6c)
 PULLBACK_ENABLED = False
 PULLBACK_CENTS = 0.02           # wait for 2c pullback from recent extreme
 PULLBACK_LOOKBACK_SEC = 90.0
-# Cooldowns
-ENTRY_COOLDOWN_SEC = 20.0
+# Cooldowns — dynamic per coin/time (replaces old static ENTRY_COOLDOWN_SEC = 20)
+# Cooldown tables: coin -> {early, mid, late} seconds
+_COOLDOWN_TABLE = {
+    "BTC": {"early": 4.0, "mid": 3.0, "late": 2.0},
+    "SOL": {"early": 4.0, "mid": 3.0, "late": 2.0},
+    "ETH": {"early": 4.0, "mid": 2.0, "late": 3.0},
+    "XRP": {"early": 4.0, "mid": 2.0, "late": 3.0},
+}
+def entry_cooldown_sec(coin: str, t_min: float) -> float:
+    tbl = _COOLDOWN_TABLE.get(coin, {"early": 4.0, "mid": 3.0, "late": 3.0})
+    if t_min < 15:
+        return tbl["early"]
+    if t_min < 45:
+        return tbl["mid"]
+    return tbl["late"]
 REENTRY_COOLDOWN_SEC = 10.0
 # Base clip sizing (USDC cost) as % of bankroll
 BASE_CLIP_PCT = 0.0035  # 0.35% bankroll per tick (~$3.50 on $1k)
@@ -133,7 +149,7 @@ LATE_SCALP_PRICE_MAX = 0.80
 LATE_SCALP_ABSDELTA_MIN = 5.0
 LATE_SCALP_ABSDELTA_MAX = 20.0
 LATE_SCALP_TP_CENTS = 0.03      # aim +3c
-LATE_SCALP_MAX_HOLD_MIN = 10.0
+LATE_SCALP_MAX_HOLD_MIN = 8.0   # reduced from 10 min
 # Risk caps
 MAX_COST_PER_MARKET_PCT = 0.015   # 1.5% bankroll per market-hour
 MAX_COST_PER_CRYPTO_PCT = 0.035   # 3.5% bankroll per crypto across markets
@@ -154,6 +170,31 @@ LAYER_STEP = 0.01                 # 1c ladder
 MIN_ORDER_USDC = 1.0
 MIN_QTY = _LOG_MIN_QTY  # from logger — below this, position is dust
 EDGE_K = 0.05    # sigmoid steepness: delta_bps -> P(Up)
+# -----------------------------------------------------------------------------
+# Probe → Scale state machine
+# -----------------------------------------------------------------------------
+PROBE_SIZE_FRAC = 0.25        # probe = max($1, clip * 0.25)
+PROBE_CONFIRM_SEC = 1.0       # wait 1s after probe for signal confirmation
+# Burst execution engine
+BURST_ORDERS = 8
+BURST_INTERVAL_MS = 200
+BURST_TOTAL_USD_MULT = 1.8    # total burst ≈ base_clip * 1.8
+BURST_STEP_USD_MIN = 1.00
+BURST_STEP_USD_MAX = 6.00
+BURST_STOP_IF_ASK_JUMPS_CENTS = 0.02   # 2 cents
+BURST_STOP_IF_EDGE_DROPS_BPS = 3.0
+# Dynamic price cap boost
+CAP_BOOST_EDGE_THRESHOLD = 10.0  # edge_bps above which cap starts boosting
+CAP_BOOST_MAX = 0.06             # max +6 cents boost
+CAP_BOOST_EDGE_FULL = 30.0       # edge_bps at which full boost is applied
+# Spread rule relaxation
+SPREAD_RELAXED_MAX = 0.09         # 9 cents (vs default 6c)
+# Fast take-profit
+FAST_TP_AFTER_SEC = 45.0
+FAST_TP_CENTS = 0.02
+FAST_TP_SELL_PCT = 0.20           # sell 20%
+# Inventory pressure controls
+INVENTORY_CAP_SHARES_PER_MARKET = 250
 # Correlation exposure scaling (reduces correlated stacking)
 CORR_SCALE_ENABLED = True
 BTC_LEAD = True
@@ -254,6 +295,7 @@ class Position:
     max_adverse_mid: float = 1.0            # worst mid seen while holding
     last_derisk_ts: Optional[str] = None    # ISO timestamp of last DERISK sell
     last_derisk_mid: float = 0.0            # mid price at last DERISK action
+    fast_tp_done: bool = False              # FAST_TP fires only once per position
 @dataclass
 class MarketState:
     slug: str
@@ -304,18 +346,26 @@ def minutes_into_hour(hour_start_utc: datetime, now_utc: datetime) -> float:
 # =============================================================================
 # STRATEGY FUNCTIONS (the exact logic)
 # =============================================================================
-def entry_threshold_bps(t_min: float) -> float:
+def entry_threshold_bps(coin: str, t_min: float) -> float:
     if PROFILE == "MAX_EV":
         if 5 <= t_min < 15: return THR_EARLY_5_15_MAXEV
         if 15 <= t_min < 45: return THR_MID_15_45_MAXEV
         if 45 <= t_min <= 57: return THR_LATE_45_57_MAXEV
         return 10_000
-    else:  # CLONE
-        if TRADE_START_MIN <= t_min < 5: return THR_EARLY_5_15
-        if 5 <= t_min < 15: return THR_EARLY_5_15
-        if 15 <= t_min < 45: return THR_MID_15_45
-        if 45 <= t_min <= 57: return THR_LATE_45_57
+    # Coin-specific thresholds
+    tbl = _THR_TABLE.get(coin, {"early": 8, "mid": 10, "late": 6})
+    if TRADE_START_MIN <= t_min < 15:
+        thr = tbl["early"]
+    elif 15 <= t_min < 45:
+        thr = tbl["mid"]
+    elif 45 <= t_min <= 57:
+        thr = tbl["late"]
+    else:
         return 10_000
+    # Special rule: XRP min 30-40 reduce by 1 bps
+    if coin == "XRP" and 30 <= t_min < 40:
+        thr = max(1, thr - 1)
+    return thr
 def price_cap(t_min: float) -> float:
     if 0 <= t_min < 5:   return CAP_0_5
     if 5 <= t_min < 15:  return CAP_5_15
@@ -323,6 +373,21 @@ def price_cap(t_min: float) -> float:
     if 30 <= t_min < 45: return CAP_30_45
     if 45 <= t_min < 60: return CAP_45_60
     return 0.0
+def dynamic_cap(t_min: float, abs_edge_bps: float) -> float:
+    """Price cap with dynamic boost based on edge strength."""
+    base = price_cap(t_min)
+    if abs_edge_bps <= CAP_BOOST_EDGE_THRESHOLD:
+        return base
+    frac = min(1.0, (abs_edge_bps - CAP_BOOST_EDGE_THRESHOLD) /
+               max(1.0, CAP_BOOST_EDGE_FULL - CAP_BOOST_EDGE_THRESHOLD))
+    boost = frac * CAP_BOOST_MAX
+    return min(0.99, base + boost)
+def spread_limit(t_min: float, abs_edge_bps: float, coin: str, in_burst: bool = False) -> float:
+    """Return max allowed spread. Relaxed to 9c during PROBING/SCALING if conditions met."""
+    thr = entry_threshold_bps(coin, t_min)
+    if in_burst and (45 <= t_min <= 57 or abs_edge_bps >= thr + 10):
+        return SPREAD_RELAXED_MAX
+    return IMB_MAX_SPREAD
 def sizing_mult(abs_delta_bps: float) -> float:
     for lo, hi, mult in SIZING_MULTIPLIERS:
         if lo <= abs_delta_bps < hi:
@@ -875,6 +940,8 @@ class Bot:
         self.signal_hist: Dict[str, List[Tuple[str, bool]]] = {}  # slug -> [(ts, valid_signal)]
         self.last_book: Dict[str, Dict[str, BookTop]] = {}  # slug -> outcome -> BookTop
         self.recent_extreme_price: Dict[str, Dict[str, float]] = {} # slug->outcome->extreme
+        # Probe → Scale state machine: slug -> {state, probe_ts, probe_ask, initial_edge_bps}
+        self.entry_sm: Dict[str, dict] = {}   # IDLE / PROBING / SCALING / COOLDOWN
         self.hour_index_counters: Dict[str, int] = {c: 0 for c in CRYPTOS}  # crypto -> monotonic index
         # Initialise new Logger (replaces old write_jsonl / log_csv)
         self.logger = Logger(
@@ -1132,6 +1199,7 @@ class Bot:
             pos.max_adverse_mid = 1.0
             pos.last_derisk_ts = None
             pos.last_derisk_mid = 0.0
+            pos.fast_tp_done = False
     # -----------------------------
     # Risk checks (log-only alerts)
     # -----------------------------
@@ -1370,6 +1438,7 @@ class Bot:
                 self.signal_hist.pop(slug, None)
                 self.last_book.pop(slug, None)
                 self.recent_extreme_price.pop(slug, None)
+                self.entry_sm.pop(slug, None)
                 continue
             # Determine winner by checking final Binance price vs hour open
             # spot here = next hour's opening price (close proxy for the prior hour)
@@ -1452,6 +1521,7 @@ class Bot:
             self.signal_hist.pop(slug, None)
             self.last_book.pop(slug, None)
             self.recent_extreme_price.pop(slug, None)
+            self.entry_sm.pop(slug, None)
     def _get_markets(self) -> List[MarketRef]:
         # In practice: discover the current hour markets
         return self.client.get_current_hour_markets()
@@ -1566,7 +1636,7 @@ class Bot:
             "up_spread": up_book.spread, "dn_spread": dn_book.spread,
             "up_imb": up_book.imb, "dn_imb": dn_book.imb,
             "delta_bps": delta_bps,
-            "entry_thr_bps": entry_threshold_bps(t_min),
+            "entry_thr_bps": entry_threshold_bps(m.crypto, t_min),
             "pos_qty_up": pos_up_qty, "pos_qty_down": pos_dn_qty,
         }
         should_change, trigger = self.logger.should_log_snapshot_on_change(m.slug, snap_dict)
@@ -1605,6 +1675,23 @@ class Bot:
             else:
                 # track extreme in direction of "most likely" (we just keep max for simplicity)
                 self.recent_extreme_price[slug][outcome] = max(prev, mid)
+    # -----------------------------------------------------------------
+    # State machine helpers
+    # -----------------------------------------------------------------
+    def _get_sm(self, slug: str) -> dict:
+        if slug not in self.entry_sm:
+            self.entry_sm[slug] = {"state": "IDLE", "probe_ts": None,
+                                   "probe_ask": None, "initial_edge_bps": None}
+        return self.entry_sm[slug]
+
+    def _sm_transition(self, slug: str, new_state: str, reason: str = "", ctx: dict = None):
+        sm = self._get_sm(slug)
+        old = sm["state"]
+        sm["state"] = new_state
+        write_jsonl({"event_type": "SM_TRANSITION", "slug": slug,
+                      "from": old, "to": new_state, "reason": reason,
+                      "t_min": round(ctx["t_min"], 3) if ctx else 0})
+
     def _core_entries(self, ctx: dict):
         m, st = ctx["m"], ctx["st"]
         t_min = ctx["t_min"]
@@ -1612,16 +1699,22 @@ class Bot:
         vel, z = ctx["vel"], ctx["z"]
         up_book, dn_book = ctx["up_book"], ctx["dn_book"]
         spot = ctx["spot"]
-        # Build valid signal (time + threshold)
-        thr = entry_threshold_bps(t_min)
-        cap = price_cap(t_min)
+        sm = self._get_sm(m.slug)
+
+        # --- Build valid signal (time + coin-specific threshold + dynamic cap) ---
+        thr = entry_threshold_bps(m.crypto, t_min)
+        edge_bps = abs(ctx["edge_up"] if ctx["drift_dir"] == "Up" else ctx["edge_down"]) * 10000.0
+        cap = dynamic_cap(t_min, edge_bps)
         valid_time = (t_min >= TRADE_START_MIN)
         valid_delta = (abs_delta_bps >= thr)
         valid_z = (not Z_ENTRY_ENABLED) or (abs(z) >= Z_ENTRY_MIN)
         outcome = ctx["drift_dir"]
         book = up_book if outcome == "Up" else dn_book
         valid_price = (book.ask <= cap)
-        valid_spread = (book.spread <= IMB_MAX_SPREAD)
+        # Spread: relaxed during PROBING/SCALING
+        in_burst = sm["state"] in ("PROBING", "SCALING")
+        max_spread = spread_limit(t_min, edge_bps, m.crypto, in_burst=in_burst)
+        valid_spread = (book.spread <= max_spread)
         valid_imb = (not IMB_ENABLED) or (book.imb >= IMB_MIN)
         valid_pullback = True
         if PULLBACK_ENABLED:
@@ -1629,17 +1722,31 @@ class Bot:
             if extreme is not None:
                 valid_pullback = (book.mid <= extreme - PULLBACK_CENTS) or (t_min > 45)
         sig = bool(valid_time and valid_delta and valid_z and valid_price and valid_spread and valid_imb and valid_pullback)
+
         # Persistence tracking
         sh = self.signal_hist.setdefault(m.slug, [])
         sh.append((iso_z(utc_now()), sig))
         sh[:] = sh[-500:]
         persist_ok = persistence_ok(sh)
-        # Cooldown check
+
+        # Cooldown check — dynamic per coin/time
         cooldown_active = False
-        if st.last_entry_ts:
+        if sm["state"] == "COOLDOWN":
+            cooldown_active = True
+        elif st.last_entry_ts:
             last = datetime.strptime(st.last_entry_ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-            cooldown_active = (utc_now() - last).total_seconds() < ENTRY_COOLDOWN_SEC
+            cd = entry_cooldown_sec(m.crypto, t_min)
+            cooldown_active = (utc_now() - last).total_seconds() < cd
+        # Exit COOLDOWN state when cooldown expires
+        if sm["state"] == "COOLDOWN" and st.last_entry_ts:
+            last = datetime.strptime(st.last_entry_ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            cd = entry_cooldown_sec(m.crypto, t_min)
+            if (utc_now() - last).total_seconds() >= cd:
+                self._sm_transition(m.slug, "IDLE", "cooldown_expired", ctx)
+                cooldown_active = False
+
         risk_blocked = not self._risk_ok(st)
+
         # Sizing
         mult = sizing_mult(abs_delta_bps)
         clip = self._calc_clip(m.crypto, t_min, abs_delta_bps)
@@ -1650,32 +1757,33 @@ class Bot:
             if btc_cost > 0:
                 reduce = clamp(btc_cost / (self.cash_usdc * MAX_COST_PER_CRYPTO_PCT), 0.0, 1.0)
                 clip *= (1.0 - BTC_EXPOSURE_REDUCE_OTHERS * reduce)
-        # ---- DECISION event (JSONL only — every tick, for tuning) ----
+
+        # ---- DECISION event ----
         will_trade = sig and persist_ok and not cooldown_active and not risk_blocked and clip >= MIN_ORDER_USDC
-        # Build skip_reason for non-trades
         skip_reason = ""
         if not will_trade:
             reasons = []
             if not valid_time: reasons.append("time")
             if not valid_delta: reasons.append(f"delta({abs_delta_bps:.1f}<{thr})")
             if not valid_z: reasons.append("zscore")
-            if not valid_price: reasons.append(f"price({book.ask:.3f}>{cap})")
-            if not valid_spread: reasons.append(f"spread({book.spread:.3f})")
+            if not valid_price: reasons.append(f"price({book.ask:.3f}>{cap:.3f})")
+            if not valid_spread: reasons.append(f"spread({book.spread:.3f}>{max_spread:.3f})")
             if not valid_imb: reasons.append("imb")
             if not valid_pullback: reasons.append("pullback")
             if sig and not persist_ok: reasons.append("persistence")
-            if sig and cooldown_active: reasons.append("cooldown")
+            if sig and cooldown_active: reasons.append(f"cooldown({entry_cooldown_sec(m.crypto, t_min):.0f}s)")
             if sig and risk_blocked: reasons.append("risk_cap")
             if sig and persist_ok and not cooldown_active and not risk_blocked and clip < MIN_ORDER_USDC:
                 reasons.append(f"clip_too_small({clip:.2f})")
             skip_reason = "|".join(reasons)
-        # ── DECISION (deduped per slug+hour by signature hash) ──
+
         sig_dict = {
             "outcome": outcome, "will_trade": will_trade,
             "valid_time": valid_time, "valid_delta": valid_delta,
             "valid_price": valid_price, "valid_spread": valid_spread,
             "valid_imb": valid_imb, "persist_ok": persist_ok,
             "cooldown": cooldown_active, "risk": risk_blocked,
+            "sm_state": sm["state"],
         }
         if self.logger.should_log_decision(m.slug, ctx["hour_start_utc"], sig_dict):
             self.logger.log_decision({
@@ -1689,14 +1797,17 @@ class Bot:
                 "valid_imb": valid_imb, "valid_pullback": valid_pullback,
                 "persistence_ok": persist_ok, "cooldown_active": cooldown_active,
                 "risk_blocked": risk_blocked,
-                "cap_used": cap, "thr_used": thr, "size_mult": mult,
+                "cap_used": cap, "cap_boost": round(cap - price_cap(t_min), 4),
+                "thr_used": thr, "size_mult": mult,
+                "spread_limit_used": max_spread,
                 "clip_usdc": round(clip, 4),
                 "will_trade": will_trade, "skip_reason": skip_reason,
                 "spot": spot, "hour_open": ctx["hour_open"],
                 "delta_bps": round(delta_bps, 3), "abs_delta_bps": round(abs_delta_bps, 3),
                 "vel": round(vel, 3), "z": round(z, 3),
+                "sm_state": sm["state"],
             })
-        # ── BOUNDARY events (state flips) ──
+        # ── BOUNDARY events ──
         boundary_state = {
             "abs_delta_bps": abs_delta_bps,
             "entry_thr_bps": thr,
@@ -1707,90 +1818,231 @@ class Bot:
         }
         for bev in self.logger.check_boundaries(m.slug, ctx["hour_start_utc"], boundary_state):
             self.logger.log_boundary(bev)
-        if not sig:
-            print(f"  [GATE_FAIL] {m.crypto:5s} {skip_reason}")
+
+        # --- State machine: IDLE → PROBING → SCALING → COOLDOWN ---
+        if sm["state"] == "IDLE":
+            if not sig:
+                print(f"  [GATE_FAIL] {m.crypto:5s} {skip_reason}")
+                return
+            if not persist_ok:
+                print(f"  [PERSIST_FAIL] {m.crypto:5s} sig=True but persistence not met (hist={len(sh)})")
+                return
+            if cooldown_active or risk_blocked:
+                return
+            if clip < MIN_ORDER_USDC:
+                print(f"  [CLIP_FAIL] {m.crypto:5s} clip=${clip:.2f} < min=${MIN_ORDER_USDC}")
+                return
+            # ---- Place PROBE order ----
+            probe_usd = max(MIN_ORDER_USDC, clip * PROBE_SIZE_FRAC)
+            probe_qty = probe_usd / max(1e-9, book.ask)
+            edge = ctx["edge_up"] if outcome == "Up" else ctx["edge_down"]
+            self._hour_edges.append(edge)
+            decision_id = new_decision_id()
+            client_oid = new_order_id()
+            pos = st.positions[outcome]
+            if pos.position_id is None:
+                pos.position_id = new_position_id()
+                pos.trade_id = uuid.uuid4().hex
+                pos.entry_decision_id = decision_id
+                pos.parent_order_id = client_oid
+                pos.entry_mid = book.mid
+                pos.max_favorable_mid = book.mid
+                pos.max_adverse_mid = book.mid
+            ctx["cap_used"] = cap
+            ctx["thr_used"] = thr
+            ctx["size_mult"] = mult
+            bk_fields = self._book_fields(up_book, dn_book, outcome)
+            print(f"  [PROBE] {m.crypto:5s} {outcome} probe=${probe_usd:.2f} ask={book.ask:.3f}")
+            self.logger.log_order_intent(
+                engine="CORE", reason="ENTRY_PROBE",
+                decision_id=decision_id, position_id=pos.position_id,
+                crypto=m.crypto, slug=m.slug, outcome=outcome,
+                side="BUY", qty=probe_qty, target_price=book.ask,
+                usdc_cost=probe_usd, ctx=ctx, book_fields=bk_fields,
+            )
+            self.logger.log_order_submit(
+                engine="CORE", reason="ENTRY_PROBE",
+                decision_id=decision_id, position_id=pos.position_id,
+                client_order_id=client_oid,
+                crypto=m.crypto, slug=m.slug, outcome=outcome,
+                side="BUY", qty=probe_qty, target_price=book.ask,
+                usdc_cost=probe_usd, ctx=ctx, book_fields=bk_fields,
+            )
+            if MODE == "LOG":
+                self._paper_buy(st, outcome, book.ask, probe_qty, probe_usd)
+                mt = infer_maker_taker("BUY", book.ask, book)
+                sc = spread_capture_fields("BUY", book.ask, book)
+                self.logger.log_order_fill(
+                    engine="CORE", reason="ENTRY_PROBE",
+                    decision_id=decision_id, client_order_id=client_oid,
+                    position_id=pos.position_id,
+                    crypto=m.crypto, slug=m.slug, outcome=outcome,
+                    side="BUY", qty=probe_qty, fill_price=book.ask,
+                    usdc_cost=probe_usd, fees_usdc=0.0,
+                    maker_taker=mt, did_cross=sc.get("did_cross", ""),
+                    vwap=pos.vwap, ctx=ctx, book_fields=bk_fields,
+                )
+            else:
+                fill = self._place_layered_buy(m, outcome, probe_qty, book.ask)
+                if fill["total_filled"] > 0:
+                    self._live_buy(st, outcome, fill["avg_price"], fill["total_filled"], fill["total_cost"])
+                    mt = infer_maker_taker("BUY", fill["avg_price"], book)
+                    sc = spread_capture_fields("BUY", fill["avg_price"], book)
+                    self.logger.log_order_fill(
+                        engine="CORE", reason="ENTRY_PROBE",
+                        decision_id=decision_id, client_order_id=client_oid,
+                        position_id=pos.position_id,
+                        crypto=m.crypto, slug=m.slug, outcome=outcome,
+                        side="BUY", qty=fill["total_filled"], fill_price=fill["avg_price"],
+                        usdc_cost=fill["total_cost"], fees_usdc=0.0,
+                        maker_taker=mt, did_cross=sc.get("did_cross", ""),
+                        vwap=pos.vwap, ctx=ctx, book_fields=bk_fields,
+                    )
+            sm["probe_ts"] = time.time()
+            sm["probe_ask"] = book.ask
+            sm["initial_edge_bps"] = edge_bps
+            self._sm_transition(m.slug, "PROBING", "probe_placed", ctx)
             return
-        if not persist_ok:
-            print(f"  [PERSIST_FAIL] {m.crypto:5s} sig=True but persistence not met (hist={len(sh)})")
+
+        elif sm["state"] == "PROBING":
+            # Wait PROBE_CONFIRM_SEC, then check signal still valid
+            elapsed = time.time() - (sm.get("probe_ts") or time.time())
+            if elapsed < PROBE_CONFIRM_SEC:
+                return  # still waiting
+            if not sig:
+                self._sm_transition(m.slug, "IDLE", "signal_lost_after_probe", ctx)
+                return
+            # Signal still valid → burst scale
+            self._sm_transition(m.slug, "SCALING", "signal_confirmed", ctx)
+            # Execute burst
+            self._execute_burst_buy(m, st, outcome, clip, ctx)
+            # Enter cooldown
+            st.last_entry_ts = iso_z(utc_now())
+            self._sm_transition(m.slug, "COOLDOWN", "burst_complete", ctx)
             return
-        if cooldown_active or risk_blocked:
+
+        elif sm["state"] == "SCALING":
+            # Should not normally land here (burst is synchronous), fall to COOLDOWN
+            st.last_entry_ts = iso_z(utc_now())
+            self._sm_transition(m.slug, "COOLDOWN", "scaling_fallthrough", ctx)
             return
-        if clip < MIN_ORDER_USDC:
-            print(f"  [CLIP_FAIL] {m.crypto:5s} clip=${clip:.2f} < min=${MIN_ORDER_USDC}")
+
+        elif sm["state"] == "COOLDOWN":
+            # Already handled above (cooldown expiry → IDLE)
             return
-        # ---- Proceed to trade ----
-        edge = ctx["edge_up"] if outcome == "Up" else ctx["edge_down"]
-        self._hour_edges.append(edge)
-        now_iso = iso_z(utc_now())
-        qty = clip / max(1e-9, book.ask)
-        decision_id = new_decision_id()
-        client_oid = new_order_id()
+
+    # -----------------------------------------------------------------
+    # Burst execution engine
+    # -----------------------------------------------------------------
+    def _execute_burst_buy(self, m: MarketRef, st: MarketState, outcome: str,
+                           base_clip_usd: float, ctx: dict):
+        """Execute a burst of micro-orders, checking book between each."""
+        up_book, dn_book = ctx["up_book"], ctx["dn_book"]
+        book = up_book if outcome == "Up" else dn_book
+        initial_ask = book.ask
+        total_burst_usd = base_clip_usd * BURST_TOTAL_USD_MULT
+        step_usd = clamp(total_burst_usd / BURST_ORDERS, BURST_STEP_USD_MIN, BURST_STEP_USD_MAX)
         pos = st.positions[outcome]
-        # Assign position_id + trade_id on first entry for this position lifecycle
-        if pos.position_id is None:
-            pos.position_id = new_position_id()
-            pos.trade_id = uuid.uuid4().hex
-            pos.entry_decision_id = decision_id
-            pos.parent_order_id = client_oid
-            pos.entry_mid = book.mid
-            pos.max_favorable_mid = book.mid
-            pos.max_adverse_mid = book.mid
-        ctx["cap_used"] = cap
-        ctx["thr_used"] = thr
-        ctx["size_mult"] = mult
         bk_fields = self._book_fields(up_book, dn_book, outcome)
-        print(f"  [TRADE!] {m.crypto:5s} {outcome} clip=${clip:.2f} ask={book.ask:.3f}")
-        # ORDER_INTENT
-        self.logger.log_order_intent(
-            engine="CORE", reason="ENTRY_DELTA",
-            decision_id=decision_id, position_id=pos.position_id,
-            crypto=m.crypto, slug=m.slug, outcome=outcome,
-            side="BUY", qty=qty, target_price=book.ask,
-            usdc_cost=clip, ctx=ctx, book_fields=bk_fields,
-        )
-        # ORDER_SUBMIT
-        self.logger.log_order_submit(
-            engine="CORE", reason="ENTRY_DELTA",
-            decision_id=decision_id, position_id=pos.position_id,
-            client_order_id=client_oid,
-            crypto=m.crypto, slug=m.slug, outcome=outcome,
-            side="BUY", qty=qty, target_price=book.ask,
-            usdc_cost=clip, ctx=ctx, book_fields=bk_fields,
-        )
-        st.last_entry_ts = now_iso
-        if MODE == "LOG":
-            self._paper_buy(st, outcome, book.ask, qty, clip)
-            mt = infer_maker_taker("BUY", book.ask, book)
-            sc = spread_capture_fields("BUY", book.ask, book)
-            self.logger.log_order_fill(
-                engine="CORE", reason="ENTRY_DELTA",
-                decision_id=decision_id, client_order_id=client_oid,
-                position_id=pos.position_id,
-                crypto=m.crypto, slug=m.slug, outcome=outcome,
-                side="BUY", qty=qty, fill_price=book.ask,
-                usdc_cost=clip, fees_usdc=0.0,
-                maker_taker=mt, did_cross=sc.get("did_cross", ""),
-                vwap=pos.vwap, ctx=ctx, book_fields=bk_fields,
-            )
-            return
-        fill = self._place_layered_buy(m, outcome, qty, book.ask)
-        if fill["total_filled"] > 0:
-            actual_qty = fill["total_filled"]
-            actual_price = fill["avg_price"]
-            actual_cost = fill["total_cost"]
-            self._live_buy(st, outcome, actual_price, actual_qty, actual_cost)
-            mt = infer_maker_taker("BUY", actual_price, book)
-            sc = spread_capture_fields("BUY", actual_price, book)
-            self.logger.log_order_fill(
-                engine="CORE", reason="ENTRY_DELTA",
-                decision_id=decision_id, client_order_id=client_oid,
-                position_id=pos.position_id,
-                crypto=m.crypto, slug=m.slug, outcome=outcome,
-                side="BUY", qty=actual_qty, fill_price=actual_price,
-                usdc_cost=actual_cost, fees_usdc=0.0,
-                maker_taker=mt, did_cross=sc.get("did_cross", ""),
-                vwap=pos.vwap, ctx=ctx, book_fields=bk_fields,
-            )
+        token_id = m.outcome_up_id if outcome == "Up" else m.outcome_down_id
+        total_filled_usd = 0.0
+        burst_count = 0
+        stop_reason = ""
+
+        write_jsonl({"event_type": "BURST_START", "slug": m.slug, "crypto": m.crypto,
+                      "outcome": outcome, "total_burst_usd": round(total_burst_usd, 2),
+                      "step_usd": round(step_usd, 2), "burst_orders": BURST_ORDERS,
+                      "initial_ask": initial_ask, "t_min": round(ctx["t_min"], 3)})
+
+        for i in range(BURST_ORDERS):
+            # Re-read order book
+            fresh_book = self.client.get_top_of_book(token_id, levels=IMB_LEVELS)
+            if fresh_book.ask <= 0 or fresh_book.bid <= 0:
+                stop_reason = "bad_book"
+                break
+            # Check ask jump
+            ask_jump = fresh_book.ask - initial_ask
+            if ask_jump >= BURST_STOP_IF_ASK_JUMPS_CENTS:
+                stop_reason = f"ask_jumped({ask_jump:.3f}c)"
+                break
+            # Recompute edge
+            p_up = _p_up_model(ctx["delta_bps"])
+            if outcome == "Up":
+                cur_edge = (p_up - fresh_book.mid) * 10000.0
+            else:
+                cur_edge = ((1.0 - p_up) - fresh_book.mid) * 10000.0
+            sm = self._get_sm(m.slug)
+            initial_edge = sm.get("initial_edge_bps") or cur_edge
+            edge_drop = initial_edge - cur_edge
+            if edge_drop >= BURST_STOP_IF_EDGE_DROPS_BPS:
+                stop_reason = f"edge_dropped({edge_drop:.1f}bps)"
+                break
+            # Check spread
+            max_sp = spread_limit(ctx["t_min"], abs(cur_edge), m.crypto, in_burst=True)
+            if fresh_book.spread > max_sp:
+                stop_reason = f"spread({fresh_book.spread:.3f}>{max_sp:.3f})"
+                break
+            # Size this micro-order
+            this_usd = min(step_usd, total_burst_usd - total_filled_usd)
+            this_usd = clamp(this_usd, BURST_STEP_USD_MIN, BURST_STEP_USD_MAX)
+            if this_usd < MIN_ORDER_USDC:
+                stop_reason = "remaining_too_small"
+                break
+            this_qty = this_usd / max(1e-9, fresh_book.ask)
+            decision_id = new_decision_id()
+            client_oid = new_order_id()
+
+            write_jsonl({"event_type": "BURST_MICRO_ORDER", "slug": m.slug,
+                          "burst_idx": i, "usd": round(this_usd, 2),
+                          "qty": round(this_qty, 1), "ask": fresh_book.ask,
+                          "edge_bps": round(cur_edge, 2), "spread": round(fresh_book.spread, 4)})
+
+            if MODE == "LOG":
+                self._paper_buy(st, outcome, fresh_book.ask, this_qty, this_usd)
+                mt = infer_maker_taker("BUY", fresh_book.ask, fresh_book)
+                sc = spread_capture_fields("BUY", fresh_book.ask, fresh_book)
+                self.logger.log_order_fill(
+                    engine="CORE", reason="ENTRY_BURST",
+                    decision_id=decision_id, client_order_id=client_oid,
+                    position_id=pos.position_id or "",
+                    crypto=m.crypto, slug=m.slug, outcome=outcome,
+                    side="BUY", qty=this_qty, fill_price=fresh_book.ask,
+                    usdc_cost=this_usd, fees_usdc=0.0,
+                    maker_taker=mt, did_cross=sc.get("did_cross", ""),
+                    vwap=pos.vwap, ctx=ctx, book_fields=bk_fields,
+                )
+            else:
+                fill = self.client.place_limit_order(token_id, "BUY", fresh_book.ask,
+                                                     this_qty, post_only=POST_ONLY_WHEN_POSSIBLE)
+                if fill.get("filled"):
+                    self._live_buy(st, outcome, fill["fill_price"], fill["fill_qty"],
+                                   fill["fill_price"] * fill["fill_qty"])
+                    mt = infer_maker_taker("BUY", fill["fill_price"], fresh_book)
+                    sc = spread_capture_fields("BUY", fill["fill_price"], fresh_book)
+                    self.logger.log_order_fill(
+                        engine="CORE", reason="ENTRY_BURST",
+                        decision_id=decision_id, client_order_id=client_oid,
+                        position_id=pos.position_id or "",
+                        crypto=m.crypto, slug=m.slug, outcome=outcome,
+                        side="BUY", qty=fill["fill_qty"], fill_price=fill["fill_price"],
+                        usdc_cost=fill["fill_price"] * fill["fill_qty"], fees_usdc=0.0,
+                        maker_taker=mt, did_cross=sc.get("did_cross", ""),
+                        vwap=pos.vwap, ctx=ctx, book_fields=bk_fields,
+                    )
+
+            total_filled_usd += this_usd
+            burst_count += 1
+            if total_filled_usd >= total_burst_usd:
+                stop_reason = "budget_exhausted"
+                break
+            # Sleep between micro-orders
+            time.sleep(BURST_INTERVAL_MS / 1000.0)
+
+        write_jsonl({"event_type": "BURST_STOP", "slug": m.slug, "crypto": m.crypto,
+                      "outcome": outcome, "burst_count": burst_count,
+                      "total_filled_usd": round(total_filled_usd, 2),
+                      "stop_reason": stop_reason or "all_orders_done",
+                      "t_min": round(ctx["t_min"], 3)})
     def _late_scalps(self, ctx: dict):
         m, st = ctx["m"], ctx["st"]
         t_min = ctx["t_min"]
@@ -1906,6 +2158,44 @@ class Bot:
                               max(book.bid, book.ask - MAX_CROSS_SLIPPAGE),
                               reason="HARD_STOP", leg="STOP", ctx=ctx)
                 continue
+
+            # --- Inventory pressure: hard cap on shares per market ---
+            inv_cap = INVENTORY_CAP_SHARES_PER_MARKET
+            if pos.qty > inv_cap:
+                # Immediately sell 50% (respecting derisk cooldown)
+                sell_qty = pos.qty * 0.50
+                if sell_qty >= MIN_QTY:
+                    should_inv_sell = False
+                    now_t = utc_now()
+                    if pos.last_derisk_ts is None:
+                        should_inv_sell = True
+                    else:
+                        try:
+                            last_dt = datetime.strptime(pos.last_derisk_ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                            elapsed = (now_t - last_dt).total_seconds()
+                        except Exception:
+                            elapsed = 999.0
+                        if elapsed >= DERISK_COOLDOWN_SEC:
+                            should_inv_sell = True
+                    if should_inv_sell:
+                        write_jsonl({"event_type": "INVENTORY_PRESSURE_SELL",
+                                      "slug": m.slug, "crypto": m.crypto,
+                                      "outcome": outcome, "qty": round(pos.qty, 1),
+                                      "cap": inv_cap, "sell_qty": round(sell_qty, 1)})
+                        self._do_sell(m, st, outcome, sell_qty, book.bid,
+                                      reason="INVENTORY_CAP", leg="INVENTORY_CAP", ctx=ctx)
+                        pos.last_derisk_ts = iso_z(now_t)
+                        pos.last_derisk_mid = book.mid
+                continue
+
+            # Inventory pressure: tighten TP ladder if > 70% cap
+            tp_tighten = 0.0
+            if pos.qty > inv_cap * 0.70:
+                tp_tighten = 0.01  # tighten by 1 cent
+                write_jsonl({"event_type": "INVENTORY_TP_TIGHTEN",
+                              "slug": m.slug, "outcome": outcome,
+                              "qty": round(pos.qty, 1), "tp_tighten": tp_tighten})
+
             # --- DERISK with cooldown + change detection ---
             derisk_triggered = False
             if outcome == "Up" and delta_bps < +DERISK_CROSS_BPS:
@@ -1935,25 +2225,48 @@ class Bot:
                         pos.last_derisk_ts = iso_z(now_t)
                         pos.last_derisk_mid = book.mid
                 continue
-            # --- Take-profit ladder (only if qty after TP is meaningful) ---
-            if (not pos.tp1_done) and book.bid >= pos.vwap + TP1:
+
+            # --- FAST_TP: early partial take-profit (once per position) ---
+            if not pos.fast_tp_done and pos.opened_at:
+                try:
+                    opened_dt = datetime.strptime(pos.opened_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                    pos_age_sec = (utc_now() - opened_dt).total_seconds()
+                except Exception:
+                    pos_age_sec = 0.0
+                if pos_age_sec >= FAST_TP_AFTER_SEC and book.bid >= pos.vwap + FAST_TP_CENTS:
+                    ftp_qty = pos.qty * FAST_TP_SELL_PCT
+                    if ftp_qty >= MIN_QTY:
+                        write_jsonl({"event_type": "FAST_TP_FIRE", "slug": m.slug,
+                                      "outcome": outcome, "pos_age_sec": round(pos_age_sec, 1),
+                                      "bid": book.bid, "vwap": pos.vwap,
+                                      "ftp_qty": round(ftp_qty, 1)})
+                        self._do_sell(m, st, outcome, ftp_qty, book.bid,
+                                      reason="FAST_TP", leg="FAST_TP",
+                                      target_price=pos.vwap + FAST_TP_CENTS, ctx=ctx)
+                    pos.fast_tp_done = True
+
+            # --- Take-profit ladder (with optional tightening) ---
+            tp1_adj = TP1 - tp_tighten
+            tp2_adj = TP2 - tp_tighten
+            tp3_adj = TP3 - tp_tighten
+            if (not pos.tp1_done) and book.bid >= pos.vwap + tp1_adj:
                 tp_qty = pos.qty * TP1_SELL_FRAC
                 if tp_qty >= MIN_QTY:
-                    tp_target = pos.vwap + TP1
+                    tp_target = pos.vwap + tp1_adj
                     self._do_sell(m, st, outcome, tp_qty, book.bid,
                                   reason="TP1", leg="TP1", target_price=tp_target, ctx=ctx)
                 pos.tp1_done = True
-            if (not pos.tp2_done) and book.bid >= pos.vwap + TP2:
+            if (not pos.tp2_done) and book.bid >= pos.vwap + tp2_adj:
                 tp_qty = pos.qty * TP2_SELL_FRAC
                 if tp_qty >= MIN_QTY:
-                    tp_target = pos.vwap + TP2
+                    tp_target = pos.vwap + tp2_adj
                     self._do_sell(m, st, outcome, tp_qty, book.bid,
                                   reason="TP2", leg="TP2", target_price=tp_target, ctx=ctx)
                 pos.tp2_done = True
-            if (not pos.tp3_done) and book.bid >= pos.vwap + TP3:
+            if (not pos.tp3_done) and book.bid >= pos.vwap + tp3_adj:
                 tp_qty = pos.qty * TP3_SELL_FRAC
                 if tp_qty >= MIN_QTY:
-                    tp_target = pos.vwap + TP3
+                    tp_target = pos.vwap + tp3_adj
                     self._do_sell(m, st, outcome, tp_qty, book.bid,
                                   reason="TP3", leg="TP3", target_price=tp_target, ctx=ctx)
                 pos.tp3_done = True
