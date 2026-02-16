@@ -193,6 +193,15 @@ INVENTORY_CAP_SHARES_PER_MARKET = 250
 CORR_SCALE_ENABLED = True
 BTC_LEAD = True
 BTC_EXPOSURE_REDUCE_OTHERS = 0.50  # up to 50% size reduction if BTC exposure high
+# ---------------------------------------------------------------------------
+# Background data refresh — sub-second loop architecture
+# ---------------------------------------------------------------------------
+MARKET_DISCOVERY_INTERVAL_SEC = 10.0   # re-discover markets via Gamma API every 10s
+BOOK_REFRESH_INTERVAL_MS = 400         # per-market refresh target (ms)
+BOOK_STALE_MS = 1500                   # data older than this is stale — skip processing
+STATE_SAVE_INTERVAL_SEC = 5.0          # flush state.json every 5s (not every loop)
+BG_POOL_WORKERS = 8                    # persistent background thread pool size
+MAIN_LOOP_TARGET_MS = 150              # main decision loop target: 150ms
 # =============================================================================
 # UTIL / LOGGING — thin wrappers around Logger instance
 # =============================================================================
@@ -941,6 +950,15 @@ class Bot:
         # Probe → Scale state machine: slug -> {state, probe_ts, probe_ask, initial_edge_bps}
         self.entry_sm: Dict[str, dict] = {}   # IDLE / PROBING / SCALING / COOLDOWN
         self.hour_index_counters: Dict[str, int] = {c: 0 for c in CRYPTOS}  # crypto -> monotonic index
+        # Background data refresh infrastructure (sub-second loop)
+        self._bg_executor = ThreadPoolExecutor(max_workers=BG_POOL_WORKERS)
+        self._bg_running = True
+        self._data_cache: Dict[str, dict] = {}   # slug -> {market, spot, hour_open, up_book, dn_book, ts}
+        self._cached_markets: List[MarketRef] = []
+        self._last_market_discovery_ts = 0.0
+        self._last_save_ts = 0.0
+        self._pending_fetches: Dict[str, bool] = {}  # slug -> True if fetch in-flight
+        self._loop_count = 0
         # Initialise new Logger (replaces old write_jsonl / log_csv)
         self.logger = Logger(
             run_id=RUN_ID,
@@ -954,6 +972,7 @@ class Bot:
         signal.signal(signal.SIGTERM, self._handle_stop)
     def _handle_stop(self, *_):
         self.running = False
+        self._bg_running = False
         write_jsonl({"event_type":"STOP_SIGNAL"})
     def _load_state(self):
         if not os.path.exists(STATE_FILE):
@@ -1319,6 +1338,52 @@ class Bot:
             return False
         return True
     # -----------------------------
+    # Background data refresh
+    # -----------------------------
+    def _submit_market_discovery(self):
+        """Submit market discovery to background pool (non-blocking)."""
+        if self._pending_fetches.get("__markets__"):
+            return  # already in-flight
+        self._pending_fetches["__markets__"] = True
+        def _do_discovery():
+            try:
+                markets = self._get_markets()
+                for m in markets:
+                    self._ensure_market_state(m)
+                self._cached_markets = markets  # atomic list assignment
+                self._last_market_discovery_ts = time.time()
+            except Exception as e:
+                self.logger.log_event({"event_type": "BG_DISCOVERY_ERROR", "err": str(e)})
+            finally:
+                self._pending_fetches.pop("__markets__", None)
+        self._bg_executor.submit(_do_discovery)
+
+    def _submit_market_refresh(self, m: MarketRef):
+        """Submit a single market's data refresh to background pool (non-blocking)."""
+        slug = m.slug
+        if self._pending_fetches.get(slug):
+            return  # already in-flight for this market
+        self._pending_fetches[slug] = True
+        def _do_refresh():
+            try:
+                data = self._prefetch_market_data(m)
+                data["ts"] = time.time()
+                self._data_cache[slug] = data  # atomic dict assignment
+            except Exception as e:
+                self.logger.log_event({"event_type": "BG_REFRESH_ERROR",
+                                       "slug": slug, "err": str(e)})
+            finally:
+                self._pending_fetches.pop(slug, None)
+        self._bg_executor.submit(_do_refresh)
+
+    def _cache_age_ms(self, slug: str) -> float:
+        """Return age of cached data in milliseconds, or inf if not cached."""
+        cached = self._data_cache.get(slug)
+        if not cached or "ts" not in cached:
+            return float('inf')
+        return (time.time() - cached["ts"]) * 1000
+
+    # -----------------------------
     # Main loop
     # -----------------------------
     def _prefetch_market_data(self, m: MarketRef) -> dict:
@@ -1346,53 +1411,101 @@ class Bot:
             "jsonl_path": self.logger._jsonl_path,
         })
         self._last_balance_print = 0.0
-        # Target loop interval: 200ms max for F247-grade reaction speed
-        _TARGET_LOOP_MS = 200
+        self._last_save_ts = time.time()
+
+        # ── Initial sync bootstrap: discover markets + prefetch (blocking, once) ──
+        try:
+            self._cached_markets = self._get_markets()
+            for m in self._cached_markets:
+                self._ensure_market_state(m)
+            self._last_market_discovery_ts = time.time()
+            if self._cached_markets:
+                with ThreadPoolExecutor(max_workers=len(self._cached_markets)) as pool:
+                    futures = {pool.submit(self._prefetch_market_data, m): m
+                               for m in self._cached_markets}
+                    for fut in as_completed(futures):
+                        try:
+                            data = fut.result()
+                            data["ts"] = time.time()
+                            self._data_cache[data["market"].slug] = data
+                        except Exception as e:
+                            m_ref = futures[fut]
+                            self.logger.log_event({"event_type": "INIT_PREFETCH_ERROR",
+                                                   "slug": m_ref.slug, "err": str(e)})
+            write_jsonl({"event_type": "INIT_BOOTSTRAP_DONE",
+                          "markets": len(self._cached_markets),
+                          "cached": len(self._data_cache)})
+        except Exception as e:
+            self.logger.log_event({"event_type": "INIT_BOOTSTRAP_ERROR", "err": str(e)})
+
+        # ══════════════════════════════════════════════════════════════════
+        # NON-BLOCKING MAIN LOOP — reads from cache, never blocks on HTTP
+        # Background pool continuously refreshes _data_cache
+        # ══════════════════════════════════════════════════════════════════
         while self.running:
             loop_start = time.time()
             self._reset_daily_if_needed()
             try:
-                markets = self._get_markets()
-                for m in markets:
-                    self._ensure_market_state(m)
+                # 1. Market discovery (background, every MARKET_DISCOVERY_INTERVAL_SEC)
+                if time.time() - self._last_market_discovery_ts >= MARKET_DISCOVERY_INTERVAL_SEC:
+                    self._submit_market_discovery()
+
+                # 2. Snapshot current markets & resolve ended hours
+                markets = list(self._cached_markets)  # atomic snapshot
                 self._resolve_ended_hours(markets)
-                prefetched = []
-                if markets:
-                    with ThreadPoolExecutor(max_workers=len(markets)) as pool:
-                        futures = {pool.submit(self._prefetch_market_data, m): m for m in markets}
-                        for fut in as_completed(futures):
-                            try:
-                                prefetched.append(fut.result())
-                            except Exception as e:
-                                m = futures[fut]
-                                self.logger.log_event({"event_type": "PREFETCH_ERROR",
-                                                       "slug": m.slug, "err": str(e)})
-                for data in prefetched:
-                    self._step_market_with_data(data)
-                self._save_state()
-                # Rotate log files if they exceed size limits
-                self.logger.rotate_files_if_needed()
+
+                # 3. Submit staggered background refreshes for stale/missing data
+                for m in markets:
+                    age = self._cache_age_ms(m.slug)
+                    if age >= BOOK_REFRESH_INTERVAL_MS:
+                        self._submit_market_refresh(m)
+
+                # 4. Process each market with cached data (ZERO HTTP, pure logic)
+                for m in markets:
+                    cached = self._data_cache.get(m.slug)
+                    if cached and self._cache_age_ms(m.slug) < BOOK_STALE_MS:
+                        self._step_market_with_data(cached)
+
+                # 5. Save state periodically (every STATE_SAVE_INTERVAL_SEC)
                 now = time.time()
+                if now - self._last_save_ts >= STATE_SAVE_INTERVAL_SEC:
+                    self._save_state()
+                    self._last_save_ts = now
+
+                # 6. Log rotation
+                self.logger.rotate_files_if_needed()
+
+                # 7. Console balance summary
                 if now - self._last_balance_print >= 30.0:
                     self._print_balance_summary()
                     self._last_balance_print = now
             except Exception as e:
                 self.logger.log_event({"event_type": "LOOP_ERROR", "err": str(e)})
+
             # Enforce target loop interval — sleep only the remaining time
             loop_elapsed_ms = (time.time() - loop_start) * 1000
-            sleep_ms = max(0, _TARGET_LOOP_MS - loop_elapsed_ms)
+            sleep_ms = max(0, MAIN_LOOP_TARGET_MS - loop_elapsed_ms)
             if sleep_ms > 0:
                 time.sleep(sleep_ms / 1000.0)
+
             # Log loop latency periodically (every 50 loops)
-            if not hasattr(self, '_loop_count'):
-                self._loop_count = 0
             self._loop_count += 1
             if self._loop_count % 50 == 0:
                 actual_loop_ms = (time.time() - loop_start) * 1000
+                cache_ages = {slug: round(self._cache_age_ms(slug), 0)
+                              for slug in self._data_cache}
+                pending = list(self._pending_fetches.keys())
                 write_jsonl({"event_type": "LOOP_LATENCY",
                               "loop_elapsed_ms": round(loop_elapsed_ms, 1),
                               "actual_loop_ms": round(actual_loop_ms, 1),
-                              "target_ms": _TARGET_LOOP_MS})
+                              "target_ms": MAIN_LOOP_TARGET_MS,
+                              "cache_ages_ms": cache_ages,
+                              "pending_fetches": pending,
+                              "markets_count": len(markets)})
+
+        # ── Shutdown ──
+        self._bg_running = False
+        self._bg_executor.shutdown(wait=False)
         self.logger.log_event({"event_type": "STOPPED", "cash": self.cash_usdc,
                                "realized_pnl": self.realized_pnl_usdc,
                                "equity": round(self._equity(), 2),
@@ -1454,6 +1567,8 @@ class Bot:
                 self.last_book.pop(slug, None)
                 self.recent_extreme_price.pop(slug, None)
                 self.entry_sm.pop(slug, None)
+                self._data_cache.pop(slug, None)
+                self._pending_fetches.pop(slug, None)
                 continue
             # Determine winner by checking final Binance price vs hour open
             # spot here = next hour's opening price (close proxy for the prior hour)
@@ -1537,6 +1652,8 @@ class Bot:
             self.last_book.pop(slug, None)
             self.recent_extreme_price.pop(slug, None)
             self.entry_sm.pop(slug, None)
+            self._data_cache.pop(slug, None)
+            self._pending_fetches.pop(slug, None)
     def _get_markets(self) -> List[MarketRef]:
         # In practice: discover the current hour markets
         return self.client.get_current_hour_markets()
