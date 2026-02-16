@@ -819,7 +819,7 @@ class Bot:
         self.hourly_pnl_usdc = 0.0
         self._hour_window = utc_now().replace(minute=0, second=0, microsecond=0)
         # Risk-alert tracking (log-only, never enforced)
-        self._hour_risk_stop_hit: Dict[str, bool] = {}   # "slug/hour_utc" -> True
+        self._hour_risk_stop_hit = False   # single flag per hour window (portfolio-wide)
         self._day_risk_stop_hit = False
         # Hourly stats for HOUR_SUMMARY
         self._hour_trade_count = 0
@@ -944,7 +944,7 @@ class Bot:
         if current_hour != self._hour_window:
             equity_now = self._equity()
             # ── HOUR_SUMMARY for the hour that just ended ──
-            any_stop = any(self._hour_risk_stop_hit.values())
+            any_stop = self._hour_risk_stop_hit
             shadow_delta = 0.0
             if self._shadow_active and SHADOW_STOP_SIM:
                 shadow_eq = self._shadow_equity()
@@ -978,7 +978,7 @@ class Bot:
             self._hour_window = current_hour
             self.hourly_pnl_usdc = 0.0
             self.hour_start_equity = equity_now
-            self._hour_risk_stop_hit = {}
+            self._hour_risk_stop_hit = False
             self._hour_trade_count = 0
             self._hour_net_pnl = 0.0
             self._hour_edges = []
@@ -1026,9 +1026,9 @@ class Bot:
         if self._shadow_active:
             sp = self._shadow_positions.get(st.slug, {}).get(outcome)
             if sp and sp["qty"] >= MIN_QTY:
-                sell_qty = min(qty, sp["qty"])
+                sell_qty = min(qty, sp["qty"])  # never sell more than shadow holds
                 shadow_proceeds = price * sell_qty
-                sp["qty"] -= sell_qty
+                sp["qty"] = max(0.0, sp["qty"] - sell_qty)
                 sp["cost_usdc"] = max(0.0, sp["cost_usdc"] - sp["vwap"] * sell_qty)
                 self._shadow_cash += shadow_proceeds
         # Hourly stats
@@ -1108,30 +1108,31 @@ class Bot:
         day_dd_pct  = (equity_now - dse) / dse if dse > 0 else 0.0
         st = ctx["st"]
         m = ctx["m"]
-        slug_hour_key = f"{m.slug}/{st.hour_start_utc}"
-        hour_triggered = slug_hour_key in self._hour_risk_stop_hit
+        hour_triggered = self._hour_risk_stop_hit
         day_triggered = self._day_risk_stop_hit
-        # ── Hourly stop-loss check ──
+        # ── Hourly stop-loss check (single global flag per hour) ──
         if hour_dd_pct <= -STOP_LOSS_PCT_PER_HOUR and not hour_triggered:
-            self._hour_risk_stop_hit[slug_hour_key] = True
+            self._hour_risk_stop_hit = True
             hour_triggered = True
-            # Build open-position summary
+            # Build open-position summary across ALL markets
             pos_summary = []
-            for outcome in ["Up", "Down"]:
-                pos = st.positions[outcome]
-                if pos.qty >= MIN_QTY:
-                    bk = self.last_book.get(m.slug, {}).get(outcome)
-                    pos_summary.append({
-                        "outcome": outcome, "qty": round(pos.qty, 2),
-                        "vwap": round(pos.vwap, 4),
-                        "mid": round(bk.mid, 4) if bk else None,
-                    })
+            for s_slug, s_st in self.market_states.items():
+                for outcome in ["Up", "Down"]:
+                    pos = s_st.positions[outcome]
+                    if pos.qty >= MIN_QTY:
+                        bk = self.last_book.get(s_slug, {}).get(outcome)
+                        pos_summary.append({
+                            "slug": s_slug, "crypto": s_st.crypto,
+                            "outcome": outcome, "qty": round(pos.qty, 2),
+                            "vwap": round(pos.vwap, 4),
+                            "mid": round(bk.mid, 4) if bk else None,
+                        })
             up_book, dn_book = ctx["up_book"], ctx["dn_book"]
             ref_book = up_book if ctx.get("drift_dir") == "Up" else dn_book
             write_jsonl({
                 "event_type": "RISK_STOP_TRIGGERED",
                 "trigger": "HOURLY",
-                "slug": m.slug, "crypto": m.crypto,
+                "detected_on_slug": m.slug, "detected_on_crypto": m.crypto,
                 "t_min": round(ctx["t_min"], 3),
                 "hour_start_equity": round(hse, 4),
                 "equity_now": round(equity_now, 4),
@@ -1151,7 +1152,7 @@ class Bot:
             write_jsonl({
                 "event_type": "RISK_STOP_TRIGGERED",
                 "trigger": "DAILY",
-                "slug": m.slug, "crypto": m.crypto,
+                "detected_on_slug": m.slug, "detected_on_crypto": m.crypto,
                 "t_min": round(ctx["t_min"], 3),
                 "day_start_equity": round(dse, 4),
                 "equity_now": round(equity_now, 4),
