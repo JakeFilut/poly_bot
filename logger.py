@@ -39,7 +39,7 @@ CHANGE_MID_CENTS      = float(os.getenv("CHANGE_MID_CENTS", "0.005"))
 CHANGE_IMB_DELTA      = float(os.getenv("CHANGE_IMB_DELTA", "0.25"))
 CHANGE_DELTA_BPS      = float(os.getenv("CHANGE_DELTA_BPS", "5.0"))
 CHANGE_COOLDOWN_SEC   = float(os.getenv("CHANGE_COOLDOWN_SEC", "1.5"))
-FLUSH_INTERVAL_SEC    = float(os.getenv("FLUSH_INTERVAL_SEC", "1.0"))
+FLUSH_INTERVAL_SEC    = float(os.getenv("FLUSH_INTERVAL_SEC", "2.0"))  # 2s buffered flush
 STATE_HIST_MAX        = int(os.getenv("STATE_HIST_MAX", "180"))
 MIN_QTY               = float(os.getenv("MIN_QTY", "0.001"))
 GZIP_ON_CLOSE         = os.getenv("GZIP_ON_CLOSE", "1") == "1"
@@ -483,9 +483,9 @@ class Logger:
                      "net_pnl_usdc": net_pnl_usdc})
         if extra:
             row.update(extra)
-        # Fills go to BOTH CSV and JSONL
+        # Fills go to BOTH CSV and JSONL (buffered — flushed every 2s)
         self._write_csv(row)
-        self._write_jsonl(row, force_flush=True)
+        self._write_jsonl(row)
 
     def log_order_cancel(self, *, decision_id="", client_order_id,
                          exchange_order_id="", position_id="",
