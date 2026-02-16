@@ -1190,12 +1190,18 @@ class Bot:
                 "up_book": up_book, "dn_book": dn_book}
 
     def run(self):
+        # Set hour_start_equity to actual equity so the first (partial) hour
+        # measures drawdown correctly — not from BANKROLL_START_USDC.
+        actual_equity = self._equity()
+        self.hour_start_equity = actual_equity
+        self.day_start_equity = actual_equity
         self.logger.log_event({
             "event_type": "START",
             "run_id": RUN_ID, "schema_version": SCHEMA_VERSION,
             "bot_version": BOT_VERSION,
             "mode": MODE, "profile": PROFILE,
             "cash": self.cash_usdc, "realized_pnl": self.realized_pnl_usdc,
+            "hour_start_equity": round(actual_equity, 4),
             "csv_path": self.logger._csv_path,
             "jsonl_path": self.logger._jsonl_path,
         })
