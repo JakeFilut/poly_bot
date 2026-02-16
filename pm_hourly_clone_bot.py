@@ -839,6 +839,9 @@ class Bot:
             self.realized_pnl_usdc = float(raw.get("realized_pnl_usdc", self.realized_pnl_usdc))
             self.daily_pnl_usdc = float(raw.get("daily_pnl_usdc", self.daily_pnl_usdc))
             self.day_start_equity = float(raw.get("day_start_equity", self.day_start_equity))
+            saved_day = raw.get("day_start")
+            if saved_day:
+                self.day_start = datetime.strptime(saved_day, "%Y-%m-%d").date()
             ms = raw.get("market_states", {})
             pos_fields = {f.name for f in Position.__dataclass_fields__.values()}
             ms_fields = {f.name for f in MarketState.__dataclass_fields__.values()}
@@ -881,6 +884,7 @@ class Bot:
                 "realized_pnl_usdc": self.realized_pnl_usdc,
                 "daily_pnl_usdc": self.daily_pnl_usdc,
                 "day_start_equity": self.day_start_equity,
+                "day_start": self.day_start.isoformat(),
                 "equity_usdc": self._equity(),
                 "market_states": ms,
             }
