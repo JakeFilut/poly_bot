@@ -64,6 +64,7 @@ CSV_COLUMNS: List[str] = [
     "cap_used","thr_used","size_mult",
     "exit_reason","vwap",
     "unrealized_pnl_usdc","realized_pnl_usdc","net_pnl_usdc",
+    "hour_start_equity","hour_dd_pct","risk_stop_triggered","shadow_blocked",
     "notes",
 ]
 
@@ -77,6 +78,7 @@ _CSV_PRECISION: Dict[str, int] = {
     "ref_bid":4,"ref_ask":4,"ref_mid":4,"ref_spread":4,"ref_imb":3,
     "up_bid":4,"up_ask":4,"up_mid":4,"up_spread":4,"up_imb":3,
     "dn_bid":4,"dn_ask":4,"dn_mid":4,"dn_spread":4,"dn_imb":3,
+    "hour_start_equity":4,"hour_dd_pct":6,
 }
 
 # Events that go to CSV (fills + order lifecycle)
@@ -536,6 +538,10 @@ class Logger:
             "cap_used": ctx.get("cap_used", ""),
             "thr_used": ctx.get("thr_used", ""),
             "size_mult": ctx.get("size_mult", ""),
+            "hour_start_equity": ctx.get("hour_start_equity", ""),
+            "hour_dd_pct": ctx.get("hour_dd_pct", ""),
+            "risk_stop_triggered": ctx.get("risk_stop_triggered", ""),
+            "shadow_blocked": ctx.get("shadow_blocked", ""),
         }
         row.update(book_fields)
         return row

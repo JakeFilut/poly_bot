@@ -11,7 +11,7 @@ Implements a close behavioral clone of the high-frequency hourly wallet you anal
 - Orderbook imbalance gating
 - Pullback entries
 - Cooldown + layered limit orders
-- Risk caps per market/crypto + daily stop loss
+- Risk caps per market/crypto + hourly/daily stop-loss alerts (log-only, shadow sim)
 - Stops adding risk after minute 57; cleanup near minute 59
 Logging:
 - CSV trade-intent + order-intent logs
@@ -137,7 +137,14 @@ LATE_SCALP_MAX_HOLD_MIN = 10.0
 # Risk caps
 MAX_COST_PER_MARKET_PCT = 0.008   # 0.8% bankroll per market-hour
 MAX_COST_PER_CRYPTO_PCT = 0.020   # 2.0% bankroll per crypto across markets
-DAILY_STOP_LOSS_PCT = 0.020       # 2% bankroll
+# ---------------------------------------------------------------------------
+# Risk / stop-loss configuration (log-only mode)
+# ---------------------------------------------------------------------------
+LOG_MODE = True                       # paper / logging mode — no real orders
+ENFORCE_STOP_LOSS = False             # MUST remain False in LOG mode
+STOP_LOSS_PCT_PER_HOUR = 0.02        # 2% equity drawdown per 1-hour window
+STOP_LOSS_PCT_PER_DAY  = 0.06        # 6% equity drawdown per calendar day
+SHADOW_STOP_SIM = True                # simulate what would have happened if stop was enforced
 # Execution policy
 POST_ONLY_WHEN_POSSIBLE = True
 MAX_CROSS_SLIPPAGE = 0.01         # cross at most 1c if absolutely needed
@@ -807,8 +814,23 @@ class Bot:
         self.cash_usdc = BANKROLL_START_USDC
         self.realized_pnl_usdc = 0.0  # cumulative realized P&L (sells + settlements)
         self.day_start = utc_now().date()
-        self.day_start_equity = BANKROLL_START_USDC  # equity at start of day for daily P&L
-        self.daily_pnl_usdc = 0.0  # daily P&L = current equity - day_start_equity
+        self.day_start_equity = BANKROLL_START_USDC
+        self.hour_start_equity = BANKROLL_START_USDC
+        self.hourly_pnl_usdc = 0.0
+        self._hour_window = utc_now().replace(minute=0, second=0, microsecond=0)
+        # Risk-alert tracking (log-only, never enforced)
+        self._hour_risk_stop_hit = False   # single flag per hour window (portfolio-wide)
+        self._day_risk_stop_hit = False
+        # Hourly stats for HOUR_SUMMARY
+        self._hour_trade_count = 0
+        self._hour_net_pnl = 0.0
+        self._hour_edges: List[float] = []
+        # Shadow stop-loss simulation
+        self._shadow_active = False
+        self._shadow_cash = 0.0
+        self._shadow_positions: Dict[str, Dict[str, dict]] = {}  # slug->{outcome->pos}
+        self._shadow_equity_at_trigger = 0.0
+        self._shadow_trades_blocked = 0
         self.market_states: Dict[str, MarketState] = {}   # slug -> MarketState
         self.signal_hist: Dict[str, List[Tuple[str, bool]]] = {}  # slug -> [(ts, valid_signal)]
         self.last_book: Dict[str, Dict[str, BookTop]] = {}  # slug -> outcome -> BookTop
@@ -837,8 +859,15 @@ class Bot:
             # Support both old ("bankroll_usdc") and new ("cash_usdc") state files
             self.cash_usdc = float(raw.get("cash_usdc", raw.get("bankroll_usdc", self.cash_usdc)))
             self.realized_pnl_usdc = float(raw.get("realized_pnl_usdc", self.realized_pnl_usdc))
-            self.daily_pnl_usdc = float(raw.get("daily_pnl_usdc", self.daily_pnl_usdc))
+            self.hourly_pnl_usdc = float(raw.get("hourly_pnl_usdc", raw.get("daily_pnl_usdc", self.hourly_pnl_usdc)))
             self.day_start_equity = float(raw.get("day_start_equity", self.day_start_equity))
+            self.hour_start_equity = float(raw.get("hour_start_equity", self.hour_start_equity))
+            saved_day = raw.get("day_start")
+            if saved_day:
+                self.day_start = datetime.strptime(saved_day, "%Y-%m-%d").date()
+            saved_hour = raw.get("hour_window")
+            if saved_hour:
+                self._hour_window = datetime.strptime(saved_hour, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
             ms = raw.get("market_states", {})
             pos_fields = {f.name for f in Position.__dataclass_fields__.values()}
             ms_fields = {f.name for f in MarketState.__dataclass_fields__.values()}
@@ -879,8 +908,11 @@ class Bot:
                 "run_id": RUN_ID,
                 "cash_usdc": self.cash_usdc,
                 "realized_pnl_usdc": self.realized_pnl_usdc,
-                "daily_pnl_usdc": self.daily_pnl_usdc,
+                "hourly_pnl_usdc": self.hourly_pnl_usdc,
                 "day_start_equity": self.day_start_equity,
+                "hour_start_equity": self.hour_start_equity,
+                "day_start": self.day_start.isoformat(),
+                "hour_window": iso_z(self._hour_window),
                 "equity_usdc": self._equity(),
                 "market_states": ms,
             }
@@ -905,8 +937,57 @@ class Bot:
         if today != self.day_start:
             self.day_start = today
             self.day_start_equity = self._equity()
-            self.daily_pnl_usdc = 0.0
+            self._day_risk_stop_hit = False
             write_jsonl({"event_type":"NEW_DAY_RESET", "day_start_equity": round(self.day_start_equity, 2)})
+        # Reset hourly state at each UTC hour boundary
+        current_hour = utc_now().replace(minute=0, second=0, microsecond=0)
+        if current_hour != self._hour_window:
+            equity_now = self._equity()
+            # ── HOUR_SUMMARY for the hour that just ended ──
+            any_stop = self._hour_risk_stop_hit
+            shadow_delta = 0.0
+            if self._shadow_active and SHADOW_STOP_SIM:
+                shadow_eq = self._shadow_equity()
+                shadow_delta = equity_now - shadow_eq
+                # ── RISK_STOP_SHADOW_RESULT ──
+                write_jsonl({
+                    "event_type": "RISK_STOP_SHADOW_RESULT",
+                    "hour_window": iso_z(self._hour_window),
+                    "hour_start_equity": round(self.hour_start_equity, 4),
+                    "actual_equity": round(equity_now, 4),
+                    "shadow_equity": round(shadow_eq, 4),
+                    "actual_equity_change": round(equity_now - self.hour_start_equity, 4),
+                    "shadow_equity_change": round(shadow_eq - self.hour_start_equity, 4),
+                    "trades_blocked": self._shadow_trades_blocked,
+                    "shadow_delta": round(shadow_delta, 4),
+                })
+            avg_edge = (sum(self._hour_edges) / len(self._hour_edges)) if self._hour_edges else 0.0
+            write_jsonl({
+                "event_type": "HOUR_SUMMARY",
+                "hour_window": iso_z(self._hour_window),
+                "hour_start_equity": round(self.hour_start_equity, 4),
+                "equity_now": round(equity_now, 4),
+                "trades": self._hour_trade_count,
+                "net_pnl": round(self._hour_net_pnl, 4),
+                "fees_estimate": 0.0,
+                "avg_edge": round(avg_edge, 6),
+                "stop_triggered": any_stop,
+                "shadow_delta": round(shadow_delta, 4),
+            })
+            # ── Reset for new hour ──
+            self._hour_window = current_hour
+            self.hourly_pnl_usdc = 0.0
+            self.hour_start_equity = equity_now
+            self._hour_risk_stop_hit = False
+            self._hour_trade_count = 0
+            self._hour_net_pnl = 0.0
+            self._hour_edges = []
+            # Reset shadow
+            self._shadow_active = False
+            self._shadow_cash = 0.0
+            self._shadow_positions = {}
+            self._shadow_equity_at_trigger = 0.0
+            self._shadow_trades_blocked = 0
     # -----------------------------
     # Position helpers (paper-mode)
     # -----------------------------
@@ -921,6 +1002,11 @@ class Bot:
         if pos.opened_at is None:
             pos.opened_at = pos.last_trade_ts
         self.cash_usdc -= usdc_cost
+        # Shadow: new entries are BLOCKED after stop trigger
+        if self._shadow_active:
+            self._shadow_trades_blocked += 1
+        # Hourly stats
+        self._hour_trade_count += 1
     def _paper_sell(self, st: MarketState, outcome: str, price: float, qty: float):
         pos = st.positions[outcome]
         qty = min(qty, pos.qty)
@@ -934,8 +1020,20 @@ class Bot:
         pos.last_trade_ts = iso_z(utc_now())
         self.cash_usdc += proceeds
         self.realized_pnl_usdc += pnl
-        self.daily_pnl_usdc += pnl
+        self.hourly_pnl_usdc += pnl
         self._clean_dust(pos)
+        # Shadow: exits still apply to existing shadow positions
+        if self._shadow_active:
+            sp = self._shadow_positions.get(st.slug, {}).get(outcome)
+            if sp and sp["qty"] >= MIN_QTY:
+                sell_qty = min(qty, sp["qty"])  # never sell more than shadow holds
+                shadow_proceeds = price * sell_qty
+                sp["qty"] = max(0.0, sp["qty"] - sell_qty)
+                sp["cost_usdc"] = max(0.0, sp["cost_usdc"] - sp["vwap"] * sell_qty)
+                self._shadow_cash += shadow_proceeds
+        # Hourly stats
+        self._hour_trade_count += 1
+        self._hour_net_pnl += pnl
         return pnl
     @staticmethod
     def _clean_dust(pos: Position):
@@ -961,10 +1059,9 @@ class Bot:
             pos.last_derisk_ts = None
             pos.last_derisk_mid = 0.0
     # -----------------------------
-    # Risk checks
+    # Risk checks (log-only alerts)
     # -----------------------------
     def _market_cost_usdc(self, st: MarketState) -> float:
-        # paper approximation: sum pos.cost_usdc
         return sum(p.cost_usdc for p in st.positions.values())
     def _crypto_cost_usdc(self, crypto: str) -> float:
         s = 0.0
@@ -972,9 +1069,110 @@ class Bot:
             if st.crypto == crypto:
                 s += sum(p.cost_usdc for p in st.positions.values())
         return s
+    def _shadow_equity(self) -> float:
+        """MTM equity for the shadow portfolio."""
+        mtm = 0.0
+        for slug, outcomes in self._shadow_positions.items():
+            for outcome, sp in outcomes.items():
+                if sp["qty"] < MIN_QTY:
+                    continue
+                book = self.last_book.get(slug, {}).get(outcome)
+                mid = book.mid if book else sp["vwap"]
+                mtm += sp["qty"] * mid
+        return self._shadow_cash + mtm
+    def _activate_shadow(self):
+        """Snapshot current state into shadow portfolio (called once per trigger)."""
+        self._shadow_active = True
+        self._shadow_cash = self.cash_usdc
+        self._shadow_equity_at_trigger = self._equity()
+        self._shadow_trades_blocked = 0
+        self._shadow_positions = {}
+        for slug, st in self.market_states.items():
+            sp = {}
+            for outcome in ["Up", "Down"]:
+                pos = st.positions[outcome]
+                if pos.qty >= MIN_QTY:
+                    sp[outcome] = {"qty": pos.qty, "cost_usdc": pos.cost_usdc, "vwap": pos.vwap}
+            if sp:
+                self._shadow_positions[slug] = sp
+    def _check_risk_drawdown(self, ctx: dict) -> dict:
+        """
+        Compute equity drawdown, emit RISK_STOP_TRIGGERED when thresholds
+        are breached. Returns dict with fields for CSV/ctx enrichment.
+        Never stops the bot — log only.
+        """
+        equity_now = self._equity()
+        hse = self.hour_start_equity if self.hour_start_equity > 0 else equity_now
+        dse = self.day_start_equity if self.day_start_equity > 0 else equity_now
+        hour_dd_pct = (equity_now - hse) / hse if hse > 0 else 0.0
+        day_dd_pct  = (equity_now - dse) / dse if dse > 0 else 0.0
+        st = ctx["st"]
+        m = ctx["m"]
+        hour_triggered = self._hour_risk_stop_hit
+        day_triggered = self._day_risk_stop_hit
+        # ── Hourly stop-loss check (single global flag per hour) ──
+        if hour_dd_pct <= -STOP_LOSS_PCT_PER_HOUR and not hour_triggered:
+            self._hour_risk_stop_hit = True
+            hour_triggered = True
+            # Build open-position summary across ALL markets
+            pos_summary = []
+            for s_slug, s_st in self.market_states.items():
+                for outcome in ["Up", "Down"]:
+                    pos = s_st.positions[outcome]
+                    if pos.qty >= MIN_QTY:
+                        bk = self.last_book.get(s_slug, {}).get(outcome)
+                        pos_summary.append({
+                            "slug": s_slug, "crypto": s_st.crypto,
+                            "outcome": outcome, "qty": round(pos.qty, 2),
+                            "vwap": round(pos.vwap, 4),
+                            "mid": round(bk.mid, 4) if bk else None,
+                        })
+            up_book, dn_book = ctx["up_book"], ctx["dn_book"]
+            ref_book = up_book if ctx.get("drift_dir") == "Up" else dn_book
+            write_jsonl({
+                "event_type": "RISK_STOP_TRIGGERED",
+                "trigger": "HOURLY",
+                "detected_on_slug": m.slug, "detected_on_crypto": m.crypto,
+                "t_min": round(ctx["t_min"], 3),
+                "hour_start_equity": round(hse, 4),
+                "equity_now": round(equity_now, 4),
+                "hour_dd_pct": round(hour_dd_pct, 6),
+                "day_dd_pct": round(day_dd_pct, 6),
+                "open_positions": pos_summary,
+                "spread": round(ref_book.spread, 4),
+                "delta_bps": round(ctx["delta_bps"], 3),
+                "zscore": round(ctx.get("z", 0), 3),
+            })
+            if SHADOW_STOP_SIM and not self._shadow_active:
+                self._activate_shadow()
+        # ── Daily stop-loss check ──
+        if day_dd_pct <= -STOP_LOSS_PCT_PER_DAY and not day_triggered:
+            self._day_risk_stop_hit = True
+            day_triggered = True
+            write_jsonl({
+                "event_type": "RISK_STOP_TRIGGERED",
+                "trigger": "DAILY",
+                "detected_on_slug": m.slug, "detected_on_crypto": m.crypto,
+                "t_min": round(ctx["t_min"], 3),
+                "day_start_equity": round(dse, 4),
+                "equity_now": round(equity_now, 4),
+                "day_dd_pct": round(day_dd_pct, 6),
+                "hour_dd_pct": round(hour_dd_pct, 6),
+            })
+        return {
+            "hour_start_equity": round(hse, 4),
+            "hour_dd_pct": round(hour_dd_pct, 6),
+            "day_dd_pct": round(day_dd_pct, 6),
+            "risk_stop_triggered": hour_triggered or day_triggered,
+            "shadow_blocked": self._shadow_active,
+        }
     def _risk_ok(self, st: MarketState) -> bool:
-        if self.daily_pnl_usdc < -self.cash_usdc * DAILY_STOP_LOSS_PCT:
-            return False
+        """Position-sizing risk caps. Stop-loss is log-only when ENFORCE_STOP_LOSS=False."""
+        if ENFORCE_STOP_LOSS:
+            equity = self._equity()
+            hse = self.hour_start_equity if self.hour_start_equity > 0 else equity
+            if (equity - hse) / max(hse, 1e-9) <= -STOP_LOSS_PCT_PER_HOUR:
+                return False
         if self._market_cost_usdc(st) > self.cash_usdc * MAX_COST_PER_MARKET_PCT:
             return False
         if self._crypto_cost_usdc(st.crypto) > self.cash_usdc * MAX_COST_PER_CRYPTO_PCT:
@@ -1035,7 +1233,7 @@ class Bot:
         self.logger.log_event({"event_type": "STOPPED", "cash": self.cash_usdc,
                                "realized_pnl": self.realized_pnl_usdc,
                                "equity": round(self._equity(), 2),
-                               "daily_pnl": self.daily_pnl_usdc})
+                               "hourly_pnl": self.hourly_pnl_usdc})
         self._save_state()
         self.logger.close()
     def _print_balance_summary(self):
@@ -1119,11 +1317,22 @@ class Bot:
                 pnl = payout - pos.cost_usdc
                 self.cash_usdc += payout
                 self.realized_pnl_usdc += pnl
-                self.daily_pnl_usdc += pnl
+                self.hourly_pnl_usdc += pnl
+                self._hour_net_pnl += pnl
                 pos_details.append({"outcome": outcome, "qty": pos.qty,
                                     "payout": payout, "pnl": pnl})
                 pos.qty = 0.0
                 pos.cost_usdc = 0.0
+            # Shadow settlement: settle shadow positions for this slug
+            if self._shadow_active and slug in self._shadow_positions:
+                for outcome in ["Up", "Down"]:
+                    sp = self._shadow_positions.get(slug, {}).get(outcome)
+                    if sp and sp["qty"] >= MIN_QTY:
+                        s_payout = (1.0 if outcome == winner else 0.0) * sp["qty"]
+                        self._shadow_cash += s_payout
+                        sp["qty"] = 0.0
+                        sp["cost_usdc"] = 0.0
+                self._shadow_positions.pop(slug, None)
             self.logger.log_event({
                 "event_type": "HOUR_RESOLVED", "slug": slug, "crypto": st.crypto,
                 "hour_start_utc": st.hour_start_utc,
@@ -1290,12 +1499,15 @@ class Bot:
                 pos_qty_up=pos_up_qty, pos_qty_down=pos_dn_qty,
                 cash_usdc=self.cash_usdc, equity_usdc=equity,
             )
+        # ── Risk drawdown check (log-only) ──
+        risk_fields = self._check_risk_drawdown(ctx)
+        ctx.update(risk_fields)
         # manage exits first (inventory recycling)
         self._manage_exits(m, st, t_min, delta_bps, ctx)
         # stop adding risk after minute 57
         if t_min > TRADE_STOP_ADD_MIN:
             return
-        # risk gate
+        # risk gate (market/crypto caps enforced; stop-loss is log-only)
         if not self._risk_ok(st):
             return
         # Core engine: drift-direction entries
@@ -1427,6 +1639,8 @@ class Bot:
             print(f"  [CLIP_FAIL] {m.crypto:5s} clip=${clip:.2f} < min=${MIN_ORDER_USDC}")
             return
         # ---- Proceed to trade ----
+        edge = ctx["edge_up"] if outcome == "Up" else ctx["edge_down"]
+        self._hour_edges.append(edge)
         now_iso = iso_z(utc_now())
         qty = clip / max(1e-9, book.ask)
         decision_id = new_decision_id()
