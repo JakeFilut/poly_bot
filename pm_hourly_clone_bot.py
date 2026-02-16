@@ -137,7 +137,7 @@ LATE_SCALP_MAX_HOLD_MIN = 10.0
 # Risk caps
 MAX_COST_PER_MARKET_PCT = 0.008   # 0.8% bankroll per market-hour
 MAX_COST_PER_CRYPTO_PCT = 0.020   # 2.0% bankroll per crypto across markets
-DAILY_STOP_LOSS_PCT = 0.020       # 2% bankroll
+HOURLY_STOP_LOSS_PCT = 0.020      # 2% bankroll per 1-hour window
 # Execution policy
 POST_ONLY_WHEN_POSSIBLE = True
 MAX_CROSS_SLIPPAGE = 0.01         # cross at most 1c if absolutely needed
@@ -808,7 +808,8 @@ class Bot:
         self.realized_pnl_usdc = 0.0  # cumulative realized P&L (sells + settlements)
         self.day_start = utc_now().date()
         self.day_start_equity = BANKROLL_START_USDC  # equity at start of day for daily P&L
-        self.daily_pnl_usdc = 0.0  # daily P&L = current equity - day_start_equity
+        self.hourly_pnl_usdc = 0.0  # realized P&L in current 1-hour window
+        self._hour_window = utc_now().replace(minute=0, second=0, microsecond=0)
         self.market_states: Dict[str, MarketState] = {}   # slug -> MarketState
         self.signal_hist: Dict[str, List[Tuple[str, bool]]] = {}  # slug -> [(ts, valid_signal)]
         self.last_book: Dict[str, Dict[str, BookTop]] = {}  # slug -> outcome -> BookTop
@@ -837,11 +838,14 @@ class Bot:
             # Support both old ("bankroll_usdc") and new ("cash_usdc") state files
             self.cash_usdc = float(raw.get("cash_usdc", raw.get("bankroll_usdc", self.cash_usdc)))
             self.realized_pnl_usdc = float(raw.get("realized_pnl_usdc", self.realized_pnl_usdc))
-            self.daily_pnl_usdc = float(raw.get("daily_pnl_usdc", self.daily_pnl_usdc))
+            self.hourly_pnl_usdc = float(raw.get("hourly_pnl_usdc", raw.get("daily_pnl_usdc", self.hourly_pnl_usdc)))
             self.day_start_equity = float(raw.get("day_start_equity", self.day_start_equity))
             saved_day = raw.get("day_start")
             if saved_day:
                 self.day_start = datetime.strptime(saved_day, "%Y-%m-%d").date()
+            saved_hour = raw.get("hour_window")
+            if saved_hour:
+                self._hour_window = datetime.strptime(saved_hour, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
             ms = raw.get("market_states", {})
             pos_fields = {f.name for f in Position.__dataclass_fields__.values()}
             ms_fields = {f.name for f in MarketState.__dataclass_fields__.values()}
@@ -882,9 +886,10 @@ class Bot:
                 "run_id": RUN_ID,
                 "cash_usdc": self.cash_usdc,
                 "realized_pnl_usdc": self.realized_pnl_usdc,
-                "daily_pnl_usdc": self.daily_pnl_usdc,
+                "hourly_pnl_usdc": self.hourly_pnl_usdc,
                 "day_start_equity": self.day_start_equity,
                 "day_start": self.day_start.isoformat(),
+                "hour_window": iso_z(self._hour_window),
                 "equity_usdc": self._equity(),
                 "market_states": ms,
             }
@@ -909,8 +914,14 @@ class Bot:
         if today != self.day_start:
             self.day_start = today
             self.day_start_equity = self._equity()
-            self.daily_pnl_usdc = 0.0
             write_jsonl({"event_type":"NEW_DAY_RESET", "day_start_equity": round(self.day_start_equity, 2)})
+        # Reset hourly P&L at each UTC hour boundary
+        current_hour = utc_now().replace(minute=0, second=0, microsecond=0)
+        if current_hour != self._hour_window:
+            prev = self.hourly_pnl_usdc
+            self._hour_window = current_hour
+            self.hourly_pnl_usdc = 0.0
+            write_jsonl({"event_type":"NEW_HOUR_RESET", "prev_hourly_pnl": round(prev, 4)})
     # -----------------------------
     # Position helpers (paper-mode)
     # -----------------------------
@@ -938,7 +949,7 @@ class Bot:
         pos.last_trade_ts = iso_z(utc_now())
         self.cash_usdc += proceeds
         self.realized_pnl_usdc += pnl
-        self.daily_pnl_usdc += pnl
+        self.hourly_pnl_usdc += pnl
         self._clean_dust(pos)
         return pnl
     @staticmethod
@@ -977,7 +988,7 @@ class Bot:
                 s += sum(p.cost_usdc for p in st.positions.values())
         return s
     def _risk_ok(self, st: MarketState) -> bool:
-        if self.daily_pnl_usdc < -self.cash_usdc * DAILY_STOP_LOSS_PCT:
+        if self.hourly_pnl_usdc < -self.cash_usdc * HOURLY_STOP_LOSS_PCT:
             return False
         if self._market_cost_usdc(st) > self.cash_usdc * MAX_COST_PER_MARKET_PCT:
             return False
@@ -1039,7 +1050,7 @@ class Bot:
         self.logger.log_event({"event_type": "STOPPED", "cash": self.cash_usdc,
                                "realized_pnl": self.realized_pnl_usdc,
                                "equity": round(self._equity(), 2),
-                               "daily_pnl": self.daily_pnl_usdc})
+                               "hourly_pnl": self.hourly_pnl_usdc})
         self._save_state()
         self.logger.close()
     def _print_balance_summary(self):
@@ -1123,7 +1134,7 @@ class Bot:
                 pnl = payout - pos.cost_usdc
                 self.cash_usdc += payout
                 self.realized_pnl_usdc += pnl
-                self.daily_pnl_usdc += pnl
+                self.hourly_pnl_usdc += pnl
                 pos_details.append({"outcome": outcome, "qty": pos.qty,
                                     "payout": payout, "pnl": pnl})
                 pos.qty = 0.0
