@@ -165,9 +165,9 @@ def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
 def write_jsonl(event: dict) -> None:
-    """Legacy shim — delegates to _LOGGER.log_jsonl if available."""
+    """Legacy shim — delegates to _LOGGER._write_jsonl if available."""
     if _LOGGER is not None:
-        _LOGGER.log_jsonl(event)
+        _LOGGER._write_jsonl(event)
     else:
         event["ts"] = iso_z(utc_now())
         event["run_id"] = RUN_ID
@@ -881,7 +881,7 @@ class Bot:
                 "market_states": ms,
             }
             with open(STATE_FILE, "w", encoding="utf-8") as f:
-                json.dump(raw, f, indent=2)
+                json.dump(raw, f, separators=(",", ":"))
         except Exception as e:
             write_jsonl({"event_type":"STATE_SAVE_ERROR", "err": str(e)})
     def _equity(self) -> float:
@@ -988,10 +988,15 @@ class Bot:
                 "up_book": up_book, "dn_book": dn_book}
 
     def run(self):
-        self.logger.log_event({"event_type": "START", "mode": MODE, "profile": PROFILE,
-                               "cash": self.cash_usdc, "realized_pnl": self.realized_pnl_usdc,
-                               "csv_path": self.logger._csv_path,
-                               "jsonl_path": self.logger._jsonl_path})
+        self.logger.log_event({
+            "event_type": "START",
+            "run_id": RUN_ID, "schema_version": SCHEMA_VERSION,
+            "bot_version": BOT_VERSION,
+            "mode": MODE, "profile": PROFILE,
+            "cash": self.cash_usdc, "realized_pnl": self.realized_pnl_usdc,
+            "csv_path": self.logger._csv_path,
+            "jsonl_path": self.logger._jsonl_path,
+        })
         self._last_balance_print = 0.0
         while self.running:
             self._reset_daily_if_needed()
@@ -1368,28 +1373,44 @@ class Bot:
             if sig and persist_ok and not cooldown_active and not risk_blocked and clip < MIN_ORDER_USDC:
                 reasons.append(f"clip_too_small({clip:.2f})")
             skip_reason = "|".join(reasons)
-        # Favored outcome = direction model favors
-        favored_outcome = "Up" if ctx["edge_up"] > ctx["edge_down"] else "Down"
-        favored_strength_bps = abs_delta_bps
-        self.logger.log_decision({
-            "engine": "CORE", "slug": m.slug, "crypto": m.crypto,
-            "hour_start_utc": ctx["hour_start_utc"], "hour_index": ctx["hour_index"],
-            "t_min": round(t_min, 3),
-            "phase": ctx["phase"], "seconds_to_close": round(ctx["seconds_to_close"], 1),
-            "selected_outcome": outcome,
-            "valid_time": valid_time, "valid_delta": valid_delta, "valid_z": valid_z,
+        # ── DECISION (deduped per slug+hour by signature hash) ──
+        sig_dict = {
+            "outcome": outcome, "will_trade": will_trade,
+            "valid_time": valid_time, "valid_delta": valid_delta,
             "valid_price": valid_price, "valid_spread": valid_spread,
-            "valid_imb": valid_imb, "valid_pullback": valid_pullback,
-            "persistence_ok": persist_ok, "cooldown_active": cooldown_active,
-            "risk_blocked": risk_blocked,
-            "cap_used": cap, "thr_used": thr, "size_mult": mult,
-            "clip_usdc": round(clip, 4),
-            "will_trade": will_trade, "did_trade": will_trade,
-            "skip_reason": skip_reason,
-            "spot": spot, "hour_open": ctx["hour_open"],
-            "delta_bps": round(delta_bps, 3), "abs_delta_bps": round(abs_delta_bps, 3),
-            "vel": round(vel, 3), "z": round(z, 3),
-        })
+            "valid_imb": valid_imb, "persist_ok": persist_ok,
+            "cooldown": cooldown_active, "risk": risk_blocked,
+        }
+        if self.logger.should_log_decision(m.slug, ctx["hour_start_utc"], sig_dict):
+            self.logger.log_decision({
+                "engine": "CORE", "slug": m.slug, "crypto": m.crypto,
+                "hour_start_utc": ctx["hour_start_utc"],
+                "t_min": round(t_min, 3),
+                "phase": ctx["phase"], "seconds_to_close": round(ctx["seconds_to_close"], 1),
+                "selected_outcome": outcome,
+                "valid_time": valid_time, "valid_delta": valid_delta, "valid_z": valid_z,
+                "valid_price": valid_price, "valid_spread": valid_spread,
+                "valid_imb": valid_imb, "valid_pullback": valid_pullback,
+                "persistence_ok": persist_ok, "cooldown_active": cooldown_active,
+                "risk_blocked": risk_blocked,
+                "cap_used": cap, "thr_used": thr, "size_mult": mult,
+                "clip_usdc": round(clip, 4),
+                "will_trade": will_trade, "skip_reason": skip_reason,
+                "spot": spot, "hour_open": ctx["hour_open"],
+                "delta_bps": round(delta_bps, 3), "abs_delta_bps": round(abs_delta_bps, 3),
+                "vel": round(vel, 3), "z": round(z, 3),
+            })
+        # ── BOUNDARY events (state flips) ──
+        boundary_state = {
+            "abs_delta_bps": abs_delta_bps,
+            "entry_thr_bps": thr,
+            "valid_price": valid_price,
+            "ask": book.ask, "price_cap": cap,
+            "persistence_ok": persist_ok,
+            "peak_abs_delta_bps": st.peak_abs_delta_bps,
+        }
+        for bev in self.logger.check_boundaries(m.slug, ctx["hour_start_utc"], boundary_state):
+            self.logger.log_boundary(bev)
         if not sig:
             print(f"  [GATE_FAIL] {m.crypto:5s} {skip_reason}")
             return
