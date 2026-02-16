@@ -197,11 +197,15 @@ BTC_EXPOSURE_REDUCE_OTHERS = 0.50  # up to 50% size reduction if BTC exposure hi
 # Background data refresh — sub-second loop architecture
 # ---------------------------------------------------------------------------
 MARKET_DISCOVERY_INTERVAL_SEC = 10.0   # re-discover markets via Gamma API every 10s
-BOOK_REFRESH_INTERVAL_MS = 400         # per-market refresh target (ms)
+BOOK_REFRESH_PRIORITY_MS = 200         # active markets (positions / probing / scaling)
+BOOK_REFRESH_IDLE_MS = 800             # idle markets (no positions, IDLE state)
 BOOK_STALE_MS = 1500                   # data older than this is stale — skip processing
 STATE_SAVE_INTERVAL_SEC = 5.0          # flush state.json every 5s (not every loop)
 BG_POOL_WORKERS = 8                    # persistent background thread pool size
 MAIN_LOOP_TARGET_MS = 150              # main decision loop target: 150ms
+# Burst freshness gate — micro-orders must have fresh data
+BURST_FRESHNESS_MAX_MS = 500           # max cache age to place a micro-order
+BURST_FRESHNESS_WAIT_MS = 250          # max time to wait for fresh data if stale
 # =============================================================================
 # UTIL / LOGGING — thin wrappers around Logger instance
 # =============================================================================
@@ -958,6 +962,7 @@ class Bot:
         self._last_market_discovery_ts = 0.0
         self._last_save_ts = 0.0
         self._pending_fetches: Dict[str, bool] = {}  # slug -> True if fetch in-flight
+        self._high_priority_slugs: set = set()       # markets needing fast refresh
         self._loop_count = 0
         # Initialise new Logger (replaces old write_jsonl / log_csv)
         self.logger = Logger(
@@ -1383,6 +1388,20 @@ class Bot:
             return float('inf')
         return (time.time() - cached["ts"]) * 1000
 
+    def _update_priority_slugs(self):
+        """Recompute which markets need fast refresh (positions or active state machine)."""
+        priority = set()
+        for slug, st in self.market_states.items():
+            sm = self.entry_sm.get(slug, {})
+            if sm.get("state") in ("PROBING", "SCALING"):
+                priority.add(slug)
+                continue
+            for outcome in ("Up", "Down"):
+                if st.positions[outcome].qty >= MIN_QTY:
+                    priority.add(slug)
+                    break
+        self._high_priority_slugs = priority  # atomic set assignment
+
     # -----------------------------
     # Main loop
     # -----------------------------
@@ -1454,10 +1473,13 @@ class Bot:
                 markets = list(self._cached_markets)  # atomic snapshot
                 self._resolve_ended_hours(markets)
 
-                # 3. Submit staggered background refreshes for stale/missing data
+                # 3. Update priority set + submit staggered refreshes
+                self._update_priority_slugs()
                 for m in markets:
-                    age = self._cache_age_ms(m.slug)
-                    if age >= BOOK_REFRESH_INTERVAL_MS:
+                    interval = (BOOK_REFRESH_PRIORITY_MS
+                                if m.slug in self._high_priority_slugs
+                                else BOOK_REFRESH_IDLE_MS)
+                    if self._cache_age_ms(m.slug) >= interval:
                         self._submit_market_refresh(m)
 
                 # 4. Process each market with cached data (ZERO HTTP, pure logic)
@@ -2082,9 +2104,11 @@ class Bot:
     # -----------------------------------------------------------------
     def _execute_burst_buy(self, m: MarketRef, st: MarketState, outcome: str,
                            base_clip_usd: float, ctx: dict):
-        """Execute a burst of micro-orders, checking book between each.
-        Spread is NOT a stop condition unless > BURST_SPREAD_HARD_LIMIT.
-        Only stops on: ask jump, hard edge collapse, or bad book."""
+        """Execute a burst of micro-orders using freshness-gated cached data.
+        Reads book/spot from _data_cache (populated by background pool).
+        Will NOT place micro-orders on data older than BURST_FRESHNESS_MAX_MS.
+        Triggers priority refresh and waits up to BURST_FRESHNESS_WAIT_MS if stale.
+        Recomputes edge from live spot each iteration for accurate gating."""
         burst_start_ts = time.time()
         up_book, dn_book = ctx["up_book"], ctx["dn_book"]
         book = up_book if outcome == "Up" else dn_book
@@ -2092,10 +2116,10 @@ class Bot:
         total_burst_usd = base_clip_usd * BURST_TOTAL_USD_MULT
         step_usd = clamp(total_burst_usd / BURST_ORDERS, BURST_STEP_USD_MIN, BURST_STEP_USD_MAX)
         pos = st.positions[outcome]
-        bk_fields = self._book_fields(up_book, dn_book, outcome)
         token_id = m.outcome_up_id if outcome == "Up" else m.outcome_down_id
         total_filled_usd = 0.0
         burst_count = 0
+        skipped_stale = 0
         stop_reason = ""
 
         write_jsonl({"event_type": "BURST_START", "slug": m.slug, "crypto": m.crypto,
@@ -2104,20 +2128,53 @@ class Bot:
                       "initial_ask": initial_ask, "t_min": round(ctx["t_min"], 3)})
 
         for i in range(BURST_ORDERS):
+            # ── Freshness gate: do NOT trade on data older than 500ms ──
+            cache_age = self._cache_age_ms(m.slug)
+            if cache_age > BURST_FRESHNESS_MAX_MS:
+                # Trigger priority refresh and poll up to 250ms
+                self._submit_market_refresh(m)
+                waited = 0.0
+                while waited < BURST_FRESHNESS_WAIT_MS:
+                    time.sleep(0.025)  # 25ms poll
+                    waited += 25.0
+                    if self._cache_age_ms(m.slug) <= BURST_FRESHNESS_MAX_MS:
+                        break
+                if self._cache_age_ms(m.slug) > BURST_FRESHNESS_MAX_MS:
+                    write_jsonl({"event_type": "BURST_SKIP_STALE", "slug": m.slug,
+                                  "burst_idx": i,
+                                  "cache_age_ms": round(self._cache_age_ms(m.slug), 0)})
+                    skipped_stale += 1
+                    continue  # skip this micro step — data too old
+
+            # ── Read fresh data from background cache (zero HTTP) ──
             order_start_ts = time.time()
-            # Re-read order book
-            fresh_book = self.client.get_top_of_book(token_id, levels=IMB_LEVELS)
-            book_latency_ms = (time.time() - order_start_ts) * 1000
+            fresh_cache = self._data_cache.get(m.slug)
+            if not fresh_cache:
+                stop_reason = "no_cache"
+                break
+            fresh_book = fresh_cache["up_book"] if outcome == "Up" else fresh_cache["dn_book"]
+            fresh_up_book = fresh_cache["up_book"]
+            fresh_dn_book = fresh_cache["dn_book"]
+            cache_read_ms = (time.time() - order_start_ts) * 1000
+
             if fresh_book.ask <= 0 or fresh_book.bid <= 0:
                 stop_reason = "bad_book"
                 break
+
             # Check ask jump
             ask_jump = fresh_book.ask - initial_ask
             if ask_jump >= BURST_STOP_IF_ASK_JUMPS_CENTS:
                 stop_reason = f"ask_jumped({ask_jump:.3f}c)"
                 break
-            # Recompute edge every iteration
-            p_up = _p_up_model(ctx["delta_bps"])
+
+            # Recompute edge with live spot from cache (not stale ctx snapshot)
+            fresh_spot = fresh_cache.get("spot", ctx["spot"])
+            fresh_hour_open = fresh_cache.get("hour_open", ctx["hour_open"])
+            if fresh_hour_open > 0:
+                live_delta_bps = (fresh_spot - fresh_hour_open) / fresh_hour_open * 10000.0
+            else:
+                live_delta_bps = ctx["delta_bps"]
+            p_up = _p_up_model(live_delta_bps)
             if outcome == "Up":
                 cur_edge = (p_up - fresh_book.mid) * 10000.0
             else:
@@ -2128,10 +2185,12 @@ class Bot:
             if edge_drop >= BURST_STOP_IF_EDGE_DROPS_BPS:
                 stop_reason = f"edge_dropped({edge_drop:.1f}bps)"
                 break
-            # Spread: only hard-stop at 12c — do NOT stop on normal spread widening
+
+            # Spread: only hard-stop at 12c
             if fresh_book.spread > BURST_SPREAD_HARD_LIMIT:
                 stop_reason = f"spread_hard({fresh_book.spread:.3f}>{BURST_SPREAD_HARD_LIMIT})"
                 break
+
             # Size this micro-order
             this_usd = min(step_usd, total_burst_usd - total_filled_usd)
             this_usd = clamp(this_usd, BURST_STEP_USD_MIN, BURST_STEP_USD_MAX)
@@ -2141,12 +2200,14 @@ class Bot:
             this_qty = this_usd / max(1e-9, fresh_book.ask)
             decision_id = new_decision_id()
             client_oid = new_order_id()
+            bk_fields = self._book_fields(fresh_up_book, fresh_dn_book, outcome)
 
             write_jsonl({"event_type": "BURST_MICRO_ORDER", "slug": m.slug,
                           "burst_idx": i, "usd": round(this_usd, 2),
                           "qty": round(this_qty, 1), "ask": fresh_book.ask,
                           "edge_bps": round(cur_edge, 2), "spread": round(fresh_book.spread, 4),
-                          "book_latency_ms": round(book_latency_ms, 1)})
+                          "cache_age_ms": round(self._cache_age_ms(m.slug), 0),
+                          "live_delta_bps": round(live_delta_bps, 2)})
 
             if MODE == "LOG":
                 self._paper_buy(st, outcome, fresh_book.ask, this_qty, this_usd)
@@ -2195,6 +2256,7 @@ class Bot:
                       "total_filled_usd": round(total_filled_usd, 2),
                       "stop_reason": stop_reason or "all_orders_done",
                       "burst_duration_ms": round(burst_duration_ms, 1),
+                      "skipped_stale": skipped_stale,
                       "t_min": round(ctx["t_min"], 3)})
     def _late_scalps(self, ctx: dict):
         m, st = ctx["m"], ctx["st"]
