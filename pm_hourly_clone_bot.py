@@ -225,7 +225,7 @@ RECYCLE_MIN_PROFIT_NET_CENTS = 0.5      # min net-of-fee profit to trigger recyc
 RECYCLE_STEP_USD = 2.0                   # per-leg sell size during recycle
 # Liquidity + staleness guards
 MAX_SPREAD_FOR_PARITY_CENTS = 10.0      # block parity if either leg spread > 10c
-MIN_TOP_LIQ_USD = 5.0                   # block parity if best bid/ask size < $5
+MIN_TOP_LIQ_USD = 1.0                   # block parity if best bid/ask size < $1 (F247 trades tiny clips)
 PARITY_MAX_CACHE_AGE_MS = 600           # block parity if cache > 600ms stale
 # End-of-hour parity flattening
 PARITY_STOP_NEW_MIN = 57.0              # stop opening NEW parity trades after minute 57
@@ -273,6 +273,7 @@ DERISK_RESCUE_TO_STRADDLE = True
 RESCUE_MIN_EDGE_NET_CENTS = 0.5         # min net edge for straddle completion to be worth it
 RESCUE_MAX_USD_PER_SLUG = 20.0          # max USD to spend completing straddle per slug
 RESCUE_STEP_USD = 2.0                    # per-order size for rescue buys
+MIN_PAIR_QTY = 5.0                       # both legs must exceed this to count as "already paired"
 # ---------------------------------------------------------------------------
 # Directional lean overlay (on top of parity, for exits)
 # ---------------------------------------------------------------------------
@@ -1222,6 +1223,11 @@ class Bot:
         self._diag_quote_submit_count = 0
         self._diag_quote_cancel_count = 0
         self._diag_quote_replace_count = 0
+        # Clone-report dedicated counters (independent of tempo report reset cycle)
+        self._clone_quote_submit_count = 0
+        self._clone_quote_cancel_count = 0
+        self._clone_quote_replace_count = 0
+        self._clone_quote_fill_count = 0
         # Maker queue time tracking: list of (submit_ts, fill_ts) for filled maker orders
         self._diag_maker_queue_times: List[float] = []  # ms from submit to fill
         # Top-of-book tracking: slug -> {outcome -> {is_best: bool, best_since_ts: float}}
@@ -2250,8 +2256,12 @@ class Bot:
             denom = (var_i * var_d) ** 0.5
             imbal_delta_corr = cov / denom if denom > 1e-9 else 0.0
 
-        # ── Build report ──
-        fill_rate = self._diag_quote_fills / max(1, self._diag_quote_submit_count)
+        # ── Build report (use clone-dedicated counters for lifecycle) ──
+        clone_fills = self._clone_quote_fill_count
+        clone_submits = self._clone_quote_submit_count
+        clone_cancels = self._clone_quote_cancel_count
+        clone_replaces = self._clone_quote_replace_count
+        fill_rate = clone_fills / max(1, clone_submits)
         clone_data = {
             "event_type": "CLONE_REPORT",
             "ts_ms": int(time.time() * 1000),
@@ -2268,9 +2278,10 @@ class Bot:
             "maker_queue_time_p50_ms": round(queue_p50, 1),
             "maker_queue_time_p90_ms": round(queue_p90, 1),
             # Lifecycle
-            "quote_submit_count": self._diag_quote_submit_count,
-            "quote_cancel_count": self._diag_quote_cancel_count,
-            "quote_replace_count": self._diag_quote_replace_count,
+            "quote_submit_count": clone_submits,
+            "quote_cancel_count": clone_cancels,
+            "quote_replace_count": clone_replaces,
+            "quote_fill_count": clone_fills,
             "quote_fill_rate": round(fill_rate, 3),
             "active_quote_orders": len(self._active_orders),
             "pending_unpaired": len(self._quote_unpaired),
@@ -2304,9 +2315,10 @@ class Bot:
               f"delay={med_pair_delay_ms:.0f}ms  "
               f"gap={med_inter_pair_ms:.0f}ms  "
               f"sig2fill={med_signal_to_fill_ms:.0f}ms")
-        print(f"  LIFECYCLE: submit={self._diag_quote_submit_count}  "
-              f"cancel={self._diag_quote_cancel_count}  "
-              f"replace={self._diag_quote_replace_count}  "
+        print(f"  LIFECYCLE: submit={clone_submits}  "
+              f"cancel={clone_cancels}  "
+              f"replace={clone_replaces}  "
+              f"fills={clone_fills}  "
               f"fill_rate={fill_rate:.0%}  "
               f"queue_p50={queue_p50:.0f}ms  "
               f"queue_p90={queue_p90:.0f}ms")
@@ -2334,6 +2346,11 @@ class Bot:
         self._diag_pairs_completed_10s = 0
         self._diag_max_imbalance.clear()
         self._diag_imbalance_delta_samples.clear()
+        # Reset clone-dedicated lifecycle counters
+        self._clone_quote_submit_count = 0
+        self._clone_quote_cancel_count = 0
+        self._clone_quote_replace_count = 0
+        self._clone_quote_fill_count = 0
         # Clean up stale pair tracker entries (older than 30s)
         stale_cutoff = time.time() - 30.0
         stale_ids = [pid for pid, info in self._pair_tracker.items()
@@ -3889,19 +3906,28 @@ class Bot:
                 # Track unpaired state: if one leg filled but the other hasn't yet
                 invested = self._parity_invested_usd.get(m.slug, 0.0)
 
-        # ── Check for straddle completion ──
-        if (st.positions["Up"].qty >= MIN_QTY
-                and st.positions["Down"].qty >= MIN_QTY):
+        # ── Check for straddle completion (both legs balanced) ──
+        up_q = st.positions["Up"].qty
+        dn_q = st.positions["Down"].qty
+        imbal = abs(up_q - dn_q)
+        both_have = up_q >= MIN_PAIR_QTY and dn_q >= MIN_PAIR_QTY
+        if both_have and imbal < MIN_PAIR_QTY:
+            # Balanced straddle — clear any hedge state
             if m.slug not in self._parity_locked_since:
                 self._parity_locked_since[m.slug] = time.time()
-            # Clear unpaired tracking on completion
             self._quote_unpaired.pop(m.slug, None)
+            self._hedge_state.pop(m.slug, None)
 
-        # ── Detect newly unpaired fills ──
-        up_has = st.positions["Up"].qty >= MIN_QTY
-        dn_has = st.positions["Down"].qty >= MIN_QTY
-        if (up_has != dn_has) and m.slug not in self._quote_unpaired:
-            filled_outcome = "Up" if up_has else "Down"
+        # ── Detect one-sided or imbalanced fills → trigger hedge ──
+        # Case 1: one leg missing entirely
+        # Case 2: significant imbalance (one leg much larger than other)
+        up_has = up_q >= MIN_QTY
+        dn_has = dn_q >= MIN_QTY
+        one_sided = (up_has != dn_has)
+        imbalanced = (up_has and dn_has and imbal >= MIN_PAIR_QTY
+                      and max(up_q, dn_q) > min(up_q, dn_q) * 2.0)
+        if (one_sided or imbalanced) and m.slug not in self._quote_unpaired:
+            filled_outcome = "Up" if up_q > dn_q else "Down"
             self._quote_unpaired[m.slug] = {
                 "outcome": filled_outcome,
                 "fill_ts": now_t,
@@ -3972,9 +3998,12 @@ class Bot:
         if unpaired is None:
             return
 
-        # If both legs now filled, clear hedge state
-        if (st.positions["Up"].qty >= MIN_QTY
-                and st.positions["Down"].qty >= MIN_QTY):
+        # If both legs now balanced, clear hedge state
+        up_q = st.positions["Up"].qty
+        dn_q = st.positions["Down"].qty
+        imbal = abs(up_q - dn_q)
+        if (up_q >= MIN_PAIR_QTY and dn_q >= MIN_PAIR_QTY
+                and imbal < MIN_PAIR_QTY):
             self._quote_unpaired.pop(m.slug, None)
             self._hedge_state.pop(m.slug, None)
             return
@@ -4164,6 +4193,7 @@ class Bot:
         placed_ts_ms = int(placed_ts * 1000)
         self._last_quote_oid = client_oid
         self._diag_quote_submit_count += 1
+        self._clone_quote_submit_count += 1
         self._active_orders[client_oid] = {
             "slug": m.slug, "outcome": outcome, "side": "BUY",
             "price": bid_price, "qty": order_qty,
@@ -4185,6 +4215,8 @@ class Bot:
                 old_info = self._active_orders.pop(old_oid)
                 self._diag_quote_cancel_count += 1
                 self._diag_quote_replace_count += 1
+                self._clone_quote_cancel_count += 1
+                self._clone_quote_replace_count += 1
                 write_jsonl({"event_type": "ORDER_REPLACE",
                               "ts_ms": placed_ts_ms,
                               "slug": m.slug, "outcome": outcome,
@@ -4229,6 +4261,7 @@ class Bot:
             self._tempo_fills[m.slug] = self._tempo_fills.get(m.slug, 0) + 1
             self._diag_maker_fills += 1
             self._diag_quote_fills += 1
+            self._clone_quote_fill_count += 1
             self._diag_maker_fill_latencies.append(fill_latency_ms)
             self._active_orders.pop(client_oid, None)
             self._diag_maker_queue_times.append(fill_latency_ms)
@@ -4287,6 +4320,7 @@ class Bot:
                 self._tempo_fills[m.slug] = self._tempo_fills.get(m.slug, 0) + 1
                 self._diag_maker_fills += 1
                 self._diag_quote_fills += 1
+                self._clone_quote_fill_count += 1
                 self._diag_maker_fill_latencies.append(fill_latency_ms)
                 self._active_orders.pop(client_oid, None)
                 self._diag_maker_queue_times.append(fill_latency_ms)
@@ -4849,12 +4883,18 @@ class Bot:
                         })
 
                         # Determine rescue block reason (if any)
+                        # "already_paired" = BOTH legs have substantial inventory
+                        up_qty = st.positions["Up"].qty
+                        dn_qty = st.positions["Down"].qty
+                        straddle_locked = min(up_qty, dn_qty)
+                        pending_pairs_count = len([p for p in self._parity_pending_pairs
+                                                    if p.get("slug") == m.slug]) if hasattr(self, '_parity_pending_pairs') else 0
                         rescue_block_reason = None
                         if emergency:
                             rescue_block_reason = "emergency"
                         elif not DERISK_RESCUE_TO_STRADDLE:
                             rescue_block_reason = "disabled"
-                        elif opp_pos.qty >= MIN_QTY:
+                        elif up_qty >= MIN_PAIR_QTY and dn_qty >= MIN_PAIR_QTY:
                             rescue_block_reason = "already_paired"
                         elif not opp_book or opp_book.bid <= 0:
                             rescue_block_reason = "no_liquidity"
@@ -4907,14 +4947,60 @@ class Bot:
                                 "slug": m.slug, "crypto": m.crypto,
                                 "reason": rescue_block_reason,
                                 "outcome": outcome,
+                                "up_qty": round(up_qty, 1),
+                                "dn_qty": round(dn_qty, 1),
+                                "min_pair_qty": MIN_PAIR_QTY,
+                                "straddle_locked": round(straddle_locked, 1),
+                                "pending_pairs_count": pending_pairs_count,
                                 "net_edge_cents": round(rescue_net_edge, 3),
                                 "min_edge_used": round(min_edge, 3),
                                 "emergency": emergency,
                                 "t_min": round(t_min, 3),
                             })
 
-                        # ── FALLBACK: sell ONLY if rescue didn't succeed ──
+                        # ── FALLBACK: derisk sell ONLY as last resort ──
+                        # Determine if derisk sell is warranted:
+                        #   - emergency (inventory/time)
+                        #   - near_close (< 45s to close)
+                        #   - stale_book (no live data)
+                        #   - rescue explicitly failed with hard block
+                        seconds_to_close_now = ctx.get("seconds_to_close", 999.0)
+                        near_close = seconds_to_close_now < 45 or t_min >= PARITY_STOP_NEW_MIN
+                        stale_data = rescue_block_reason in ("stale_book", "no_liquidity")
+                        hard_rescue_fail = rescue_block_reason in ("cap_reached", "threshold",
+                                                                     "qty_too_small", "disabled")
+
+                        derisk_decision = None
                         if not rescue_done:
+                            if emergency:
+                                derisk_decision = "emergency"
+                            elif near_close:
+                                derisk_decision = "near_close"
+                            elif stale_data:
+                                derisk_decision = "stale_data"
+                            elif hard_rescue_fail:
+                                derisk_decision = "rescue_failed"
+                            else:
+                                # Rescue blocked as "already_paired" — don't sell,
+                                # let hedge/parity rebalance instead
+                                derisk_decision = "defer_to_hedge"
+
+                        write_jsonl({
+                            "event_type": "DERISK_DECISION",
+                            "ts_ms": int(time.time() * 1000),
+                            "slug": m.slug, "crypto": m.crypto,
+                            "outcome": outcome,
+                            "decision": derisk_decision if derisk_decision else "rescue_success",
+                            "rescue_done": rescue_done,
+                            "rescue_block_reason": rescue_block_reason,
+                            "emergency": emergency,
+                            "near_close": near_close,
+                            "sell_qty": round(sell_qty, 1),
+                            "up_qty": round(st.positions["Up"].qty, 1),
+                            "dn_qty": round(st.positions["Down"].qty, 1),
+                        })
+
+                        if not rescue_done and derisk_decision != "defer_to_hedge":
                             # Check for emergency taker conditions
                             emergency_taker = emergency
                             if not emergency_taker and abs_edge >= thr + DERISK_TAKER_EDGE_EXTRA_BPS:
@@ -4940,6 +5026,16 @@ class Bot:
                                 self._do_sell(m, st, outcome, sell_qty, maker_price,
                                               reason="DERISK_MAKER", leg="DERISK", ctx=ctx,
                                               use_maker=True)
+                        elif not rescue_done and derisk_decision == "defer_to_hedge":
+                            # Trigger hedge state machine for opposite leg instead of selling
+                            if m.slug not in self._quote_unpaired:
+                                self._quote_unpaired[m.slug] = {
+                                    "outcome": outcome,  # the side we HAVE
+                                    "fill_ts": time.time(),
+                                    "escalated": False,
+                                }
+                                self._diag_quote_unpaired_events += 1
+
                         pos.last_derisk_ts = iso_z(now_t)
                         pos.last_derisk_mid = book.mid
                 continue
