@@ -198,6 +198,44 @@ BURST_CROSS_MAX_SPREAD = 0.01          # cross at ask ONLY when spread <= 1c (us
 CAP_BOOST_EDGE_THRESHOLD = 10.0  # edge_bps above which cap starts boosting
 CAP_BOOST_MAX = 0.08             # max +8 cents boost (aggressive chase)
 CAP_BOOST_EDGE_FULL = 30.0       # edge_bps at which full boost is applied
+# ---------------------------------------------------------------------------
+# Parity (straddle) arbitrage engine — Up + Down ≈ 1.000
+# ---------------------------------------------------------------------------
+PARITY_BUY_ENABLED = True                # buy cheap straddle (up_ask + dn_ask < 1)
+PARITY_SELL_ENABLED = True               # sell rich straddle (up_bid + dn_bid > 1)
+PARITY_MAX_USD_PER_SLUG = 40.0          # max total straddle investment per slug
+PARITY_STEP_USD = 2.00                   # per-leg size per parity order
+PARITY_COOLDOWN_MS = 250                 # min time between parity orders per slug
+PARITY_MAKER_REFRESH_MS = 200            # cancel/replace maker every 200ms
+PARITY_TAKER_ALLOWED_SPREAD_CENTS = 1.0  # allow taker only when spread <= 1c
+# Fee-aware parity edge (CRITICAL)
+MAKER_FEE_BPS = float(os.getenv("MAKER_FEE_BPS", "0.5"))   # configurable: Poly CLOB ≈0-0.5 bps maker
+TAKER_FEE_BPS = float(os.getenv("TAKER_FEE_BPS", "2.0"))   # configurable: Poly CLOB ≈2 bps taker
+PARITY_BUY_MIN_EDGE_NET_CENTS = 1.0     # min NET edge after fees/slippage to buy straddle
+PARITY_SELL_MIN_EDGE_NET_CENTS = 1.0    # min NET edge after fees/slippage to sell straddle
+PARITY_EDGE_BUFFER_CENTS = 0.25         # safety buffer on top of min edge thresholds
+# Partial-fill protection
+PAIR_FILL_TIMEOUT_MS = 1200              # max time to wait for second leg fill
+# Maker queue discipline (reduce cancel spam)
+MIN_REPLACE_INTERVAL_MS = 200            # min time between cancel/replace on same order
+MAKER_ORDER_TIMEOUT_MS = 3000            # cancel maker order if unfilled after 3s
+# Locked inventory recycle
+LOCKED_MAX_HOLD_SEC = 180                # max seconds to hold locked straddle before recycling
+RECYCLE_MIN_PROFIT_NET_CENTS = 0.5      # min net-of-fee profit to trigger recycle sell
+RECYCLE_STEP_USD = 2.0                   # per-leg sell size during recycle
+# Liquidity + staleness guards
+MAX_SPREAD_FOR_PARITY_CENTS = 10.0      # block parity if either leg spread > 10c
+MIN_TOP_LIQ_USD = 5.0                   # block parity if best bid/ask size < $5
+PARITY_MAX_CACHE_AGE_MS = 600           # block parity if cache > 600ms stale
+# End-of-hour parity flattening
+PARITY_STOP_NEW_MIN = 57.0              # stop opening NEW parity trades after minute 57
+PARITY_FLATTEN_START_MIN = 59.0         # begin flattening locked + unpaired parity inventory
+PARITY_HARD_FLATTEN_MIN = 59.25         # force taker flatten (if time_to_close<20s or emergency)
+# ---------------------------------------------------------------------------
+# Directional lean overlay (on top of parity, for exits)
+# ---------------------------------------------------------------------------
+LEAN_EXIT_PRIORITY = True                # prioritize exits on "wrong" side
+LEAN_MAX_IMBALANCE_SHARES = 80           # cap how unbalanced Up vs Down can get
 # Spread rule relaxation
 SPREAD_RELAXED_MAX = 0.12         # 12 cents during burst (F247 tolerant)
 # Fast take-profit — skim faster than before
@@ -510,6 +548,46 @@ def whipsaw_ok(delta_bps: float, vel: float,
         vel_sign = 1 if vel > 0 else -1
         if delta_sign != vel_sign:
             return False, f"vel_opposes(delta={delta_bps:+.1f},vel={vel:+.1f})"
+    return True, ""
+
+def parity_net_edge_cents(raw_edge_cents: float, up_book: "BookTop", dn_book: "BookTop",
+                          is_buy: bool) -> Tuple[float, float, float]:
+    """Compute net parity edge after estimated fees and slippage.
+    Returns (net_edge_cents, total_fee_cents, total_slippage_cents).
+    For BUY straddle: we cross both asks (taker) or post bids (maker).
+    For SELL straddle: we cross both bids (taker) or post asks (maker)."""
+    total_fee_cents = 0.0
+    total_slippage_cents = 0.0
+    for book in (up_book, dn_book):
+        spread_cents = book.spread * 100
+        use_taker = spread_cents <= PARITY_TAKER_ALLOWED_SPREAD_CENTS
+        if use_taker:
+            # Taker: fee + half-spread slippage
+            fee = TAKER_FEE_BPS / 100.0  # bps -> cents (approx: 1 bps on $0.50 ~ 0.005c)
+            slippage = spread_cents / 2.0
+        else:
+            # Maker: fee only, no slippage (we're at best price)
+            fee = MAKER_FEE_BPS / 100.0
+            slippage = 0.0
+        total_fee_cents += fee
+        total_slippage_cents += slippage
+    net = raw_edge_cents - total_fee_cents - total_slippage_cents
+    return net, total_fee_cents, total_slippage_cents
+
+def parity_liquidity_ok(up_book: "BookTop", dn_book: "BookTop") -> Tuple[bool, str]:
+    """Check liquidity and spread guards for parity entry.
+    Returns (ok, block_reason)."""
+    for label, book in [("up", up_book), ("dn", dn_book)]:
+        spread_cents = book.spread * 100
+        if spread_cents > MAX_SPREAD_FOR_PARITY_CENTS:
+            return False, f"{label}_spread({spread_cents:.1f}c>{MAX_SPREAD_FOR_PARITY_CENTS}c)"
+        # Check top-of-book liquidity in USD
+        bid_usd = book.bid_sz * book.bid if book.bid > 0 else 0.0
+        ask_usd = book.ask_sz * book.ask if book.ask > 0 else 0.0
+        if bid_usd < MIN_TOP_LIQ_USD:
+            return False, f"{label}_bid_liq(${bid_usd:.1f}<${MIN_TOP_LIQ_USD})"
+        if ask_usd < MIN_TOP_LIQ_USD:
+            return False, f"{label}_ask_liq(${ask_usd:.1f}<${MIN_TOP_LIQ_USD})"
     return True, ""
 
 # =============================================================================
@@ -1003,6 +1081,44 @@ class Bot:
         self._diag_blocked_whipsaw = 0
         self._diag_blocked_taker_gate = 0
         self._diag_blocked_noflip = 0
+        # Parity arb tracking
+        self._parity_last_order_ts: Dict[str, float] = {}    # slug -> last parity order timestamp
+        self._parity_invested_usd: Dict[str, float] = {}     # slug -> total parity investment
+        # Partial-fill tracking: list of pending pairs awaiting second leg
+        # Each entry: {pair_id, slug, filled_outcome, filled_usd, filled_qty, filled_price,
+        #              pending_outcome, ts, edge_net_cents}
+        self._parity_pending_pairs: List[dict] = []
+        # Maker queue discipline: slug -> {outcome -> {order_id, price, last_replace_ts}}
+        self._parity_maker_orders: Dict[str, Dict[str, dict]] = {}
+        # Locked straddle first-open timestamps: slug -> first_locked_ts
+        self._parity_locked_since: Dict[str, float] = {}
+        # Per-minute parity diagnostics
+        self._diag_parity_buy_signals = 0
+        self._diag_parity_sell_signals = 0
+        self._diag_parity_trades = 0
+        self._diag_parity_edges: List[float] = []            # NET cents captured per trade
+        self._diag_parity_maker_count = 0
+        self._diag_parity_taker_count = 0
+        self._diag_pair_partial_count = 0
+        self._diag_pair_fill_delays: List[float] = []        # ms per pair fill
+        self._diag_unpaired_unwind_usd = 0.0
+        self._diag_maker_orders_placed = 0
+        self._diag_maker_fills = 0
+        self._diag_cancel_replace_count = 0
+        self._diag_parity_blocked_spread = 0
+        self._diag_parity_blocked_liq = 0
+        self._diag_parity_blocked_stale = 0
+        self._diag_parity_blocked_fee = 0
+        self._diag_recycle_count = 0
+        # Maker fill-quality metrics
+        self._diag_maker_fill_latencies: List[float] = []   # ms from place->fill per maker order
+        self._diag_maker_timeout_cancel_count = 0
+        self._diag_maker_lost_best_count = 0
+        # End-of-hour flatten counters
+        self._diag_flatten_actions = 0
+        self._diag_flatten_taker = 0
+        # Similarity/tempo stats: timestamps of all parity trades this minute
+        self._diag_parity_trade_timestamps: List[float] = []
         # Probe → Scale state machine: slug -> {state, probe_ts, probe_ask, initial_edge_bps}
         self.entry_sm: Dict[str, dict] = {}   # IDLE / PROBING / SCALING / COOLDOWN
         self.hour_index_counters: Dict[str, int] = {c: 0 for c in CRYPTOS}  # crypto -> monotonic index
@@ -1487,7 +1603,20 @@ class Bot:
             "hour_start_equity": round(actual_equity, 4),
             "csv_path": self.logger._csv_path,
             "jsonl_path": self.logger._jsonl_path,
+            # Fee model config (logged at startup for audit trail)
+            "maker_fee_bps": MAKER_FEE_BPS,
+            "taker_fee_bps": TAKER_FEE_BPS,
+            "parity_buy_min_edge_net_cents": PARITY_BUY_MIN_EDGE_NET_CENTS,
+            "parity_sell_min_edge_net_cents": PARITY_SELL_MIN_EDGE_NET_CENTS,
+            "parity_edge_buffer_cents": PARITY_EDGE_BUFFER_CENTS,
+            "parity_stop_new_min": PARITY_STOP_NEW_MIN,
+            "parity_flatten_start_min": PARITY_FLATTEN_START_MIN,
+            "parity_hard_flatten_min": PARITY_HARD_FLATTEN_MIN,
         })
+        print(f"  FEE MODEL: maker={MAKER_FEE_BPS}bps taker={TAKER_FEE_BPS}bps "
+              f"buffer={PARITY_EDGE_BUFFER_CENTS}c "
+              f"buy_min_net={PARITY_BUY_MIN_EDGE_NET_CENTS}c "
+              f"sell_min_net={PARITY_SELL_MIN_EDGE_NET_CENTS}c")
         self._last_balance_print = 0.0
         self._last_save_ts = time.time()
 
@@ -1635,6 +1764,43 @@ class Bot:
             p95_idx = int(len(sorted_loops) * 0.95)
             loop_p95 = round(sorted_loops[min(p95_idx, len(sorted_loops) - 1)], 1)
         # Diagnostic counters snapshot
+        avg_parity_edge = (sum(self._diag_parity_edges) / len(self._diag_parity_edges)
+                           if self._diag_parity_edges else 0.0)
+        avg_pair_delay = (sum(self._diag_pair_fill_delays) / len(self._diag_pair_fill_delays)
+                          if self._diag_pair_fill_delays else 0.0)
+        maker_fill_rate = (self._diag_maker_fills / max(1, self._diag_maker_orders_placed)
+                           if self._diag_maker_orders_placed > 0 else 0.0)
+        # Maker fill latency percentiles
+        maker_lat_p50 = 0.0
+        maker_lat_p90 = 0.0
+        if self._diag_maker_fill_latencies:
+            sorted_lat = sorted(self._diag_maker_fill_latencies)
+            p50_idx = len(sorted_lat) // 2
+            p90_idx = int(len(sorted_lat) * 0.9)
+            maker_lat_p50 = sorted_lat[min(p50_idx, len(sorted_lat) - 1)]
+            maker_lat_p90 = sorted_lat[min(p90_idx, len(sorted_lat) - 1)]
+        # Similarity/tempo stats
+        trade_ts = sorted(self._diag_parity_trade_timestamps)
+        paired_trades_per_min = len(trade_ts)
+        max_trades_in_one_sec = 0
+        if trade_ts:
+            # Count max trades in any 1-second window
+            for j, t0 in enumerate(trade_ts):
+                cnt = sum(1 for t1 in trade_ts[j:] if t1 - t0 <= 1.0)
+                max_trades_in_one_sec = max(max_trades_in_one_sec, cnt)
+        # Median time between trades
+        inter_trade_ms = []
+        for j in range(1, len(trade_ts)):
+            inter_trade_ms.append((trade_ts[j] - trade_ts[j - 1]) * 1000)
+        median_inter_trade_ms = (sorted(inter_trade_ms)[len(inter_trade_ms) // 2]
+                                  if inter_trade_ms else 0.0)
+        # Paired trade ratio = parity trades / total fills
+        total_fills_all = sum(v.get("fills_per_min", 0) for v in per_market.values())
+        paired_ratio = (self._diag_parity_trades / max(1, total_fills_all))
+        # Maker ratio = maker / (maker + taker) across parity
+        total_parity_mt = self._diag_parity_maker_count + self._diag_parity_taker_count
+        maker_ratio = (self._diag_parity_maker_count / max(1, total_parity_mt))
+
         diag = {
             "taker_count": self._diag_taker_count,
             "maker_count": self._diag_maker_count,
@@ -1643,7 +1809,57 @@ class Bot:
             "blocked_whipsaw": self._diag_blocked_whipsaw,
             "blocked_taker_gate": self._diag_blocked_taker_gate,
             "blocked_noflip": self._diag_blocked_noflip,
+            "parity_buy_signals": self._diag_parity_buy_signals,
+            "parity_sell_signals": self._diag_parity_sell_signals,
+            "parity_trades": self._diag_parity_trades,
+            "parity_avg_edge_net_cents": round(avg_parity_edge, 3),
+            "parity_maker_count": self._diag_parity_maker_count,
+            "parity_taker_count": self._diag_parity_taker_count,
+            "pair_partial_count": self._diag_pair_partial_count,
+            "avg_pair_fill_delay_ms": round(avg_pair_delay, 1),
+            "unpaired_unwind_usd": round(self._diag_unpaired_unwind_usd, 2),
+            "maker_orders_placed": self._diag_maker_orders_placed,
+            "maker_fills": self._diag_maker_fills,
+            "maker_fill_rate": round(maker_fill_rate, 3),
+            "cancel_replace_per_min": self._diag_cancel_replace_count,
+            "blocked_spread": self._diag_parity_blocked_spread,
+            "blocked_liq": self._diag_parity_blocked_liq,
+            "blocked_stale": self._diag_parity_blocked_stale,
+            "recycle_count": self._diag_recycle_count,
+            "maker_fill_latency_ms_p50": round(maker_lat_p50, 1),
+            "maker_fill_latency_ms_p90": round(maker_lat_p90, 1),
+            "maker_timeout_cancel_count": self._diag_maker_timeout_cancel_count,
+            "maker_top_of_book_lost_count": self._diag_maker_lost_best_count,
+            "flatten_actions_count": self._diag_flatten_actions,
+            "flatten_taker_count": self._diag_flatten_taker,
         }
+        tempo_stats = {
+            "paired_trade_ratio": round(paired_ratio, 3),
+            "paired_trades_per_min": paired_trades_per_min,
+            "max_trades_in_one_sec": max_trades_in_one_sec,
+            "median_inter_trade_ms": round(median_inter_trade_ms, 1),
+            "maker_ratio": round(maker_ratio, 3),
+        }
+        # Per-slug inventory imbalance
+        inv_imbalance = {}
+        for slug, st in self.market_states.items():
+            up_qty = st.positions["Up"].qty
+            dn_qty = st.positions["Down"].qty
+            if up_qty >= MIN_QTY or dn_qty >= MIN_QTY:
+                locked_age = 0.0
+                ls = self._parity_locked_since.get(slug)
+                if ls:
+                    locked_age = time.time() - ls
+                inv_imbalance[slug] = {
+                    "up_qty": round(up_qty, 1),
+                    "dn_qty": round(dn_qty, 1),
+                    "up_vwap": round(st.positions["Up"].vwap, 4),
+                    "dn_vwap": round(st.positions["Down"].vwap, 4),
+                    "imbalance": round(up_qty - dn_qty, 1),
+                    "straddle_locked": round(min(up_qty, dn_qty), 1),
+                    "locked_age_sec": round(locked_age, 1),
+                    "unpaired_usd": round(self._parity_invested_usd.get(slug, 0), 2),
+                }
         write_jsonl({
             "event_type": "TEMPO_REPORT",
             "per_market": per_market,
@@ -1652,6 +1868,8 @@ class Bot:
             "stale_skip_total": self._stale_skip_total,
             "priority_slugs": list(self._high_priority_slugs),
             "diagnostics": diag,
+            "tempo_stats": tempo_stats,
+            "inventory_imbalance": inv_imbalance,
         })
         # Print summary to console
         total_fills = sum(v.get("fills_per_min", 0) for v in per_market.values())
@@ -1663,6 +1881,41 @@ class Bot:
               f"blocked: whipsaw={diag['blocked_whipsaw']} "
               f"taker_gate={diag['blocked_taker_gate']} "
               f"noflip={diag['blocked_noflip']}")
+        print(f"  PARITY: buy_sig={diag['parity_buy_signals']}  "
+              f"sell_sig={diag['parity_sell_signals']}  "
+              f"trades={diag['parity_trades']}  "
+              f"avg_net_edge={diag['parity_avg_edge_net_cents']:.2f}c  "
+              f"maker={diag['parity_maker_count']}  "
+              f"taker={diag['parity_taker_count']}")
+        print(f"  PAIRS: partial={diag['pair_partial_count']}  "
+              f"avg_delay={diag['avg_pair_fill_delay_ms']:.0f}ms  "
+              f"unwind=${diag['unpaired_unwind_usd']:.2f}  "
+              f"recycle={diag['recycle_count']}")
+        print(f"  MAKER: placed={diag['maker_orders_placed']}  "
+              f"fills={diag['maker_fills']}  "
+              f"rate={diag['maker_fill_rate']:.1%}  "
+              f"lat_p50={diag['maker_fill_latency_ms_p50']:.0f}ms  "
+              f"lat_p90={diag['maker_fill_latency_ms_p90']:.0f}ms  "
+              f"timeout={diag['maker_timeout_cancel_count']}  "
+              f"lost_best={diag['maker_top_of_book_lost_count']}  "
+              f"cancel_rep={diag['cancel_replace_per_min']}")
+        if diag['flatten_actions_count'] > 0:
+            print(f"  FLATTEN: actions={diag['flatten_actions_count']}  "
+                  f"taker={diag['flatten_taker_count']}")
+        print(f"  TEMPO: paired_ratio={tempo_stats['paired_trade_ratio']:.1%}  "
+              f"paired/min={tempo_stats['paired_trades_per_min']}  "
+              f"max_burst={tempo_stats['max_trades_in_one_sec']}/s  "
+              f"med_gap={tempo_stats['median_inter_trade_ms']:.0f}ms  "
+              f"mkr_ratio={tempo_stats['maker_ratio']:.1%}")
+        print(f"  GUARD: spread_blk={diag['blocked_spread']}  "
+              f"liq_blk={diag['blocked_liq']}  "
+              f"stale_blk={diag['blocked_stale']}")
+        if inv_imbalance:
+            for slug, inv in inv_imbalance.items():
+                print(f"    INV {slug[:30]:30s}  Up={inv['up_qty']:5.0f}  "
+                      f"Dn={inv['dn_qty']:5.0f}  "
+                      f"imbal={inv['imbalance']:+5.0f}  "
+                      f"locked={inv['straddle_locked']:.0f}({inv['locked_age_sec']:.0f}s)")
         for slug, info in per_market.items():
             if info["fills_per_min"] > 0 or info["intents_per_min"] > 0:
                 print(f"    {slug[:30]:30s}  fills={info['fills_per_min']:3d}  "
@@ -1681,6 +1934,28 @@ class Bot:
         self._diag_blocked_whipsaw = 0
         self._diag_blocked_taker_gate = 0
         self._diag_blocked_noflip = 0
+        self._diag_parity_buy_signals = 0
+        self._diag_parity_sell_signals = 0
+        self._diag_parity_trades = 0
+        self._diag_parity_edges.clear()
+        self._diag_parity_maker_count = 0
+        self._diag_parity_taker_count = 0
+        self._diag_pair_partial_count = 0
+        self._diag_pair_fill_delays.clear()
+        self._diag_unpaired_unwind_usd = 0.0
+        self._diag_maker_orders_placed = 0
+        self._diag_maker_fills = 0
+        self._diag_cancel_replace_count = 0
+        self._diag_parity_blocked_spread = 0
+        self._diag_parity_blocked_liq = 0
+        self._diag_parity_blocked_stale = 0
+        self._diag_recycle_count = 0
+        self._diag_maker_fill_latencies.clear()
+        self._diag_maker_timeout_cancel_count = 0
+        self._diag_maker_lost_best_count = 0
+        self._diag_flatten_actions = 0
+        self._diag_flatten_taker = 0
+        self._diag_parity_trade_timestamps.clear()
 
     def _print_balance_summary(self):
         """Print balance and open positions to console."""
@@ -1739,6 +2014,11 @@ class Bot:
                 self.entry_sm.pop(slug, None)
                 self._data_cache.pop(slug, None)
                 self._pending_fetches.pop(slug, None)
+                self._parity_last_order_ts.pop(slug, None)
+                self._parity_invested_usd.pop(slug, None)
+                self._parity_locked_since.pop(slug, None)
+                self._parity_maker_orders.pop(slug, None)
+                self._parity_pending_pairs[:] = [p for p in self._parity_pending_pairs if p["slug"] != slug]
                 continue
             # Determine winner by checking final Binance price vs hour open
             # spot here = next hour's opening price (close proxy for the prior hour)
@@ -1824,6 +2104,11 @@ class Bot:
             self.entry_sm.pop(slug, None)
             self._data_cache.pop(slug, None)
             self._pending_fetches.pop(slug, None)
+            self._parity_last_order_ts.pop(slug, None)
+            self._parity_invested_usd.pop(slug, None)
+            self._parity_locked_since.pop(slug, None)
+            self._parity_maker_orders.pop(slug, None)
+            self._parity_pending_pairs[:] = [p for p in self._parity_pending_pairs if p["slug"] != slug]
     def _get_markets(self) -> List[MarketRef]:
         # In practice: discover the current hour markets
         return self.client.get_current_hour_markets()
@@ -1920,6 +2205,18 @@ class Bot:
         ctx = self._make_tick_ctx(m, st, spot, hour_open, t_min, delta_bps, abs_delta_bps,
                                   vel, z, up_book, dn_book)
         ctx["ts_snapshot"] = ts_snapshot
+        # ── Parity metrics (computed every tick, used by parity arb engine) ──
+        ctx["straddle_buy_cost"] = up_book.ask + dn_book.ask
+        ctx["straddle_sell_value"] = up_book.bid + dn_book.bid
+        ctx["parity_edge_buy_cents"] = (1.000 - ctx["straddle_buy_cost"]) * 100
+        ctx["parity_edge_sell_cents"] = (ctx["straddle_sell_value"] - 1.000) * 100
+        # Fee-aware net edges (pre-computed for logging even when parity doesn't trade)
+        ctx["parity_raw_buy_cents"] = ctx["parity_edge_buy_cents"]
+        ctx["parity_raw_sell_cents"] = ctx["parity_edge_sell_cents"]
+        _net_buy, _, _ = parity_net_edge_cents(ctx["parity_raw_buy_cents"], up_book, dn_book, True)
+        _net_sell, _, _ = parity_net_edge_cents(ctx["parity_raw_sell_cents"], up_book, dn_book, False)
+        ctx["parity_net_buy_cents"] = _net_buy
+        ctx["parity_net_sell_cents"] = _net_sell
         # ── SNAPSHOT_COMPACT (every SNAPSHOT_INTERVAL_SEC per market) ──
         pos_up_qty = st.positions["Up"].qty
         pos_dn_qty = st.positions["Down"].qty
@@ -1936,6 +2233,8 @@ class Bot:
                 dn_spread=dn_book.spread, dn_imb=dn_book.imb,
                 pos_qty_up=pos_up_qty, pos_qty_down=pos_dn_qty,
                 cash_usdc=self.cash_usdc, equity_usdc=equity,
+                parity_edge_buy_cents=ctx["parity_edge_buy_cents"],
+                parity_edge_sell_cents=ctx["parity_edge_sell_cents"],
             )
         # ── SNAPSHOT_ON_CHANGE (only when significant changes happen) ──
         snap_dict = {
@@ -1961,6 +2260,11 @@ class Bot:
         ctx.update(risk_fields)
         # manage exits first (inventory recycling)
         self._manage_exits(m, st, t_min, delta_bps, ctx)
+        # Directional lean exit overlay (unload wrong-side inventory)
+        self._directional_lean_exits(m, st, t_min, delta_bps, ctx)
+        # Parity arb engine: runs every tick (handles flattening, pending pairs,
+        # recycle even after TRADE_STOP_ADD_MIN; new-trade gating is internal)
+        self._parity_arb(ctx)
         # stop adding risk after minute 57
         if t_min > TRADE_STOP_ADD_MIN:
             return
@@ -2483,6 +2787,720 @@ class Bot:
                       "skipped_stale": skipped_stale,
                       "maker_count": maker_count, "taker_count": taker_count,
                       "t_min": round(ctx["t_min"], 3)})
+
+    # =================================================================
+    # PARITY (STRADDLE) ARBITRAGE ENGINE  (v2: fee-aware, partial-fill
+    # protected, maker-disciplined, with locked recycle)
+    # =================================================================
+    def _parity_arb(self, ctx: dict):
+        """Fee-aware parity arbitrage with partial-fill protection.
+        1. Compute raw + net (after fees/slippage) edges
+        2. Liquidity/staleness guards
+        3. Execute paired orders with pair_id tracking
+        4. Handle pending partial fills from prior ticks"""
+        m, st = ctx["m"], ctx["st"]
+        t_min = ctx["t_min"]
+        up_book: BookTop = ctx["up_book"]
+        dn_book: BookTop = ctx["dn_book"]
+        spot, hour_open = ctx["spot"], ctx["hour_open"]
+
+        # ── Handle pending partial fills first (always, even after stop-new time) ──
+        self._parity_handle_pending_pairs(m, st, ctx)
+
+        # ── Recycle locked inventory if stale ──
+        self._parity_recycle_locked(m, st, ctx)
+
+        # ── End-of-hour flattening (runs even after PARITY_STOP_NEW_MIN) ──
+        if t_min >= PARITY_FLATTEN_START_MIN:
+            self._parity_flatten_eoh(m, st, t_min, ctx)
+            return  # don't open new parity trades while flattening
+
+        # ── Compute raw parity metrics ──
+        straddle_buy_cost = up_book.ask + dn_book.ask
+        straddle_sell_value = up_book.bid + dn_book.bid
+        raw_buy_edge = (1.000 - straddle_buy_cost) * 100
+        raw_sell_edge = (straddle_sell_value - 1.000) * 100
+
+        # ── Fee-aware net edges ──
+        buy_net, buy_fee, buy_slip = parity_net_edge_cents(raw_buy_edge, up_book, dn_book, True)
+        sell_net, sell_fee, sell_slip = parity_net_edge_cents(raw_sell_edge, up_book, dn_book, False)
+
+        # Store in ctx for logging
+        ctx["parity_raw_buy_cents"] = raw_buy_edge
+        ctx["parity_raw_sell_cents"] = raw_sell_edge
+        ctx["parity_net_buy_cents"] = buy_net
+        ctx["parity_net_sell_cents"] = sell_net
+
+        # ── Stop new parity trades after PARITY_STOP_NEW_MIN ──
+        if t_min >= PARITY_STOP_NEW_MIN:
+            return
+
+        # ── Cooldown gate ──
+        now_t = time.time()
+        last_ts = self._parity_last_order_ts.get(m.slug, 0.0)
+        if (now_t - last_ts) * 1000 < PARITY_COOLDOWN_MS:
+            return
+
+        # ── Staleness guard ──
+        cache_age = self._cache_age_ms(m.slug)
+        if cache_age > PARITY_MAX_CACHE_AGE_MS:
+            self._diag_parity_blocked_stale += 1
+            return
+
+        # ── Liquidity guard ──
+        liq_ok, liq_reason = parity_liquidity_ok(up_book, dn_book)
+        if not liq_ok:
+            if "spread" in liq_reason:
+                self._diag_parity_blocked_spread += 1
+            else:
+                self._diag_parity_blocked_liq += 1
+            return
+
+        # ── Investment cap gate ──
+        invested = self._parity_invested_usd.get(m.slug, 0.0)
+
+        # ── Directional lean ──
+        lean_up = spot >= hour_open
+
+        # ── BUY CHEAP STRADDLE (with edge buffer) ──
+        buy_threshold = PARITY_BUY_MIN_EDGE_NET_CENTS + PARITY_EDGE_BUFFER_CENTS
+        if PARITY_BUY_ENABLED and buy_net >= buy_threshold:
+            self._diag_parity_buy_signals += 1
+
+            if invested >= PARITY_MAX_USD_PER_SLUG:
+                return
+
+            if up_book.ask <= 0 or dn_book.ask <= 0 or up_book.bid <= 0 or dn_book.bid <= 0:
+                return
+
+            leg_usd = min(PARITY_STEP_USD, (PARITY_MAX_USD_PER_SLUG - invested) / 2.0)
+            if leg_usd < MIN_ORDER_USDC:
+                return
+
+            # Generate pair_id for partial-fill tracking
+            pair_id = uuid.uuid4().hex[:16]
+
+            # Execute leg 1: BUY Up
+            up_filled = self._parity_buy_leg(m, st, "Up", up_book, leg_usd, ctx, pair_id)
+
+            # Execute leg 2: BUY Down
+            dn_filled = self._parity_buy_leg(m, st, "Down", dn_book, leg_usd, ctx, pair_id)
+
+            total_cost = up_filled + dn_filled
+            both_filled = up_filled > 0 and dn_filled > 0
+            one_filled = (up_filled > 0) != (dn_filled > 0)
+
+            if both_filled:
+                self._parity_invested_usd[m.slug] = invested + total_cost
+                self._parity_last_order_ts[m.slug] = time.time()
+                self._diag_parity_trades += 1
+                self._diag_parity_edges.append(buy_net)
+                self._diag_parity_trade_timestamps.append(time.time())
+                # Track locked straddle start time
+                if m.slug not in self._parity_locked_since:
+                    self._parity_locked_since[m.slug] = time.time()
+
+                write_jsonl({"event_type": "PARITY_BUY_STRADDLE",
+                              "slug": m.slug, "crypto": m.crypto,
+                              "pair_id": pair_id,
+                              "straddle_buy_cost": round(straddle_buy_cost, 4),
+                              "raw_edge_cents": round(raw_buy_edge, 3),
+                              "net_edge_cents": round(buy_net, 3),
+                              "fee_cents": round(buy_fee, 3),
+                              "slippage_cents": round(buy_slip, 3),
+                              "up_cost": round(up_filled, 4),
+                              "dn_cost": round(dn_filled, 4),
+                              "total_invested": round(invested + total_cost, 2),
+                              "t_min": round(t_min, 3)})
+
+            elif one_filled:
+                # Partial fill — queue for resolution
+                self._diag_pair_partial_count += 1
+                filled_outcome = "Up" if up_filled > 0 else "Down"
+                pending_outcome = "Down" if filled_outcome == "Up" else "Up"
+                filled_usd = up_filled if up_filled > 0 else dn_filled
+                filled_book = up_book if filled_outcome == "Up" else dn_book
+                self._parity_pending_pairs.append({
+                    "pair_id": pair_id,
+                    "slug": m.slug,
+                    "filled_outcome": filled_outcome,
+                    "filled_usd": filled_usd,
+                    "filled_qty": filled_usd / max(1e-9, filled_book.ask),
+                    "filled_price": filled_book.ask,
+                    "pending_outcome": pending_outcome,
+                    "ts": time.time(),
+                    "edge_net_cents": buy_net,
+                })
+                self._parity_invested_usd[m.slug] = invested + filled_usd
+                self._parity_last_order_ts[m.slug] = time.time()
+
+                write_jsonl({"event_type": "PARITY_PARTIAL_FILL",
+                              "slug": m.slug, "pair_id": pair_id,
+                              "filled_outcome": filled_outcome,
+                              "filled_usd": round(filled_usd, 4),
+                              "pending_outcome": pending_outcome,
+                              "net_edge_cents": round(buy_net, 3)})
+            return
+
+        # ── SELL RICH STRADDLE ──
+        # ── SELL RICH STRADDLE (with edge buffer) ──
+        sell_threshold = PARITY_SELL_MIN_EDGE_NET_CENTS + PARITY_EDGE_BUFFER_CENTS
+        if PARITY_SELL_ENABLED and sell_net >= sell_threshold:
+            self._diag_parity_sell_signals += 1
+
+            pos_up = st.positions["Up"]
+            pos_dn = st.positions["Down"]
+
+            if pos_up.qty < MIN_QTY or pos_dn.qty < MIN_QTY:
+                return
+            if up_book.bid <= 0 or dn_book.bid <= 0:
+                return
+
+            sell_up_usd = min(PARITY_STEP_USD, pos_up.qty * up_book.bid)
+            sell_dn_usd = min(PARITY_STEP_USD, pos_dn.qty * dn_book.bid)
+            sell_usd = min(sell_up_usd, sell_dn_usd)
+            if sell_usd < MIN_ORDER_USDC:
+                return
+
+            pair_id = uuid.uuid4().hex[:16]
+
+            if LEAN_EXIT_PRIORITY:
+                sell_order = [("Down", dn_book), ("Up", up_book)] if lean_up else [("Up", up_book), ("Down", dn_book)]
+            else:
+                sell_order = [("Up", up_book), ("Down", dn_book)]
+
+            total_proceeds = 0.0
+            legs_filled = 0
+            for outcome, book in sell_order:
+                sell_qty = sell_usd / max(1e-9, book.bid)
+                pos = st.positions[outcome]
+                sell_qty = min(sell_qty, pos.qty)
+                if sell_qty < MIN_QTY:
+                    continue
+
+                use_taker = (book.spread * 100) <= PARITY_TAKER_ALLOWED_SPREAD_CENTS
+                sell_price = book.bid if use_taker else max(book.bid, book.ask - 0.001)
+                if use_taker:
+                    self._diag_parity_taker_count += 1
+                else:
+                    self._diag_parity_maker_count += 1
+
+                self._do_sell(m, st, outcome, sell_qty, sell_price,
+                              reason="PARITY_SELL_STRADDLE", leg="PARITY_SELL",
+                              ctx=ctx, use_maker=not use_taker)
+                total_proceeds += sell_qty * sell_price
+                legs_filled += 1
+
+            if total_proceeds > 0:
+                self._parity_last_order_ts[m.slug] = time.time()
+                self._diag_parity_trades += 1
+                self._diag_parity_edges.append(sell_net)
+                self._diag_parity_trade_timestamps.append(time.time())
+                self._parity_invested_usd[m.slug] = max(0.0, invested - total_proceeds)
+
+                # Update locked tracking
+                up_q = st.positions["Up"].qty
+                dn_q = st.positions["Down"].qty
+                if min(up_q, dn_q) < MIN_QTY:
+                    self._parity_locked_since.pop(m.slug, None)
+
+                write_jsonl({"event_type": "PARITY_SELL_STRADDLE",
+                              "slug": m.slug, "crypto": m.crypto,
+                              "pair_id": pair_id,
+                              "straddle_sell_value": round(straddle_sell_value, 4),
+                              "raw_edge_cents": round(raw_sell_edge, 3),
+                              "net_edge_cents": round(sell_net, 3),
+                              "fee_cents": round(sell_fee, 3),
+                              "total_proceeds": round(total_proceeds, 4),
+                              "legs_filled": legs_filled,
+                              "remaining_invested": round(self._parity_invested_usd.get(m.slug, 0), 2),
+                              "t_min": round(t_min, 3)})
+
+    def _parity_handle_pending_pairs(self, m: MarketRef, st: MarketState, ctx: dict):
+        """Resolve partial fills from prior ticks. If timeout exceeded:
+        - edge still good → cross remaining leg (taker if spread<=1c)
+        - edge gone → unwind filled leg to flatten."""
+        now_t = time.time()
+        up_book: BookTop = ctx["up_book"]
+        dn_book: BookTop = ctx["dn_book"]
+        resolved = []
+
+        for i, pair in enumerate(self._parity_pending_pairs):
+            if pair["slug"] != m.slug:
+                continue
+            elapsed_ms = (now_t - pair["ts"]) * 1000
+
+            if elapsed_ms < PAIR_FILL_TIMEOUT_MS:
+                # Still within timeout — try to fill the pending leg
+                pending_book = up_book if pair["pending_outcome"] == "Up" else dn_book
+                if pending_book.ask <= 0:
+                    continue
+                # Recompute net edge
+                raw_buy_edge = ctx.get("parity_raw_buy_cents", 0.0)
+                net_buy, _, _ = parity_net_edge_cents(raw_buy_edge, up_book, dn_book, True)
+
+                if net_buy >= PARITY_BUY_MIN_EDGE_NET_CENTS:
+                    # Edge still good — try to fill pending leg
+                    filled = self._parity_buy_leg(m, st, pair["pending_outcome"],
+                                                   pending_book, pair["filled_usd"],
+                                                   ctx, pair["pair_id"])
+                    if filled > 0:
+                        # Pair complete
+                        self._diag_parity_trades += 1
+                        self._diag_parity_edges.append(net_buy)
+                        self._diag_pair_fill_delays.append(elapsed_ms)
+                        self._diag_parity_trade_timestamps.append(time.time())
+                        self._parity_invested_usd[m.slug] = (
+                            self._parity_invested_usd.get(m.slug, 0.0) + filled)
+                        if m.slug not in self._parity_locked_since:
+                            self._parity_locked_since[m.slug] = time.time()
+                        write_jsonl({"event_type": "PARITY_PAIR_COMPLETED",
+                                      "slug": m.slug, "pair_id": pair["pair_id"],
+                                      "delay_ms": round(elapsed_ms, 1),
+                                      "net_edge_cents": round(net_buy, 3)})
+                        resolved.append(i)
+                continue
+
+            # Timeout exceeded — decide: cross or unwind
+            pending_book = up_book if pair["pending_outcome"] == "Up" else dn_book
+            raw_buy_edge = ctx.get("parity_raw_buy_cents", 0.0)
+            net_buy, _, _ = parity_net_edge_cents(raw_buy_edge, up_book, dn_book, True)
+
+            if net_buy >= PARITY_BUY_MIN_EDGE_NET_CENTS and pending_book.ask > 0:
+                # Edge still good — force cross remaining leg (taker if spread<=1c)
+                filled = self._parity_buy_leg(m, st, pair["pending_outcome"],
+                                               pending_book, pair["filled_usd"],
+                                               ctx, pair["pair_id"])
+                if filled > 0:
+                    self._diag_parity_trades += 1
+                    self._diag_parity_edges.append(net_buy)
+                    self._diag_pair_fill_delays.append(elapsed_ms)
+                    self._diag_parity_trade_timestamps.append(time.time())
+                    self._parity_invested_usd[m.slug] = (
+                        self._parity_invested_usd.get(m.slug, 0.0) + filled)
+                    if m.slug not in self._parity_locked_since:
+                        self._parity_locked_since[m.slug] = time.time()
+                    write_jsonl({"event_type": "PARITY_PAIR_COMPLETED_LATE",
+                                  "slug": m.slug, "pair_id": pair["pair_id"],
+                                  "delay_ms": round(elapsed_ms, 1)})
+                    resolved.append(i)
+                    continue
+
+            # Edge gone or fill failed — unwind the filled leg
+            filled_book = up_book if pair["filled_outcome"] == "Up" else dn_book
+            pos = st.positions[pair["filled_outcome"]]
+            unwind_qty = min(pair["filled_qty"], pos.qty)
+            if unwind_qty >= MIN_QTY and filled_book.bid > 0:
+                use_taker = (filled_book.spread * 100) <= PARITY_TAKER_ALLOWED_SPREAD_CENTS
+                unwind_price = filled_book.bid if use_taker else max(filled_book.bid, filled_book.ask - 0.001)
+                self._do_sell(m, st, pair["filled_outcome"], unwind_qty, unwind_price,
+                              reason="PARITY_UNWIND_PARTIAL", leg="PARITY_UNWIND",
+                              ctx=ctx, use_maker=not use_taker)
+                self._diag_unpaired_unwind_usd += unwind_qty * unwind_price
+                self._parity_invested_usd[m.slug] = max(
+                    0.0, self._parity_invested_usd.get(m.slug, 0.0) - unwind_qty * unwind_price)
+                write_jsonl({"event_type": "PARITY_UNWIND_PARTIAL",
+                              "slug": m.slug, "pair_id": pair["pair_id"],
+                              "unwound_outcome": pair["filled_outcome"],
+                              "unwind_qty": round(unwind_qty, 1),
+                              "delay_ms": round(elapsed_ms, 1)})
+            resolved.append(i)
+
+        # Remove resolved pairs (reverse order to preserve indices)
+        for idx in sorted(resolved, reverse=True):
+            self._parity_pending_pairs.pop(idx)
+
+    def _parity_recycle_locked(self, m: MarketRef, st: MarketState, ctx: dict):
+        """Recycle locked straddle inventory that has been held too long.
+        Tries to sell both legs at a small net profit (maker-first)."""
+        locked_since = self._parity_locked_since.get(m.slug)
+        if locked_since is None:
+            return
+        pos_up = st.positions["Up"]
+        pos_dn = st.positions["Down"]
+        locked_qty = min(pos_up.qty, pos_dn.qty)
+        if locked_qty < MIN_QTY:
+            self._parity_locked_since.pop(m.slug, None)
+            return
+
+        hold_sec = time.time() - locked_since
+        if hold_sec < LOCKED_MAX_HOLD_SEC:
+            return
+
+        up_book: BookTop = ctx["up_book"]
+        dn_book: BookTop = ctx["dn_book"]
+
+        # Check if we can sell both legs at net profit
+        up_vwap = pos_up.vwap
+        dn_vwap = pos_dn.vwap
+        straddle_vwap = up_vwap + dn_vwap
+        straddle_sell_value = up_book.bid + dn_book.bid
+
+        # Net profit after fees
+        raw_profit_cents = (straddle_sell_value - straddle_vwap) * 100
+        _, sell_fee, sell_slip = parity_net_edge_cents(raw_profit_cents, up_book, dn_book, False)
+        net_profit_cents = raw_profit_cents - sell_fee - sell_slip
+
+        if net_profit_cents < RECYCLE_MIN_PROFIT_NET_CENTS:
+            return
+
+        # Sell both legs
+        sell_usd = min(RECYCLE_STEP_USD, locked_qty * min(up_book.bid, dn_book.bid))
+        if sell_usd < MIN_ORDER_USDC:
+            return
+
+        pair_id = uuid.uuid4().hex[:16]
+        for outcome, book in [("Up", up_book), ("Down", dn_book)]:
+            pos = st.positions[outcome]
+            sell_qty = min(sell_usd / max(1e-9, book.bid), pos.qty)
+            if sell_qty < MIN_QTY:
+                continue
+            use_taker = (book.spread * 100) <= PARITY_TAKER_ALLOWED_SPREAD_CENTS
+            sell_price = book.bid if use_taker else max(book.bid, book.ask - 0.001)
+            if use_taker:
+                self._diag_parity_taker_count += 1
+            else:
+                self._diag_parity_maker_count += 1
+            self._do_sell(m, st, outcome, sell_qty, sell_price,
+                          reason="PARITY_RECYCLE", leg="PARITY_RECYCLE",
+                          ctx=ctx, use_maker=not use_taker)
+
+        self._diag_recycle_count += 1
+        self._parity_invested_usd[m.slug] = max(
+            0.0, self._parity_invested_usd.get(m.slug, 0.0) - sell_usd * 2)
+
+        # Update locked tracking
+        if min(st.positions["Up"].qty, st.positions["Down"].qty) < MIN_QTY:
+            self._parity_locked_since.pop(m.slug, None)
+        else:
+            self._parity_locked_since[m.slug] = time.time()  # reset timer
+
+        write_jsonl({"event_type": "PARITY_RECYCLE",
+                      "slug": m.slug, "crypto": m.crypto,
+                      "pair_id": pair_id,
+                      "hold_sec": round(hold_sec, 1),
+                      "raw_profit_cents": round(raw_profit_cents, 3),
+                      "net_profit_cents": round(net_profit_cents, 3),
+                      "sell_usd": round(sell_usd, 2),
+                      "t_min": round(ctx["t_min"], 3)})
+
+    def _parity_buy_leg(self, m: MarketRef, st: MarketState,
+                        outcome: str, book: BookTop,
+                        leg_usd: float, ctx: dict,
+                        pair_id: str = "") -> float:
+        """Execute one leg of a parity buy. Returns cost (USDC) of filled order.
+        Uses maker-first: taker only if spread <= 1c. Tracks maker queue discipline
+        including fill latency, timeout cancels, and lost-best-price detection."""
+        token_id = m.outcome_up_id if outcome == "Up" else m.outcome_down_id
+        pos = st.positions[outcome]
+        placed_ts = time.time()
+
+        # Maker/taker decision
+        use_taker = (book.spread * 100) <= PARITY_TAKER_ALLOWED_SPREAD_CENTS
+        if use_taker:
+            order_price = book.ask
+            self._diag_parity_taker_count += 1
+        else:
+            # Maker queue discipline: only replace if price changed by >= 1 tick
+            order_price = book.bid
+            maker_state = self._parity_maker_orders.get(m.slug, {}).get(outcome)
+            if maker_state:
+                price_diff = abs(order_price - maker_state.get("price", 0))
+                elapsed_ms = (placed_ts - maker_state.get("last_replace_ts", 0)) * 1000
+
+                # Detect: our order is no longer best price (price moved away)
+                if price_diff >= 0.005 and order_price > maker_state.get("price", 0):
+                    self._diag_maker_lost_best_count += 1
+
+                # Detect: maker timeout (unfilled after MAKER_ORDER_TIMEOUT_MS)
+                if elapsed_ms >= MAKER_ORDER_TIMEOUT_MS and not maker_state.get("filled"):
+                    self._diag_maker_timeout_cancel_count += 1
+
+                if price_diff < 0.005 and elapsed_ms < MIN_REPLACE_INTERVAL_MS:
+                    # Price hasn't moved enough and interval not met — skip replace
+                    return 0.0
+                if price_diff >= 0.005 or elapsed_ms >= MIN_REPLACE_INTERVAL_MS:
+                    self._diag_cancel_replace_count += 1
+            self._diag_parity_maker_count += 1
+            self._diag_maker_orders_placed += 1
+            # Track maker order state with timestamps
+            self._parity_maker_orders.setdefault(m.slug, {})[outcome] = {
+                "price": order_price,
+                "last_replace_ts": placed_ts,
+                "placed_ts": placed_ts,
+                "first_not_best_ts": None,
+                "filled": False,
+            }
+
+        order_qty = leg_usd / max(1e-9, order_price)
+        if order_qty < 1:
+            return 0.0
+
+        decision_id = new_decision_id()
+        client_oid = new_order_id()
+        if pos.position_id is None:
+            pos.position_id = new_position_id()
+            pos.trade_id = uuid.uuid4().hex
+            pos.entry_decision_id = decision_id
+            pos.parent_order_id = client_oid
+            pos.entry_mid = book.mid
+            pos.max_favorable_mid = book.mid
+            pos.max_adverse_mid = book.mid
+
+        up_book = ctx["up_book"]
+        dn_book = ctx["dn_book"]
+        bk_fields = self._book_fields(up_book, dn_book, outcome)
+        mt = "taker" if use_taker else "maker"
+
+        self.logger.log_order_intent(
+            engine="PARITY", reason="PARITY_BUY",
+            decision_id=decision_id, position_id=pos.position_id,
+            crypto=m.crypto, slug=m.slug, outcome=outcome,
+            side="BUY", qty=order_qty, target_price=order_price,
+            usdc_cost=leg_usd, ctx=ctx, book_fields=bk_fields,
+        )
+        self.logger.log_order_submit(
+            engine="PARITY", reason="PARITY_BUY",
+            decision_id=decision_id, position_id=pos.position_id,
+            client_order_id=client_oid,
+            crypto=m.crypto, slug=m.slug, outcome=outcome,
+            side="BUY", qty=order_qty, target_price=order_price,
+            usdc_cost=leg_usd, ctx=ctx, book_fields=bk_fields,
+            extra={"pair_id": pair_id, "placed_ts": placed_ts} if pair_id else {"placed_ts": placed_ts},
+        )
+
+        if MODE == "LOG":
+            fill_ts = time.time()
+            self._paper_buy(st, outcome, order_price, order_qty, leg_usd)
+            sc = spread_capture_fields("BUY", order_price, book)
+            fill_latency_ms = (fill_ts - placed_ts) * 1000
+            self.logger.log_order_fill(
+                engine="PARITY", reason="PARITY_BUY",
+                decision_id=decision_id, client_order_id=client_oid,
+                position_id=pos.position_id,
+                crypto=m.crypto, slug=m.slug, outcome=outcome,
+                side="BUY", qty=order_qty, fill_price=order_price,
+                usdc_cost=leg_usd, fees_usdc=0.0,
+                maker_taker=mt, did_cross=sc.get("did_cross", ""),
+                vwap=pos.vwap, ctx=ctx, book_fields=bk_fields,
+                extra={"placed_ts": placed_ts, "fill_ts": fill_ts,
+                       "fill_latency_ms": round(fill_latency_ms, 1)},
+            )
+            self._tempo_fills[m.slug] = self._tempo_fills.get(m.slug, 0) + 1
+            if mt == "maker":
+                self._diag_maker_fills += 1
+                self._diag_maker_fill_latencies.append(fill_latency_ms)
+                # Mark maker order as filled
+                ms = self._parity_maker_orders.get(m.slug, {}).get(outcome)
+                if ms:
+                    ms["filled"] = True
+            return leg_usd
+        else:
+            post_only = not use_taker
+            fill = self.client.place_limit_order(token_id, "BUY", order_price,
+                                                  order_qty, post_only=post_only)
+            fill_ts = time.time()
+            if fill.get("filled"):
+                fill_latency_ms = (fill_ts - placed_ts) * 1000
+                actual_cost = fill["fill_price"] * fill["fill_qty"]
+                self._live_buy(st, outcome, fill["fill_price"], fill["fill_qty"], actual_cost)
+                sc = spread_capture_fields("BUY", fill["fill_price"], book)
+                actual_mt = infer_maker_taker("BUY", fill["fill_price"], book)
+                self.logger.log_order_fill(
+                    engine="PARITY", reason="PARITY_BUY",
+                    decision_id=decision_id, client_order_id=client_oid,
+                    position_id=pos.position_id,
+                    crypto=m.crypto, slug=m.slug, outcome=outcome,
+                    side="BUY", qty=fill["fill_qty"], fill_price=fill["fill_price"],
+                    usdc_cost=actual_cost, fees_usdc=0.0,
+                    maker_taker=actual_mt, did_cross=sc.get("did_cross", ""),
+                    vwap=pos.vwap, ctx=ctx, book_fields=bk_fields,
+                    extra={"placed_ts": placed_ts, "fill_ts": fill_ts,
+                           "fill_latency_ms": round(fill_latency_ms, 1)},
+                )
+                self._tempo_fills[m.slug] = self._tempo_fills.get(m.slug, 0) + 1
+                if actual_mt == "maker":
+                    self._diag_maker_fills += 1
+                    self._diag_maker_fill_latencies.append(fill_latency_ms)
+                    ms = self._parity_maker_orders.get(m.slug, {}).get(outcome)
+                    if ms:
+                        ms["filled"] = True
+                return actual_cost
+            return 0.0
+
+    # =================================================================
+    # END-OF-HOUR PARITY FLATTENING
+    # =================================================================
+    def _parity_flatten_eoh(self, m: MarketRef, st: MarketState,
+                             t_min: float, ctx: dict):
+        """Flatten all parity (locked + unpaired) inventory as hour ends.
+        PARITY_FLATTEN_START_MIN..PARITY_HARD_FLATTEN_MIN: maker-first with 200ms refresh.
+        After PARITY_HARD_FLATTEN_MIN: taker if time_to_close<20s or emergency inventory."""
+        up_book: BookTop = ctx["up_book"]
+        dn_book: BookTop = ctx["dn_book"]
+        seconds_to_close = ctx.get("seconds_to_close", 999.0)
+        hard_mode = t_min >= PARITY_HARD_FLATTEN_MIN
+
+        for outcome in ["Up", "Down"]:
+            pos = st.positions[outcome]
+            if pos.qty < MIN_QTY:
+                continue
+            book = up_book if outcome == "Up" else dn_book
+            if book.bid <= 0:
+                continue
+
+            # Determine maker vs taker
+            allow_taker = False
+            if hard_mode:
+                if seconds_to_close < 20.0:
+                    allow_taker = True
+                elif pos.qty >= INVENTORY_EMERGENCY_SHARES:
+                    allow_taker = True
+            spread_ok = (book.spread * 100) <= PARITY_TAKER_ALLOWED_SPREAD_CENTS
+            use_taker = allow_taker and spread_ok
+
+            # Maker queue discipline: respect MIN_REPLACE_INTERVAL_MS
+            if not use_taker:
+                maker_state = self._parity_maker_orders.get(m.slug, {}).get(outcome)
+                if maker_state:
+                    elapsed_ms = (time.time() - maker_state.get("last_replace_ts", 0)) * 1000
+                    price_diff = abs(book.bid - maker_state.get("price", 0))
+                    if price_diff < 0.005 and elapsed_ms < PARITY_MAKER_REFRESH_MS:
+                        continue  # not time to replace yet
+
+            # Sell quantity: in hard mode, sell everything; otherwise step-based
+            if hard_mode:
+                sell_qty = pos.qty
+            else:
+                sell_qty = min(pos.qty, RECYCLE_STEP_USD / max(1e-9, book.bid))
+            if sell_qty < MIN_QTY:
+                continue
+
+            if use_taker:
+                sell_price = book.bid
+                self._diag_flatten_taker += 1
+                self._diag_parity_taker_count += 1
+            else:
+                sell_price = max(book.bid, book.ask - 0.001)
+                self._diag_parity_maker_count += 1
+                # Update maker order tracking
+                self._parity_maker_orders.setdefault(m.slug, {})[outcome] = {
+                    "price": book.bid,
+                    "last_replace_ts": time.time(),
+                    "placed_ts": time.time(),
+                    "first_not_best_ts": None,
+                    "filled": False,
+                }
+
+            self._diag_flatten_actions += 1
+            flatten_reason = "PARITY_HARD_FLATTEN" if hard_mode else "PARITY_FLATTEN"
+
+            self._do_sell(m, st, outcome, sell_qty, sell_price,
+                          reason=flatten_reason, leg="PARITY_FLATTEN",
+                          ctx=ctx, use_maker=not use_taker)
+
+            write_jsonl({"event_type": flatten_reason,
+                          "slug": m.slug, "crypto": m.crypto,
+                          "outcome": outcome, "sell_qty": round(sell_qty, 1),
+                          "sell_price": round(sell_price, 4),
+                          "use_taker": use_taker,
+                          "seconds_to_close": round(seconds_to_close, 1),
+                          "t_min": round(t_min, 3)})
+
+        # Also flatten any pending partial fills by unwinding
+        resolved = []
+        for i, pair in enumerate(self._parity_pending_pairs):
+            if pair["slug"] != m.slug:
+                continue
+            filled_book = up_book if pair["filled_outcome"] == "Up" else dn_book
+            pos = st.positions[pair["filled_outcome"]]
+            unwind_qty = min(pair.get("filled_qty", 0), pos.qty)
+            if unwind_qty >= MIN_QTY and filled_book.bid > 0:
+                use_taker_unwind = hard_mode and (seconds_to_close < 20.0 or spread_ok)
+                unwind_price = filled_book.bid if use_taker_unwind else max(filled_book.bid, filled_book.ask - 0.001)
+                self._do_sell(m, st, pair["filled_outcome"], unwind_qty, unwind_price,
+                              reason="PARITY_FLATTEN_UNPAIRED", leg="PARITY_FLATTEN",
+                              ctx=ctx, use_maker=not use_taker_unwind)
+                self._diag_flatten_actions += 1
+                if use_taker_unwind:
+                    self._diag_flatten_taker += 1
+            resolved.append(i)
+        for idx in sorted(resolved, reverse=True):
+            self._parity_pending_pairs.pop(idx)
+
+        # Clear locked tracking if fully flat
+        up_q = st.positions["Up"].qty
+        dn_q = st.positions["Down"].qty
+        if up_q < MIN_QTY and dn_q < MIN_QTY:
+            self._parity_locked_since.pop(m.slug, None)
+            self._parity_invested_usd.pop(m.slug, None)
+
+    # =================================================================
+    # DIRECTIONAL LEAN EXIT OVERLAY
+    # =================================================================
+    def _directional_lean_exits(self, m: MarketRef, st: MarketState,
+                                 t_min: float, delta_bps: float, ctx: dict):
+        """Directional lean: prioritize exits on the "wrong" side of spot vs hour_open.
+        If spot > hour_open (up trend): unload Down inventory first.
+        If spot < hour_open (down trend): unload Up inventory first.
+        Only applies to imbalanced positions."""
+        if not LEAN_EXIT_PRIORITY:
+            return
+        spot, hour_open = ctx["spot"], ctx["hour_open"]
+        lean_up = spot >= hour_open
+
+        pos_up = st.positions["Up"]
+        pos_dn = st.positions["Down"]
+        imbalance = pos_up.qty - pos_dn.qty  # positive = more Up than Down
+
+        # Determine which side to preferentially exit
+        if lean_up:
+            # Up trend: prefer holding Up, unload excess Down
+            wrong_side = "Down"
+            wrong_pos = pos_dn
+            right_pos = pos_up
+        else:
+            # Down trend: prefer holding Down, unload excess Up
+            wrong_side = "Up"
+            wrong_pos = pos_up
+            right_pos = pos_dn
+
+        # Only act if we have "wrong side" inventory exceeding the right side
+        if wrong_pos.qty < MIN_QTY:
+            return
+
+        book = self.last_book.get(m.slug, {}).get(wrong_side)
+        if not book or book.bid <= 0:
+            return
+
+        # Sell excess on wrong side to bring closer to balance
+        excess = wrong_pos.qty - right_pos.qty
+        if excess <= 0:
+            return  # already balanced or right-side heavy
+
+        # Sell up to LEAN_MAX_IMBALANCE_SHARES reduction, but at most 25% of wrong-side
+        sell_qty = min(excess, wrong_pos.qty * 0.25, float(LEAN_MAX_IMBALANCE_SHARES))
+        if sell_qty < MIN_QTY:
+            return
+
+        # Only sell if we're profitable on this side (don't force a loss)
+        if book.bid < wrong_pos.vwap:
+            return
+
+        # Use maker when spread > 1c
+        use_taker = (book.spread * 100) <= PARITY_TAKER_ALLOWED_SPREAD_CENTS
+        sell_price = book.bid if use_taker else max(book.bid, book.ask - 0.001)
+
+        write_jsonl({"event_type": "LEAN_EXIT", "slug": m.slug, "crypto": m.crypto,
+                      "wrong_side": wrong_side, "sell_qty": round(sell_qty, 1),
+                      "imbalance": round(pos_up.qty - pos_dn.qty, 1),
+                      "lean": "Up" if lean_up else "Down",
+                      "t_min": round(t_min, 3)})
+
+        self._do_sell(m, st, wrong_side, sell_qty, sell_price,
+                      reason="LEAN_EXIT", leg="LEAN_EXIT",
+                      ctx=ctx, use_maker=not use_taker)
+
     def _late_scalps(self, ctx: dict):
         m, st = ctx["m"], ctx["st"]
         t_min = ctx["t_min"]
