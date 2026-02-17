@@ -258,8 +258,10 @@ FAST_CLONE = bool(os.getenv("FAST_CLONE", "True") not in ("", "0", "False", "fal
 # One-sided auto-hedge — faster escalation than unpaired management
 HEDGE_TICK1_MS = 250                    # +1 tick after 250ms
 HEDGE_TICK2_MS = 500                    # +2 ticks after 500ms
-HEDGE_CROSS_MS = 800                    # taker cross after 800ms
-HEDGE_MIN_CROSS_EDGE_CENTS = 0.5       # min net edge for taker cross
+HEDGE_CROSS_MS = 800                    # taker cross after 800ms (normal)
+HEDGE_EARLY_CROSS_MS = 400             # taker cross after 400ms if edge is good
+HEDGE_MIN_CROSS_EDGE_CENTS = 0.5       # min net edge for normal taker cross
+HEDGE_EARLY_CROSS_EDGE_CENTS = 0.25    # min net edge for early taker cross (400ms)
 HEDGE_MAX_CROSS_SPREAD_CENTS = 2.0     # max spread for taker cross (cents)
 # ---------------------------------------------------------------------------
 # Imbalance caps — keep net exposure near neutral (F247 style)
@@ -299,8 +301,10 @@ BOOK_REFRESH_PRIORITY_MS = 100         # active markets: 100ms (positions / prob
 BOOK_REFRESH_IDLE_MS = 400             # idle markets: 400ms (no positions, IDLE state)
 BOOK_STALE_MS = 1500                   # data older than this is stale — skip processing
 STATE_SAVE_INTERVAL_SEC = 5.0          # flush state.json every 5s (not every loop)
-BG_POOL_WORKERS = 16                   # 16 bg threads — covers priority + idle markets
+BG_POOL_WORKERS = 16                   # bg threads — covers priority + idle markets
+BG_POOL_MIN_WORKERS = 12               # minimum pool size
 MAIN_LOOP_TARGET_MS = 75              # 75ms decision loop target (f247 parity)
+BG_REFRESH_STARVE_CYCLES = 2           # if pending for > N cycles, force-submit
 # Burst freshness gate — micro-orders must have fresh data
 BURST_FRESHNESS_MAX_MS = 500           # max cache age to place a micro-order
 BURST_FRESHNESS_WAIT_MS = 250          # max time to wait for fresh data if stale
@@ -319,6 +323,7 @@ if FAST_CLONE:
     HEDGE_TICK1_MS = 250
     HEDGE_TICK2_MS = 500
     HEDGE_CROSS_MS = 800
+    HEDGE_EARLY_CROSS_MS = 400
 # =============================================================================
 # UTIL / LOGGING — thin wrappers around Logger instance
 # =============================================================================
@@ -1267,7 +1272,9 @@ class Bot:
         self.entry_sm: Dict[str, dict] = {}   # IDLE / PROBING / SCALING / COOLDOWN
         self.hour_index_counters: Dict[str, int] = {c: 0 for c in CRYPTOS}  # crypto -> monotonic index
         # Background data refresh infrastructure (sub-second loop)
-        self._bg_executor = ThreadPoolExecutor(max_workers=BG_POOL_WORKERS)
+        # Dynamic pool: max(BG_POOL_MIN_WORKERS, 3 * markets_count)
+        dynamic_workers = max(BG_POOL_MIN_WORKERS, BG_POOL_WORKERS)
+        self._bg_executor = ThreadPoolExecutor(max_workers=dynamic_workers)
         self._bg_running = True
         self._data_cache: Dict[str, dict] = {}   # slug -> {market, spot, hour_open, up_book, dn_book, ts}
         self._cached_markets: List[MarketRef] = []
@@ -1277,6 +1284,12 @@ class Bot:
         self._high_priority_slugs: set = set()       # markets needing fast refresh
         self._stale_skip_total = 0                   # counter: stale cache skips
         self._loop_count = 0
+        # Deadline scheduling: slug -> next_due_ts
+        self._bg_next_due: Dict[str, float] = {}
+        # Per-slug refresh diagnostics
+        self._bg_fetch_durations: Dict[str, List[float]] = {}  # slug -> [duration_ms, ...]
+        self._bg_refresh_miss_count: Dict[str, int] = {}       # slug -> miss count
+        self._bg_pending_cycles: Dict[str, int] = {}           # slug -> cycles pending
         # Tempo parity diagnostics
         self._tempo_fills: Dict[str, int] = {}       # slug -> fills this minute
         self._tempo_intents: Dict[str, int] = {}     # slug -> intents this minute
@@ -1688,11 +1701,21 @@ class Bot:
         if self._pending_fetches.get(slug):
             return  # already in-flight for this market
         self._pending_fetches[slug] = True
+        self._bg_pending_cycles[slug] = 0  # reset starvation counter
+        start_ts = time.time()
         def _do_refresh():
             try:
                 data = self._prefetch_market_data(m)
-                data["ts"] = time.time()
+                end_ts = time.time()
+                data["ts"] = end_ts
                 self._data_cache[slug] = data  # atomic dict assignment
+                # Track fetch duration
+                dur_ms = (end_ts - start_ts) * 1000
+                durations = self._bg_fetch_durations.setdefault(slug, [])
+                durations.append(dur_ms)
+                # Keep last 100 for rolling stats
+                if len(durations) > 100:
+                    self._bg_fetch_durations[slug] = durations[-100:]
             except Exception as e:
                 self.logger.log_event({"event_type": "BG_REFRESH_ERROR",
                                        "slug": slug, "err": str(e)})
@@ -1816,14 +1839,39 @@ class Bot:
                 markets = list(self._cached_markets)  # atomic snapshot
                 self._resolve_ended_hours(markets)
 
-                # 3. Update priority set + submit staggered refreshes
+                # 3. Update priority set + deadline-based refresh scheduling
                 self._update_priority_slugs()
+                now_ts = time.time()
                 for m in markets:
-                    interval = (BOOK_REFRESH_PRIORITY_MS
-                                if m.slug in self._high_priority_slugs
-                                else BOOK_REFRESH_IDLE_MS)
-                    if self._cache_age_ms(m.slug) >= interval:
+                    slug = m.slug
+                    interval_ms = (BOOK_REFRESH_PRIORITY_MS
+                                   if slug in self._high_priority_slugs
+                                   else BOOK_REFRESH_IDLE_MS)
+                    interval_sec = interval_ms / 1000.0
+
+                    # Initialize deadline if not set
+                    if slug not in self._bg_next_due:
+                        self._bg_next_due[slug] = now_ts
+
+                    # Track starvation: if pending for > BG_REFRESH_STARVE_CYCLES
+                    if self._pending_fetches.get(slug):
+                        self._bg_pending_cycles[slug] = self._bg_pending_cycles.get(slug, 0) + 1
+                        if self._bg_pending_cycles.get(slug, 0) > BG_REFRESH_STARVE_CYCLES:
+                            # Starved: previous fetch is still in-flight after N cycles
+                            # Don't re-submit (already in-flight), but track the miss
+                            self._bg_refresh_miss_count[slug] = self._bg_refresh_miss_count.get(slug, 0) + 1
+                        continue
+
+                    # Deadline scheduling: submit if past due
+                    if now_ts >= self._bg_next_due[slug]:
                         self._submit_market_refresh(m)
+                        # Advance deadline by interval (not from now — prevents drift)
+                        self._bg_next_due[slug] = max(now_ts, self._bg_next_due[slug] + interval_sec)
+
+                    # Also track cache_age misses (cache too old = 3x interval)
+                    cache_age = self._cache_age_ms(slug)
+                    if cache_age > interval_ms * 3:
+                        self._bg_refresh_miss_count[slug] = self._bg_refresh_miss_count.get(slug, 0) + 1
 
                 # 4. Process each market with cached data (ZERO HTTP, pure logic)
                 stale_skips = 0
@@ -2256,6 +2304,49 @@ class Bot:
             denom = (var_i * var_d) ** 0.5
             imbal_delta_corr = cov / denom if denom > 1e-9 else 0.0
 
+        # ── 5. Per-slug F247 clone KPI ──
+        per_slug_kpi = {}
+        for slug in set(list(self._tempo_cache_ages.keys()) + list(self._bg_fetch_durations.keys())
+                        + [s for s in self.market_states]):
+            # Cache age p50/p90
+            ages = self._tempo_cache_ages.get(slug, [])
+            ca_p50 = 0.0
+            ca_p90 = 0.0
+            if ages:
+                sa = sorted(ages)
+                ca_p50 = sa[len(sa) // 2]
+                ca_p90 = sa[min(int(len(sa) * 0.9), len(sa) - 1)]
+            # BG fetch duration p50/p90
+            fetch_durs = self._bg_fetch_durations.get(slug, [])
+            bf_p50 = 0.0
+            bf_p90 = 0.0
+            if fetch_durs:
+                sf = sorted(fetch_durs)
+                bf_p50 = sf[len(sf) // 2]
+                bf_p90 = sf[min(int(len(sf) * 0.9), len(sf) - 1)]
+            # Per-slug pair completion from _pair_tracker and _clone_pair_delays
+            # (global pair delays, not per-slug — approximate from total)
+            slug_pairs = sum(1 for pid, info in self._pair_tracker.items()
+                             if info.get("slug") == slug
+                             and "Up" in info["fills"] and "Down" in info["fills"])
+            # Refresh misses
+            refresh_misses = self._bg_refresh_miss_count.get(slug, 0)
+            # Hedge cross rate: crosses / (crosses + unwinds) for this window
+            # (global — per-slug would need more tracking, so use global for now)
+            hedge_total = self._diag_hedge_cross + self._diag_hedge_unwind
+            hedge_cross_rate = self._diag_hedge_cross / max(1, hedge_total)
+
+            if ca_p90 > 0 or bf_p90 > 0 or slug_pairs > 0 or refresh_misses > 0:
+                per_slug_kpi[slug] = {
+                    "cache_age_p50_ms": round(ca_p50, 0),
+                    "cache_age_p90_ms": round(ca_p90, 0),
+                    "bg_fetch_p50_ms": round(bf_p50, 0),
+                    "bg_fetch_p90_ms": round(bf_p90, 0),
+                    "refresh_miss_count": refresh_misses,
+                    "pairs_completed": slug_pairs,
+                    "hedge_cross_rate": round(hedge_cross_rate, 3),
+                }
+
         # ── Build report (use clone-dedicated counters for lifecycle) ──
         clone_fills = self._clone_quote_fill_count
         clone_submits = self._clone_quote_submit_count
@@ -2305,6 +2396,8 @@ class Bot:
             "adverse_degrades": self._diag_adverse_guard_degrades,
             "adverse_hard_pauses": self._diag_adverse_guard_pauses,
             "fast_clone": FAST_CLONE,
+            # Per-slug KPIs
+            "per_slug_kpi": per_slug_kpi,
         }
         write_jsonl(clone_data)
 
@@ -2334,6 +2427,16 @@ class Bot:
             for slug, info in per_slug_imbalance.items():
                 print(f"    {slug[:30]:30s}  imbal={info['current_imbalance']:+5.0f}  "
                       f"max={info['max_abs_imbalance']:.0f}")
+        # Per-slug KPI line
+        if per_slug_kpi:
+            for slug, kpi in per_slug_kpi.items():
+                if kpi["cache_age_p90_ms"] > 0 or kpi["pairs_completed"] > 0:
+                    print(f"    KPI {slug[:25]:25s}  "
+                          f"ca_p90={kpi['cache_age_p90_ms']:.0f}ms  "
+                          f"bg_p90={kpi['bg_fetch_p90_ms']:.0f}ms  "
+                          f"pairs={kpi['pairs_completed']}  "
+                          f"miss={kpi['refresh_miss_count']}  "
+                          f"hcross={kpi['hedge_cross_rate']:.0%}")
         # Reset clone-specific counters (per-minute)
         self._clone_pair_delays.clear()
         self._clone_inter_pair_gaps.clear()
@@ -2351,6 +2454,8 @@ class Bot:
         self._clone_quote_cancel_count = 0
         self._clone_quote_replace_count = 0
         self._clone_quote_fill_count = 0
+        # Reset per-slug refresh miss counts
+        self._bg_refresh_miss_count.clear()
         # Clean up stale pair tracker entries (older than 30s)
         stale_cutoff = time.time() - 30.0
         stale_ids = [pid for pid, info in self._pair_tracker.items()
@@ -4020,7 +4125,8 @@ class Bot:
 
         # Initialize hedge state if needed
         hedge = self._hedge_state.setdefault(m.slug, {
-            "tick1_done": False, "tick2_done": False, "cross_done": False,
+            "tick1_done": False, "tick2_done": False,
+            "early_cross_done": False, "cross_done": False,
         })
 
         # Compute net edge for escalation decisions
@@ -4085,6 +4191,35 @@ class Bot:
                           "missing_outcome": missing_outcome,
                           "age_ms": round(age_ms, 0),
                           "edge_cents": round(edge_c, 3)})
+
+        # ── Early taker cross: at HEDGE_EARLY_CROSS_MS if edge >= 0.25c and spread <= 2c ──
+        if (age_ms >= HEDGE_EARLY_CROSS_MS and not hedge.get("early_cross_done")
+                and not hedge["cross_done"] and missing_book.ask > 0):
+            cross_price = missing_book.ask
+            spread_cents = (missing_book.ask - missing_book.bid) * 100 if missing_book.bid > 0 else 999
+            ok, edge_c = _edge_ok(cross_price)
+            if edge_c >= HEDGE_EARLY_CROSS_EDGE_CENTS and spread_cents <= HEDGE_MAX_CROSS_SPREAD_CENTS:
+                leg_usd = min(dynamic_step_usd,
+                              (PARITY_QUOTE_MAX_USD_PER_SLUG -
+                               self._parity_invested_usd.get(m.slug, 0.0)) / 2.0)
+                if leg_usd >= MIN_ORDER_USDC:
+                    cost = self._parity_buy_leg(
+                        m, st, missing_outcome, missing_book,
+                        leg_usd, ctx,
+                        pair_id=uuid.uuid4().hex[:16])
+                    if cost > 0:
+                        self._diag_hedge_cross += 1
+                        self._diag_quote_orders_placed += 1
+                        hedge["cross_done"] = True  # skip normal cross too
+                        write_jsonl({"event_type": "HEDGE_EARLY_CROSS",
+                                      "ts_ms": int(now_t * 1000),
+                                      "slug": m.slug, "crypto": m.crypto,
+                                      "missing_outcome": missing_outcome,
+                                      "cross_price": round(cross_price, 4),
+                                      "edge_cents": round(edge_c, 3),
+                                      "spread_cents": round(spread_cents, 2),
+                                      "age_ms": round(age_ms, 0)})
+            hedge["early_cross_done"] = True
 
         # ── Taker cross: at HEDGE_CROSS_MS if edge >= 0.5c and spread <= 2c ──
         if age_ms >= HEDGE_CROSS_MS and not hedge["cross_done"] and missing_book.ask > 0:
@@ -4291,6 +4426,22 @@ class Bot:
                               "net_edge_cents": round(net_edge, 3),
                               "up_vwap": round(up_vwap, 4),
                               "dn_vwap": round(dn_vwap, 4)})
+            else:
+                # One leg filled but not balanced — immediately trigger hedge
+                up_q = st.positions["Up"].qty
+                dn_q = st.positions["Down"].qty
+                if (up_q >= MIN_QTY or dn_q >= MIN_QTY) and m.slug not in self._quote_unpaired:
+                    imbal = abs(up_q - dn_q)
+                    one_sided = (up_q < MIN_QTY) != (dn_q < MIN_QTY)
+                    big_imbal = imbal >= MIN_PAIR_QTY and max(up_q, dn_q) > min(up_q, dn_q) * 2.0
+                    if one_sided or big_imbal:
+                        heavier = "Up" if up_q > dn_q else "Down"
+                        self._quote_unpaired[m.slug] = {
+                            "outcome": heavier,
+                            "fill_ts": fill_ts,
+                            "escalated": False,
+                        }
+                        self._diag_quote_unpaired_events += 1
 
             return actual_cost
         else:
@@ -4843,10 +4994,21 @@ class Bot:
                         elif seconds_to_close < 45:
                             emergency = True
 
-                        # ── RESCUE-TO-STRADDLE: ALWAYS attempt before any sell ──
+                        # ── RESCUE-TO-STRADDLE ──
                         opposite = "Down" if outcome == "Up" else "Up"
                         opp_pos = st.positions[opposite]
                         rescue_done = False
+
+                        # Skip rescue entirely if position is already a balanced straddle
+                        _up_q = st.positions["Up"].qty
+                        _dn_q = st.positions["Down"].qty
+                        _already_balanced = (_up_q >= MIN_PAIR_QTY and _dn_q >= MIN_PAIR_QTY
+                                             and abs(_up_q - _dn_q) < MIN_PAIR_QTY)
+                        if _already_balanced and not emergency:
+                            # Balanced straddle — no rescue needed, no derisk sell
+                            pos.last_derisk_ts = iso_z(now_t)
+                            pos.last_derisk_mid = book.mid
+                            continue
 
                         # Count every one-sided + drift reversal as a rescue attempt
                         self._diag_rescue_attempts += 1
