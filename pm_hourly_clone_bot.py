@@ -245,6 +245,10 @@ PARITY_QUOTE_ONLY_IF_LIQ_OK = True      # require liquidity guards for quoting
 QUOTE_UNPAIRED_ESCALATE_AFTER_MS = 800  # raise missing leg bid by 1 tick if still net edge ok
 QUOTE_UNPAIRED_MAX_SEC = 6.0            # after this, unwind or pause quoting this slug
 QUOTE_PAUSE_AFTER_UNPAIRED_SEC = 15.0   # pause quoting this slug after forced unpaired unwind
+# Adverse selection guard
+ADVERSE_SPOT_MOVE_BPS_THRESHOLD = 12.0  # pause quoting if spot moved > 12 bps in 10s
+ADVERSE_LOOKBACK_SEC = 10.0             # lookback window for spot move detection
+ADVERSE_PAUSE_SEC = 10.0                # pause quoting for this many seconds on trigger
 # ---------------------------------------------------------------------------
 # Derisk RESCUE-TO-STRADDLE — convert losing one-sided to straddle
 # ---------------------------------------------------------------------------
@@ -1168,6 +1172,11 @@ class Bot:
         self._quote_unpaired: Dict[str, dict] = {}
         # Quote pause tracking: slug -> pause_until_ts
         self._quote_paused_until: Dict[str, float] = {}
+        # Adverse selection guard
+        self._diag_adverse_guard_events = 0
+        self._diag_adverse_guard_pauses = 0
+        # Per-slug spot history for adverse selection: slug -> [(epoch_ts, spot)]
+        self._spot_history: Dict[str, List[Tuple[float, float]]] = {}
         # Rescue invested tracking: slug -> USD spent on rescue buys
         self._rescue_invested_usd: Dict[str, float] = {}
         # Similarity/tempo stats: timestamps of all parity trades this minute
@@ -1905,6 +1914,8 @@ class Bot:
             "quote_unpaired_events": self._diag_quote_unpaired_events,
             "quote_unpaired_escalations": self._diag_quote_unpaired_escalations,
             "quote_pause_count": self._diag_quote_pause_count,
+            "adverse_guard_events": self._diag_adverse_guard_events,
+            "adverse_guard_pauses": self._diag_adverse_guard_pauses,
         }
         tempo_stats = {
             "paired_trade_ratio": round(paired_ratio, 3),
@@ -2007,7 +2018,9 @@ class Bot:
               f"mkr_ratio={tempo_stats['maker_ratio']:.1%}")
         print(f"  GUARD: spread_blk={diag['blocked_spread']}  "
               f"liq_blk={diag['blocked_liq']}  "
-              f"stale_blk={diag['blocked_stale']}")
+              f"stale_blk={diag['blocked_stale']}  "
+              f"adverse_events={diag['adverse_guard_events']}  "
+              f"adverse_pauses={diag['adverse_guard_pauses']}")
         if inv_imbalance:
             for slug, inv in inv_imbalance.items():
                 print(f"    INV {slug[:30]:30s}  Up={inv['up_qty']:5.0f}  "
@@ -2061,6 +2074,8 @@ class Bot:
         self._diag_quote_unpaired_events = 0
         self._diag_quote_unpaired_escalations = 0
         self._diag_quote_pause_count = 0
+        self._diag_adverse_guard_events = 0
+        self._diag_adverse_guard_pauses = 0
         self._diag_parity_trade_timestamps.clear()
 
     def _print_balance_summary(self):
@@ -2297,6 +2312,14 @@ class Bot:
         st.delta_hist = st.delta_hist[-STATE_HIST_MAX:]
         st.price_hist.append((iso_z(now), spot))
         st.price_hist = st.price_hist[-STATE_HIST_MAX:]
+        # Lightweight spot history for adverse selection (epoch-based, cheap to query)
+        spot_ts = time.time()
+        slug_spot_hist = self._spot_history.setdefault(m.slug, [])
+        slug_spot_hist.append((spot_ts, spot))
+        # Trim to last 30s of data (ample for 10s lookback)
+        cutoff = spot_ts - 30.0
+        while slug_spot_hist and slug_spot_hist[0][0] < cutoff:
+            slug_spot_hist.pop(0)
         vel = delta_velocity_bps_per_min(st.delta_hist, lookback_sec=30.0)
         z = zscore(st.delta_hist) if Z_ENTRY_ENABLED else 0.0
         self.last_book[m.slug]["Up"] = up_book
@@ -3334,6 +3357,50 @@ class Bot:
         self._quote_dynamic_target[slug] = current
         return current
 
+    def _quote_get_dynamic_step(self, slug: str) -> float:
+        """Return inventory-aware quote step size (USD) for this slug."""
+        fill_rate = (self._diag_quote_fills / max(1, self._diag_quote_orders_placed)
+                     if self._diag_quote_orders_placed > 0 else 0.5)
+        locked_usd = 0.0
+        imbalance = 0.0
+        st = self.market_states.get(slug)
+        if st:
+            up_q = st.positions["Up"].qty
+            dn_q = st.positions["Down"].qty
+            locked_shares = min(up_q, dn_q)
+            if locked_shares >= MIN_QTY:
+                locked_usd = locked_shares * (st.positions["Up"].vwap + st.positions["Down"].vwap)
+            imbalance = abs(up_q - dn_q)
+        # High inventory or imbalance -> reduce step (less risk per order)
+        if locked_usd > 0.6 * PARITY_QUOTE_MAX_USD_PER_SLUG or imbalance > 20:
+            return max(0.75, PARITY_QUOTE_STEP_USD * 0.5)
+        # Low fill rate + low locked -> increase step (be more aggressive)
+        if fill_rate < 0.30 and locked_usd < PARITY_QUOTE_MAX_USD_PER_SLUG * 0.3:
+            return min(3.0, PARITY_QUOTE_STEP_USD * 1.25)
+        return PARITY_QUOTE_STEP_USD
+
+    def _quote_check_adverse(self, slug: str) -> Tuple[bool, float]:
+        """Check adverse selection: large spot move in last ADVERSE_LOOKBACK_SEC.
+        Returns (is_adverse, spot_move_bps)."""
+        hist = self._spot_history.get(slug, [])
+        if len(hist) < 2:
+            return False, 0.0
+        now_t = time.time()
+        cutoff = now_t - ADVERSE_LOOKBACK_SEC
+        # Find oldest spot within lookback window
+        oldest_spot = None
+        for ts, sp in hist:
+            if ts >= cutoff:
+                oldest_spot = sp
+                break
+        if oldest_spot is None or oldest_spot <= 0:
+            return False, 0.0
+        latest_spot = hist[-1][1]
+        if latest_spot <= 0:
+            return False, 0.0
+        move_bps = abs((latest_spot - oldest_spot) / oldest_spot) * 10000.0
+        return move_bps > ADVERSE_SPOT_MOVE_BPS_THRESHOLD, move_bps
+
     def _parity_quote(self, m: MarketRef, st: MarketState, ctx: dict):
         """Post maker bids on both Up and Down to 'manufacture' cheap straddles.
         Dynamic target edge, anchor-based pricing, unpaired management."""
@@ -3347,6 +3414,22 @@ class Bot:
         # ── Pause check ──
         pause_until = self._quote_paused_until.get(m.slug, 0.0)
         if now_t < pause_until:
+            return
+
+        # ── Adverse selection guard ──
+        is_adverse, spot_move_bps = self._quote_check_adverse(m.slug)
+        if is_adverse:
+            self._diag_adverse_guard_events += 1
+            # Pause quoting for this slug
+            self._quote_paused_until[m.slug] = now_t + ADVERSE_PAUSE_SEC
+            self._diag_adverse_guard_pauses += 1
+            # Also set dynamic target to MAX for next cycle
+            self._quote_dynamic_target[m.slug] = PARITY_QUOTE_TARGET_EDGE_NET_CENTS_MAX
+            write_jsonl({"event_type": "ADVERSE_GUARD_TRIGGERED",
+                          "slug": m.slug, "crypto": m.crypto,
+                          "spot_move_bps": round(spot_move_bps, 2),
+                          "threshold_bps": ADVERSE_SPOT_MOVE_BPS_THRESHOLD,
+                          "pause_sec": ADVERSE_PAUSE_SEC})
             return
 
         # ── Liquidity guard (optional) ──
@@ -3384,6 +3467,9 @@ class Bot:
         if target_up is None or target_dn is None:
             return
 
+        # ── Dynamic step sizing ──
+        dynamic_step_usd = self._quote_get_dynamic_step(m.slug)
+
         # ── Post/refresh quotes on each leg ──
         slug_quotes = self._parity_quotes.get(m.slug, {})
         pair_id = uuid.uuid4().hex[:16]
@@ -3398,13 +3484,14 @@ class Bot:
                 if not outbid and price_diff < 0.005 and elapsed_ms < PARITY_QUOTE_REFRESH_MS:
                     continue
 
-            leg_usd = min(PARITY_QUOTE_STEP_USD,
+            leg_usd = min(dynamic_step_usd,
                           (PARITY_QUOTE_MAX_USD_PER_SLUG - invested) / 2.0)
             if leg_usd < MIN_ORDER_USDC:
                 continue
 
             cost = self._parity_quote_buy(m, st, outcome, book, target_price,
-                                           leg_usd, ctx, pair_id)
+                                           leg_usd, ctx, pair_id,
+                                           quote_step_usd_used=dynamic_step_usd)
             if cost > 0:
                 self._diag_quote_orders_placed += 1
                 self._parity_quotes.setdefault(m.slug, {})[outcome] = {
@@ -3521,14 +3608,16 @@ class Bot:
                 if edge_cents - fee_cents >= target_edge * 0.5:  # allow half target for escalation
                     # Place escalated bid
                     if escalated_price < missing_book.ask:
-                        leg_usd = min(PARITY_QUOTE_STEP_USD,
+                        dynamic_step_usd = self._quote_get_dynamic_step(m.slug)
+                        leg_usd = min(dynamic_step_usd,
                                       (PARITY_QUOTE_MAX_USD_PER_SLUG -
                                        self._parity_invested_usd.get(m.slug, 0.0)) / 2.0)
                         if leg_usd >= MIN_ORDER_USDC:
                             cost = self._parity_quote_buy(
                                 m, st, missing_outcome, missing_book,
                                 escalated_price, leg_usd, ctx,
-                                uuid.uuid4().hex[:16])
+                                uuid.uuid4().hex[:16],
+                                quote_step_usd_used=dynamic_step_usd)
                             if cost > 0:
                                 self._diag_quote_unpaired_escalations += 1
                                 self._diag_quote_orders_placed += 1
@@ -3564,7 +3653,8 @@ class Bot:
 
     def _parity_quote_buy(self, m: MarketRef, st: MarketState,
                            outcome: str, book: BookTop, bid_price: float,
-                           leg_usd: float, ctx: dict, pair_id: str) -> float:
+                           leg_usd: float, ctx: dict, pair_id: str,
+                           quote_step_usd_used: float = 0.0) -> float:
         """Place a maker buy at bid_price for quoting mode. Returns cost if filled."""
         token_id = m.outcome_up_id if outcome == "Up" else m.outcome_down_id
         pos = st.positions[outcome]
@@ -3603,7 +3693,8 @@ class Bot:
             crypto=m.crypto, slug=m.slug, outcome=outcome,
             side="BUY", qty=order_qty, target_price=bid_price,
             usdc_cost=leg_usd, ctx=ctx, book_fields=bk_fields,
-            extra={"pair_id": pair_id, "placed_ts": placed_ts},
+            extra={"pair_id": pair_id, "placed_ts": placed_ts,
+                   "quote_step_usd_used": round(quote_step_usd_used, 2)},
         )
 
         if MODE == "LOG":
@@ -3628,7 +3719,8 @@ class Bot:
                 maker_taker="maker", did_cross="",
                 vwap=pos.vwap, ctx=ctx, book_fields=bk_fields,
                 extra={"placed_ts": placed_ts, "fill_ts": fill_ts,
-                       "fill_latency_ms": round(fill_latency_ms, 1)},
+                       "fill_latency_ms": round(fill_latency_ms, 1),
+                       "quote_step_usd_used": round(quote_step_usd_used, 2)},
             )
             self._tempo_fills[m.slug] = self._tempo_fills.get(m.slug, 0) + 1
             self._diag_maker_fills += 1
@@ -3677,7 +3769,8 @@ class Bot:
                     maker_taker="maker", did_cross="",
                     vwap=pos.vwap, ctx=ctx, book_fields=bk_fields,
                     extra={"placed_ts": placed_ts, "fill_ts": fill_ts,
-                           "fill_latency_ms": round(fill_latency_ms, 1)},
+                           "fill_latency_ms": round(fill_latency_ms, 1),
+                           "quote_step_usd_used": round(quote_step_usd_used, 2)},
                 )
                 self._tempo_fills[m.slug] = self._tempo_fills.get(m.slug, 0) + 1
                 self._diag_maker_fills += 1
