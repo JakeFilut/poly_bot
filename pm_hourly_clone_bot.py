@@ -250,6 +250,16 @@ ADVERSE_SPOT_MOVE_BPS_THRESHOLD = 12.0  # pause quoting if spot moved > 12 bps i
 ADVERSE_LOOKBACK_SEC = 10.0             # lookback window for spot move detection
 ADVERSE_PAUSE_SEC = 10.0                # pause quoting for this many seconds on trigger
 # ---------------------------------------------------------------------------
+# FAST_CLONE mode — tighter timing to match F247 speed
+# ---------------------------------------------------------------------------
+FAST_CLONE = bool(os.getenv("FAST_CLONE", "True") not in ("", "0", "False", "false"))
+# One-sided auto-hedge — faster escalation than unpaired management
+HEDGE_TICK1_MS = 250                    # +1 tick after 250ms
+HEDGE_TICK2_MS = 500                    # +2 ticks after 500ms
+HEDGE_CROSS_MS = 800                    # taker cross after 800ms
+HEDGE_MIN_CROSS_EDGE_CENTS = 0.5       # min net edge for taker cross
+HEDGE_MAX_CROSS_SPREAD_CENTS = 2.0     # max spread for taker cross (cents)
+# ---------------------------------------------------------------------------
 # Derisk RESCUE-TO-STRADDLE — convert losing one-sided to straddle
 # ---------------------------------------------------------------------------
 DERISK_RESCUE_TO_STRADDLE = True
@@ -286,6 +296,21 @@ MAIN_LOOP_TARGET_MS = 75              # 75ms decision loop target (f247 parity)
 # Burst freshness gate — micro-orders must have fresh data
 BURST_FRESHNESS_MAX_MS = 500           # max cache age to place a micro-order
 BURST_FRESHNESS_WAIT_MS = 250          # max time to wait for fresh data if stale
+# ---------------------------------------------------------------------------
+# FAST_CLONE speed overrides — tighter loops, faster hedging
+# ---------------------------------------------------------------------------
+if FAST_CLONE:
+    MAIN_LOOP_TARGET_MS = 80
+    BOOK_REFRESH_PRIORITY_MS = 80
+    BOOK_REFRESH_IDLE_MS = 150
+    BOOK_STALE_MS = 700
+    MIN_REPLACE_INTERVAL_MS = 100
+    PARITY_MAKER_REFRESH_MS = 120
+    QUOTE_UNPAIRED_ESCALATE_AFTER_MS = 250
+    QUOTE_UNPAIRED_MAX_SEC = 2.0
+    HEDGE_TICK1_MS = 250
+    HEDGE_TICK2_MS = 500
+    HEDGE_CROSS_MS = 800
 # =============================================================================
 # UTIL / LOGGING — thin wrappers around Logger instance
 # =============================================================================
@@ -1181,6 +1206,36 @@ class Bot:
         self._rescue_invested_usd: Dict[str, float] = {}
         # Similarity/tempo stats: timestamps of all parity trades this minute
         self._diag_parity_trade_timestamps: List[float] = []
+        # ── Order lifecycle tracking ──
+        # Active orders: order_id -> {slug, outcome, side, price, qty, submit_ts, reason}
+        self._active_orders: Dict[str, dict] = {}
+        self._diag_quote_submit_count = 0
+        self._diag_quote_cancel_count = 0
+        self._diag_quote_replace_count = 0
+        # Maker queue time tracking: list of (submit_ts, fill_ts) for filled maker orders
+        self._diag_maker_queue_times: List[float] = []  # ms from submit to fill
+        # Top-of-book tracking: slug -> {outcome -> {is_best: bool, best_since_ts: float}}
+        self._top_of_book_state: Dict[str, Dict[str, dict]] = {}
+        self._diag_top_of_book_time_ms = 0.0
+        self._diag_top_of_book_total_ms = 0.0
+        # ── Auto-hedge tracking ──
+        # Overrides unpaired management with faster escalation
+        # slug -> {outcome, fill_ts, tick1_done, tick2_done, cross_done}
+        self._hedge_state: Dict[str, dict] = {}
+        self._diag_hedge_tick1 = 0
+        self._diag_hedge_tick2 = 0
+        self._diag_hedge_cross = 0
+        self._diag_hedge_unwind = 0
+        # ── F247 similarity / CLONE_REPORT tracking ──
+        # pair delays: list of ms between Up and Down fills for same slug
+        self._clone_pair_delays: List[float] = []
+        # inter-pair gaps: list of ms between consecutive pair completions
+        self._clone_inter_pair_gaps: List[float] = []
+        self._clone_last_pair_ts: float = 0.0
+        # signal-to-fill: ms from significant spot move to first fill
+        self._clone_signal_to_fill: List[float] = []
+        # Track last significant spot move per slug: slug -> (ts, spot)
+        self._clone_last_spot_move: Dict[str, Tuple[float, float]] = {}
         # Probe → Scale state machine: slug -> {state, probe_ts, probe_ask, initial_edge_bps}
         self.entry_sm: Dict[str, dict] = {}   # IDLE / PROBING / SCALING / COOLDOWN
         self.hour_index_counters: Dict[str, int] = {c: 0 for c in CRYPTOS}  # crypto -> monotonic index
@@ -1778,6 +1833,7 @@ class Bot:
                 # 8. Tempo parity diagnostics (every 60s)
                 if now - self._tempo_last_report_ts >= 60.0:
                     self._emit_tempo_report()
+                    self._emit_clone_report()
                     self._tempo_last_report_ts = now
             except Exception as e:
                 self.logger.log_event({"event_type": "LOOP_ERROR", "err": str(e)})
@@ -1916,6 +1972,13 @@ class Bot:
             "quote_pause_count": self._diag_quote_pause_count,
             "adverse_guard_events": self._diag_adverse_guard_events,
             "adverse_guard_pauses": self._diag_adverse_guard_pauses,
+            "quote_submit_count": self._diag_quote_submit_count,
+            "quote_cancel_count": self._diag_quote_cancel_count,
+            "quote_replace_count": self._diag_quote_replace_count,
+            "hedge_tick1": self._diag_hedge_tick1,
+            "hedge_tick2": self._diag_hedge_tick2,
+            "hedge_cross": self._diag_hedge_cross,
+            "hedge_unwind": self._diag_hedge_unwind,
         }
         tempo_stats = {
             "paired_trade_ratio": round(paired_ratio, 3),
@@ -2077,6 +2140,90 @@ class Bot:
         self._diag_adverse_guard_events = 0
         self._diag_adverse_guard_pauses = 0
         self._diag_parity_trade_timestamps.clear()
+        self._diag_quote_submit_count = 0
+        self._diag_quote_cancel_count = 0
+        self._diag_quote_replace_count = 0
+        self._diag_maker_queue_times.clear()
+        self._diag_hedge_tick1 = 0
+        self._diag_hedge_tick2 = 0
+        self._diag_hedge_cross = 0
+        self._diag_hedge_unwind = 0
+
+    def _emit_clone_report(self):
+        """Emit F247 similarity metrics every minute."""
+        import statistics
+        # paired_straddle_ratio: pairs completed within 1.5s / total quote fills
+        pairs_within_1500ms = sum(1 for d in self._clone_pair_delays if d <= 1500)
+        total_pairs = len(self._clone_pair_delays)
+        paired_straddle_ratio = (pairs_within_1500ms / total_pairs
+                                 if total_pairs > 0 else 0.0)
+        # median pair fill delay
+        med_pair_delay_ms = (statistics.median(self._clone_pair_delays)
+                             if self._clone_pair_delays else 0.0)
+        # median time between pairs (burstiness)
+        med_inter_pair_ms = (statistics.median(self._clone_inter_pair_gaps)
+                             if self._clone_inter_pair_gaps else 0.0)
+        # signal-to-fill latency
+        med_signal_to_fill_ms = (statistics.median(self._clone_signal_to_fill)
+                                 if self._clone_signal_to_fill else 0.0)
+        # maker queue time percentiles
+        queue_p50 = 0.0
+        queue_p90 = 0.0
+        if self._diag_maker_queue_times:
+            sorted_qt = sorted(self._diag_maker_queue_times)
+            p50_idx = len(sorted_qt) // 2
+            p90_idx = int(len(sorted_qt) * 0.9)
+            queue_p50 = sorted_qt[min(p50_idx, len(sorted_qt) - 1)]
+            queue_p90 = sorted_qt[min(p90_idx, len(sorted_qt) - 1)]
+        # top-of-book time pct
+        tob_pct = (self._diag_top_of_book_time_ms /
+                   max(1.0, self._diag_top_of_book_total_ms)
+                   if self._diag_top_of_book_total_ms > 0 else 0.0)
+
+        clone_data = {
+            "event_type": "CLONE_REPORT",
+            "paired_straddle_ratio": round(paired_straddle_ratio, 3),
+            "pairs_within_1500ms": pairs_within_1500ms,
+            "total_pairs": total_pairs,
+            "median_pair_fill_delay_ms": round(med_pair_delay_ms, 1),
+            "median_time_between_pairs_ms": round(med_inter_pair_ms, 1),
+            "median_signal_to_fill_ms": round(med_signal_to_fill_ms, 1),
+            "maker_queue_time_p50_ms": round(queue_p50, 1),
+            "maker_queue_time_p90_ms": round(queue_p90, 1),
+            "top_of_book_time_pct": round(tob_pct, 3),
+            "quote_submit_count": self._diag_quote_submit_count,
+            "quote_cancel_count": self._diag_quote_cancel_count,
+            "quote_replace_count": self._diag_quote_replace_count,
+            "quote_fill_rate": round(self._diag_quote_fills /
+                                     max(1, self._diag_quote_submit_count), 3),
+            "hedge_tick1": self._diag_hedge_tick1,
+            "hedge_tick2": self._diag_hedge_tick2,
+            "hedge_cross": self._diag_hedge_cross,
+            "hedge_unwind": self._diag_hedge_unwind,
+            "fast_clone": FAST_CLONE,
+        }
+        write_jsonl(clone_data)
+        print(f"  CLONE: straddle_ratio={paired_straddle_ratio:.1%}  "
+              f"pairs={total_pairs}  "
+              f"pair_delay={med_pair_delay_ms:.0f}ms  "
+              f"inter_pair={med_inter_pair_ms:.0f}ms  "
+              f"sig_to_fill={med_signal_to_fill_ms:.0f}ms")
+        print(f"  LIFECYCLE: submit={self._diag_quote_submit_count}  "
+              f"cancel={self._diag_quote_cancel_count}  "
+              f"replace={self._diag_quote_replace_count}  "
+              f"fill_rate={self._diag_quote_fills / max(1, self._diag_quote_submit_count):.1%}  "
+              f"queue_p50={queue_p50:.0f}ms  "
+              f"queue_p90={queue_p90:.0f}ms")
+        print(f"  HEDGE: tick1={self._diag_hedge_tick1}  "
+              f"tick2={self._diag_hedge_tick2}  "
+              f"cross={self._diag_hedge_cross}  "
+              f"unwind={self._diag_hedge_unwind}")
+        # Reset clone-specific counters (per-minute)
+        self._clone_pair_delays.clear()
+        self._clone_inter_pair_gaps.clear()
+        self._clone_signal_to_fill.clear()
+        self._diag_top_of_book_time_ms = 0.0
+        self._diag_top_of_book_total_ms = 0.0
 
     def _print_balance_summary(self):
         """Print balance and open positions to console."""
@@ -2320,6 +2467,14 @@ class Bot:
         cutoff = spot_ts - 30.0
         while slug_spot_hist and slug_spot_hist[0][0] < cutoff:
             slug_spot_hist.pop(0)
+        # Track significant spot moves for signal-to-fill latency (clone metrics)
+        last_move = self._clone_last_spot_move.get(m.slug)
+        if last_move:
+            move_bps = abs((spot - last_move[1]) / last_move[1]) * 10000.0 if last_move[1] > 0 else 0.0
+            if move_bps >= 5.0:  # significant move = 5+ bps
+                self._clone_last_spot_move[m.slug] = (spot_ts, spot)
+        else:
+            self._clone_last_spot_move[m.slug] = (spot_ts, spot)
         vel = delta_velocity_bps_per_min(st.delta_hist, lookback_sec=30.0)
         z = zscore(st.delta_hist) if Z_ENTRY_ENABLED else 0.0
         self.last_book[m.slug]["Up"] = up_book
@@ -3498,6 +3653,7 @@ class Bot:
                     "price": target_price,
                     "ts": now_t,
                     "pair_id": pair_id,
+                    "order_id": getattr(self, '_last_quote_oid', ''),
                 }
                 # Track unpaired state: if one leg filled but the other hasn't yet
                 invested = self._parity_invested_usd.get(m.slug, 0.0)
@@ -3573,15 +3729,24 @@ class Bot:
 
     def _quote_manage_unpaired(self, m: MarketRef, st: MarketState,
                                 ctx: dict, now_t: float):
-        """Manage unpaired quote fills: escalate, then unwind/pause."""
+        """Auto-hedge unpaired fills: fast escalation (+1 tick at 250ms,
+        +2 ticks at 500ms, taker cross at 800ms), then unwind+pause."""
         unpaired = self._quote_unpaired.get(m.slug)
         if unpaired is None:
             return
 
-        # If both legs now filled, clear
+        # If both legs now filled, clear and record pair delay for clone metrics
         if (st.positions["Up"].qty >= MIN_QTY
                 and st.positions["Down"].qty >= MIN_QTY):
+            fill_ts = unpaired.get("fill_ts", now_t)
+            pair_delay_ms = (now_t - fill_ts) * 1000
+            self._clone_pair_delays.append(pair_delay_ms)
+            if self._clone_last_pair_ts > 0:
+                gap_ms = (now_t - self._clone_last_pair_ts) * 1000
+                self._clone_inter_pair_gaps.append(gap_ms)
+            self._clone_last_pair_ts = now_t
             self._quote_unpaired.pop(m.slug, None)
+            self._hedge_state.pop(m.slug, None)
             return
 
         filled_outcome = unpaired["outcome"]
@@ -3594,40 +3759,105 @@ class Bot:
         missing_outcome = "Down" if filled_outcome == "Up" else "Up"
         missing_book = dn_book if missing_outcome == "Down" else up_book
 
-        # ── Escalation: after QUOTE_UNPAIRED_ESCALATE_AFTER_MS, raise missing bid by 1 tick ──
-        if age_ms >= QUOTE_UNPAIRED_ESCALATE_AFTER_MS and not unpaired.get("escalated"):
-            if missing_book.bid > 0:
-                escalated_price = clamp_to_tick(missing_book.bid + 0.001)
-                # Check net edge is still OK with escalated price
-                filled_book = up_book if filled_outcome == "Up" else dn_book
-                our_filled_price = st.positions[filled_outcome].vwap
-                est_combined = our_filled_price + escalated_price
-                edge_cents = (1.000 - est_combined) * 100
-                target_edge = self._quote_get_dynamic_target(m.slug)
-                fee_cents = 2 * MAKER_FEE_BPS / 100.0
-                if edge_cents - fee_cents >= target_edge * 0.5:  # allow half target for escalation
-                    # Place escalated bid
-                    if escalated_price < missing_book.ask:
-                        dynamic_step_usd = self._quote_get_dynamic_step(m.slug)
-                        leg_usd = min(dynamic_step_usd,
-                                      (PARITY_QUOTE_MAX_USD_PER_SLUG -
-                                       self._parity_invested_usd.get(m.slug, 0.0)) / 2.0)
-                        if leg_usd >= MIN_ORDER_USDC:
-                            cost = self._parity_quote_buy(
-                                m, st, missing_outcome, missing_book,
-                                escalated_price, leg_usd, ctx,
-                                uuid.uuid4().hex[:16],
-                                quote_step_usd_used=dynamic_step_usd)
-                            if cost > 0:
-                                self._diag_quote_unpaired_escalations += 1
-                                self._diag_quote_orders_placed += 1
-                unpaired["escalated"] = True
-                write_jsonl({"event_type": "QUOTE_UNPAIRED_ESCALATE",
+        # Initialize hedge state if needed
+        hedge = self._hedge_state.setdefault(m.slug, {
+            "tick1_done": False, "tick2_done": False, "cross_done": False,
+        })
+
+        # Compute net edge for escalation decisions
+        our_filled_price = st.positions[filled_outcome].vwap
+        fee_cents = 2 * MAKER_FEE_BPS / 100.0
+        target_edge = self._quote_get_dynamic_target(m.slug)
+        dynamic_step_usd = self._quote_get_dynamic_step(m.slug)
+
+        def _edge_ok(price: float) -> Tuple[bool, float]:
+            est_combined = our_filled_price + price
+            edge_c = (1.000 - est_combined) * 100 - fee_cents
+            return edge_c >= target_edge * 0.3, edge_c
+
+        # ── Tick 1 escalation: +1 tick at HEDGE_TICK1_MS ──
+        if age_ms >= HEDGE_TICK1_MS and not hedge["tick1_done"] and missing_book.bid > 0:
+            esc_price = clamp_to_tick(missing_book.bid + 0.001)
+            ok, edge_c = _edge_ok(esc_price)
+            if ok and esc_price < missing_book.ask:
+                leg_usd = min(dynamic_step_usd,
+                              (PARITY_QUOTE_MAX_USD_PER_SLUG -
+                               self._parity_invested_usd.get(m.slug, 0.0)) / 2.0)
+                if leg_usd >= MIN_ORDER_USDC:
+                    cost = self._parity_quote_buy(
+                        m, st, missing_outcome, missing_book,
+                        esc_price, leg_usd, ctx,
+                        uuid.uuid4().hex[:16],
+                        quote_step_usd_used=dynamic_step_usd)
+                    if cost > 0:
+                        self._diag_hedge_tick1 += 1
+                        self._diag_quote_unpaired_escalations += 1
+                        self._diag_quote_orders_placed += 1
+            hedge["tick1_done"] = True
+            write_jsonl({"event_type": "HEDGE_TICK1",
+                          "slug": m.slug, "crypto": m.crypto,
+                          "missing_outcome": missing_outcome,
+                          "age_ms": round(age_ms, 0),
+                          "edge_cents": round(edge_c, 3)})
+
+        # ── Tick 2 escalation: +2 ticks at HEDGE_TICK2_MS ──
+        if age_ms >= HEDGE_TICK2_MS and not hedge["tick2_done"] and missing_book.bid > 0:
+            esc_price = clamp_to_tick(missing_book.bid + 0.002)
+            ok, edge_c = _edge_ok(esc_price)
+            if ok and esc_price < missing_book.ask:
+                leg_usd = min(dynamic_step_usd,
+                              (PARITY_QUOTE_MAX_USD_PER_SLUG -
+                               self._parity_invested_usd.get(m.slug, 0.0)) / 2.0)
+                if leg_usd >= MIN_ORDER_USDC:
+                    cost = self._parity_quote_buy(
+                        m, st, missing_outcome, missing_book,
+                        esc_price, leg_usd, ctx,
+                        uuid.uuid4().hex[:16],
+                        quote_step_usd_used=dynamic_step_usd)
+                    if cost > 0:
+                        self._diag_hedge_tick2 += 1
+                        self._diag_quote_unpaired_escalations += 1
+                        self._diag_quote_orders_placed += 1
+            hedge["tick2_done"] = True
+            write_jsonl({"event_type": "HEDGE_TICK2",
+                          "slug": m.slug, "crypto": m.crypto,
+                          "missing_outcome": missing_outcome,
+                          "age_ms": round(age_ms, 0),
+                          "edge_cents": round(edge_c, 3)})
+
+        # ── Taker cross: at HEDGE_CROSS_MS if edge >= 0.5c and spread <= 2c ──
+        if age_ms >= HEDGE_CROSS_MS and not hedge["cross_done"] and missing_book.ask > 0:
+            cross_price = missing_book.ask
+            spread_cents = (missing_book.ask - missing_book.bid) * 100 if missing_book.bid > 0 else 999
+            ok, edge_c = _edge_ok(cross_price)
+            if edge_c >= HEDGE_MIN_CROSS_EDGE_CENTS and spread_cents <= HEDGE_MAX_CROSS_SPREAD_CENTS:
+                leg_usd = min(dynamic_step_usd,
+                              (PARITY_QUOTE_MAX_USD_PER_SLUG -
+                               self._parity_invested_usd.get(m.slug, 0.0)) / 2.0)
+                if leg_usd >= MIN_ORDER_USDC:
+                    cost = self._parity_buy_leg(
+                        m, st, missing_outcome, missing_book,
+                        leg_usd, ctx,
+                        pair_id=uuid.uuid4().hex[:16])
+                    if cost > 0:
+                        self._diag_hedge_cross += 1
+                        self._diag_quote_orders_placed += 1
+                        write_jsonl({"event_type": "HEDGE_CROSS",
+                                      "slug": m.slug, "crypto": m.crypto,
+                                      "missing_outcome": missing_outcome,
+                                      "cross_price": round(cross_price, 4),
+                                      "edge_cents": round(edge_c, 3),
+                                      "spread_cents": round(spread_cents, 2),
+                                      "age_ms": round(age_ms, 0)})
+            else:
+                # Edge collapsed — unwind the filled leg
+                write_jsonl({"event_type": "HEDGE_EDGE_COLLAPSE",
                               "slug": m.slug, "crypto": m.crypto,
                               "filled_outcome": filled_outcome,
-                              "missing_outcome": missing_outcome,
-                              "age_ms": round(age_ms, 0),
-                              "escalated_price": round(escalated_price, 4) if missing_book.bid > 0 else 0})
+                              "edge_cents": round(edge_c, 3),
+                              "spread_cents": round(spread_cents, 2),
+                              "age_ms": round(age_ms, 0)})
+            hedge["cross_done"] = True
 
         # ── Timeout: after QUOTE_UNPAIRED_MAX_SEC, unwind and pause ──
         if age_sec >= QUOTE_UNPAIRED_MAX_SEC:
@@ -3635,16 +3865,16 @@ class Bot:
             if pos.qty >= MIN_QTY:
                 filled_book = up_book if filled_outcome == "Up" else dn_book
                 if filled_book.bid > 0:
-                    # Unwind: sell the filled leg at maker price
                     unwind_price = max(filled_book.bid, filled_book.ask - 0.001)
                     self._do_sell(m, st, filled_outcome, pos.qty, unwind_price,
                                   reason="QUOTE_UNPAIRED_UNWIND", leg="PARITY_QUOTE",
                                   ctx=ctx, use_maker=True)
                     self._diag_unpaired_unwind_usd += unwind_price * pos.qty
-            # Pause quoting for this slug
+                    self._diag_hedge_unwind += 1
             self._quote_paused_until[m.slug] = now_t + QUOTE_PAUSE_AFTER_UNPAIRED_SEC
             self._diag_quote_pause_count += 1
             self._quote_unpaired.pop(m.slug, None)
+            self._hedge_state.pop(m.slug, None)
             write_jsonl({"event_type": "QUOTE_UNPAIRED_TIMEOUT",
                           "slug": m.slug, "crypto": m.crypto,
                           "filled_outcome": filled_outcome,
@@ -3696,6 +3926,29 @@ class Bot:
             extra={"pair_id": pair_id, "placed_ts": placed_ts,
                    "quote_step_usd_used": round(quote_step_usd_used, 2)},
         )
+        # ── Order lifecycle: track submit ──
+        self._last_quote_oid = client_oid
+        self._diag_quote_submit_count += 1
+        self._active_orders[client_oid] = {
+            "slug": m.slug, "outcome": outcome, "side": "BUY",
+            "price": bid_price, "qty": order_qty,
+            "submit_ts": placed_ts, "reason": "PARITY_QUOTE",
+        }
+        # Cancel any previous quote for this slug+outcome (ORDER_REPLACE)
+        slug_quotes = self._parity_quotes.get(m.slug, {})
+        prev_quote = slug_quotes.get(outcome)
+        if prev_quote and prev_quote.get("order_id"):
+            old_oid = prev_quote["order_id"]
+            if old_oid in self._active_orders:
+                old_info = self._active_orders.pop(old_oid)
+                self._diag_quote_cancel_count += 1
+                self._diag_quote_replace_count += 1
+                write_jsonl({"event_type": "ORDER_REPLACE",
+                              "slug": m.slug, "outcome": outcome,
+                              "old_id": old_oid, "new_id": client_oid,
+                              "old_px": round(old_info["price"], 4),
+                              "new_px": round(bid_price, 4),
+                              "reason": "refresh"})
 
         if MODE == "LOG":
             fill_ts = time.time()
@@ -3726,6 +3979,14 @@ class Bot:
             self._diag_maker_fills += 1
             self._diag_quote_fills += 1
             self._diag_maker_fill_latencies.append(fill_latency_ms)
+            self._active_orders.pop(client_oid, None)
+            self._diag_maker_queue_times.append(fill_latency_ms)
+            # Signal-to-fill tracking for clone metrics
+            last_move = self._clone_last_spot_move.get(m.slug)
+            if last_move:
+                s2f = (fill_ts - last_move[0]) * 1000
+                if s2f > 0 and s2f < 30000:
+                    self._clone_signal_to_fill.append(s2f)
             self._parity_invested_usd[m.slug] = self._parity_invested_usd.get(m.slug, 0.0) + actual_cost
             self._parity_last_order_ts[m.slug] = time.time()
             self._diag_parity_trades += 1
@@ -3776,6 +4037,13 @@ class Bot:
                 self._diag_maker_fills += 1
                 self._diag_quote_fills += 1
                 self._diag_maker_fill_latencies.append(fill_latency_ms)
+                self._active_orders.pop(client_oid, None)
+                self._diag_maker_queue_times.append(fill_latency_ms)
+                last_move = self._clone_last_spot_move.get(m.slug)
+                if last_move:
+                    s2f = (fill_ts - last_move[0]) * 1000
+                    if s2f > 0 and s2f < 30000:
+                        self._clone_signal_to_fill.append(s2f)
                 self._parity_invested_usd[m.slug] = self._parity_invested_usd.get(m.slug, 0.0) + actual_cost
                 self._parity_last_order_ts[m.slug] = time.time()
                 self._diag_parity_trades += 1
@@ -4291,69 +4559,111 @@ class Bot:
                         elif seconds_to_close < 45:
                             emergency = True
 
-                        # ── RESCUE-TO-STRADDLE: try to complete straddle instead of selling ──
+                        # ── RESCUE-TO-STRADDLE: ALWAYS attempt before any sell ──
+                        opposite = "Down" if outcome == "Up" else "Up"
+                        opp_pos = st.positions[opposite]
                         rescue_done = False
-                        if DERISK_RESCUE_TO_STRADDLE and not emergency:
-                            opposite = "Down" if outcome == "Up" else "Up"
-                            opp_pos = st.positions[opposite]
-                            # Only rescue if we're one-sided (opposite is empty or small)
-                            if opp_pos.qty < MIN_QTY:
-                                up_book_r = self.last_book.get(m.slug, {}).get("Up")
-                                dn_book_r = self.last_book.get(m.slug, {}).get("Down")
-                                if up_book_r and dn_book_r and up_book_r.bid > 0 and dn_book_r.bid > 0:
-                                    opp_book = dn_book_r if opposite == "Down" else up_book_r
-                                    # Compute rescue feasibility using CURRENT book prices + tick rounding
-                                    # Our existing leg: use current bid (what we could sell for)
-                                    our_leg_price = clamp_to_tick(book.bid)
-                                    # Rescue leg: best makerable price = current bid (we post there)
-                                    rescue_bid = clamp_to_tick(opp_book.bid)
-                                    est_straddle_cost = our_leg_price + rescue_bid
-                                    rescue_edge_cents = (1.000 - est_straddle_cost) * 100
-                                    # Deduct maker fees (both legs)
-                                    fee_cents = 2 * MAKER_FEE_BPS / 100.0
-                                    rescue_net_edge = rescue_edge_cents - fee_cents
-                                    # Use dynamic quote target as the feasibility threshold
-                                    dyn_target = self._quote_get_dynamic_target(m.slug)
-                                    min_edge = max(RESCUE_MIN_EDGE_NET_CENTS, dyn_target * 0.5)
-                                    rescue_invested = self._rescue_invested_usd.get(m.slug, 0.0)
-                                    can_rescue = (rescue_net_edge >= min_edge
-                                                  and rescue_invested < RESCUE_MAX_USD_PER_SLUG)
-                                    self._diag_rescue_attempts += 1
-                                    if can_rescue:
-                                        # Buy opposite leg at bid (maker) — complete pairing quickly
-                                        rescue_usd = min(RESCUE_STEP_USD,
-                                                         RESCUE_MAX_USD_PER_SLUG - rescue_invested)
-                                        rescue_qty = rescue_usd / max(1e-9, rescue_bid)
-                                        if rescue_qty >= 1:
-                                            cost = self._parity_buy_leg(
-                                                m, st, opposite, opp_book,
-                                                rescue_usd, ctx,
-                                                pair_id=uuid.uuid4().hex[:16])
-                                            if cost > 0:
-                                                self._rescue_invested_usd[m.slug] = rescue_invested + cost
-                                                self._diag_rescue_success += 1
-                                                rescue_done = True
-                                                # Mark as straddle locked if both legs exist
-                                                if (st.positions["Up"].qty >= MIN_QTY
-                                                        and st.positions["Down"].qty >= MIN_QTY):
-                                                    if m.slug not in self._parity_locked_since:
-                                                        self._parity_locked_since[m.slug] = time.time()
-                                                write_jsonl({
-                                                    "event_type": "DERISK_RESCUE",
-                                                    "slug": m.slug, "crypto": m.crypto,
-                                                    "losing_outcome": outcome,
-                                                    "rescue_outcome": opposite,
-                                                    "rescue_usd": round(cost, 4),
-                                                    "rescue_price": round(rescue_bid, 4),
-                                                    "our_leg_price": round(our_leg_price, 4),
-                                                    "est_straddle_cost": round(est_straddle_cost, 4),
-                                                    "rescue_net_edge_cents": round(rescue_net_edge, 3),
-                                                    "dyn_target_cents": round(dyn_target, 3),
-                                                    "min_edge_used": round(min_edge, 3),
-                                                    "t_min": round(t_min, 3),
-                                                })
 
-                        # ── FALLBACK: sell the losing leg if rescue didn't happen ──
+                        # Count every one-sided + drift reversal as a rescue attempt
+                        self._diag_rescue_attempts += 1
+
+                        # Compute rescue feasibility
+                        up_book_r = self.last_book.get(m.slug, {}).get("Up")
+                        dn_book_r = self.last_book.get(m.slug, {}).get("Down")
+                        opp_book = (dn_book_r if opposite == "Down" else up_book_r) if (up_book_r and dn_book_r) else None
+                        our_leg_price = clamp_to_tick(book.bid) if book.bid > 0 else 0.0
+                        rescue_bid = clamp_to_tick(opp_book.bid) if (opp_book and opp_book.bid > 0) else 0.0
+                        est_straddle_cost = our_leg_price + rescue_bid if (our_leg_price > 0 and rescue_bid > 0) else 0.0
+                        rescue_edge_cents = (1.000 - est_straddle_cost) * 100 if est_straddle_cost > 0 else -999.0
+                        fee_cents = 2 * MAKER_FEE_BPS / 100.0
+                        rescue_net_edge = rescue_edge_cents - fee_cents
+                        dyn_target = self._quote_get_dynamic_target(m.slug)
+                        min_edge = max(RESCUE_MIN_EDGE_NET_CENTS, dyn_target * 0.5)
+                        rescue_invested = self._rescue_invested_usd.get(m.slug, 0.0)
+
+                        # Log RESCUE_CHECK for every attempt
+                        write_jsonl({
+                            "event_type": "RESCUE_CHECK",
+                            "slug": m.slug, "crypto": m.crypto,
+                            "outcome": outcome, "opposite": opposite,
+                            "t_min": round(t_min, 3),
+                            "our_qty": round(pos.qty, 1),
+                            "opp_qty": round(opp_pos.qty, 1),
+                            "our_bid": round(our_leg_price, 4),
+                            "opp_bid": round(rescue_bid, 4),
+                            "net_edge_cents": round(rescue_net_edge, 3),
+                            "dyn_target_cents": round(dyn_target, 3),
+                            "min_edge_used": round(min_edge, 3),
+                            "emergency": emergency,
+                            "rescue_invested": round(rescue_invested, 2),
+                        })
+
+                        # Determine rescue block reason (if any)
+                        rescue_block_reason = None
+                        if emergency:
+                            rescue_block_reason = "emergency"
+                        elif not DERISK_RESCUE_TO_STRADDLE:
+                            rescue_block_reason = "disabled"
+                        elif opp_pos.qty >= MIN_QTY:
+                            rescue_block_reason = "already_paired"
+                        elif not opp_book or opp_book.bid <= 0:
+                            rescue_block_reason = "no_liquidity"
+                        elif not up_book_r or not dn_book_r or up_book_r.bid <= 0 or dn_book_r.bid <= 0:
+                            rescue_block_reason = "stale_book"
+                        elif rescue_invested >= RESCUE_MAX_USD_PER_SLUG:
+                            rescue_block_reason = "cap_reached"
+                        elif rescue_net_edge < min_edge:
+                            rescue_block_reason = "threshold"
+                        elif t_min >= PARITY_STOP_NEW_MIN:
+                            rescue_block_reason = "near_close"
+
+                        if rescue_block_reason is None:
+                            # ── Execute rescue buy ──
+                            rescue_usd = min(RESCUE_STEP_USD,
+                                             RESCUE_MAX_USD_PER_SLUG - rescue_invested)
+                            rescue_qty = rescue_usd / max(1e-9, rescue_bid)
+                            if rescue_qty >= 1:
+                                pair_id = uuid.uuid4().hex[:16]
+                                cost = self._parity_buy_leg(
+                                    m, st, opposite, opp_book,
+                                    rescue_usd, ctx, pair_id=pair_id)
+                                if cost > 0:
+                                    self._rescue_invested_usd[m.slug] = rescue_invested + cost
+                                    self._diag_rescue_success += 1
+                                    rescue_done = True
+                                    if (st.positions["Up"].qty >= MIN_QTY
+                                            and st.positions["Down"].qty >= MIN_QTY):
+                                        if m.slug not in self._parity_locked_since:
+                                            self._parity_locked_since[m.slug] = time.time()
+                                    write_jsonl({
+                                        "event_type": "RESCUE_TRIGGERED",
+                                        "slug": m.slug, "crypto": m.crypto,
+                                        "pair_id": pair_id,
+                                        "losing_outcome": outcome,
+                                        "rescue_outcome": opposite,
+                                        "step_usd": round(cost, 4),
+                                        "rescue_price": round(rescue_bid, 4),
+                                        "our_leg_price": round(our_leg_price, 4),
+                                        "est_straddle_cost": round(est_straddle_cost, 4),
+                                        "net_edge_cents": round(rescue_net_edge, 3),
+                                        "t_min": round(t_min, 3),
+                                    })
+                            else:
+                                rescue_block_reason = "qty_too_small"
+
+                        if rescue_block_reason is not None:
+                            write_jsonl({
+                                "event_type": "RESCUE_BLOCKED",
+                                "slug": m.slug, "crypto": m.crypto,
+                                "reason": rescue_block_reason,
+                                "outcome": outcome,
+                                "net_edge_cents": round(rescue_net_edge, 3),
+                                "min_edge_used": round(min_edge, 3),
+                                "emergency": emergency,
+                                "t_min": round(t_min, 3),
+                            })
+
+                        # ── FALLBACK: sell ONLY if rescue didn't succeed ──
                         if not rescue_done:
                             # Check for emergency taker conditions
                             emergency_taker = emergency
