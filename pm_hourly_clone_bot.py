@@ -127,6 +127,28 @@ DERISK_CROSS_BPS = 5.0
 DERISK_SELL_FRAC_PER_TICK = 0.35
 DERISK_COOLDOWN_SEC = 10.0      # min seconds between DERISK actions on same position
 DERISK_MID_CHANGE_CENTS = 0.01  # or mid must move >= 1c since last derisk
+# Maker-first DERISK — stop panic taker sells
+DERISK_MAKER_REFRESH_MS = 250          # cancel/replace maker every 250ms
+DERISK_TAKER_EMERGENCY_ONLY = True     # only taker derisk in emergency
+INVENTORY_EMERGENCY_SHARES = 300       # above this = emergency taker derisk
+DERISK_TAKER_EDGE_EXTRA_BPS = 25      # edge must exceed thr+25 for taker derisk
+DERISK_TAKER_EDGE_WORSEN_SEC = 1.0    # edge must be worsening for 1s
+# ---------------------------------------------------------------------------
+# Taker gating — ONLY cross if BOTH conditions met (entry + exit)
+# ---------------------------------------------------------------------------
+TAKER_MAX_SPREAD_CENTS = 1.0           # spread <= 1c
+TAKER_MIN_EDGE_EXTRA_BPS = 12         # abs(edge_bps) >= thr + 12
+# ---------------------------------------------------------------------------
+# Whipsaw / anti-chop filter
+# ---------------------------------------------------------------------------
+ENTRY_MIN_STABLE_SIGN_MS = 400         # delta sign must be stable 400ms
+BLOCK_IF_VEL_OPPOSES = True            # block if velocity opposes delta
+VEL_OPPOSE_THRESHOLD = 2.0            # bps/min threshold for opposition
+# ---------------------------------------------------------------------------
+# No-flip rule — prevent immediate direction reversal
+# ---------------------------------------------------------------------------
+NO_FLIP_COOLDOWN_SEC = 3.0            # don't reverse direction within 3s
+NO_FLIP_OVERRIDE_EXTRA_BPS = 20       # unless edge >= thr + 20
 # Late scalp engine
 LATE_SCALP_ENABLED = True
 LATE_SCALP_T_START = 40.0
@@ -161,17 +183,17 @@ EDGE_K = 0.05    # sigmoid steepness: delta_bps -> P(Up)
 # -----------------------------------------------------------------------------
 PROBE_SIZE_FRAC = 0.25        # probe = max($1, clip * 0.25)
 PROBE_CONFIRM_SEC = 0.3       # 300ms — near-instant confirmation (F247)
-# Duration-based burst engine (f247-style)
-BURST_DURATION_SEC = 3.0          # burst window: up to 3 seconds
-BURST_INTERVAL_MS = 200           # micro-order every 200ms
-BURST_STEP_USD_MIN = 0.25         # micro-order floor (f247 tiny prints)
-BURST_STEP_USD_MAX = 1.00         # micro-order ceiling
+# Count-based burst engine (f247-tuned: less spam, bigger steps)
+BURST_ORDERS = 8                       # max micro-orders per burst
+BURST_INTERVAL_MS = 180                # micro-order every 180ms
+BURST_STEP_USD_MIN = 0.75             # micro-order floor
+BURST_STEP_USD_MAX = 6.00             # micro-order ceiling
+BURST_MIN_EDGE_EXTRA_BPS = 6          # only burst if edge >= thr + 6, else probe only
 BURST_STOP_IF_PRICE_MOVES_CENTS = 0.02  # stop if price moves 2c against us
 BURST_STOP_IF_EDGE_DROPS_BPS = 6.0     # hard edge collapse
 BURST_EDGE_BELOW_HOLD_MS = 500         # edge below threshold must persist 500ms to stop
 BURST_SPREAD_HARD_LIMIT = 0.12         # absolute max spread for any order type
-BURST_CROSS_MAX_SPREAD = 0.01          # cross at ask ONLY when spread <= 1c
-BURST_MAKER_REFRESH_MS = 300           # re-place maker if not filled in 300ms
+BURST_CROSS_MAX_SPREAD = 0.01          # cross at ask ONLY when spread <= 1c (used by taker gate)
 # Dynamic price cap boost
 CAP_BOOST_EDGE_THRESHOLD = 10.0  # edge_bps above which cap starts boosting
 CAP_BOOST_MAX = 0.08             # max +8 cents boost (aggressive chase)
@@ -466,6 +488,30 @@ def persistence_ok(signal_series: List[Tuple[str, bool]]) -> bool:
     except Exception:
         return False
     return oldest_t <= cutoff or len(signal_series) > 10
+
+def taker_gate_allows(spread_cents: float, abs_edge_bps: float, thr_bps: float) -> bool:
+    """Return True only if taker (crossing) is permitted.
+    BOTH conditions must be true: spread <= 1c AND edge >= thr + 12."""
+    return (spread_cents <= TAKER_MAX_SPREAD_CENTS and
+            abs_edge_bps >= thr_bps + TAKER_MIN_EDGE_EXTRA_BPS)
+
+def whipsaw_ok(delta_bps: float, vel: float,
+               edge_sign_since: Optional[float]) -> Tuple[bool, str]:
+    """Return (allowed, block_reason). Blocks entry in chop conditions."""
+    # 1. Sign stability: delta sign must be unchanged for >= ENTRY_MIN_STABLE_SIGN_MS
+    if edge_sign_since is None:
+        return False, "sign_no_history"
+    elapsed_ms = (time.time() - edge_sign_since) * 1000
+    if elapsed_ms < ENTRY_MIN_STABLE_SIGN_MS:
+        return False, f"sign_unstable({elapsed_ms:.0f}ms<{ENTRY_MIN_STABLE_SIGN_MS}ms)"
+    # 2. Velocity alignment: vel must not oppose delta_bps
+    if BLOCK_IF_VEL_OPPOSES and abs(vel) >= VEL_OPPOSE_THRESHOLD:
+        delta_sign = 1 if delta_bps > 0 else -1
+        vel_sign = 1 if vel > 0 else -1
+        if delta_sign != vel_sign:
+            return False, f"vel_opposes(delta={delta_bps:+.1f},vel={vel:+.1f})"
+    return True, ""
+
 # =============================================================================
 # POLYMARKET ADAPTER — wired to real CLOB via py_clob_client + Binance spot
 # =============================================================================
@@ -943,6 +989,20 @@ class Bot:
         self.signal_hist: Dict[str, List[Tuple[str, bool]]] = {}  # slug -> [(ts, valid_signal)]
         self.last_book: Dict[str, Dict[str, BookTop]] = {}  # slug -> outcome -> BookTop
         self.recent_extreme_price: Dict[str, Dict[str, float]] = {} # slug->outcome->extreme
+        # Whipsaw filter: slug -> (current_sign, since_ts)
+        self._edge_sign_state: Dict[str, Tuple[int, float]] = {}
+        # No-flip rule: slug -> (last_outcome, last_ts)
+        self._last_trade_direction: Dict[str, Tuple[str, float]] = {}
+        # Derisk edge worsening tracker: (slug, outcome) -> first_worsen_ts
+        self._derisk_edge_worsen_since: Dict[Tuple[str, str], float] = {}
+        # Per-minute diagnostic counters
+        self._diag_taker_count = 0
+        self._diag_maker_count = 0
+        self._diag_derisk_count = 0
+        self._diag_derisk_taker_count = 0
+        self._diag_blocked_whipsaw = 0
+        self._diag_blocked_taker_gate = 0
+        self._diag_blocked_noflip = 0
         # Probe → Scale state machine: slug -> {state, probe_ts, probe_ask, initial_edge_bps}
         self.entry_sm: Dict[str, dict] = {}   # IDLE / PROBING / SCALING / COOLDOWN
         self.hour_index_counters: Dict[str, int] = {c: 0 for c in CRYPTOS}  # crypto -> monotonic index
@@ -1574,6 +1634,16 @@ class Bot:
             sorted_loops = sorted(self._tempo_loop_times)
             p95_idx = int(len(sorted_loops) * 0.95)
             loop_p95 = round(sorted_loops[min(p95_idx, len(sorted_loops) - 1)], 1)
+        # Diagnostic counters snapshot
+        diag = {
+            "taker_count": self._diag_taker_count,
+            "maker_count": self._diag_maker_count,
+            "derisk_count": self._diag_derisk_count,
+            "derisk_taker_count": self._diag_derisk_taker_count,
+            "blocked_whipsaw": self._diag_blocked_whipsaw,
+            "blocked_taker_gate": self._diag_blocked_taker_gate,
+            "blocked_noflip": self._diag_blocked_noflip,
+        }
         write_jsonl({
             "event_type": "TEMPO_REPORT",
             "per_market": per_market,
@@ -1581,12 +1651,18 @@ class Bot:
             "loop_count": len(self._tempo_loop_times),
             "stale_skip_total": self._stale_skip_total,
             "priority_slugs": list(self._high_priority_slugs),
+            "diagnostics": diag,
         })
         # Print summary to console
         total_fills = sum(v.get("fills_per_min", 0) for v in per_market.values())
         total_intents = sum(v.get("intents_per_min", 0) for v in per_market.values())
         print(f"\n  TEMPO: fills/min={total_fills}  intents/min={total_intents}  "
               f"loop_p95={loop_p95:.1f}ms  stale_skips={self._stale_skip_total}")
+        print(f"  DIAG:  taker={diag['taker_count']}  maker={diag['maker_count']}  "
+              f"derisk={diag['derisk_count']}(taker={diag['derisk_taker_count']})  "
+              f"blocked: whipsaw={diag['blocked_whipsaw']} "
+              f"taker_gate={diag['blocked_taker_gate']} "
+              f"noflip={diag['blocked_noflip']}")
         for slug, info in per_market.items():
             if info["fills_per_min"] > 0 or info["intents_per_min"] > 0:
                 print(f"    {slug[:30]:30s}  fills={info['fills_per_min']:3d}  "
@@ -1598,6 +1674,13 @@ class Bot:
         self._tempo_cache_ages.clear()
         self._tempo_loop_times.clear()
         self._stale_skip_total = 0
+        self._diag_taker_count = 0
+        self._diag_maker_count = 0
+        self._diag_derisk_count = 0
+        self._diag_derisk_taker_count = 0
+        self._diag_blocked_whipsaw = 0
+        self._diag_blocked_taker_gate = 0
+        self._diag_blocked_noflip = 0
 
     def _print_balance_summary(self):
         """Print balance and open positions to console."""
@@ -1814,6 +1897,11 @@ class Bot:
         delta_bps = (spot - hour_open) / hour_open * 10000.0
         abs_delta_bps = abs(delta_bps)
         st.peak_abs_delta_bps = max(st.peak_abs_delta_bps, abs_delta_bps)
+        # Track edge sign stability for whipsaw filter
+        cur_sign = 1 if delta_bps > 0 else (-1 if delta_bps < 0 else 0)
+        prev = self._edge_sign_state.get(m.slug)
+        if prev is None or prev[0] != cur_sign:
+            self._edge_sign_state[m.slug] = (cur_sign, time.time())
         st.delta_hist.append((iso_z(now), delta_bps))
         st.delta_hist = st.delta_hist[-STATE_HIST_MAX:]
         st.price_hist.append((iso_z(now), spot))
@@ -1977,8 +2065,34 @@ class Bot:
                 reduce = clamp(btc_cost / (self.cash_usdc * MAX_COST_PER_CRYPTO_PCT), 0.0, 1.0)
                 clip *= (1.0 - BTC_EXPOSURE_REDUCE_OTHERS * reduce)
 
+        # ---- Whipsaw / anti-chop filter ----
+        whipsaw_blocked = False
+        whipsaw_reason = ""
+        if sig and persist_ok and not cooldown_active and not risk_blocked:
+            edge_sign_entry = self._edge_sign_state.get(m.slug)
+            ws_since = edge_sign_entry[1] if edge_sign_entry else None
+            ws_ok, ws_reason = whipsaw_ok(delta_bps, vel, ws_since)
+            if not ws_ok:
+                whipsaw_blocked = True
+                whipsaw_reason = ws_reason
+                self._diag_blocked_whipsaw += 1
+
+        # ---- No-flip rule: block immediate direction reversal ----
+        noflip_blocked = False
+        noflip_reason = ""
+        if sig and persist_ok and not cooldown_active and not risk_blocked and not whipsaw_blocked:
+            prev_dir = self._last_trade_direction.get(m.slug)
+            if prev_dir is not None:
+                prev_outcome, prev_ts = prev_dir
+                if prev_outcome != outcome and (time.time() - prev_ts) < NO_FLIP_COOLDOWN_SEC:
+                    if abs_delta_bps < thr + NO_FLIP_OVERRIDE_EXTRA_BPS:
+                        noflip_blocked = True
+                        noflip_reason = f"noflip({prev_outcome}->{outcome},{time.time()-prev_ts:.1f}s)"
+                        self._diag_blocked_noflip += 1
+
         # ---- DECISION event ----
-        will_trade = sig and persist_ok and not cooldown_active and not risk_blocked and clip >= MIN_ORDER_USDC
+        will_trade = (sig and persist_ok and not cooldown_active and not risk_blocked
+                      and not whipsaw_blocked and not noflip_blocked and clip >= MIN_ORDER_USDC)
         if will_trade:
             self._tempo_intents[m.slug] = self._tempo_intents.get(m.slug, 0) + 1
         skip_reason = ""
@@ -1994,6 +2108,8 @@ class Bot:
             if sig and not persist_ok: reasons.append("persistence")
             if sig and cooldown_active: reasons.append(f"cooldown({entry_cooldown_sec(m.crypto, t_min):.0f}s)")
             if sig and risk_blocked: reasons.append("risk_cap")
+            if whipsaw_blocked: reasons.append(f"whipsaw({whipsaw_reason})")
+            if noflip_blocked: reasons.append(noflip_reason)
             if sig and persist_ok and not cooldown_active and not risk_blocked and clip < MIN_ORDER_USDC:
                 reasons.append(f"clip_too_small({clip:.2f})")
             skip_reason = "|".join(reasons)
@@ -2053,11 +2169,18 @@ class Bot:
             if clip < MIN_ORDER_USDC:
                 print(f"  [CLIP_FAIL] {m.crypto:5s} clip=${clip:.2f} < min=${MIN_ORDER_USDC}")
                 return
-            # ---- Place PROBE order ----
+            # ---- Place PROBE order (taker-gated) ----
             signal_detect_ts = time.time()
             sm["signal_detect_ts"] = signal_detect_ts
+            # Record trade direction for no-flip rule
+            self._last_trade_direction[m.slug] = (outcome, time.time())
+            # Taker gate: only cross if spread <= 1c AND edge >= thr + 12
+            probe_use_taker = taker_gate_allows(book.spread * 100, abs_delta_bps, thr)
+            if not probe_use_taker:
+                self._diag_blocked_taker_gate += 1
+            probe_price = book.ask if probe_use_taker else book.bid
             probe_usd = max(MIN_ORDER_USDC, clip * PROBE_SIZE_FRAC)
-            probe_qty = probe_usd / max(1e-9, book.ask)
+            probe_qty = probe_usd / max(1e-9, probe_price)
             edge = ctx["edge_up"] if outcome == "Up" else ctx["edge_down"]
             self._hour_edges.append(edge)
             decision_id = new_decision_id()
@@ -2084,11 +2207,16 @@ class Bot:
                           "order_place_ts": order_place_ts,
                           "signal_to_order_ms": round(signal_to_order_ms, 1),
                           "t_min": round(t_min, 3)})
+            probe_mt = "taker" if probe_use_taker else "maker"
+            if probe_use_taker:
+                self._diag_taker_count += 1
+            else:
+                self._diag_maker_count += 1
             self.logger.log_order_intent(
                 engine="CORE", reason="ENTRY_PROBE",
                 decision_id=decision_id, position_id=pos.position_id,
                 crypto=m.crypto, slug=m.slug, outcome=outcome,
-                side="BUY", qty=probe_qty, target_price=book.ask,
+                side="BUY", qty=probe_qty, target_price=probe_price,
                 usdc_cost=probe_usd, ctx=ctx, book_fields=bk_fields,
             )
             self.logger.log_order_submit(
@@ -2096,25 +2224,25 @@ class Bot:
                 decision_id=decision_id, position_id=pos.position_id,
                 client_order_id=client_oid,
                 crypto=m.crypto, slug=m.slug, outcome=outcome,
-                side="BUY", qty=probe_qty, target_price=book.ask,
+                side="BUY", qty=probe_qty, target_price=probe_price,
                 usdc_cost=probe_usd, ctx=ctx, book_fields=bk_fields,
             )
             if MODE == "LOG":
-                self._paper_buy(st, outcome, book.ask, probe_qty, probe_usd)
-                mt = infer_maker_taker("BUY", book.ask, book)
-                sc = spread_capture_fields("BUY", book.ask, book)
+                self._paper_buy(st, outcome, probe_price, probe_qty, probe_usd)
+                mt = probe_mt
+                sc = spread_capture_fields("BUY", probe_price, book)
                 self.logger.log_order_fill(
                     engine="CORE", reason="ENTRY_PROBE",
                     decision_id=decision_id, client_order_id=client_oid,
                     position_id=pos.position_id,
                     crypto=m.crypto, slug=m.slug, outcome=outcome,
-                    side="BUY", qty=probe_qty, fill_price=book.ask,
+                    side="BUY", qty=probe_qty, fill_price=probe_price,
                     usdc_cost=probe_usd, fees_usdc=0.0,
                     maker_taker=mt, did_cross=sc.get("did_cross", ""),
                     vwap=pos.vwap, ctx=ctx, book_fields=bk_fields,
                 )
             else:
-                fill = self._place_layered_buy(m, outcome, probe_qty, book.ask)
+                fill = self._place_layered_buy(m, outcome, probe_qty, probe_price)
                 if fill["total_filled"] > 0:
                     self._live_buy(st, outcome, fill["avg_price"], fill["total_filled"], fill["total_cost"])
                     mt = infer_maker_taker("BUY", fill["avg_price"], book)
@@ -2130,7 +2258,7 @@ class Bot:
                         vwap=pos.vwap, ctx=ctx, book_fields=bk_fields,
                     )
             sm["probe_ts"] = time.time()
-            sm["probe_ask"] = book.ask
+            sm["probe_ask"] = probe_price
             sm["initial_edge_bps"] = edge_bps
             self._sm_transition(m.slug, "PROBING", "probe_placed", ctx)
             return
@@ -2143,14 +2271,20 @@ class Bot:
             if not sig:
                 self._sm_transition(m.slug, "IDLE", "signal_lost_after_probe", ctx)
                 return
-            # Signal still valid → burst scale in background thread
+            # Edge gate: only burst if edge >= thr + BURST_MIN_EDGE_EXTRA_BPS
+            if abs_delta_bps < thr + BURST_MIN_EDGE_EXTRA_BPS:
+                # Edge not strong enough for burst — stay with probe only
+                st.last_entry_ts = iso_z(utc_now())
+                self._sm_transition(m.slug, "COOLDOWN", "probe_only_weak_edge", ctx)
+                return
+            # Signal still valid + strong edge → burst scale in background thread
             self._sm_transition(m.slug, "SCALING", "signal_confirmed", ctx)
-            # Launch burst in background thread so signal loop is not blocked
             burst_ctx = dict(ctx)  # snapshot context
             burst_clip = clip
+            burst_thr = thr  # capture threshold for taker gating inside burst
             def _run_burst():
                 try:
-                    self._execute_burst_buy(m, st, outcome, burst_clip, burst_ctx)
+                    self._execute_burst_buy(m, st, outcome, burst_clip, burst_ctx, burst_thr)
                 finally:
                     st.last_entry_ts = iso_z(utc_now())
                     self._sm_transition(m.slug, "COOLDOWN", "burst_complete", burst_ctx)
@@ -2170,14 +2304,13 @@ class Bot:
     # Burst execution engine
     # -----------------------------------------------------------------
     def _execute_burst_buy(self, m: MarketRef, st: MarketState, outcome: str,
-                           base_clip_usd: float, ctx: dict):
-        """Duration-based burst engine (f247-style).
-        Runs for BURST_DURATION_SEC, placing micro-orders every BURST_INTERVAL_MS.
-        Favors maker at best bid when spread > 1c, crosses at ask when spread <= 1c.
-        Stops early on: edge collapse (sustained 500ms), price move 2c against,
-        per-market max position, bad book, or hard spread limit."""
+                           base_clip_usd: float, ctx: dict, thr_bps: float = 0):
+        """Count-based burst engine (f247-tuned: less spam, bigger steps).
+        Places up to BURST_ORDERS micro-orders every BURST_INTERVAL_MS.
+        Taker-gated: only crosses if spread <= 1c AND abs(edge) >= thr + 12.
+        Otherwise posts maker at best bid. Stops on edge collapse (sustained 500ms),
+        price move 2c against, inventory cap, or hard spread limit."""
         burst_start_ts = time.time()
-        burst_deadline = burst_start_ts + BURST_DURATION_SEC
         up_book, dn_book = ctx["up_book"], ctx["dn_book"]
         book = up_book if outcome == "Up" else dn_book
         initial_mid = book.mid
@@ -2190,16 +2323,16 @@ class Bot:
         maker_count = 0
         taker_count = 0
         stop_reason = ""
-        edge_below_since: Optional[float] = None  # timestamp when edge first dropped
+        edge_below_since: Optional[float] = None
 
         write_jsonl({"event_type": "BURST_START", "slug": m.slug, "crypto": m.crypto,
-                      "outcome": outcome, "duration_sec": BURST_DURATION_SEC,
+                      "outcome": outcome, "burst_orders": BURST_ORDERS,
                       "step_usd_range": f"{BURST_STEP_USD_MIN}-{BURST_STEP_USD_MAX}",
-                      "initial_mid": initial_mid, "t_min": round(ctx["t_min"], 3)})
+                      "initial_mid": initial_mid, "thr_bps": thr_bps,
+                      "t_min": round(ctx["t_min"], 3)})
 
-        order_idx = 0
-        while time.time() < burst_deadline:
-            # ── Freshness gate: do NOT trade on data older than 500ms ──
+        for i in range(BURST_ORDERS):
+            # ── Freshness gate ──
             cache_age = self._cache_age_ms(m.slug)
             if cache_age > BURST_FRESHNESS_MAX_MS:
                 self._submit_market_refresh(m)
@@ -2211,11 +2344,9 @@ class Bot:
                         break
                 if self._cache_age_ms(m.slug) > BURST_FRESHNESS_MAX_MS:
                     write_jsonl({"event_type": "BURST_SKIP_STALE", "slug": m.slug,
-                                  "burst_idx": order_idx,
+                                  "burst_idx": i,
                                   "cache_age_ms": round(self._cache_age_ms(m.slug), 0)})
                     skipped_stale += 1
-                    time.sleep(BURST_INTERVAL_MS / 1000.0)
-                    order_idx += 1
                     continue
 
             # ── Read fresh data from background cache ──
@@ -2232,9 +2363,8 @@ class Bot:
                 break
 
             # ── Stop: price moved 2c against us ──
-            price_move = fresh_book.mid - initial_mid
-            if price_move <= -BURST_STOP_IF_PRICE_MOVES_CENTS:
-                stop_reason = f"price_adverse({price_move:.3f}c)"
+            if fresh_book.mid - initial_mid <= -BURST_STOP_IF_PRICE_MOVES_CENTS:
+                stop_reason = f"price_adverse({fresh_book.mid - initial_mid:.3f}c)"
                 break
 
             # ── Stop: per-market max position ──
@@ -2249,6 +2379,7 @@ class Bot:
                 live_delta_bps = (fresh_spot - fresh_hour_open) / fresh_hour_open * 10000.0
             else:
                 live_delta_bps = ctx["delta_bps"]
+            abs_live_delta = abs(live_delta_bps)
             p_up = _p_up_model(live_delta_bps)
             if outcome == "Up":
                 cur_edge = (p_up - fresh_book.mid) * 10000.0
@@ -2266,29 +2397,28 @@ class Bot:
                 elif (now_t - edge_below_since) * 1000 >= BURST_EDGE_BELOW_HOLD_MS:
                     stop_reason = f"edge_sustained_drop({edge_drop:.1f}bps,{(now_t-edge_below_since)*1000:.0f}ms)"
                     break
-                # Edge is below but not sustained long enough — continue
             else:
-                edge_below_since = None  # reset: edge recovered
+                edge_below_since = None
 
             # ── Stop: hard spread limit ──
             if fresh_book.spread > BURST_SPREAD_HARD_LIMIT:
                 stop_reason = f"spread_hard({fresh_book.spread:.3f}>{BURST_SPREAD_HARD_LIMIT})"
                 break
 
-            # ── Size micro-order: 0.25–1.00 USDC ──
-            this_usd = clamp(base_clip_usd * 0.05, BURST_STEP_USD_MIN, BURST_STEP_USD_MAX)
-            this_qty = this_usd / max(1e-9, fresh_book.ask)
+            # ── Size micro-order: 0.75–6.00 USDC ──
+            this_usd = clamp(base_clip_usd * 0.15, BURST_STEP_USD_MIN, BURST_STEP_USD_MAX)
             decision_id = new_decision_id()
             client_oid = new_order_id()
             bk_fields = self._book_fields(fresh_up_book, fresh_dn_book, outcome)
 
-            # ── Maker vs taker decision ──
-            use_taker = (fresh_book.spread <= BURST_CROSS_MAX_SPREAD)
+            # ── Taker gate: only cross if spread <= 1c AND edge >= thr + 12 ──
+            use_taker = taker_gate_allows(fresh_book.spread * 100, abs_live_delta, thr_bps)
             order_price = fresh_book.ask if use_taker else fresh_book.bid
+            this_qty = this_usd / max(1e-9, order_price)
             order_type = "taker" if use_taker else "maker"
 
             write_jsonl({"event_type": "BURST_MICRO_ORDER", "slug": m.slug,
-                          "burst_idx": order_idx, "usd": round(this_usd, 2),
+                          "burst_idx": i, "usd": round(this_usd, 2),
                           "qty": round(this_qty, 2), "price": order_price,
                           "order_type": order_type,
                           "edge_bps": round(cur_edge, 2), "spread": round(fresh_book.spread, 4),
@@ -2297,7 +2427,7 @@ class Bot:
 
             if MODE == "LOG":
                 self._paper_buy(st, outcome, order_price, this_qty, this_usd)
-                mt = "taker" if use_taker else "maker"
+                mt = order_type
                 sc = spread_capture_fields("BUY", order_price, fresh_book)
                 self.logger.log_order_fill(
                     engine="CORE", reason="ENTRY_BURST",
@@ -2311,14 +2441,8 @@ class Bot:
                 )
                 total_filled_usd += this_usd
                 burst_count += 1
-                if use_taker:
-                    taker_count += 1
-                else:
-                    maker_count += 1
-                # Track fill for tempo diagnostics
-                self._tempo_fills[m.slug] = self._tempo_fills.get(m.slug, 0) + 1
             else:
-                post_only = not use_taker  # maker orders use post_only
+                post_only = not use_taker
                 fill = self.client.place_limit_order(token_id, "BUY", order_price,
                                                      this_qty, post_only=post_only)
                 if fill.get("filled"):
@@ -2338,13 +2462,15 @@ class Bot:
                     )
                     total_filled_usd += fill["fill_price"] * fill["fill_qty"]
                     burst_count += 1
-                    if use_taker:
-                        taker_count += 1
-                    else:
-                        maker_count += 1
-                    self._tempo_fills[m.slug] = self._tempo_fills.get(m.slug, 0) + 1
 
-            order_idx += 1
+            # Track diagnostics
+            if use_taker:
+                taker_count += 1
+                self._diag_taker_count += 1
+            else:
+                maker_count += 1
+                self._diag_maker_count += 1
+            self._tempo_fills[m.slug] = self._tempo_fills.get(m.slug, 0) + 1
             # Sleep between micro-orders
             time.sleep(BURST_INTERVAL_MS / 1000.0)
 
@@ -2352,11 +2478,10 @@ class Bot:
         write_jsonl({"event_type": "BURST_STOP", "slug": m.slug, "crypto": m.crypto,
                       "outcome": outcome, "burst_count": burst_count,
                       "total_filled_usd": round(total_filled_usd, 2),
-                      "stop_reason": stop_reason or "duration_expired",
+                      "stop_reason": stop_reason or "all_orders_done",
                       "burst_duration_ms": round(burst_duration_ms, 1),
                       "skipped_stale": skipped_stale,
                       "maker_count": maker_count, "taker_count": taker_count,
-                      "order_attempts": order_idx,
                       "t_min": round(ctx["t_min"], 3)})
     def _late_scalps(self, ctx: dict):
         m, st = ctx["m"], ctx["st"]
@@ -2511,7 +2636,7 @@ class Bot:
                               "slug": m.slug, "outcome": outcome,
                               "qty": round(pos.qty, 1), "tp_tighten": tp_tighten})
 
-            # --- DERISK with cooldown + change detection ---
+            # --- DERISK with cooldown + change detection (MAKER-FIRST) ---
             derisk_triggered = False
             if outcome == "Up" and delta_bps < +DERISK_CROSS_BPS:
                 derisk_triggered = True
@@ -2535,8 +2660,40 @@ class Bot:
                         if elapsed >= DERISK_COOLDOWN_SEC or mid_moved:
                             should_derisk = True
                     if should_derisk:
-                        self._do_sell(m, st, outcome, qty, book.bid,
-                                      reason="DERISK_REVERSAL", leg="DERISK", ctx=ctx)
+                        self._diag_derisk_count += 1
+                        # Determine: emergency taker or maker-first?
+                        thr = entry_threshold_bps(m.crypto, t_min)
+                        abs_edge = abs(ctx.get("delta_bps", 0))
+                        seconds_to_close = ctx.get("seconds_to_close", 999.0)
+                        emergency_taker = False
+                        if pos.qty >= INVENTORY_EMERGENCY_SHARES:
+                            emergency_taker = True
+                        elif seconds_to_close < 45:
+                            emergency_taker = True
+                        elif abs_edge >= thr + DERISK_TAKER_EDGE_EXTRA_BPS:
+                            # Check if edge has been worsening for >= 1s
+                            wk = (m.slug, outcome)
+                            wt = self._derisk_edge_worsen_since.get(wk)
+                            if wt is None:
+                                self._derisk_edge_worsen_since[wk] = time.time()
+                            elif (time.time() - wt) >= DERISK_TAKER_EDGE_WORSEN_SEC:
+                                emergency_taker = True
+                        else:
+                            self._derisk_edge_worsen_since.pop((m.slug, outcome), None)
+
+                        if emergency_taker and DERISK_TAKER_EMERGENCY_ONLY:
+                            # Emergency: taker sell at bid
+                            self._diag_derisk_taker_count += 1
+                            self._diag_taker_count += 1
+                            self._do_sell(m, st, outcome, qty, book.bid,
+                                          reason="DERISK_EMERGENCY", leg="DERISK", ctx=ctx)
+                        else:
+                            # Maker-first: post sell at bid + 0.001 (maker)
+                            self._diag_maker_count += 1
+                            maker_price = min(book.ask, book.bid + 0.001) if book.bid > 0 else book.bid
+                            self._do_sell(m, st, outcome, qty, maker_price,
+                                          reason="DERISK_MAKER", leg="DERISK", ctx=ctx,
+                                          use_maker=True)
                         pos.last_derisk_ts = iso_z(now_t)
                         pos.last_derisk_mid = book.mid
                 continue
@@ -2593,7 +2750,7 @@ class Bot:
                     pos.scalp_mode = False
     def _do_sell(self, m: MarketRef, st: MarketState, outcome: str, qty: float, price: float,
                  reason: str, leg: str = "EXIT", target_price: Optional[float] = None,
-                 ctx: Optional[dict] = None):
+                 ctx: Optional[dict] = None, use_maker: bool = False):
         qty = max(0.0, qty)
         if qty < MIN_QTY:
             return  # don't sell dust — don't log it either
@@ -2675,7 +2832,7 @@ class Bot:
                     "exit_reason": reason,
                 }, also_csv=True)
             return
-        fill_result = self.client.place_limit_order(token_id, "SELL", price, qty, post_only=False)
+        fill_result = self.client.place_limit_order(token_id, "SELL", price, qty, post_only=use_maker)
         if fill_result.get("filled"):
             actual_qty = fill_result["fill_qty"]
             actual_price = fill_result["fill_price"]
