@@ -209,14 +209,16 @@ PARITY_COOLDOWN_MS = 250                 # min time between parity orders per sl
 PARITY_MAKER_REFRESH_MS = 200            # cancel/replace maker every 200ms
 PARITY_TAKER_ALLOWED_SPREAD_CENTS = 1.0  # allow taker only when spread <= 1c
 # Fee-aware parity edge (CRITICAL)
-MAKER_FEE_BPS = 0.0                      # maker rebate / fee (Polymarket CLOB: 0 maker fee)
-TAKER_FEE_BPS = 2.0                      # taker fee in bps (~2 bps on Polymarket)
+MAKER_FEE_BPS = float(os.getenv("MAKER_FEE_BPS", "0.5"))   # configurable: Poly CLOB ≈0-0.5 bps maker
+TAKER_FEE_BPS = float(os.getenv("TAKER_FEE_BPS", "2.0"))   # configurable: Poly CLOB ≈2 bps taker
 PARITY_BUY_MIN_EDGE_NET_CENTS = 1.0     # min NET edge after fees/slippage to buy straddle
 PARITY_SELL_MIN_EDGE_NET_CENTS = 1.0    # min NET edge after fees/slippage to sell straddle
+PARITY_EDGE_BUFFER_CENTS = 0.25         # safety buffer on top of min edge thresholds
 # Partial-fill protection
 PAIR_FILL_TIMEOUT_MS = 1200              # max time to wait for second leg fill
 # Maker queue discipline (reduce cancel spam)
 MIN_REPLACE_INTERVAL_MS = 200            # min time between cancel/replace on same order
+MAKER_ORDER_TIMEOUT_MS = 3000            # cancel maker order if unfilled after 3s
 # Locked inventory recycle
 LOCKED_MAX_HOLD_SEC = 180                # max seconds to hold locked straddle before recycling
 RECYCLE_MIN_PROFIT_NET_CENTS = 0.5      # min net-of-fee profit to trigger recycle sell
@@ -225,6 +227,10 @@ RECYCLE_STEP_USD = 2.0                   # per-leg sell size during recycle
 MAX_SPREAD_FOR_PARITY_CENTS = 10.0      # block parity if either leg spread > 10c
 MIN_TOP_LIQ_USD = 5.0                   # block parity if best bid/ask size < $5
 PARITY_MAX_CACHE_AGE_MS = 600           # block parity if cache > 600ms stale
+# End-of-hour parity flattening
+PARITY_STOP_NEW_MIN = 57.0              # stop opening NEW parity trades after minute 57
+PARITY_FLATTEN_START_MIN = 59.0         # begin flattening locked + unpaired parity inventory
+PARITY_HARD_FLATTEN_MIN = 59.25         # force taker flatten (if time_to_close<20s or emergency)
 # ---------------------------------------------------------------------------
 # Directional lean overlay (on top of parity, for exits)
 # ---------------------------------------------------------------------------
@@ -1104,6 +1110,13 @@ class Bot:
         self._diag_parity_blocked_stale = 0
         self._diag_parity_blocked_fee = 0
         self._diag_recycle_count = 0
+        # Maker fill-quality metrics
+        self._diag_maker_fill_latencies: List[float] = []   # ms from place->fill per maker order
+        self._diag_maker_timeout_cancel_count = 0
+        self._diag_maker_lost_best_count = 0
+        # End-of-hour flatten counters
+        self._diag_flatten_actions = 0
+        self._diag_flatten_taker = 0
         # Similarity/tempo stats: timestamps of all parity trades this minute
         self._diag_parity_trade_timestamps: List[float] = []
         # Probe → Scale state machine: slug -> {state, probe_ts, probe_ask, initial_edge_bps}
@@ -1590,7 +1603,20 @@ class Bot:
             "hour_start_equity": round(actual_equity, 4),
             "csv_path": self.logger._csv_path,
             "jsonl_path": self.logger._jsonl_path,
+            # Fee model config (logged at startup for audit trail)
+            "maker_fee_bps": MAKER_FEE_BPS,
+            "taker_fee_bps": TAKER_FEE_BPS,
+            "parity_buy_min_edge_net_cents": PARITY_BUY_MIN_EDGE_NET_CENTS,
+            "parity_sell_min_edge_net_cents": PARITY_SELL_MIN_EDGE_NET_CENTS,
+            "parity_edge_buffer_cents": PARITY_EDGE_BUFFER_CENTS,
+            "parity_stop_new_min": PARITY_STOP_NEW_MIN,
+            "parity_flatten_start_min": PARITY_FLATTEN_START_MIN,
+            "parity_hard_flatten_min": PARITY_HARD_FLATTEN_MIN,
         })
+        print(f"  FEE MODEL: maker={MAKER_FEE_BPS}bps taker={TAKER_FEE_BPS}bps "
+              f"buffer={PARITY_EDGE_BUFFER_CENTS}c "
+              f"buy_min_net={PARITY_BUY_MIN_EDGE_NET_CENTS}c "
+              f"sell_min_net={PARITY_SELL_MIN_EDGE_NET_CENTS}c")
         self._last_balance_print = 0.0
         self._last_save_ts = time.time()
 
@@ -1744,6 +1770,15 @@ class Bot:
                           if self._diag_pair_fill_delays else 0.0)
         maker_fill_rate = (self._diag_maker_fills / max(1, self._diag_maker_orders_placed)
                            if self._diag_maker_orders_placed > 0 else 0.0)
+        # Maker fill latency percentiles
+        maker_lat_p50 = 0.0
+        maker_lat_p90 = 0.0
+        if self._diag_maker_fill_latencies:
+            sorted_lat = sorted(self._diag_maker_fill_latencies)
+            p50_idx = len(sorted_lat) // 2
+            p90_idx = int(len(sorted_lat) * 0.9)
+            maker_lat_p50 = sorted_lat[min(p50_idx, len(sorted_lat) - 1)]
+            maker_lat_p90 = sorted_lat[min(p90_idx, len(sorted_lat) - 1)]
         # Similarity/tempo stats
         trade_ts = sorted(self._diag_parity_trade_timestamps)
         paired_trades_per_min = len(trade_ts)
@@ -1791,6 +1826,12 @@ class Bot:
             "blocked_liq": self._diag_parity_blocked_liq,
             "blocked_stale": self._diag_parity_blocked_stale,
             "recycle_count": self._diag_recycle_count,
+            "maker_fill_latency_ms_p50": round(maker_lat_p50, 1),
+            "maker_fill_latency_ms_p90": round(maker_lat_p90, 1),
+            "maker_timeout_cancel_count": self._diag_maker_timeout_cancel_count,
+            "maker_top_of_book_lost_count": self._diag_maker_lost_best_count,
+            "flatten_actions_count": self._diag_flatten_actions,
+            "flatten_taker_count": self._diag_flatten_taker,
         }
         tempo_stats = {
             "paired_trade_ratio": round(paired_ratio, 3),
@@ -1849,9 +1890,18 @@ class Bot:
         print(f"  PAIRS: partial={diag['pair_partial_count']}  "
               f"avg_delay={diag['avg_pair_fill_delay_ms']:.0f}ms  "
               f"unwind=${diag['unpaired_unwind_usd']:.2f}  "
-              f"mkr_fill_rate={diag['maker_fill_rate']:.1%}  "
-              f"cancel_replace={diag['cancel_replace_per_min']}  "
               f"recycle={diag['recycle_count']}")
+        print(f"  MAKER: placed={diag['maker_orders_placed']}  "
+              f"fills={diag['maker_fills']}  "
+              f"rate={diag['maker_fill_rate']:.1%}  "
+              f"lat_p50={diag['maker_fill_latency_ms_p50']:.0f}ms  "
+              f"lat_p90={diag['maker_fill_latency_ms_p90']:.0f}ms  "
+              f"timeout={diag['maker_timeout_cancel_count']}  "
+              f"lost_best={diag['maker_top_of_book_lost_count']}  "
+              f"cancel_rep={diag['cancel_replace_per_min']}")
+        if diag['flatten_actions_count'] > 0:
+            print(f"  FLATTEN: actions={diag['flatten_actions_count']}  "
+                  f"taker={diag['flatten_taker_count']}")
         print(f"  TEMPO: paired_ratio={tempo_stats['paired_trade_ratio']:.1%}  "
               f"paired/min={tempo_stats['paired_trades_per_min']}  "
               f"max_burst={tempo_stats['max_trades_in_one_sec']}/s  "
@@ -1900,6 +1950,11 @@ class Bot:
         self._diag_parity_blocked_liq = 0
         self._diag_parity_blocked_stale = 0
         self._diag_recycle_count = 0
+        self._diag_maker_fill_latencies.clear()
+        self._diag_maker_timeout_cancel_count = 0
+        self._diag_maker_lost_best_count = 0
+        self._diag_flatten_actions = 0
+        self._diag_flatten_taker = 0
         self._diag_parity_trade_timestamps.clear()
 
     def _print_balance_summary(self):
@@ -2207,11 +2262,12 @@ class Bot:
         self._manage_exits(m, st, t_min, delta_bps, ctx)
         # Directional lean exit overlay (unload wrong-side inventory)
         self._directional_lean_exits(m, st, t_min, delta_bps, ctx)
+        # Parity arb engine: runs every tick (handles flattening, pending pairs,
+        # recycle even after TRADE_STOP_ADD_MIN; new-trade gating is internal)
+        self._parity_arb(ctx)
         # stop adding risk after minute 57
         if t_min > TRADE_STOP_ADD_MIN:
             return
-        # Parity arb engine: straddle buy/sell (runs before directional to capture arb)
-        self._parity_arb(ctx)
         # risk gate (market/crypto caps enforced; stop-loss is log-only)
         if not self._risk_ok(st):
             return
@@ -2748,11 +2804,16 @@ class Bot:
         dn_book: BookTop = ctx["dn_book"]
         spot, hour_open = ctx["spot"], ctx["hour_open"]
 
-        # ── Handle pending partial fills first ──
+        # ── Handle pending partial fills first (always, even after stop-new time) ──
         self._parity_handle_pending_pairs(m, st, ctx)
 
         # ── Recycle locked inventory if stale ──
         self._parity_recycle_locked(m, st, ctx)
+
+        # ── End-of-hour flattening (runs even after PARITY_STOP_NEW_MIN) ──
+        if t_min >= PARITY_FLATTEN_START_MIN:
+            self._parity_flatten_eoh(m, st, t_min, ctx)
+            return  # don't open new parity trades while flattening
 
         # ── Compute raw parity metrics ──
         straddle_buy_cost = up_book.ask + dn_book.ask
@@ -2769,6 +2830,10 @@ class Bot:
         ctx["parity_raw_sell_cents"] = raw_sell_edge
         ctx["parity_net_buy_cents"] = buy_net
         ctx["parity_net_sell_cents"] = sell_net
+
+        # ── Stop new parity trades after PARITY_STOP_NEW_MIN ──
+        if t_min >= PARITY_STOP_NEW_MIN:
+            return
 
         # ── Cooldown gate ──
         now_t = time.time()
@@ -2797,8 +2862,9 @@ class Bot:
         # ── Directional lean ──
         lean_up = spot >= hour_open
 
-        # ── BUY CHEAP STRADDLE ──
-        if PARITY_BUY_ENABLED and buy_net >= PARITY_BUY_MIN_EDGE_NET_CENTS:
+        # ── BUY CHEAP STRADDLE (with edge buffer) ──
+        buy_threshold = PARITY_BUY_MIN_EDGE_NET_CENTS + PARITY_EDGE_BUFFER_CENTS
+        if PARITY_BUY_ENABLED and buy_net >= buy_threshold:
             self._diag_parity_buy_signals += 1
 
             if invested >= PARITY_MAX_USD_PER_SLUG:
@@ -2877,7 +2943,9 @@ class Bot:
             return
 
         # ── SELL RICH STRADDLE ──
-        if PARITY_SELL_ENABLED and sell_net >= PARITY_SELL_MIN_EDGE_NET_CENTS:
+        # ── SELL RICH STRADDLE (with edge buffer) ──
+        sell_threshold = PARITY_SELL_MIN_EDGE_NET_CENTS + PARITY_EDGE_BUFFER_CENTS
+        if PARITY_SELL_ENABLED and sell_net >= sell_threshold:
             self._diag_parity_sell_signals += 1
 
             pos_up = st.positions["Up"]
@@ -3121,9 +3189,11 @@ class Bot:
                         leg_usd: float, ctx: dict,
                         pair_id: str = "") -> float:
         """Execute one leg of a parity buy. Returns cost (USDC) of filled order.
-        Uses maker-first: taker only if spread <= 1c. Tracks maker queue discipline."""
+        Uses maker-first: taker only if spread <= 1c. Tracks maker queue discipline
+        including fill latency, timeout cancels, and lost-best-price detection."""
         token_id = m.outcome_up_id if outcome == "Up" else m.outcome_down_id
         pos = st.positions[outcome]
+        placed_ts = time.time()
 
         # Maker/taker decision
         use_taker = (book.spread * 100) <= PARITY_TAKER_ALLOWED_SPREAD_CENTS
@@ -3136,18 +3206,30 @@ class Bot:
             maker_state = self._parity_maker_orders.get(m.slug, {}).get(outcome)
             if maker_state:
                 price_diff = abs(order_price - maker_state.get("price", 0))
-                elapsed = (time.time() - maker_state.get("last_replace_ts", 0)) * 1000
-                if price_diff < 0.005 and elapsed < MIN_REPLACE_INTERVAL_MS:
+                elapsed_ms = (placed_ts - maker_state.get("last_replace_ts", 0)) * 1000
+
+                # Detect: our order is no longer best price (price moved away)
+                if price_diff >= 0.005 and order_price > maker_state.get("price", 0):
+                    self._diag_maker_lost_best_count += 1
+
+                # Detect: maker timeout (unfilled after MAKER_ORDER_TIMEOUT_MS)
+                if elapsed_ms >= MAKER_ORDER_TIMEOUT_MS and not maker_state.get("filled"):
+                    self._diag_maker_timeout_cancel_count += 1
+
+                if price_diff < 0.005 and elapsed_ms < MIN_REPLACE_INTERVAL_MS:
                     # Price hasn't moved enough and interval not met — skip replace
                     return 0.0
-                if price_diff >= 0.005 or elapsed >= MIN_REPLACE_INTERVAL_MS:
+                if price_diff >= 0.005 or elapsed_ms >= MIN_REPLACE_INTERVAL_MS:
                     self._diag_cancel_replace_count += 1
             self._diag_parity_maker_count += 1
             self._diag_maker_orders_placed += 1
-            # Track maker order state
+            # Track maker order state with timestamps
             self._parity_maker_orders.setdefault(m.slug, {})[outcome] = {
                 "price": order_price,
-                "last_replace_ts": time.time(),
+                "last_replace_ts": placed_ts,
+                "placed_ts": placed_ts,
+                "first_not_best_ts": None,
+                "filled": False,
             }
 
         order_qty = leg_usd / max(1e-9, order_price)
@@ -3184,12 +3266,14 @@ class Bot:
             crypto=m.crypto, slug=m.slug, outcome=outcome,
             side="BUY", qty=order_qty, target_price=order_price,
             usdc_cost=leg_usd, ctx=ctx, book_fields=bk_fields,
-            extra={"pair_id": pair_id} if pair_id else None,
+            extra={"pair_id": pair_id, "placed_ts": placed_ts} if pair_id else {"placed_ts": placed_ts},
         )
 
         if MODE == "LOG":
+            fill_ts = time.time()
             self._paper_buy(st, outcome, order_price, order_qty, leg_usd)
             sc = spread_capture_fields("BUY", order_price, book)
+            fill_latency_ms = (fill_ts - placed_ts) * 1000
             self.logger.log_order_fill(
                 engine="PARITY", reason="PARITY_BUY",
                 decision_id=decision_id, client_order_id=client_oid,
@@ -3199,16 +3283,25 @@ class Bot:
                 usdc_cost=leg_usd, fees_usdc=0.0,
                 maker_taker=mt, did_cross=sc.get("did_cross", ""),
                 vwap=pos.vwap, ctx=ctx, book_fields=bk_fields,
+                extra={"placed_ts": placed_ts, "fill_ts": fill_ts,
+                       "fill_latency_ms": round(fill_latency_ms, 1)},
             )
             self._tempo_fills[m.slug] = self._tempo_fills.get(m.slug, 0) + 1
             if mt == "maker":
                 self._diag_maker_fills += 1
+                self._diag_maker_fill_latencies.append(fill_latency_ms)
+                # Mark maker order as filled
+                ms = self._parity_maker_orders.get(m.slug, {}).get(outcome)
+                if ms:
+                    ms["filled"] = True
             return leg_usd
         else:
             post_only = not use_taker
             fill = self.client.place_limit_order(token_id, "BUY", order_price,
                                                   order_qty, post_only=post_only)
+            fill_ts = time.time()
             if fill.get("filled"):
+                fill_latency_ms = (fill_ts - placed_ts) * 1000
                 actual_cost = fill["fill_price"] * fill["fill_qty"]
                 self._live_buy(st, outcome, fill["fill_price"], fill["fill_qty"], actual_cost)
                 sc = spread_capture_fields("BUY", fill["fill_price"], book)
@@ -3222,12 +3315,125 @@ class Bot:
                     usdc_cost=actual_cost, fees_usdc=0.0,
                     maker_taker=actual_mt, did_cross=sc.get("did_cross", ""),
                     vwap=pos.vwap, ctx=ctx, book_fields=bk_fields,
+                    extra={"placed_ts": placed_ts, "fill_ts": fill_ts,
+                           "fill_latency_ms": round(fill_latency_ms, 1)},
                 )
                 self._tempo_fills[m.slug] = self._tempo_fills.get(m.slug, 0) + 1
                 if actual_mt == "maker":
                     self._diag_maker_fills += 1
+                    self._diag_maker_fill_latencies.append(fill_latency_ms)
+                    ms = self._parity_maker_orders.get(m.slug, {}).get(outcome)
+                    if ms:
+                        ms["filled"] = True
                 return actual_cost
             return 0.0
+
+    # =================================================================
+    # END-OF-HOUR PARITY FLATTENING
+    # =================================================================
+    def _parity_flatten_eoh(self, m: MarketRef, st: MarketState,
+                             t_min: float, ctx: dict):
+        """Flatten all parity (locked + unpaired) inventory as hour ends.
+        PARITY_FLATTEN_START_MIN..PARITY_HARD_FLATTEN_MIN: maker-first with 200ms refresh.
+        After PARITY_HARD_FLATTEN_MIN: taker if time_to_close<20s or emergency inventory."""
+        up_book: BookTop = ctx["up_book"]
+        dn_book: BookTop = ctx["dn_book"]
+        seconds_to_close = ctx.get("seconds_to_close", 999.0)
+        hard_mode = t_min >= PARITY_HARD_FLATTEN_MIN
+
+        for outcome in ["Up", "Down"]:
+            pos = st.positions[outcome]
+            if pos.qty < MIN_QTY:
+                continue
+            book = up_book if outcome == "Up" else dn_book
+            if book.bid <= 0:
+                continue
+
+            # Determine maker vs taker
+            allow_taker = False
+            if hard_mode:
+                if seconds_to_close < 20.0:
+                    allow_taker = True
+                elif pos.qty >= INVENTORY_EMERGENCY_SHARES:
+                    allow_taker = True
+            spread_ok = (book.spread * 100) <= PARITY_TAKER_ALLOWED_SPREAD_CENTS
+            use_taker = allow_taker and spread_ok
+
+            # Maker queue discipline: respect MIN_REPLACE_INTERVAL_MS
+            if not use_taker:
+                maker_state = self._parity_maker_orders.get(m.slug, {}).get(outcome)
+                if maker_state:
+                    elapsed_ms = (time.time() - maker_state.get("last_replace_ts", 0)) * 1000
+                    price_diff = abs(book.bid - maker_state.get("price", 0))
+                    if price_diff < 0.005 and elapsed_ms < PARITY_MAKER_REFRESH_MS:
+                        continue  # not time to replace yet
+
+            # Sell quantity: in hard mode, sell everything; otherwise step-based
+            if hard_mode:
+                sell_qty = pos.qty
+            else:
+                sell_qty = min(pos.qty, RECYCLE_STEP_USD / max(1e-9, book.bid))
+            if sell_qty < MIN_QTY:
+                continue
+
+            if use_taker:
+                sell_price = book.bid
+                self._diag_flatten_taker += 1
+                self._diag_parity_taker_count += 1
+            else:
+                sell_price = max(book.bid, book.ask - 0.001)
+                self._diag_parity_maker_count += 1
+                # Update maker order tracking
+                self._parity_maker_orders.setdefault(m.slug, {})[outcome] = {
+                    "price": book.bid,
+                    "last_replace_ts": time.time(),
+                    "placed_ts": time.time(),
+                    "first_not_best_ts": None,
+                    "filled": False,
+                }
+
+            self._diag_flatten_actions += 1
+            flatten_reason = "PARITY_HARD_FLATTEN" if hard_mode else "PARITY_FLATTEN"
+
+            self._do_sell(m, st, outcome, sell_qty, sell_price,
+                          reason=flatten_reason, leg="PARITY_FLATTEN",
+                          ctx=ctx, use_maker=not use_taker)
+
+            write_jsonl({"event_type": flatten_reason,
+                          "slug": m.slug, "crypto": m.crypto,
+                          "outcome": outcome, "sell_qty": round(sell_qty, 1),
+                          "sell_price": round(sell_price, 4),
+                          "use_taker": use_taker,
+                          "seconds_to_close": round(seconds_to_close, 1),
+                          "t_min": round(t_min, 3)})
+
+        # Also flatten any pending partial fills by unwinding
+        resolved = []
+        for i, pair in enumerate(self._parity_pending_pairs):
+            if pair["slug"] != m.slug:
+                continue
+            filled_book = up_book if pair["filled_outcome"] == "Up" else dn_book
+            pos = st.positions[pair["filled_outcome"]]
+            unwind_qty = min(pair.get("filled_qty", 0), pos.qty)
+            if unwind_qty >= MIN_QTY and filled_book.bid > 0:
+                use_taker_unwind = hard_mode and (seconds_to_close < 20.0 or spread_ok)
+                unwind_price = filled_book.bid if use_taker_unwind else max(filled_book.bid, filled_book.ask - 0.001)
+                self._do_sell(m, st, pair["filled_outcome"], unwind_qty, unwind_price,
+                              reason="PARITY_FLATTEN_UNPAIRED", leg="PARITY_FLATTEN",
+                              ctx=ctx, use_maker=not use_taker_unwind)
+                self._diag_flatten_actions += 1
+                if use_taker_unwind:
+                    self._diag_flatten_taker += 1
+            resolved.append(i)
+        for idx in sorted(resolved, reverse=True):
+            self._parity_pending_pairs.pop(idx)
+
+        # Clear locked tracking if fully flat
+        up_q = st.positions["Up"].qty
+        dn_q = st.positions["Down"].qty
+        if up_q < MIN_QTY and dn_q < MIN_QTY:
+            self._parity_locked_since.pop(m.slug, None)
+            self._parity_invested_usd.pop(m.slug, None)
 
     # =================================================================
     # DIRECTIONAL LEAN EXIT OVERLAY
