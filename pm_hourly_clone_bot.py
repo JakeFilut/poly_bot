@@ -256,13 +256,14 @@ ADVERSE_ACCEL_BPS_PER_MIN = 40.0        # velocity threshold to escalate degrade
 # ---------------------------------------------------------------------------
 FAST_CLONE = bool(os.getenv("FAST_CLONE", "True") not in ("", "0", "False", "false"))
 # One-sided auto-hedge — faster escalation than unpaired management
-HEDGE_TICK1_MS = 250                    # +1 tick after 250ms
-HEDGE_TICK2_MS = 500                    # +2 ticks after 500ms
-HEDGE_CROSS_MS = 800                    # taker cross after 800ms (normal)
-HEDGE_EARLY_CROSS_MS = 400             # taker cross after 400ms if edge is good
-HEDGE_MIN_CROSS_EDGE_CENTS = 0.5       # min net edge for normal taker cross
-HEDGE_EARLY_CROSS_EDGE_CENTS = 0.25    # min net edge for early taker cross (400ms)
+HEDGE_TICK1_MS = 200                    # +1 tick after 200ms
+HEDGE_TICK2_MS = 350                    # +3 ticks after 350ms
+HEDGE_EARLY_CROSS_MS = 500             # taker cross after 500ms (primary completion)
+HEDGE_CROSS_MS = 800                    # taker cross after 800ms (fallback)
+HEDGE_MIN_CROSS_EDGE_CENTS = 0.5       # min net edge for taker cross (both early+late)
+HEDGE_EARLY_CROSS_EDGE_CENTS = 0.5     # min net edge for early taker cross (500ms)
 HEDGE_MAX_CROSS_SPREAD_CENTS = 2.0     # max spread for taker cross (cents)
+HEDGE_STALE_CACHE_MS = 450.0           # block hedge actions if cache > 450ms
 # ---------------------------------------------------------------------------
 # Imbalance caps — keep net exposure near neutral (F247 style)
 # ---------------------------------------------------------------------------
@@ -320,10 +321,10 @@ if FAST_CLONE:
     PARITY_MAKER_REFRESH_MS = 120
     QUOTE_UNPAIRED_ESCALATE_AFTER_MS = 250
     QUOTE_UNPAIRED_MAX_SEC = 2.0
-    HEDGE_TICK1_MS = 250
-    HEDGE_TICK2_MS = 500
+    HEDGE_TICK1_MS = 200
+    HEDGE_TICK2_MS = 350
+    HEDGE_EARLY_CROSS_MS = 500
     HEDGE_CROSS_MS = 800
-    HEDGE_EARLY_CROSS_MS = 400
 # =============================================================================
 # UTIL / LOGGING — thin wrappers around Logger instance
 # =============================================================================
@@ -1246,12 +1247,24 @@ class Bot:
         self._diag_hedge_tick1 = 0
         self._diag_hedge_tick2 = 0
         self._diag_hedge_cross = 0
+        self._diag_hedge_cross_early = 0
+        self._diag_hedge_cross_late = 0
+        self._diag_hedge_skipped_stale = 0
         self._diag_hedge_unwind = 0
         # ── Pair fill tracker: pair_id -> {slug, crypto, fills: {outcome: fill_ts}} ──
         self._pair_tracker: Dict[str, dict] = {}
         self._diag_pairs_completed = 0
+        self._diag_pairs_completed_500ms = 0
         self._diag_pairs_completed_1500ms = 0
         self._diag_pairs_completed_10s = 0
+        # ── Per-slug pair completion KPI ──
+        self._diag_slug_unpaired_events: Dict[str, int] = {}
+        self._diag_slug_paired_500ms: Dict[str, int] = {}
+        self._diag_slug_paired_1500ms: Dict[str, int] = {}
+        self._diag_slug_timeouts: Dict[str, int] = {}
+        # ── Pending fetch streak tracking ──
+        self._diag_pending_fetch_streak: Dict[str, int] = {}
+        self._diag_pending_fetch_streak_max: int = 0
         # ── F247 similarity / CLONE_REPORT tracking ──
         # pair delays: list of ms between Up and Down fills for same slug
         self._clone_pair_delays: List[float] = []
@@ -1856,10 +1869,21 @@ class Bot:
                     # Track starvation: if pending for > BG_REFRESH_STARVE_CYCLES
                     if self._pending_fetches.get(slug):
                         self._bg_pending_cycles[slug] = self._bg_pending_cycles.get(slug, 0) + 1
-                        if self._bg_pending_cycles.get(slug, 0) > BG_REFRESH_STARVE_CYCLES:
+                        pending_streak = self._bg_pending_cycles.get(slug, 0)
+                        # Track pending fetch streak per slug and global max
+                        self._diag_pending_fetch_streak[slug] = max(
+                            self._diag_pending_fetch_streak.get(slug, 0), pending_streak)
+                        self._diag_pending_fetch_streak_max = max(
+                            self._diag_pending_fetch_streak_max, pending_streak)
+                        if pending_streak > BG_REFRESH_STARVE_CYCLES:
                             # Starved: previous fetch is still in-flight after N cycles
-                            # Don't re-submit (already in-flight), but track the miss
                             self._bg_refresh_miss_count[slug] = self._bg_refresh_miss_count.get(slug, 0) + 1
+                            # Priority resubmit: if pending > 2 cycles, force re-submit
+                            # (cancel stale future, re-queue with priority)
+                            self._pending_fetches.pop(slug, None)
+                            self._bg_pending_cycles[slug] = 0
+                            self._submit_market_refresh(m)
+                            self._bg_next_due[slug] = now_ts + interval_sec
                         continue
 
                     # Deadline scheduling: submit if past due
@@ -2227,6 +2251,9 @@ class Bot:
         self._diag_hedge_tick1 = 0
         self._diag_hedge_tick2 = 0
         self._diag_hedge_cross = 0
+        self._diag_hedge_cross_early = 0
+        self._diag_hedge_cross_late = 0
+        self._diag_hedge_skipped_stale = 0
         self._diag_hedge_unwind = 0
 
     def _emit_clone_report(self):
@@ -2234,9 +2261,12 @@ class Bot:
         import statistics
 
         # ── 1. Paired straddle metrics (from _pair_tracker via _record_pair_fill) ──
+        pairs_within_500ms = self._diag_pairs_completed_500ms
         pairs_within_1500ms = self._diag_pairs_completed_1500ms
         pairs_within_10s = self._diag_pairs_completed_10s
         total_pairs = self._diag_pairs_completed
+        paired_500ms_ratio = (pairs_within_500ms / max(1, total_pairs)
+                              if total_pairs > 0 else 0.0)
         paired_straddle_ratio = (pairs_within_1500ms / max(1, total_pairs)
                                  if total_pairs > 0 else 0.0)
         paired_10s_ratio = (pairs_within_10s / max(1, total_pairs)
@@ -2324,26 +2354,31 @@ class Bot:
                 sf = sorted(fetch_durs)
                 bf_p50 = sf[len(sf) // 2]
                 bf_p90 = sf[min(int(len(sf) * 0.9), len(sf) - 1)]
-            # Per-slug pair completion from _pair_tracker and _clone_pair_delays
-            # (global pair delays, not per-slug — approximate from total)
-            slug_pairs = sum(1 for pid, info in self._pair_tracker.items()
-                             if info.get("slug") == slug
-                             and "Up" in info["fills"] and "Down" in info["fills"])
+            # Per-slug pair completion KPI
+            slug_unpaired = self._diag_slug_unpaired_events.get(slug, 0)
+            slug_p500 = self._diag_slug_paired_500ms.get(slug, 0)
+            slug_p1500 = self._diag_slug_paired_1500ms.get(slug, 0)
+            slug_timeouts = self._diag_slug_timeouts.get(slug, 0)
             # Refresh misses
             refresh_misses = self._bg_refresh_miss_count.get(slug, 0)
+            # Pending fetch streak
+            slug_fetch_streak = self._diag_pending_fetch_streak.get(slug, 0)
             # Hedge cross rate: crosses / (crosses + unwinds) for this window
-            # (global — per-slug would need more tracking, so use global for now)
             hedge_total = self._diag_hedge_cross + self._diag_hedge_unwind
             hedge_cross_rate = self._diag_hedge_cross / max(1, hedge_total)
 
-            if ca_p90 > 0 or bf_p90 > 0 or slug_pairs > 0 or refresh_misses > 0:
+            if ca_p90 > 0 or bf_p90 > 0 or slug_p500 > 0 or slug_p1500 > 0 or refresh_misses > 0:
                 per_slug_kpi[slug] = {
                     "cache_age_p50_ms": round(ca_p50, 0),
                     "cache_age_p90_ms": round(ca_p90, 0),
                     "bg_fetch_p50_ms": round(bf_p50, 0),
                     "bg_fetch_p90_ms": round(bf_p90, 0),
                     "refresh_miss_count": refresh_misses,
-                    "pairs_completed": slug_pairs,
+                    "unpaired_events": slug_unpaired,
+                    "paired_within_500ms": slug_p500,
+                    "paired_within_1500ms": slug_p1500,
+                    "timeouts": slug_timeouts,
+                    "pending_fetch_streak": slug_fetch_streak,
                     "hedge_cross_rate": round(hedge_cross_rate, 3),
                 }
 
@@ -2358,8 +2393,10 @@ class Bot:
             "ts_ms": int(time.time() * 1000),
             # Pair metrics
             "pairs_completed": total_pairs,
+            "pairs_within_500ms": pairs_within_500ms,
             "pairs_within_1500ms": pairs_within_1500ms,
             "pairs_within_10s": pairs_within_10s,
+            "paired_within_500ms_ratio": round(paired_500ms_ratio, 3),
             "paired_straddle_ratio_1500ms": round(paired_straddle_ratio, 3),
             "paired_straddle_ratio_10s": round(paired_10s_ratio, 3),
             "median_pair_fill_delay_ms": round(med_pair_delay_ms, 1),
@@ -2380,7 +2417,11 @@ class Bot:
             "hedge_tick1": self._diag_hedge_tick1,
             "hedge_tick2": self._diag_hedge_tick2,
             "hedge_cross": self._diag_hedge_cross,
+            "hedge_cross_early_count": self._diag_hedge_cross_early,
+            "hedge_cross_late_count": self._diag_hedge_cross_late,
+            "hedge_skipped_stale_count": self._diag_hedge_skipped_stale,
             "hedge_unwind": self._diag_hedge_unwind,
+            "pending_fetch_streak_max": self._diag_pending_fetch_streak_max,
             # Hold time
             "hold_time_p50_sec": round(hold_p50, 1),
             "hold_time_p90_sec": round(hold_p90, 1),
@@ -2403,8 +2444,9 @@ class Bot:
 
         # Console print
         print(f"  CLONE: pairs={total_pairs}  "
-              f"ratio_1.5s={paired_straddle_ratio:.0%}  "
-              f"ratio_10s={paired_10s_ratio:.0%}  "
+              f"r500={paired_500ms_ratio:.0%}  "
+              f"r1.5s={paired_straddle_ratio:.0%}  "
+              f"r10s={paired_10s_ratio:.0%}  "
               f"delay={med_pair_delay_ms:.0f}ms  "
               f"gap={med_inter_pair_ms:.0f}ms  "
               f"sig2fill={med_signal_to_fill_ms:.0f}ms")
@@ -2417,8 +2459,11 @@ class Bot:
               f"queue_p90={queue_p90:.0f}ms")
         print(f"  HEDGE: tick1={self._diag_hedge_tick1}  "
               f"tick2={self._diag_hedge_tick2}  "
-              f"cross={self._diag_hedge_cross}  "
-              f"unwind={self._diag_hedge_unwind}")
+              f"cross_early={self._diag_hedge_cross_early}  "
+              f"cross_late={self._diag_hedge_cross_late}  "
+              f"stale_skip={self._diag_hedge_skipped_stale}  "
+              f"unwind={self._diag_hedge_unwind}  "
+              f"fetch_streak={self._diag_pending_fetch_streak_max}")
         print(f"  HOLD: p50={hold_p50:.0f}s  p90={hold_p90:.0f}s  "
               f"active_p50={active_hold_p50:.0f}s  locked={len(active_hold_secs)}")
         print(f"  IMBAL: max={global_max_imbalance:.0f}  "
@@ -2430,11 +2475,13 @@ class Bot:
         # Per-slug KPI line
         if per_slug_kpi:
             for slug, kpi in per_slug_kpi.items():
-                if kpi["cache_age_p90_ms"] > 0 or kpi["pairs_completed"] > 0:
+                if kpi["cache_age_p90_ms"] > 0 or kpi.get("paired_within_500ms", 0) > 0 or kpi.get("paired_within_1500ms", 0) > 0:
                     print(f"    KPI {slug[:25]:25s}  "
                           f"ca_p90={kpi['cache_age_p90_ms']:.0f}ms  "
                           f"bg_p90={kpi['bg_fetch_p90_ms']:.0f}ms  "
-                          f"pairs={kpi['pairs_completed']}  "
+                          f"p500={kpi.get('paired_within_500ms', 0)}  "
+                          f"p1500={kpi.get('paired_within_1500ms', 0)}  "
+                          f"tout={kpi.get('timeouts', 0)}  "
                           f"miss={kpi['refresh_miss_count']}  "
                           f"hcross={kpi['hedge_cross_rate']:.0%}")
         # Reset clone-specific counters (per-minute)
@@ -2445,8 +2492,15 @@ class Bot:
         self._diag_top_of_book_time_ms = 0.0
         self._diag_top_of_book_total_ms = 0.0
         self._diag_pairs_completed = 0
+        self._diag_pairs_completed_500ms = 0
         self._diag_pairs_completed_1500ms = 0
         self._diag_pairs_completed_10s = 0
+        self._diag_slug_unpaired_events.clear()
+        self._diag_slug_paired_500ms.clear()
+        self._diag_slug_paired_1500ms.clear()
+        self._diag_slug_timeouts.clear()
+        self._diag_pending_fetch_streak.clear()
+        self._diag_pending_fetch_streak_max = 0
         self._diag_max_imbalance.clear()
         self._diag_imbalance_delta_samples.clear()
         # Reset clone-dedicated lifecycle counters
@@ -3751,8 +3805,12 @@ class Bot:
             delay_ms = abs(up_ts - dn_ts) * 1000
             self._clone_pair_delays.append(delay_ms)
             self._diag_pairs_completed += 1
+            if delay_ms <= 500:
+                self._diag_pairs_completed_500ms += 1
+                self._diag_slug_paired_500ms[slug] = self._diag_slug_paired_500ms.get(slug, 0) + 1
             if delay_ms <= 1500:
                 self._diag_pairs_completed_1500ms += 1
+                self._diag_slug_paired_1500ms[slug] = self._diag_slug_paired_1500ms.get(slug, 0) + 1
             if delay_ms <= 10000:
                 self._diag_pairs_completed_10s += 1
             # Inter-pair gap
@@ -4097,11 +4155,15 @@ class Bot:
 
     def _quote_manage_unpaired(self, m: MarketRef, st: MarketState,
                                 ctx: dict, now_t: float):
-        """Auto-hedge unpaired fills: fast escalation (+1 tick at 250ms,
-        +2 ticks at 500ms, taker cross at 800ms), then unwind+pause."""
+        """Auto-hedge unpaired fills: fast escalation (+1 tick at 200ms,
+        +3 ticks at 350ms, early cross at 500ms, late cross at 800ms),
+        then unwind+pause. Stale cache (>450ms) blocks all hedge actions."""
         unpaired = self._quote_unpaired.get(m.slug)
         if unpaired is None:
             return
+
+        # Track unpaired event per slug
+        self._diag_slug_unpaired_events[m.slug] = self._diag_slug_unpaired_events.get(m.slug, 0) + 1
 
         # If both legs now balanced, clear hedge state
         up_q = st.positions["Up"].qty
@@ -4129,6 +4191,24 @@ class Bot:
             "early_cross_done": False, "cross_done": False,
         })
 
+        # ── Stale cache guard: block all hedge actions if cache > 450ms ──
+        cache_age = self._cache_age_ms(m.slug)
+        if cache_age > HEDGE_STALE_CACHE_MS:
+            self._diag_hedge_skipped_stale += 1
+            # Force immediate refresh for this slug
+            if not self._pending_fetches.get(m.slug):
+                for mkt in self._cached_markets:
+                    if mkt.slug == m.slug:
+                        self._submit_market_refresh(mkt)
+                        self._bg_next_due[m.slug] = now_t + 0.1
+                        break
+            write_jsonl({"event_type": "HEDGE_SKIPPED_STALE",
+                          "ts_ms": int(now_t * 1000),
+                          "slug": m.slug, "crypto": m.crypto,
+                          "cache_age_ms": round(cache_age, 0),
+                          "age_ms": round(age_ms, 0)})
+            return  # Do NOT escalate/cross on stale data
+
         # Compute net edge for escalation decisions
         our_filled_price = st.positions[filled_outcome].vwap
         fee_cents = 2 * MAKER_FEE_BPS / 100.0
@@ -4140,7 +4220,7 @@ class Bot:
             edge_c = (1.000 - est_combined) * 100 - fee_cents
             return edge_c >= target_edge * 0.3, edge_c
 
-        # ── Tick 1 escalation: +1 tick at HEDGE_TICK1_MS ──
+        # ── Tick 1 escalation: +1 tick at HEDGE_TICK1_MS (200ms) ──
         if age_ms >= HEDGE_TICK1_MS and not hedge["tick1_done"] and missing_book.bid > 0:
             esc_price = clamp_to_tick(missing_book.bid + 0.001)
             ok, edge_c = _edge_ok(esc_price)
@@ -4164,11 +4244,12 @@ class Bot:
                           "slug": m.slug, "crypto": m.crypto,
                           "missing_outcome": missing_outcome,
                           "age_ms": round(age_ms, 0),
+                          "cache_age_ms": round(cache_age, 0),
                           "edge_cents": round(edge_c, 3)})
 
-        # ── Tick 2 escalation: +2 ticks at HEDGE_TICK2_MS ──
+        # ── Tick 2 escalation: +3 ticks at HEDGE_TICK2_MS (350ms) ──
         if age_ms >= HEDGE_TICK2_MS and not hedge["tick2_done"] and missing_book.bid > 0:
-            esc_price = clamp_to_tick(missing_book.bid + 0.002)
+            esc_price = clamp_to_tick(missing_book.bid + 0.003)
             ok, edge_c = _edge_ok(esc_price)
             if ok and esc_price < missing_book.ask:
                 leg_usd = min(dynamic_step_usd,
@@ -4190,9 +4271,10 @@ class Bot:
                           "slug": m.slug, "crypto": m.crypto,
                           "missing_outcome": missing_outcome,
                           "age_ms": round(age_ms, 0),
+                          "cache_age_ms": round(cache_age, 0),
                           "edge_cents": round(edge_c, 3)})
 
-        # ── Early taker cross: at HEDGE_EARLY_CROSS_MS if edge >= 0.25c and spread <= 2c ──
+        # ── Early taker cross: at HEDGE_EARLY_CROSS_MS (500ms) — primary completion ──
         if (age_ms >= HEDGE_EARLY_CROSS_MS and not hedge.get("early_cross_done")
                 and not hedge["cross_done"] and missing_book.ask > 0):
             cross_price = missing_book.ask
@@ -4209,19 +4291,21 @@ class Bot:
                         pair_id=uuid.uuid4().hex[:16])
                     if cost > 0:
                         self._diag_hedge_cross += 1
+                        self._diag_hedge_cross_early += 1
                         self._diag_quote_orders_placed += 1
-                        hedge["cross_done"] = True  # skip normal cross too
-                        write_jsonl({"event_type": "HEDGE_EARLY_CROSS",
+                        hedge["cross_done"] = True  # skip late cross too
+                        write_jsonl({"event_type": "HEDGE_CROSS_EARLY",
                                       "ts_ms": int(now_t * 1000),
                                       "slug": m.slug, "crypto": m.crypto,
                                       "missing_outcome": missing_outcome,
                                       "cross_price": round(cross_price, 4),
                                       "edge_cents": round(edge_c, 3),
                                       "spread_cents": round(spread_cents, 2),
+                                      "cache_age_ms": round(cache_age, 0),
                                       "age_ms": round(age_ms, 0)})
             hedge["early_cross_done"] = True
 
-        # ── Taker cross: at HEDGE_CROSS_MS if edge >= 0.5c and spread <= 2c ──
+        # ── Late taker cross: at HEDGE_CROSS_MS (800ms) — fallback completion ──
         if age_ms >= HEDGE_CROSS_MS and not hedge["cross_done"] and missing_book.ask > 0:
             cross_price = missing_book.ask
             spread_cents = (missing_book.ask - missing_book.bid) * 100 if missing_book.bid > 0 else 999
@@ -4237,14 +4321,16 @@ class Bot:
                         pair_id=uuid.uuid4().hex[:16])
                     if cost > 0:
                         self._diag_hedge_cross += 1
+                        self._diag_hedge_cross_late += 1
                         self._diag_quote_orders_placed += 1
-                        write_jsonl({"event_type": "HEDGE_CROSS",
+                        write_jsonl({"event_type": "HEDGE_CROSS_LATE",
                                       "ts_ms": int(now_t * 1000),
                                       "slug": m.slug, "crypto": m.crypto,
                                       "missing_outcome": missing_outcome,
                                       "cross_price": round(cross_price, 4),
                                       "edge_cents": round(edge_c, 3),
                                       "spread_cents": round(spread_cents, 2),
+                                      "cache_age_ms": round(cache_age, 0),
                                       "age_ms": round(age_ms, 0)})
             else:
                 # Edge collapsed — unwind the filled leg
@@ -4254,6 +4340,7 @@ class Bot:
                               "filled_outcome": filled_outcome,
                               "edge_cents": round(edge_c, 3),
                               "spread_cents": round(spread_cents, 2),
+                              "cache_age_ms": round(cache_age, 0),
                               "age_ms": round(age_ms, 0)})
             hedge["cross_done"] = True
 
@@ -4271,6 +4358,7 @@ class Bot:
                     self._diag_hedge_unwind += 1
             self._quote_paused_until[m.slug] = now_t + QUOTE_PAUSE_AFTER_UNPAIRED_SEC
             self._diag_quote_pause_count += 1
+            self._diag_slug_timeouts[m.slug] = self._diag_slug_timeouts.get(m.slug, 0) + 1
             self._quote_unpaired.pop(m.slug, None)
             self._hedge_state.pop(m.slug, None)
             write_jsonl({"event_type": "QUOTE_UNPAIRED_TIMEOUT",
