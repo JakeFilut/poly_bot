@@ -371,7 +371,8 @@ class Logger:
                              delta_bps, abs_delta_bps, vel, z,
                              up_bid, up_ask, up_mid, up_spread, up_imb,
                              dn_bid, dn_ask, dn_mid, dn_spread, dn_imb,
-                             pos_qty_up, pos_qty_down, cash_usdc, equity_usdc):
+                             pos_qty_up, pos_qty_down, cash_usdc, equity_usdc,
+                             parity_edge_buy_cents=0.0, parity_edge_sell_cents=0.0):
         self._write_jsonl({
             "event_type": "SNAPSHOT_COMPACT",
             "slug": slug, "crypto": crypto,
@@ -385,6 +386,8 @@ class Logger:
             "dn_mid": round(dn_mid, 4), "dn_spread": round(dn_spread, 4), "dn_imb": round(dn_imb, 3),
             "pos_qty_up": round(pos_qty_up, 10), "pos_qty_down": round(pos_qty_down, 10),
             "cash_usdc": round(cash_usdc, 2), "equity_usdc": round(equity_usdc, 2),
+            "parity_edge_buy_cents": round(parity_edge_buy_cents, 3),
+            "parity_edge_sell_cents": round(parity_edge_sell_cents, 3),
         })
 
     def log_snapshot_on_change(self, *, slug, crypto, trigger, t_min, delta_bps,

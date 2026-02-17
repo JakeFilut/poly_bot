@@ -198,6 +198,23 @@ BURST_CROSS_MAX_SPREAD = 0.01          # cross at ask ONLY when spread <= 1c (us
 CAP_BOOST_EDGE_THRESHOLD = 10.0  # edge_bps above which cap starts boosting
 CAP_BOOST_MAX = 0.08             # max +8 cents boost (aggressive chase)
 CAP_BOOST_EDGE_FULL = 30.0       # edge_bps at which full boost is applied
+# ---------------------------------------------------------------------------
+# Parity (straddle) arbitrage engine — Up + Down ≈ 1.000
+# ---------------------------------------------------------------------------
+PARITY_BUY_ENABLED = True                # buy cheap straddle (up_ask + dn_ask < 1)
+PARITY_SELL_ENABLED = True               # sell rich straddle (up_bid + dn_bid > 1)
+PARITY_BUY_MIN_EDGE_CENTS = 1.5         # must be at least 1.5c cheap to buy straddle
+PARITY_SELL_MIN_EDGE_CENTS = 1.5        # must be at least 1.5c rich to sell straddle
+PARITY_MAX_USD_PER_SLUG = 40.0          # max total straddle investment per slug
+PARITY_STEP_USD = 2.00                   # per-leg size per parity order
+PARITY_COOLDOWN_MS = 250                 # min time between parity orders per slug
+PARITY_MAKER_REFRESH_MS = 200            # cancel/replace maker every 200ms
+PARITY_TAKER_ALLOWED_SPREAD_CENTS = 1.0  # allow taker only when spread <= 1c
+# ---------------------------------------------------------------------------
+# Directional lean overlay (on top of parity, for exits)
+# ---------------------------------------------------------------------------
+LEAN_EXIT_PRIORITY = True                # prioritize exits on "wrong" side
+LEAN_MAX_IMBALANCE_SHARES = 80           # cap how unbalanced Up vs Down can get
 # Spread rule relaxation
 SPREAD_RELAXED_MAX = 0.12         # 12 cents during burst (F247 tolerant)
 # Fast take-profit — skim faster than before
@@ -1003,6 +1020,16 @@ class Bot:
         self._diag_blocked_whipsaw = 0
         self._diag_blocked_taker_gate = 0
         self._diag_blocked_noflip = 0
+        # Parity arb tracking
+        self._parity_last_order_ts: Dict[str, float] = {}    # slug -> last parity order timestamp
+        self._parity_invested_usd: Dict[str, float] = {}     # slug -> total parity investment
+        # Per-minute parity diagnostics
+        self._diag_parity_buy_signals = 0
+        self._diag_parity_sell_signals = 0
+        self._diag_parity_trades = 0
+        self._diag_parity_edges: List[float] = []            # cents captured per trade
+        self._diag_parity_maker_count = 0
+        self._diag_parity_taker_count = 0
         # Probe → Scale state machine: slug -> {state, probe_ts, probe_ask, initial_edge_bps}
         self.entry_sm: Dict[str, dict] = {}   # IDLE / PROBING / SCALING / COOLDOWN
         self.hour_index_counters: Dict[str, int] = {c: 0 for c in CRYPTOS}  # crypto -> monotonic index
@@ -1635,6 +1662,8 @@ class Bot:
             p95_idx = int(len(sorted_loops) * 0.95)
             loop_p95 = round(sorted_loops[min(p95_idx, len(sorted_loops) - 1)], 1)
         # Diagnostic counters snapshot
+        avg_parity_edge = (sum(self._diag_parity_edges) / len(self._diag_parity_edges)
+                           if self._diag_parity_edges else 0.0)
         diag = {
             "taker_count": self._diag_taker_count,
             "maker_count": self._diag_maker_count,
@@ -1643,7 +1672,27 @@ class Bot:
             "blocked_whipsaw": self._diag_blocked_whipsaw,
             "blocked_taker_gate": self._diag_blocked_taker_gate,
             "blocked_noflip": self._diag_blocked_noflip,
+            "parity_buy_signals": self._diag_parity_buy_signals,
+            "parity_sell_signals": self._diag_parity_sell_signals,
+            "parity_trades": self._diag_parity_trades,
+            "parity_avg_edge_cents": round(avg_parity_edge, 3),
+            "parity_maker_count": self._diag_parity_maker_count,
+            "parity_taker_count": self._diag_parity_taker_count,
         }
+        # Per-slug inventory imbalance
+        inv_imbalance = {}
+        for slug, st in self.market_states.items():
+            up_qty = st.positions["Up"].qty
+            dn_qty = st.positions["Down"].qty
+            if up_qty >= MIN_QTY or dn_qty >= MIN_QTY:
+                inv_imbalance[slug] = {
+                    "up_qty": round(up_qty, 1),
+                    "dn_qty": round(dn_qty, 1),
+                    "up_vwap": round(st.positions["Up"].vwap, 4),
+                    "dn_vwap": round(st.positions["Down"].vwap, 4),
+                    "imbalance": round(up_qty - dn_qty, 1),
+                    "straddle_locked": round(min(up_qty, dn_qty), 1),
+                }
         write_jsonl({
             "event_type": "TEMPO_REPORT",
             "per_market": per_market,
@@ -1652,6 +1701,7 @@ class Bot:
             "stale_skip_total": self._stale_skip_total,
             "priority_slugs": list(self._high_priority_slugs),
             "diagnostics": diag,
+            "inventory_imbalance": inv_imbalance,
         })
         # Print summary to console
         total_fills = sum(v.get("fills_per_min", 0) for v in per_market.values())
@@ -1663,6 +1713,18 @@ class Bot:
               f"blocked: whipsaw={diag['blocked_whipsaw']} "
               f"taker_gate={diag['blocked_taker_gate']} "
               f"noflip={diag['blocked_noflip']}")
+        print(f"  PARITY: buy_sig={diag['parity_buy_signals']}  "
+              f"sell_sig={diag['parity_sell_signals']}  "
+              f"trades={diag['parity_trades']}  "
+              f"avg_edge={diag['parity_avg_edge_cents']:.2f}c  "
+              f"maker={diag['parity_maker_count']}  "
+              f"taker={diag['parity_taker_count']}")
+        if inv_imbalance:
+            for slug, inv in inv_imbalance.items():
+                print(f"    INV {slug[:30]:30s}  Up={inv['up_qty']:5.0f}  "
+                      f"Dn={inv['dn_qty']:5.0f}  "
+                      f"imbal={inv['imbalance']:+5.0f}  "
+                      f"locked={inv['straddle_locked']:.0f}")
         for slug, info in per_market.items():
             if info["fills_per_min"] > 0 or info["intents_per_min"] > 0:
                 print(f"    {slug[:30]:30s}  fills={info['fills_per_min']:3d}  "
@@ -1681,6 +1743,12 @@ class Bot:
         self._diag_blocked_whipsaw = 0
         self._diag_blocked_taker_gate = 0
         self._diag_blocked_noflip = 0
+        self._diag_parity_buy_signals = 0
+        self._diag_parity_sell_signals = 0
+        self._diag_parity_trades = 0
+        self._diag_parity_edges.clear()
+        self._diag_parity_maker_count = 0
+        self._diag_parity_taker_count = 0
 
     def _print_balance_summary(self):
         """Print balance and open positions to console."""
@@ -1739,6 +1807,8 @@ class Bot:
                 self.entry_sm.pop(slug, None)
                 self._data_cache.pop(slug, None)
                 self._pending_fetches.pop(slug, None)
+                self._parity_last_order_ts.pop(slug, None)
+                self._parity_invested_usd.pop(slug, None)
                 continue
             # Determine winner by checking final Binance price vs hour open
             # spot here = next hour's opening price (close proxy for the prior hour)
@@ -1824,6 +1894,8 @@ class Bot:
             self.entry_sm.pop(slug, None)
             self._data_cache.pop(slug, None)
             self._pending_fetches.pop(slug, None)
+            self._parity_last_order_ts.pop(slug, None)
+            self._parity_invested_usd.pop(slug, None)
     def _get_markets(self) -> List[MarketRef]:
         # In practice: discover the current hour markets
         return self.client.get_current_hour_markets()
@@ -1920,6 +1992,11 @@ class Bot:
         ctx = self._make_tick_ctx(m, st, spot, hour_open, t_min, delta_bps, abs_delta_bps,
                                   vel, z, up_book, dn_book)
         ctx["ts_snapshot"] = ts_snapshot
+        # ── Parity metrics (computed every tick, used by parity arb engine) ──
+        ctx["straddle_buy_cost"] = up_book.ask + dn_book.ask
+        ctx["straddle_sell_value"] = up_book.bid + dn_book.bid
+        ctx["parity_edge_buy_cents"] = (1.000 - ctx["straddle_buy_cost"]) * 100
+        ctx["parity_edge_sell_cents"] = (ctx["straddle_sell_value"] - 1.000) * 100
         # ── SNAPSHOT_COMPACT (every SNAPSHOT_INTERVAL_SEC per market) ──
         pos_up_qty = st.positions["Up"].qty
         pos_dn_qty = st.positions["Down"].qty
@@ -1936,6 +2013,8 @@ class Bot:
                 dn_spread=dn_book.spread, dn_imb=dn_book.imb,
                 pos_qty_up=pos_up_qty, pos_qty_down=pos_dn_qty,
                 cash_usdc=self.cash_usdc, equity_usdc=equity,
+                parity_edge_buy_cents=ctx["parity_edge_buy_cents"],
+                parity_edge_sell_cents=ctx["parity_edge_sell_cents"],
             )
         # ── SNAPSHOT_ON_CHANGE (only when significant changes happen) ──
         snap_dict = {
@@ -1961,9 +2040,13 @@ class Bot:
         ctx.update(risk_fields)
         # manage exits first (inventory recycling)
         self._manage_exits(m, st, t_min, delta_bps, ctx)
+        # Directional lean exit overlay (unload wrong-side inventory)
+        self._directional_lean_exits(m, st, t_min, delta_bps, ctx)
         # stop adding risk after minute 57
         if t_min > TRADE_STOP_ADD_MIN:
             return
+        # Parity arb engine: straddle buy/sell (runs before directional to capture arb)
+        self._parity_arb(ctx)
         # risk gate (market/crypto caps enforced; stop-loss is log-only)
         if not self._risk_ok(st):
             return
@@ -2483,6 +2566,308 @@ class Bot:
                       "skipped_stale": skipped_stale,
                       "maker_count": maker_count, "taker_count": taker_count,
                       "t_min": round(ctx["t_min"], 3)})
+
+    # =================================================================
+    # PARITY (STRADDLE) ARBITRAGE ENGINE
+    # =================================================================
+    def _parity_arb(self, ctx: dict):
+        """Parity arbitrage: buy cheap straddle (up_ask+dn_ask < 1) or sell rich
+        straddle (up_bid+dn_bid > 1). Uses maker-first execution with cancel/replace.
+        Directional lean overlay adjusts exit priority based on spot vs hour_open."""
+        m, st = ctx["m"], ctx["st"]
+        t_min = ctx["t_min"]
+        up_book: BookTop = ctx["up_book"]
+        dn_book: BookTop = ctx["dn_book"]
+        spot, hour_open = ctx["spot"], ctx["hour_open"]
+        delta_bps = ctx["delta_bps"]
+
+        # ── Compute parity metrics ──
+        straddle_buy_cost = up_book.ask + dn_book.ask
+        straddle_sell_value = up_book.bid + dn_book.bid
+        parity_edge_buy_cents = (1.000 - straddle_buy_cost) * 100
+        parity_edge_sell_cents = (straddle_sell_value - 1.000) * 100
+
+        # ── Cooldown gate ──
+        now_t = time.time()
+        last_ts = self._parity_last_order_ts.get(m.slug, 0.0)
+        if (now_t - last_ts) * 1000 < PARITY_COOLDOWN_MS:
+            return
+
+        # ── Investment cap gate ──
+        invested = self._parity_invested_usd.get(m.slug, 0.0)
+
+        # ── Directional lean: determine "correct" side ──
+        lean_up = spot >= hour_open  # up trend → prefer holding Up
+
+        # ── BUY CHEAP STRADDLE ──
+        if PARITY_BUY_ENABLED and parity_edge_buy_cents >= PARITY_BUY_MIN_EDGE_CENTS:
+            self._diag_parity_buy_signals += 1
+
+            if invested >= PARITY_MAX_USD_PER_SLUG:
+                return  # cap reached
+
+            # Check books are valid
+            if up_book.ask <= 0 or dn_book.ask <= 0 or up_book.bid <= 0 or dn_book.bid <= 0:
+                return
+
+            # Check directional lean imbalance cap
+            pos_up = st.positions["Up"]
+            pos_dn = st.positions["Down"]
+            imbalance = abs(pos_up.qty - pos_dn.qty)
+            if imbalance >= LEAN_MAX_IMBALANCE_SHARES:
+                # Only allow if adding to the "behind" side would reduce imbalance
+                # (straddle adds to both, so this is ok unless already at cap)
+                pass  # straddle adds equal to both, so imbalance stays same
+
+            # Size each leg
+            leg_usd = min(PARITY_STEP_USD, (PARITY_MAX_USD_PER_SLUG - invested) / 2.0)
+            if leg_usd < MIN_ORDER_USDC:
+                return
+
+            # Execute paired orders: BUY Up + BUY Down
+            up_filled = self._parity_buy_leg(m, st, "Up", up_book, leg_usd, ctx)
+            dn_filled = self._parity_buy_leg(m, st, "Down", dn_book, leg_usd, ctx)
+
+            total_cost = up_filled + dn_filled
+            if total_cost > 0:
+                self._parity_invested_usd[m.slug] = invested + total_cost
+                self._parity_last_order_ts[m.slug] = time.time()
+                self._diag_parity_trades += 1
+                self._diag_parity_edges.append(parity_edge_buy_cents)
+
+                write_jsonl({"event_type": "PARITY_BUY_STRADDLE",
+                              "slug": m.slug, "crypto": m.crypto,
+                              "straddle_buy_cost": round(straddle_buy_cost, 4),
+                              "parity_edge_buy_cents": round(parity_edge_buy_cents, 2),
+                              "up_cost": round(up_filled, 4),
+                              "dn_cost": round(dn_filled, 4),
+                              "total_invested": round(invested + total_cost, 2),
+                              "t_min": round(t_min, 3)})
+            return
+
+        # ── SELL RICH STRADDLE ──
+        if PARITY_SELL_ENABLED and parity_edge_sell_cents >= PARITY_SELL_MIN_EDGE_CENTS:
+            self._diag_parity_sell_signals += 1
+
+            pos_up = st.positions["Up"]
+            pos_dn = st.positions["Down"]
+
+            # Must have inventory on both sides to sell straddle
+            if pos_up.qty < MIN_QTY or pos_dn.qty < MIN_QTY:
+                return
+
+            # Check books valid
+            if up_book.bid <= 0 or dn_book.bid <= 0:
+                return
+
+            # Size: sell min(STEP, available) from each leg
+            sell_up_usd = min(PARITY_STEP_USD, pos_up.qty * up_book.bid)
+            sell_dn_usd = min(PARITY_STEP_USD, pos_dn.qty * dn_book.bid)
+            sell_usd = min(sell_up_usd, sell_dn_usd)  # keep legs balanced
+            if sell_usd < MIN_ORDER_USDC:
+                return
+
+            # Directional lean: if lean_up, sell Down first (prioritize unwinding wrong side)
+            if LEAN_EXIT_PRIORITY:
+                sell_order = [("Down", dn_book), ("Up", up_book)] if lean_up else [("Up", up_book), ("Down", dn_book)]
+            else:
+                sell_order = [("Up", up_book), ("Down", dn_book)]
+
+            total_proceeds = 0.0
+            for outcome, book in sell_order:
+                sell_qty = sell_usd / max(1e-9, book.bid)
+                pos = st.positions[outcome]
+                sell_qty = min(sell_qty, pos.qty)
+                if sell_qty < MIN_QTY:
+                    continue
+
+                # Maker/taker decision
+                use_taker = (book.spread * 100) <= PARITY_TAKER_ALLOWED_SPREAD_CENTS
+                sell_price = book.bid  # always sell at bid (or post at ask-1tick for maker)
+                if not use_taker:
+                    sell_price = max(book.bid, book.ask - 0.001)  # maker: post near ask
+                    self._diag_parity_maker_count += 1
+                else:
+                    self._diag_parity_taker_count += 1
+
+                self._do_sell(m, st, outcome, sell_qty, sell_price,
+                              reason="PARITY_SELL_STRADDLE", leg="PARITY_SELL",
+                              ctx=ctx, use_maker=not use_taker)
+                total_proceeds += sell_qty * sell_price
+
+            if total_proceeds > 0:
+                self._parity_last_order_ts[m.slug] = time.time()
+                self._diag_parity_trades += 1
+                self._diag_parity_edges.append(parity_edge_sell_cents)
+
+                # Reduce invested tracking
+                self._parity_invested_usd[m.slug] = max(0.0, invested - total_proceeds)
+
+                write_jsonl({"event_type": "PARITY_SELL_STRADDLE",
+                              "slug": m.slug, "crypto": m.crypto,
+                              "straddle_sell_value": round(straddle_sell_value, 4),
+                              "parity_edge_sell_cents": round(parity_edge_sell_cents, 2),
+                              "total_proceeds": round(total_proceeds, 4),
+                              "remaining_invested": round(self._parity_invested_usd.get(m.slug, 0), 2),
+                              "t_min": round(t_min, 3)})
+
+    def _parity_buy_leg(self, m: MarketRef, st: MarketState,
+                        outcome: str, book: BookTop,
+                        leg_usd: float, ctx: dict) -> float:
+        """Execute one leg of a parity buy. Returns cost (USDC) of filled order.
+        Uses maker-first: taker only if spread <= 1c."""
+        token_id = m.outcome_up_id if outcome == "Up" else m.outcome_down_id
+        pos = st.positions[outcome]
+
+        # Maker/taker decision
+        use_taker = (book.spread * 100) <= PARITY_TAKER_ALLOWED_SPREAD_CENTS
+        if use_taker:
+            order_price = book.ask
+            self._diag_parity_taker_count += 1
+        else:
+            order_price = book.bid  # post at best bid (maker)
+            self._diag_parity_maker_count += 1
+
+        order_qty = leg_usd / max(1e-9, order_price)
+        if order_qty < 1:
+            return 0.0
+
+        decision_id = new_decision_id()
+        client_oid = new_order_id()
+        if pos.position_id is None:
+            pos.position_id = new_position_id()
+            pos.trade_id = uuid.uuid4().hex
+            pos.entry_decision_id = decision_id
+            pos.parent_order_id = client_oid
+            pos.entry_mid = book.mid
+            pos.max_favorable_mid = book.mid
+            pos.max_adverse_mid = book.mid
+
+        up_book = ctx["up_book"]
+        dn_book = ctx["dn_book"]
+        bk_fields = self._book_fields(up_book, dn_book, outcome)
+        mt = "taker" if use_taker else "maker"
+
+        self.logger.log_order_intent(
+            engine="PARITY", reason="PARITY_BUY",
+            decision_id=decision_id, position_id=pos.position_id,
+            crypto=m.crypto, slug=m.slug, outcome=outcome,
+            side="BUY", qty=order_qty, target_price=order_price,
+            usdc_cost=leg_usd, ctx=ctx, book_fields=bk_fields,
+        )
+        self.logger.log_order_submit(
+            engine="PARITY", reason="PARITY_BUY",
+            decision_id=decision_id, position_id=pos.position_id,
+            client_order_id=client_oid,
+            crypto=m.crypto, slug=m.slug, outcome=outcome,
+            side="BUY", qty=order_qty, target_price=order_price,
+            usdc_cost=leg_usd, ctx=ctx, book_fields=bk_fields,
+        )
+
+        if MODE == "LOG":
+            self._paper_buy(st, outcome, order_price, order_qty, leg_usd)
+            sc = spread_capture_fields("BUY", order_price, book)
+            self.logger.log_order_fill(
+                engine="PARITY", reason="PARITY_BUY",
+                decision_id=decision_id, client_order_id=client_oid,
+                position_id=pos.position_id,
+                crypto=m.crypto, slug=m.slug, outcome=outcome,
+                side="BUY", qty=order_qty, fill_price=order_price,
+                usdc_cost=leg_usd, fees_usdc=0.0,
+                maker_taker=mt, did_cross=sc.get("did_cross", ""),
+                vwap=pos.vwap, ctx=ctx, book_fields=bk_fields,
+            )
+            self._tempo_fills[m.slug] = self._tempo_fills.get(m.slug, 0) + 1
+            return leg_usd
+        else:
+            post_only = not use_taker
+            fill = self.client.place_limit_order(token_id, "BUY", order_price,
+                                                  order_qty, post_only=post_only)
+            if fill.get("filled"):
+                actual_cost = fill["fill_price"] * fill["fill_qty"]
+                self._live_buy(st, outcome, fill["fill_price"], fill["fill_qty"], actual_cost)
+                sc = spread_capture_fields("BUY", fill["fill_price"], book)
+                self.logger.log_order_fill(
+                    engine="PARITY", reason="PARITY_BUY",
+                    decision_id=decision_id, client_order_id=client_oid,
+                    position_id=pos.position_id,
+                    crypto=m.crypto, slug=m.slug, outcome=outcome,
+                    side="BUY", qty=fill["fill_qty"], fill_price=fill["fill_price"],
+                    usdc_cost=actual_cost, fees_usdc=0.0,
+                    maker_taker=infer_maker_taker("BUY", fill["fill_price"], book),
+                    did_cross=sc.get("did_cross", ""),
+                    vwap=pos.vwap, ctx=ctx, book_fields=bk_fields,
+                )
+                self._tempo_fills[m.slug] = self._tempo_fills.get(m.slug, 0) + 1
+                return actual_cost
+            return 0.0
+
+    # =================================================================
+    # DIRECTIONAL LEAN EXIT OVERLAY
+    # =================================================================
+    def _directional_lean_exits(self, m: MarketRef, st: MarketState,
+                                 t_min: float, delta_bps: float, ctx: dict):
+        """Directional lean: prioritize exits on the "wrong" side of spot vs hour_open.
+        If spot > hour_open (up trend): unload Down inventory first.
+        If spot < hour_open (down trend): unload Up inventory first.
+        Only applies to imbalanced positions."""
+        if not LEAN_EXIT_PRIORITY:
+            return
+        spot, hour_open = ctx["spot"], ctx["hour_open"]
+        lean_up = spot >= hour_open
+
+        pos_up = st.positions["Up"]
+        pos_dn = st.positions["Down"]
+        imbalance = pos_up.qty - pos_dn.qty  # positive = more Up than Down
+
+        # Determine which side to preferentially exit
+        if lean_up:
+            # Up trend: prefer holding Up, unload excess Down
+            wrong_side = "Down"
+            wrong_pos = pos_dn
+            right_pos = pos_up
+        else:
+            # Down trend: prefer holding Down, unload excess Up
+            wrong_side = "Up"
+            wrong_pos = pos_up
+            right_pos = pos_dn
+
+        # Only act if we have "wrong side" inventory exceeding the right side
+        if wrong_pos.qty < MIN_QTY:
+            return
+
+        book = self.last_book.get(m.slug, {}).get(wrong_side)
+        if not book or book.bid <= 0:
+            return
+
+        # Sell excess on wrong side to bring closer to balance
+        excess = wrong_pos.qty - right_pos.qty
+        if excess <= 0:
+            return  # already balanced or right-side heavy
+
+        # Sell up to LEAN_MAX_IMBALANCE_SHARES reduction, but at most 25% of wrong-side
+        sell_qty = min(excess, wrong_pos.qty * 0.25, float(LEAN_MAX_IMBALANCE_SHARES))
+        if sell_qty < MIN_QTY:
+            return
+
+        # Only sell if we're profitable on this side (don't force a loss)
+        if book.bid < wrong_pos.vwap:
+            return
+
+        # Use maker when spread > 1c
+        use_taker = (book.spread * 100) <= PARITY_TAKER_ALLOWED_SPREAD_CENTS
+        sell_price = book.bid if use_taker else max(book.bid, book.ask - 0.001)
+
+        write_jsonl({"event_type": "LEAN_EXIT", "slug": m.slug, "crypto": m.crypto,
+                      "wrong_side": wrong_side, "sell_qty": round(sell_qty, 1),
+                      "imbalance": round(pos_up.qty - pos_dn.qty, 1),
+                      "lean": "Up" if lean_up else "Down",
+                      "t_min": round(t_min, 3)})
+
+        self._do_sell(m, st, wrong_side, sell_qty, sell_price,
+                      reason="LEAN_EXIT", leg="LEAN_EXIT",
+                      ctx=ctx, use_maker=not use_taker)
+
     def _late_scalps(self, ctx: dict):
         m, st = ctx["m"], ctx["st"]
         t_min = ctx["t_min"]
