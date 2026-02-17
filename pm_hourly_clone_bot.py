@@ -260,6 +260,11 @@ HEDGE_CROSS_MS = 800                    # taker cross after 800ms
 HEDGE_MIN_CROSS_EDGE_CENTS = 0.5       # min net edge for taker cross
 HEDGE_MAX_CROSS_SPREAD_CENTS = 2.0     # max spread for taker cross (cents)
 # ---------------------------------------------------------------------------
+# Imbalance caps — keep net exposure near neutral (F247 style)
+# ---------------------------------------------------------------------------
+IMBALANCE_CAP_SHARES = 30              # hard cap: abs(up_qty - dn_qty) per slug
+IMBALANCE_SOFT_CAP_SHARES = 20         # soft cap: start reducing new orders above this
+# ---------------------------------------------------------------------------
 # Derisk RESCUE-TO-STRADDLE — convert losing one-sided to straddle
 # ---------------------------------------------------------------------------
 DERISK_RESCUE_TO_STRADDLE = True
@@ -270,7 +275,7 @@ RESCUE_STEP_USD = 2.0                    # per-order size for rescue buys
 # Directional lean overlay (on top of parity, for exits)
 # ---------------------------------------------------------------------------
 LEAN_EXIT_PRIORITY = True                # prioritize exits on "wrong" side
-LEAN_MAX_IMBALANCE_SHARES = 80           # cap how unbalanced Up vs Down can get
+LEAN_MAX_IMBALANCE_SHARES = 30           # cap how unbalanced Up vs Down can get (align with IMBALANCE_CAP_SHARES)
 # Spread rule relaxation
 SPREAD_RELAXED_MAX = 0.12         # 12 cents during burst (F247 tolerant)
 # Fast take-profit — skim faster than before
@@ -1226,6 +1231,11 @@ class Bot:
         self._diag_hedge_tick2 = 0
         self._diag_hedge_cross = 0
         self._diag_hedge_unwind = 0
+        # ── Pair fill tracker: pair_id -> {slug, crypto, fills: {outcome: fill_ts}} ──
+        self._pair_tracker: Dict[str, dict] = {}
+        self._diag_pairs_completed = 0
+        self._diag_pairs_completed_1500ms = 0
+        self._diag_pairs_completed_10s = 0
         # ── F247 similarity / CLONE_REPORT tracking ──
         # pair delays: list of ms between Up and Down fills for same slug
         self._clone_pair_delays: List[float] = []
@@ -1236,6 +1246,12 @@ class Bot:
         self._clone_signal_to_fill: List[float] = []
         # Track last significant spot move per slug: slug -> (ts, spot)
         self._clone_last_spot_move: Dict[str, Tuple[float, float]] = {}
+        # Hold time tracking: list of hold durations (seconds) for completed straddle cycles
+        self._clone_hold_times: List[float] = []
+        # Per-slug max imbalance tracker for analytics: slug -> max_abs_imbalance this minute
+        self._diag_max_imbalance: Dict[str, float] = {}
+        # Per-slug imbalance x delta samples: list of (imbalance_shares, delta_bps)
+        self._diag_imbalance_delta_samples: List[Tuple[float, float]] = []
         # Probe → Scale state machine: slug -> {state, probe_ts, probe_ask, initial_edge_bps}
         self.entry_sm: Dict[str, dict] = {}   # IDLE / PROBING / SCALING / COOLDOWN
         self.hour_index_counters: Dict[str, int] = {c: 0 for c in CRYPTOS}  # crypto -> monotonic index
@@ -1923,9 +1939,11 @@ class Bot:
             inter_trade_ms.append((trade_ts[j] - trade_ts[j - 1]) * 1000)
         median_inter_trade_ms = (sorted(inter_trade_ms)[len(inter_trade_ms) // 2]
                                   if inter_trade_ms else 0.0)
-        # Paired trade ratio = parity trades / total fills
+        # Paired trade ratio = pair completions / total individual fills
         total_fills_all = sum(v.get("fills_per_min", 0) for v in per_market.values())
-        paired_ratio = (self._diag_parity_trades / max(1, total_fills_all))
+        # Each pair completion = 2 fills, so ratio = 2*pairs / total_fills
+        paired_ratio = (2 * self._diag_pairs_completed / max(1, total_fills_all)
+                        if total_fills_all > 0 else 0.0)
         # Maker ratio = maker / (maker + taker) across parity
         total_parity_mt = self._diag_parity_maker_count + self._diag_parity_taker_count
         maker_ratio = (self._diag_parity_maker_count / max(1, total_parity_mt))
@@ -2150,14 +2168,19 @@ class Bot:
         self._diag_hedge_unwind = 0
 
     def _emit_clone_report(self):
-        """Emit F247 similarity metrics every minute."""
+        """Emit F247 similarity metrics + 4 analytics every minute."""
         import statistics
-        # paired_straddle_ratio: pairs completed within 1.5s / total quote fills
-        pairs_within_1500ms = sum(1 for d in self._clone_pair_delays if d <= 1500)
-        total_pairs = len(self._clone_pair_delays)
-        paired_straddle_ratio = (pairs_within_1500ms / total_pairs
+
+        # ── 1. Paired straddle metrics (from _pair_tracker via _record_pair_fill) ──
+        pairs_within_1500ms = self._diag_pairs_completed_1500ms
+        pairs_within_10s = self._diag_pairs_completed_10s
+        total_pairs = self._diag_pairs_completed
+        paired_straddle_ratio = (pairs_within_1500ms / max(1, total_pairs)
                                  if total_pairs > 0 else 0.0)
-        # median pair fill delay
+        paired_10s_ratio = (pairs_within_10s / max(1, total_pairs)
+                            if total_pairs > 0 else 0.0)
+
+        # median pair fill delay (Up vs Down fill timestamps)
         med_pair_delay_ms = (statistics.median(self._clone_pair_delays)
                              if self._clone_pair_delays else 0.0)
         # median time between pairs (burstiness)
@@ -2166,7 +2189,7 @@ class Bot:
         # signal-to-fill latency
         med_signal_to_fill_ms = (statistics.median(self._clone_signal_to_fill)
                                  if self._clone_signal_to_fill else 0.0)
-        # maker queue time percentiles
+        # maker queue time percentiles (submit_ts -> fill_ts)
         queue_p50 = 0.0
         queue_p90 = 0.0
         if self._diag_maker_queue_times:
@@ -2175,55 +2198,133 @@ class Bot:
             p90_idx = int(len(sorted_qt) * 0.9)
             queue_p50 = sorted_qt[min(p50_idx, len(sorted_qt) - 1)]
             queue_p90 = sorted_qt[min(p90_idx, len(sorted_qt) - 1)]
-        # top-of-book time pct
-        tob_pct = (self._diag_top_of_book_time_ms /
-                   max(1.0, self._diag_top_of_book_total_ms)
-                   if self._diag_top_of_book_total_ms > 0 else 0.0)
 
+        # ── 2. Hold time distribution for paired inventory ──
+        hold_p50 = 0.0
+        hold_p90 = 0.0
+        if self._clone_hold_times:
+            sorted_ht = sorted(self._clone_hold_times)
+            hold_p50 = sorted_ht[len(sorted_ht) // 2]
+            hold_p90 = sorted_ht[int(len(sorted_ht) * 0.9)]
+        # Also compute current hold times from active locked positions
+        active_hold_secs = []
+        now_t = time.time()
+        for slug, ls_ts in self._parity_locked_since.items():
+            active_hold_secs.append(now_t - ls_ts)
+        active_hold_p50 = (statistics.median(active_hold_secs)
+                           if active_hold_secs else 0.0)
+
+        # ── 3. Net imbalance per slug and max abs imbalance ──
+        per_slug_imbalance = {}
+        global_max_imbalance = 0.0
+        for slug, st in self.market_states.items():
+            up_q = st.positions["Up"].qty
+            dn_q = st.positions["Down"].qty
+            imbal = up_q - dn_q
+            max_imbal = self._diag_max_imbalance.get(slug, abs(imbal))
+            global_max_imbalance = max(global_max_imbalance, max_imbal)
+            if abs(imbal) >= MIN_QTY or max_imbal >= MIN_QTY:
+                per_slug_imbalance[slug] = {
+                    "current_imbalance": round(imbal, 1),
+                    "max_abs_imbalance": round(max_imbal, 1),
+                }
+
+        # ── 4. Correlation between net exposure and spot trend ──
+        imbal_delta_corr = 0.0
+        if len(self._diag_imbalance_delta_samples) >= 10:
+            imbals = [s[0] for s in self._diag_imbalance_delta_samples]
+            deltas = [s[1] for s in self._diag_imbalance_delta_samples]
+            mean_i = sum(imbals) / len(imbals)
+            mean_d = sum(deltas) / len(deltas)
+            cov = sum((i - mean_i) * (d - mean_d) for i, d in zip(imbals, deltas)) / len(imbals)
+            var_i = sum((i - mean_i) ** 2 for i in imbals) / len(imbals)
+            var_d = sum((d - mean_d) ** 2 for d in deltas) / len(deltas)
+            denom = (var_i * var_d) ** 0.5
+            imbal_delta_corr = cov / denom if denom > 1e-9 else 0.0
+
+        # ── Build report ──
+        fill_rate = self._diag_quote_fills / max(1, self._diag_quote_submit_count)
         clone_data = {
             "event_type": "CLONE_REPORT",
-            "paired_straddle_ratio": round(paired_straddle_ratio, 3),
+            # Pair metrics
+            "pairs_completed": total_pairs,
             "pairs_within_1500ms": pairs_within_1500ms,
-            "total_pairs": total_pairs,
+            "pairs_within_10s": pairs_within_10s,
+            "paired_straddle_ratio_1500ms": round(paired_straddle_ratio, 3),
+            "paired_straddle_ratio_10s": round(paired_10s_ratio, 3),
             "median_pair_fill_delay_ms": round(med_pair_delay_ms, 1),
             "median_time_between_pairs_ms": round(med_inter_pair_ms, 1),
             "median_signal_to_fill_ms": round(med_signal_to_fill_ms, 1),
+            # Queue/latency
             "maker_queue_time_p50_ms": round(queue_p50, 1),
             "maker_queue_time_p90_ms": round(queue_p90, 1),
-            "top_of_book_time_pct": round(tob_pct, 3),
+            # Lifecycle
             "quote_submit_count": self._diag_quote_submit_count,
             "quote_cancel_count": self._diag_quote_cancel_count,
             "quote_replace_count": self._diag_quote_replace_count,
-            "quote_fill_rate": round(self._diag_quote_fills /
-                                     max(1, self._diag_quote_submit_count), 3),
+            "quote_fill_rate": round(fill_rate, 3),
+            # Hedge
             "hedge_tick1": self._diag_hedge_tick1,
             "hedge_tick2": self._diag_hedge_tick2,
             "hedge_cross": self._diag_hedge_cross,
             "hedge_unwind": self._diag_hedge_unwind,
+            # Hold time
+            "hold_time_p50_sec": round(hold_p50, 1),
+            "hold_time_p90_sec": round(hold_p90, 1),
+            "active_hold_p50_sec": round(active_hold_p50, 1),
+            "active_locked_count": len(active_hold_secs),
+            # Imbalance
+            "max_abs_imbalance": round(global_max_imbalance, 1),
+            "per_slug_imbalance": per_slug_imbalance,
+            # Correlation
+            "imbalance_delta_correlation": round(imbal_delta_corr, 3),
             "fast_clone": FAST_CLONE,
         }
         write_jsonl(clone_data)
-        print(f"  CLONE: straddle_ratio={paired_straddle_ratio:.1%}  "
-              f"pairs={total_pairs}  "
-              f"pair_delay={med_pair_delay_ms:.0f}ms  "
-              f"inter_pair={med_inter_pair_ms:.0f}ms  "
-              f"sig_to_fill={med_signal_to_fill_ms:.0f}ms")
+
+        # Console print
+        print(f"  CLONE: pairs={total_pairs}  "
+              f"ratio_1.5s={paired_straddle_ratio:.0%}  "
+              f"ratio_10s={paired_10s_ratio:.0%}  "
+              f"delay={med_pair_delay_ms:.0f}ms  "
+              f"gap={med_inter_pair_ms:.0f}ms  "
+              f"sig2fill={med_signal_to_fill_ms:.0f}ms")
         print(f"  LIFECYCLE: submit={self._diag_quote_submit_count}  "
               f"cancel={self._diag_quote_cancel_count}  "
               f"replace={self._diag_quote_replace_count}  "
-              f"fill_rate={self._diag_quote_fills / max(1, self._diag_quote_submit_count):.1%}  "
+              f"fill_rate={fill_rate:.0%}  "
               f"queue_p50={queue_p50:.0f}ms  "
               f"queue_p90={queue_p90:.0f}ms")
         print(f"  HEDGE: tick1={self._diag_hedge_tick1}  "
               f"tick2={self._diag_hedge_tick2}  "
               f"cross={self._diag_hedge_cross}  "
               f"unwind={self._diag_hedge_unwind}")
+        print(f"  HOLD: p50={hold_p50:.0f}s  p90={hold_p90:.0f}s  "
+              f"active_p50={active_hold_p50:.0f}s  locked={len(active_hold_secs)}")
+        print(f"  IMBAL: max={global_max_imbalance:.0f}  "
+              f"corr(imbal,delta)={imbal_delta_corr:.2f}")
+        if per_slug_imbalance:
+            for slug, info in per_slug_imbalance.items():
+                print(f"    {slug[:30]:30s}  imbal={info['current_imbalance']:+5.0f}  "
+                      f"max={info['max_abs_imbalance']:.0f}")
         # Reset clone-specific counters (per-minute)
         self._clone_pair_delays.clear()
         self._clone_inter_pair_gaps.clear()
         self._clone_signal_to_fill.clear()
+        self._clone_hold_times.clear()
         self._diag_top_of_book_time_ms = 0.0
         self._diag_top_of_book_total_ms = 0.0
+        self._diag_pairs_completed = 0
+        self._diag_pairs_completed_1500ms = 0
+        self._diag_pairs_completed_10s = 0
+        self._diag_max_imbalance.clear()
+        self._diag_imbalance_delta_samples.clear()
+        # Clean up stale pair tracker entries (older than 30s)
+        stale_cutoff = time.time() - 30.0
+        stale_ids = [pid for pid, info in self._pair_tracker.items()
+                     if all(f["ts"] < stale_cutoff for f in info["fills"].values())]
+        for pid in stale_ids:
+            self._pair_tracker.pop(pid, None)
 
     def _print_balance_summary(self):
         """Print balance and open positions to console."""
@@ -2489,6 +2590,13 @@ class Bot:
         ctx = self._make_tick_ctx(m, st, spot, hour_open, t_min, delta_bps, abs_delta_bps,
                                   vel, z, up_book, dn_book)
         ctx["ts_snapshot"] = ts_snapshot
+        # ── Analytics: track imbalance per slug for CLONE_REPORT ──
+        up_q = st.positions["Up"].qty
+        dn_q = st.positions["Down"].qty
+        abs_imbal = abs(up_q - dn_q)
+        cur_max = self._diag_max_imbalance.get(m.slug, 0.0)
+        self._diag_max_imbalance[m.slug] = max(cur_max, abs_imbal)
+        self._diag_imbalance_delta_samples.append((up_q - dn_q, delta_bps))
         # ── Parity metrics (computed every tick, used by parity arb engine) ──
         ctx["straddle_buy_cost"] = up_book.ask + dn_book.ask
         ctx["straddle_sell_value"] = up_book.bid + dn_book.bid
@@ -3459,6 +3567,7 @@ class Bot:
                           ctx=ctx, use_maker=not use_taker)
 
         self._diag_recycle_count += 1
+        self._clone_hold_times.append(hold_sec)
         self._parity_invested_usd[m.slug] = max(
             0.0, self._parity_invested_usd.get(m.slug, 0.0) - sell_usd * 2)
 
@@ -3476,6 +3585,54 @@ class Bot:
                       "net_profit_cents": round(net_profit_cents, 3),
                       "sell_usd": round(sell_usd, 2),
                       "t_min": round(ctx["t_min"], 3)})
+
+    # =================================================================
+    # PAIR FILL TRACKER — thread pair_id through all quote/arb fills
+    # =================================================================
+    def _record_pair_fill(self, pair_id: str, slug: str, crypto: str,
+                          outcome: str, fill_ts: float, maker_taker: str):
+        """Record a fill for a pair_id. When both legs filled, compute pair metrics."""
+        if not pair_id:
+            return
+        entry = self._pair_tracker.setdefault(pair_id, {
+            "slug": slug, "crypto": crypto, "fills": {},
+        })
+        entry["fills"][outcome] = {"ts": fill_ts, "maker_taker": maker_taker}
+
+        # Track maker vs taker for parity
+        if maker_taker == "maker":
+            self._diag_parity_maker_count += 1
+        elif maker_taker == "taker":
+            self._diag_parity_taker_count += 1
+
+        # Check if pair is now complete (both Up and Down filled)
+        if "Up" in entry["fills"] and "Down" in entry["fills"]:
+            up_ts = entry["fills"]["Up"]["ts"]
+            dn_ts = entry["fills"]["Down"]["ts"]
+            delay_ms = abs(up_ts - dn_ts) * 1000
+            self._clone_pair_delays.append(delay_ms)
+            self._diag_pairs_completed += 1
+            if delay_ms <= 1500:
+                self._diag_pairs_completed_1500ms += 1
+            if delay_ms <= 10000:
+                self._diag_pairs_completed_10s += 1
+            # Inter-pair gap
+            completion_ts = max(up_ts, dn_ts)
+            if self._clone_last_pair_ts > 0:
+                gap_ms = (completion_ts - self._clone_last_pair_ts) * 1000
+                self._clone_inter_pair_gaps.append(gap_ms)
+            self._clone_last_pair_ts = completion_ts
+            # Straddle edge at completion
+            self._diag_parity_trades += 1
+            self._diag_parity_trade_timestamps.append(completion_ts)
+            write_jsonl({
+                "event_type": "PAIR_COMPLETED",
+                "pair_id": pair_id, "slug": slug, "crypto": crypto,
+                "delay_ms": round(delay_ms, 1),
+                "up_ts": round(up_ts, 3), "dn_ts": round(dn_ts, 3),
+            })
+            # Clean up tracker (keep last 100 for reference)
+            self._pair_tracker.pop(pair_id, None)
 
     # =================================================================
     # PARITY QUOTING MODE — continuously post maker bids on both legs
@@ -3632,19 +3789,46 @@ class Bot:
         for outcome, target_price, book in [("Up", target_up, up_book),
                                              ("Down", target_dn, dn_book)]:
             existing = slug_quotes.get(outcome)
+            effective_price = target_price
             if existing:
                 price_diff = abs(target_price - existing.get("price", 0))
                 elapsed_ms = (now_t - existing.get("ts", 0)) * 1000
-                outbid = book.bid > existing.get("price", 0) + 0.001
-                if not outbid and price_diff < 0.005 and elapsed_ms < PARITY_QUOTE_REFRESH_MS:
-                    continue
+                our_price = existing.get("price", 0)
+                outbid = book.bid > our_price + 0.0005
+
+                # Queue position heuristic: step up when outbid to regain best
+                if outbid and elapsed_ms >= HEDGE_TICK1_MS:
+                    # 250ms+ outbid: step +1 tick above best_bid
+                    step_up = clamp_to_tick(book.bid + 0.001)
+                    if step_up < book.ask:
+                        effective_price = step_up
+                elif outbid and elapsed_ms >= 100:
+                    # 100ms+ outbid: match best_bid
+                    effective_price = clamp_to_tick(book.bid)
+                elif not outbid and price_diff < 0.001 and elapsed_ms < PARITY_QUOTE_REFRESH_MS:
+                    continue  # no need to refresh yet
+
+            # Check that effective_price still yields net edge
+            other_price = target_dn if outcome == "Up" else target_up
+            combined_check = effective_price + other_price
+            if combined_check > target_combined_net + 0.002:
+                effective_price = target_price  # revert to conservative price
+
+            # Imbalance check: don't add to over-weighted side (TASK C)
+            up_q = st.positions["Up"].qty
+            dn_q = st.positions["Down"].qty
+            imbalance = up_q - dn_q
+            if outcome == "Up" and imbalance > IMBALANCE_CAP_SHARES:
+                continue  # too much Up, skip
+            if outcome == "Down" and imbalance < -IMBALANCE_CAP_SHARES:
+                continue  # too much Down, skip
 
             leg_usd = min(dynamic_step_usd,
                           (PARITY_QUOTE_MAX_USD_PER_SLUG - invested) / 2.0)
             if leg_usd < MIN_ORDER_USDC:
                 continue
 
-            cost = self._parity_quote_buy(m, st, outcome, book, target_price,
+            cost = self._parity_quote_buy(m, st, outcome, book, effective_price,
                                            leg_usd, ctx, pair_id,
                                            quote_step_usd_used=dynamic_step_usd)
             if cost > 0:
@@ -3683,19 +3867,25 @@ class Bot:
                                       target_combined: float):
         """Compute anchor-based quote prices for both legs.
         Set one leg at best_bid, compute other = target_combined - anchor.
-        Try both anchors, pick the one where both prices are competitive."""
+        Try both anchors, pick the one where both prices are competitive.
+        Allow derived price up to best_bid + 2 ticks (more aggressive fills)."""
         min_tick = 0.01  # minimum price to bid
+        max_above_best = 0.002  # allow up to 2 ticks above best_bid
 
         # Try anchor=Up (set Up at best_bid, compute Down)
         anchor_up = clamp_to_tick(up_book.bid)
         derived_dn = clamp_to_tick(target_combined - anchor_up)
         up_ok = anchor_up >= min_tick and anchor_up < up_book.ask
-        dn_ok = derived_dn >= min_tick and derived_dn <= dn_book.bid and derived_dn < dn_book.ask
+        dn_ok = (derived_dn >= min_tick
+                 and derived_dn <= dn_book.bid + max_above_best
+                 and derived_dn < dn_book.ask)
 
         # Try anchor=Down (set Down at best_bid, compute Up)
         anchor_dn = clamp_to_tick(dn_book.bid)
         derived_up = clamp_to_tick(target_combined - anchor_dn)
-        up_ok2 = derived_up >= min_tick and derived_up <= up_book.bid and derived_up < up_book.ask
+        up_ok2 = (derived_up >= min_tick
+                  and derived_up <= up_book.bid + max_above_best
+                  and derived_up < up_book.ask)
         dn_ok2 = anchor_dn >= min_tick and anchor_dn < dn_book.ask
 
         # Pick the anchor where the derived leg is most competitive
@@ -3735,16 +3925,9 @@ class Bot:
         if unpaired is None:
             return
 
-        # If both legs now filled, clear and record pair delay for clone metrics
+        # If both legs now filled, clear hedge state
         if (st.positions["Up"].qty >= MIN_QTY
                 and st.positions["Down"].qty >= MIN_QTY):
-            fill_ts = unpaired.get("fill_ts", now_t)
-            pair_delay_ms = (now_t - fill_ts) * 1000
-            self._clone_pair_delays.append(pair_delay_ms)
-            if self._clone_last_pair_ts > 0:
-                gap_ms = (now_t - self._clone_last_pair_ts) * 1000
-                self._clone_inter_pair_gaps.append(gap_ms)
-            self._clone_last_pair_ts = now_t
             self._quote_unpaired.pop(m.slug, None)
             self._hedge_state.pop(m.slug, None)
             return
@@ -3981,6 +4164,7 @@ class Bot:
             self._diag_maker_fill_latencies.append(fill_latency_ms)
             self._active_orders.pop(client_oid, None)
             self._diag_maker_queue_times.append(fill_latency_ms)
+            self._record_pair_fill(pair_id, m.slug, m.crypto, outcome, fill_ts, "maker")
             # Signal-to-fill tracking for clone metrics
             last_move = self._clone_last_spot_move.get(m.slug)
             if last_move:
@@ -3989,8 +4173,6 @@ class Bot:
                     self._clone_signal_to_fill.append(s2f)
             self._parity_invested_usd[m.slug] = self._parity_invested_usd.get(m.slug, 0.0) + actual_cost
             self._parity_last_order_ts[m.slug] = time.time()
-            self._diag_parity_trades += 1
-            self._diag_parity_trade_timestamps.append(time.time())
 
             # If both legs now filled, log straddle completion
             if (st.positions["Up"].qty >= MIN_QTY
@@ -4039,6 +4221,7 @@ class Bot:
                 self._diag_maker_fill_latencies.append(fill_latency_ms)
                 self._active_orders.pop(client_oid, None)
                 self._diag_maker_queue_times.append(fill_latency_ms)
+                self._record_pair_fill(pair_id, m.slug, m.crypto, outcome, fill_ts, "maker")
                 last_move = self._clone_last_spot_move.get(m.slug)
                 if last_move:
                     s2f = (fill_ts - last_move[0]) * 1000
@@ -4046,8 +4229,6 @@ class Bot:
                         self._clone_signal_to_fill.append(s2f)
                 self._parity_invested_usd[m.slug] = self._parity_invested_usd.get(m.slug, 0.0) + actual_cost
                 self._parity_last_order_ts[m.slug] = time.time()
-                self._diag_parity_trades += 1
-                self._diag_parity_trade_timestamps.append(time.time())
                 return actual_cost
             return 0.0
 
