@@ -246,9 +246,11 @@ QUOTE_UNPAIRED_ESCALATE_AFTER_MS = 800  # raise missing leg bid by 1 tick if sti
 QUOTE_UNPAIRED_MAX_SEC = 6.0            # after this, unwind or pause quoting this slug
 QUOTE_PAUSE_AFTER_UNPAIRED_SEC = 15.0   # pause quoting this slug after forced unpaired unwind
 # Adverse selection guard
-ADVERSE_SPOT_MOVE_BPS_THRESHOLD = 12.0  # pause quoting if spot moved > 12 bps in 10s
+ADVERSE_SPOT_MOVE_BPS_THRESHOLD = 20.0  # degrade quoting if spot moved > 20 bps in 10s
 ADVERSE_LOOKBACK_SEC = 10.0             # lookback window for spot move detection
-ADVERSE_PAUSE_SEC = 10.0                # pause quoting for this many seconds on trigger
+ADVERSE_PAUSE_SEC = 10.0                # hard-pause quoting only if move is accelerating
+ADVERSE_DEGRADE_SEC = 10.0              # degrade duration: MAX target + 50% step reduction
+ADVERSE_ACCEL_BPS_PER_MIN = 40.0        # velocity threshold to escalate degrade -> hard-pause
 # ---------------------------------------------------------------------------
 # FAST_CLONE mode — tighter timing to match F247 speed
 # ---------------------------------------------------------------------------
@@ -1205,6 +1207,9 @@ class Bot:
         # Adverse selection guard
         self._diag_adverse_guard_events = 0
         self._diag_adverse_guard_pauses = 0
+        self._diag_adverse_guard_degrades = 0
+        # Per-slug degrade state: slug -> degrade_until_ts (soft mode: MAX target + 50% step)
+        self._quote_degraded_until: Dict[str, float] = {}
         # Per-slug spot history for adverse selection: slug -> [(epoch_ts, spot)]
         self._spot_history: Dict[str, List[Tuple[float, float]]] = {}
         # Rescue invested tracking: slug -> USD spent on rescue buys
@@ -1848,8 +1853,8 @@ class Bot:
 
                 # 8. Tempo parity diagnostics (every 60s)
                 if now - self._tempo_last_report_ts >= 60.0:
+                    self._emit_clone_report()   # must run BEFORE tempo_report resets counters
                     self._emit_tempo_report()
-                    self._emit_clone_report()
                     self._tempo_last_report_ts = now
             except Exception as e:
                 self.logger.log_event({"event_type": "LOOP_ERROR", "err": str(e)})
@@ -1989,6 +1994,7 @@ class Bot:
             "quote_unpaired_escalations": self._diag_quote_unpaired_escalations,
             "quote_pause_count": self._diag_quote_pause_count,
             "adverse_guard_events": self._diag_adverse_guard_events,
+            "adverse_guard_degrades": self._diag_adverse_guard_degrades,
             "adverse_guard_pauses": self._diag_adverse_guard_pauses,
             "quote_submit_count": self._diag_quote_submit_count,
             "quote_cancel_count": self._diag_quote_cancel_count,
@@ -2100,8 +2106,9 @@ class Bot:
         print(f"  GUARD: spread_blk={diag['blocked_spread']}  "
               f"liq_blk={diag['blocked_liq']}  "
               f"stale_blk={diag['blocked_stale']}  "
-              f"adverse_events={diag['adverse_guard_events']}  "
-              f"adverse_pauses={diag['adverse_guard_pauses']}")
+              f"adverse={diag['adverse_guard_events']}  "
+              f"degrades={diag['adverse_guard_degrades']}  "
+              f"hard_pauses={diag['adverse_guard_pauses']}")
         if inv_imbalance:
             for slug, inv in inv_imbalance.items():
                 print(f"    INV {slug[:30]:30s}  Up={inv['up_qty']:5.0f}  "
@@ -2157,6 +2164,7 @@ class Bot:
         self._diag_quote_pause_count = 0
         self._diag_adverse_guard_events = 0
         self._diag_adverse_guard_pauses = 0
+        self._diag_adverse_guard_degrades = 0
         self._diag_parity_trade_timestamps.clear()
         self._diag_quote_submit_count = 0
         self._diag_quote_cancel_count = 0
@@ -2246,6 +2254,7 @@ class Bot:
         fill_rate = self._diag_quote_fills / max(1, self._diag_quote_submit_count)
         clone_data = {
             "event_type": "CLONE_REPORT",
+            "ts_ms": int(time.time() * 1000),
             # Pair metrics
             "pairs_completed": total_pairs,
             "pairs_within_1500ms": pairs_within_1500ms,
@@ -2263,6 +2272,8 @@ class Bot:
             "quote_cancel_count": self._diag_quote_cancel_count,
             "quote_replace_count": self._diag_quote_replace_count,
             "quote_fill_rate": round(fill_rate, 3),
+            "active_quote_orders": len(self._active_orders),
+            "pending_unpaired": len(self._quote_unpaired),
             # Hedge
             "hedge_tick1": self._diag_hedge_tick1,
             "hedge_tick2": self._diag_hedge_tick2,
@@ -2278,6 +2289,10 @@ class Bot:
             "per_slug_imbalance": per_slug_imbalance,
             # Correlation
             "imbalance_delta_correlation": round(imbal_delta_corr, 3),
+            # Adverse guard
+            "adverse_events": self._diag_adverse_guard_events,
+            "adverse_degrades": self._diag_adverse_guard_degrades,
+            "adverse_hard_pauses": self._diag_adverse_guard_pauses,
             "fast_clone": FAST_CLONE,
         }
         write_jsonl(clone_data)
@@ -3456,6 +3471,7 @@ class Bot:
                         if m.slug not in self._parity_locked_since:
                             self._parity_locked_since[m.slug] = time.time()
                         write_jsonl({"event_type": "PARITY_PAIR_COMPLETED",
+                                      "ts_ms": int(time.time() * 1000),
                                       "slug": m.slug, "pair_id": pair["pair_id"],
                                       "delay_ms": round(elapsed_ms, 1),
                                       "net_edge_cents": round(net_buy, 3)})
@@ -3482,6 +3498,7 @@ class Bot:
                     if m.slug not in self._parity_locked_since:
                         self._parity_locked_since[m.slug] = time.time()
                     write_jsonl({"event_type": "PARITY_PAIR_COMPLETED_LATE",
+                                  "ts_ms": int(time.time() * 1000),
                                   "slug": m.slug, "pair_id": pair["pair_id"],
                                   "delay_ms": round(elapsed_ms, 1)})
                     resolved.append(i)
@@ -3627,9 +3644,10 @@ class Bot:
             self._diag_parity_trade_timestamps.append(completion_ts)
             write_jsonl({
                 "event_type": "PAIR_COMPLETED",
+                "ts_ms": int(completion_ts * 1000),
                 "pair_id": pair_id, "slug": slug, "crypto": crypto,
                 "delay_ms": round(delay_ms, 1),
-                "up_ts": round(up_ts, 3), "dn_ts": round(dn_ts, 3),
+                "up_ts_ms": int(up_ts * 1000), "dn_ts_ms": int(dn_ts * 1000),
             })
             # Clean up tracker (keep last 100 for reference)
             self._pair_tracker.pop(pair_id, None)
@@ -3670,7 +3688,8 @@ class Bot:
         return current
 
     def _quote_get_dynamic_step(self, slug: str) -> float:
-        """Return inventory-aware quote step size (USD) for this slug."""
+        """Return inventory-aware quote step size (USD) for this slug.
+        Reduced by 50% during adverse degrade window."""
         fill_rate = (self._diag_quote_fills / max(1, self._diag_quote_orders_placed)
                      if self._diag_quote_orders_placed > 0 else 0.5)
         locked_usd = 0.0
@@ -3685,33 +3704,44 @@ class Bot:
             imbalance = abs(up_q - dn_q)
         # High inventory or imbalance -> reduce step (less risk per order)
         if locked_usd > 0.6 * PARITY_QUOTE_MAX_USD_PER_SLUG or imbalance > 20:
-            return max(0.75, PARITY_QUOTE_STEP_USD * 0.5)
+            base = max(0.75, PARITY_QUOTE_STEP_USD * 0.5)
         # Low fill rate + low locked -> increase step (be more aggressive)
-        if fill_rate < 0.30 and locked_usd < PARITY_QUOTE_MAX_USD_PER_SLUG * 0.3:
-            return min(3.0, PARITY_QUOTE_STEP_USD * 1.25)
-        return PARITY_QUOTE_STEP_USD
+        elif fill_rate < 0.30 and locked_usd < PARITY_QUOTE_MAX_USD_PER_SLUG * 0.3:
+            base = min(3.0, PARITY_QUOTE_STEP_USD * 1.25)
+        else:
+            base = PARITY_QUOTE_STEP_USD
+        # Adverse degrade: reduce step by 50%
+        if time.time() < self._quote_degraded_until.get(slug, 0.0):
+            base *= 0.5
+        return base
 
-    def _quote_check_adverse(self, slug: str) -> Tuple[bool, float]:
+    def _quote_check_adverse(self, slug: str) -> Tuple[bool, float, float]:
         """Check adverse selection: large spot move in last ADVERSE_LOOKBACK_SEC.
-        Returns (is_adverse, spot_move_bps)."""
+        Returns (is_adverse, spot_move_bps, velocity_bps_per_min)."""
         hist = self._spot_history.get(slug, [])
         if len(hist) < 2:
-            return False, 0.0
+            return False, 0.0, 0.0
         now_t = time.time()
         cutoff = now_t - ADVERSE_LOOKBACK_SEC
         # Find oldest spot within lookback window
         oldest_spot = None
+        oldest_ts = None
         for ts, sp in hist:
             if ts >= cutoff:
                 oldest_spot = sp
+                oldest_ts = ts
                 break
         if oldest_spot is None or oldest_spot <= 0:
-            return False, 0.0
+            return False, 0.0, 0.0
         latest_spot = hist[-1][1]
+        latest_ts = hist[-1][0]
         if latest_spot <= 0:
-            return False, 0.0
+            return False, 0.0, 0.0
         move_bps = abs((latest_spot - oldest_spot) / oldest_spot) * 10000.0
-        return move_bps > ADVERSE_SPOT_MOVE_BPS_THRESHOLD, move_bps
+        # Compute velocity: bps per minute
+        elapsed_sec = max(0.1, latest_ts - oldest_ts)
+        vel_bps_per_min = move_bps / elapsed_sec * 60.0
+        return move_bps > ADVERSE_SPOT_MOVE_BPS_THRESHOLD, move_bps, vel_bps_per_min
 
     def _parity_quote(self, m: MarketRef, st: MarketState, ctx: dict):
         """Post maker bids on both Up and Down to 'manufacture' cheap straddles.
@@ -3728,21 +3758,38 @@ class Bot:
         if now_t < pause_until:
             return
 
-        # ── Adverse selection guard ──
-        is_adverse, spot_move_bps = self._quote_check_adverse(m.slug)
+        # ── Adverse selection guard (degrade-first, hard-pause only if accelerating) ──
+        is_adverse, spot_move_bps, vel_bps_per_min = self._quote_check_adverse(m.slug)
         if is_adverse:
             self._diag_adverse_guard_events += 1
-            # Pause quoting for this slug
-            self._quote_paused_until[m.slug] = now_t + ADVERSE_PAUSE_SEC
-            self._diag_adverse_guard_pauses += 1
-            # Also set dynamic target to MAX for next cycle
-            self._quote_dynamic_target[m.slug] = PARITY_QUOTE_TARGET_EDGE_NET_CENTS_MAX
-            write_jsonl({"event_type": "ADVERSE_GUARD_TRIGGERED",
-                          "slug": m.slug, "crypto": m.crypto,
-                          "spot_move_bps": round(spot_move_bps, 2),
-                          "threshold_bps": ADVERSE_SPOT_MOVE_BPS_THRESHOLD,
-                          "pause_sec": ADVERSE_PAUSE_SEC})
-            return
+            ts_ms = int(time.time() * 1000)
+            if vel_bps_per_min >= ADVERSE_ACCEL_BPS_PER_MIN:
+                # Move is accelerating — hard pause
+                self._quote_paused_until[m.slug] = now_t + ADVERSE_PAUSE_SEC
+                self._diag_adverse_guard_pauses += 1
+                self._quote_dynamic_target[m.slug] = PARITY_QUOTE_TARGET_EDGE_NET_CENTS_MAX
+                write_jsonl({"event_type": "ADVERSE_GUARD_HARD_PAUSE",
+                              "ts_ms": ts_ms,
+                              "slug": m.slug, "crypto": m.crypto,
+                              "spot_move_bps": round(spot_move_bps, 2),
+                              "vel_bps_per_min": round(vel_bps_per_min, 1),
+                              "threshold_bps": ADVERSE_SPOT_MOVE_BPS_THRESHOLD,
+                              "accel_threshold": ADVERSE_ACCEL_BPS_PER_MIN,
+                              "pause_sec": ADVERSE_PAUSE_SEC})
+                return
+            else:
+                # Move is significant but not accelerating — degrade (don't pause)
+                self._quote_degraded_until[m.slug] = now_t + ADVERSE_DEGRADE_SEC
+                self._diag_adverse_guard_degrades += 1
+                self._quote_dynamic_target[m.slug] = PARITY_QUOTE_TARGET_EDGE_NET_CENTS_MAX
+                write_jsonl({"event_type": "ADVERSE_GUARD_DEGRADE",
+                              "ts_ms": ts_ms,
+                              "slug": m.slug, "crypto": m.crypto,
+                              "spot_move_bps": round(spot_move_bps, 2),
+                              "vel_bps_per_min": round(vel_bps_per_min, 1),
+                              "threshold_bps": ADVERSE_SPOT_MOVE_BPS_THRESHOLD,
+                              "degrade_sec": ADVERSE_DEGRADE_SEC})
+                # Don't return — continue quoting but with degraded parameters
 
         # ── Liquidity guard (optional) ──
         if PARITY_QUOTE_ONLY_IF_LIQ_OK:
@@ -3978,6 +4025,7 @@ class Bot:
                         self._diag_quote_orders_placed += 1
             hedge["tick1_done"] = True
             write_jsonl({"event_type": "HEDGE_TICK1",
+                          "ts_ms": int(now_t * 1000),
                           "slug": m.slug, "crypto": m.crypto,
                           "missing_outcome": missing_outcome,
                           "age_ms": round(age_ms, 0),
@@ -4003,6 +4051,7 @@ class Bot:
                         self._diag_quote_orders_placed += 1
             hedge["tick2_done"] = True
             write_jsonl({"event_type": "HEDGE_TICK2",
+                          "ts_ms": int(now_t * 1000),
                           "slug": m.slug, "crypto": m.crypto,
                           "missing_outcome": missing_outcome,
                           "age_ms": round(age_ms, 0),
@@ -4026,6 +4075,7 @@ class Bot:
                         self._diag_hedge_cross += 1
                         self._diag_quote_orders_placed += 1
                         write_jsonl({"event_type": "HEDGE_CROSS",
+                                      "ts_ms": int(now_t * 1000),
                                       "slug": m.slug, "crypto": m.crypto,
                                       "missing_outcome": missing_outcome,
                                       "cross_price": round(cross_price, 4),
@@ -4035,6 +4085,7 @@ class Bot:
             else:
                 # Edge collapsed — unwind the filled leg
                 write_jsonl({"event_type": "HEDGE_EDGE_COLLAPSE",
+                              "ts_ms": int(now_t * 1000),
                               "slug": m.slug, "crypto": m.crypto,
                               "filled_outcome": filled_outcome,
                               "edge_cents": round(edge_c, 3),
@@ -4110,13 +4161,21 @@ class Bot:
                    "quote_step_usd_used": round(quote_step_usd_used, 2)},
         )
         # ── Order lifecycle: track submit ──
+        placed_ts_ms = int(placed_ts * 1000)
         self._last_quote_oid = client_oid
         self._diag_quote_submit_count += 1
         self._active_orders[client_oid] = {
             "slug": m.slug, "outcome": outcome, "side": "BUY",
             "price": bid_price, "qty": order_qty,
-            "submit_ts": placed_ts, "reason": "PARITY_QUOTE",
+            "submit_ts": placed_ts, "submit_ts_ms": placed_ts_ms,
+            "reason": "PARITY_QUOTE",
         }
+        write_jsonl({"event_type": "ORDER_SUBMIT",
+                      "ts_ms": placed_ts_ms,
+                      "slug": m.slug, "outcome": outcome,
+                      "order_id": client_oid, "pair_id": pair_id,
+                      "price": round(bid_price, 4), "qty": round(order_qty, 1),
+                      "reason": "PARITY_QUOTE"})
         # Cancel any previous quote for this slug+outcome (ORDER_REPLACE)
         slug_quotes = self._parity_quotes.get(m.slug, {})
         prev_quote = slug_quotes.get(outcome)
@@ -4127,6 +4186,7 @@ class Bot:
                 self._diag_quote_cancel_count += 1
                 self._diag_quote_replace_count += 1
                 write_jsonl({"event_type": "ORDER_REPLACE",
+                              "ts_ms": placed_ts_ms,
                               "slug": m.slug, "outcome": outcome,
                               "old_id": old_oid, "new_id": client_oid,
                               "old_px": round(old_info["price"], 4),
@@ -4135,6 +4195,7 @@ class Bot:
 
         if MODE == "LOG":
             fill_ts = time.time()
+            fill_ts_ms = int(fill_ts * 1000)
             # In paper mode: maker fill simulated — fill at our bid_price
             # Only fill if our bid >= current best bid (we'd be at top of book)
             if bid_price < book.bid - 0.001:
@@ -4154,10 +4215,17 @@ class Bot:
                 usdc_cost=actual_cost, fees_usdc=fee,
                 maker_taker="maker", did_cross="",
                 vwap=pos.vwap, ctx=ctx, book_fields=bk_fields,
-                extra={"placed_ts": placed_ts, "fill_ts": fill_ts,
+                extra={"placed_ts_ms": placed_ts_ms, "fill_ts_ms": fill_ts_ms,
                        "fill_latency_ms": round(fill_latency_ms, 1),
                        "quote_step_usd_used": round(quote_step_usd_used, 2)},
             )
+            write_jsonl({"event_type": "ORDER_FILL",
+                          "ts_ms": fill_ts_ms,
+                          "slug": m.slug, "outcome": outcome,
+                          "order_id": client_oid, "pair_id": pair_id,
+                          "price": round(bid_price, 4), "qty": round(order_qty, 1),
+                          "maker_taker": "maker",
+                          "fill_latency_ms": round(fill_latency_ms, 1)})
             self._tempo_fills[m.slug] = self._tempo_fills.get(m.slug, 0) + 1
             self._diag_maker_fills += 1
             self._diag_quote_fills += 1
@@ -4183,6 +4251,7 @@ class Bot:
                 net_edge = (1.000 - straddle_cost) * 100
                 self._diag_parity_edges.append(net_edge)
                 write_jsonl({"event_type": "PARITY_QUOTE_STRADDLE",
+                              "ts_ms": fill_ts_ms,
                               "slug": m.slug, "crypto": m.crypto,
                               "pair_id": pair_id,
                               "straddle_cost": round(straddle_cost, 4),
