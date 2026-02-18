@@ -330,8 +330,8 @@ if FAST_CLONE:
 # RATE LIMITING / CHURN CONTROL — hard caps per slug (F247 cadence)
 # ---------------------------------------------------------------------------
 RATE_LIMIT_ENABLED = bool(os.getenv("RATE_LIMIT_ENABLED", "True") not in ("", "0", "False", "false"))
-MIN_ORDER_INTERVAL_MS = float(os.getenv("MIN_ORDER_INTERVAL_MS", "500"))       # min ms between ANY orders on same slug
-MAX_ORDER_SUBMITS_PER_MIN = int(os.getenv("MAX_ORDER_SUBMITS_PER_MIN", "60"))  # hard cap submits/min per slug — no bursting
+MIN_ORDER_INTERVAL_MS = float(os.getenv("MIN_ORDER_INTERVAL_MS", "400"))       # min ms between ANY orders on same slug
+MAX_ORDER_SUBMITS_PER_MIN = int(os.getenv("MAX_ORDER_SUBMITS_PER_MIN", "120")) # hard cap submits/min per slug
 QUOTE_REFRESH_SKIP_IF_SAME = True                                               # skip refresh if price unchanged
 QUOTE_REFRESH_MIN_TICK_MOVE = 0.001                                              # require >= 1 tick move to refresh
 QUOTE_REFRESH_MIN_ELAPSED_MS = float(os.getenv("QUOTE_REFRESH_MIN_ELAPSED_MS", "500"))  # min ms between refreshes
@@ -347,7 +347,7 @@ DSCALP_VEL_MIN_BPS_PER_MIN = float(os.getenv("DSCALP_VEL_MIN_BPS_PER_MIN", "1.0"
 DSCALP_MAX_SPREAD_CENTS = float(os.getenv("DSCALP_MAX_SPREAD_CENTS", "2.0"))   # max spread for entry
 DSCALP_MAX_CACHE_AGE_MS = float(os.getenv("DSCALP_MAX_CACHE_AGE_MS", "250"))   # max cache age for entry
 # Sizing — one entry = one meaningful position, no micro-splits
-DSCALP_STEP_USD = float(os.getenv("DSCALP_STEP_USD", "7.0"))                   # per-order size (~F247's $7.4 avg)
+DSCALP_STEP_USD = float(os.getenv("DSCALP_STEP_USD", "8.0"))                   # per-order size (target avg $7-8)
 DSCALP_STEP_USD_MIN = float(os.getenv("DSCALP_STEP_USD_MIN", "6.0"))           # minimum entry size (no $1 clips)
 DSCALP_MAX_USD_PER_SLUG = float(os.getenv("DSCALP_MAX_USD_PER_SLUG", "30.0"))  # max directional per slug
 DSCALP_COOLDOWN_MS = float(os.getenv("DSCALP_COOLDOWN_MS", "4000"))            # 4s between entries (target ~15 trades/min)
@@ -368,6 +368,7 @@ PARITY_DEFER_TO_DIRECTIONAL = True                                              
 PARITY_BLOCK_IF_ADVERSE = True                                                   # block parity when adverse guard active
 PARITY_STANDDOWN_AFTER_DSCALP_SEC = float(os.getenv("PARITY_STANDDOWN_AFTER_DSCALP_SEC", "30"))  # parity stands down X sec after dscalp fires
 PARITY_IMBALANCE_BLOCK_SHARES = float(os.getenv("PARITY_IMBALANCE_BLOCK_SHARES", "5.0"))  # block parity if net imbal >= this
+PARITY_DSCALP_INV_BLOCK_USD = float(os.getenv("PARITY_DSCALP_INV_BLOCK_USD", "25.0"))  # block parity if directional invested > $25 on slug
 PARITY_MAX_FILL_PCT = float(os.getenv("PARITY_MAX_FILL_PCT", "0.30"))           # target: parity < 30% of total fills
 PARITY_MAX_WHEN_DIRECTIONAL_USD = float(os.getenv("PARITY_MAX_WHEN_DIRECTIONAL_USD", "0.0"))  # $0 parity when directional active
 # ---------------------------------------------------------------------------
@@ -3160,15 +3161,16 @@ class Bot:
     def _should_block_parity(self, m: MarketRef, st: MarketState) -> bool:
         """Determine if parity quoting should be blocked for this slug.
         Parity is blocked when:
-        1. Directional inventory exists on this slug
+        1. Directional inventory > $25 on this slug
         2. Directional scalp fired recently (standdown timer)
         3. Net imbalance >= threshold
         4. Adverse guard active
         5. Parity fill % exceeds target cap"""
         slug = m.slug
 
-        # 1. Directional inventory active
-        if slug in self._dscalp_positions:
+        # 1. Directional inventory exceeds USD threshold
+        dscalp_inv = self._dscalp_invested_usd.get(slug, 0.0)
+        if dscalp_inv >= PARITY_DSCALP_INV_BLOCK_USD:
             return True
 
         # 2. Standdown timer: dscalp fired within last N seconds
