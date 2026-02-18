@@ -256,10 +256,11 @@ ADVERSE_ACCEL_BPS_PER_MIN = 40.0        # velocity threshold to escalate degrade
 # ---------------------------------------------------------------------------
 FAST_CLONE = bool(os.getenv("FAST_CLONE", "True") not in ("", "0", "False", "false"))
 # One-sided auto-hedge — faster escalation than unpaired management
-HEDGE_TICK1_MS = 200                    # +1 tick after 200ms
-HEDGE_TICK2_MS = 350                    # +3 ticks after 350ms
-HEDGE_EARLY_CROSS_MS = 500             # taker cross after 500ms (primary completion)
-HEDGE_CROSS_MS = 800                    # taker cross after 800ms (fallback)
+HEDGE_TICK_ESCALATION_ENABLED = False   # DISABLED: no micro-neutralizing
+HEDGE_TICK1_MS = 200                    # +1 tick after 200ms (disabled by flag above)
+HEDGE_TICK2_MS = 350                    # +3 ticks after 350ms (disabled by flag above)
+HEDGE_EARLY_CROSS_MS = 1500            # taker cross after 1500ms (no rushing)
+HEDGE_CROSS_MS = 2000                   # taker cross after 2000ms (fallback)
 HEDGE_MIN_CROSS_EDGE_CENTS = 0.5       # min net edge for taker cross (both early+late)
 HEDGE_EARLY_CROSS_EDGE_CENTS = 0.5     # min net edge for early taker cross (500ms)
 HEDGE_MAX_CROSS_SPREAD_CENTS = 2.0     # max spread for taker cross (cents)
@@ -323,14 +324,14 @@ if FAST_CLONE:
     QUOTE_UNPAIRED_MAX_SEC = 2.0
     HEDGE_TICK1_MS = 200
     HEDGE_TICK2_MS = 350
-    HEDGE_EARLY_CROSS_MS = 500
-    HEDGE_CROSS_MS = 800
+    HEDGE_EARLY_CROSS_MS = 1500
+    HEDGE_CROSS_MS = 2000
 # ---------------------------------------------------------------------------
 # RATE LIMITING / CHURN CONTROL — hard caps per slug (F247 cadence)
 # ---------------------------------------------------------------------------
 RATE_LIMIT_ENABLED = bool(os.getenv("RATE_LIMIT_ENABLED", "True") not in ("", "0", "False", "false"))
-MIN_ORDER_INTERVAL_MS = float(os.getenv("MIN_ORDER_INTERVAL_MS", "400"))       # min ms between ANY orders on same slug
-MAX_ORDER_SUBMITS_PER_MIN = int(os.getenv("MAX_ORDER_SUBMITS_PER_MIN", "120")) # hard cap submits/min per slug
+MIN_ORDER_INTERVAL_MS = float(os.getenv("MIN_ORDER_INTERVAL_MS", "500"))       # min ms between ANY orders on same slug
+MAX_ORDER_SUBMITS_PER_MIN = int(os.getenv("MAX_ORDER_SUBMITS_PER_MIN", "60"))  # hard cap submits/min per slug — no bursting
 QUOTE_REFRESH_SKIP_IF_SAME = True                                               # skip refresh if price unchanged
 QUOTE_REFRESH_MIN_TICK_MOVE = 0.001                                              # require >= 1 tick move to refresh
 QUOTE_REFRESH_MIN_ELAPSED_MS = float(os.getenv("QUOTE_REFRESH_MIN_ELAPSED_MS", "500"))  # min ms between refreshes
@@ -339,26 +340,25 @@ QUOTE_REFRESH_MIN_ELAPSED_MS = float(os.getenv("QUOTE_REFRESH_MIN_ELAPSED_MS", "
 # Strategy stack: 1) Directional Scalp  2) Inventory Repair  3) Parity (throttled)
 # ---------------------------------------------------------------------------
 DIRECTIONAL_SCALP_ENABLED = bool(os.getenv("DIRECTIONAL_SCALP_ENABLED", "True") not in ("", "0", "False", "false"))
-# Entry gates (explicit — must meet delta OR range condition)
-DSCALP_DELTA_MIN_BPS = float(os.getenv("DSCALP_DELTA_MIN_BPS", "12.0"))        # min abs_delta_bps for entry
-DSCALP_RANGE_PERCENTILE = float(os.getenv("DSCALP_RANGE_PERCENTILE", "0.30"))  # OR: price in bottom 30% of 5m range
-DSCALP_RANGE_LOOKBACK_SEC = float(os.getenv("DSCALP_RANGE_LOOKBACK_SEC", "300"))  # 5min lookback for range calc
+# Entry gates (explicit — must meet delta OR spot_move condition)
+DSCALP_DELTA_MIN_BPS = float(os.getenv("DSCALP_DELTA_MIN_BPS", "15.0"))        # min abs_delta_bps for entry (raised for conviction)
+DSCALP_SPOT_MOVE_10S_BPS = float(os.getenv("DSCALP_SPOT_MOVE_10S_BPS", "8.0"))  # OR: spot moved >= 8bps in last 10s
 DSCALP_VEL_MIN_BPS_PER_MIN = float(os.getenv("DSCALP_VEL_MIN_BPS_PER_MIN", "1.0"))  # min velocity (supportive, not hard gate)
 DSCALP_MAX_SPREAD_CENTS = float(os.getenv("DSCALP_MAX_SPREAD_CENTS", "2.0"))   # max spread for entry
 DSCALP_MAX_CACHE_AGE_MS = float(os.getenv("DSCALP_MAX_CACHE_AGE_MS", "250"))   # max cache age for entry
-# Sizing — no micro-splits, F247-sized clips
+# Sizing — one entry = one meaningful position, no micro-splits
 DSCALP_STEP_USD = float(os.getenv("DSCALP_STEP_USD", "7.0"))                   # per-order size (~F247's $7.4 avg)
-DSCALP_STEP_USD_MIN = float(os.getenv("DSCALP_STEP_USD_MIN", "5.0"))           # minimum entry size (no $1 clips)
+DSCALP_STEP_USD_MIN = float(os.getenv("DSCALP_STEP_USD_MIN", "6.0"))           # minimum entry size (no $1 clips)
 DSCALP_MAX_USD_PER_SLUG = float(os.getenv("DSCALP_MAX_USD_PER_SLUG", "30.0"))  # max directional per slug
 DSCALP_COOLDOWN_MS = float(os.getenv("DSCALP_COOLDOWN_MS", "4000"))            # 4s between entries (target ~15 trades/min)
 # Exit ladder
-DSCALP_TP1_CENTS = float(os.getenv("DSCALP_TP1_CENTS", "3.0"))                 # +3c: sell 30%
-DSCALP_TP1_FRAC = float(os.getenv("DSCALP_TP1_FRAC", "0.30"))
-DSCALP_TP2_CENTS = float(os.getenv("DSCALP_TP2_CENTS", "5.0"))                 # +5c: sell 30%
-DSCALP_TP2_FRAC = float(os.getenv("DSCALP_TP2_FRAC", "0.30"))
-DSCALP_TP3_CENTS = float(os.getenv("DSCALP_TP3_CENTS", "7.0"))                 # +7c: sell remainder
-DSCALP_TP3_FRAC = float(os.getenv("DSCALP_TP3_FRAC", "1.0"))
-DSCALP_MIN_HOLD_SEC = float(os.getenv("DSCALP_MIN_HOLD_SEC", "60"))            # 60s min hold unless emergency
+DSCALP_TP1_CENTS = float(os.getenv("DSCALP_TP1_CENTS", "3.0"))                 # +3c: sell 25%
+DSCALP_TP1_FRAC = float(os.getenv("DSCALP_TP1_FRAC", "0.25"))
+DSCALP_TP2_CENTS = float(os.getenv("DSCALP_TP2_CENTS", "6.0"))                 # +6c: sell 25%
+DSCALP_TP2_FRAC = float(os.getenv("DSCALP_TP2_FRAC", "0.25"))
+DSCALP_TP3_CENTS = float(os.getenv("DSCALP_TP3_CENTS", "9.0"))                 # +9c: sell 25%, remainder for timeout/trailing
+DSCALP_TP3_FRAC = float(os.getenv("DSCALP_TP3_FRAC", "0.25"))
+DSCALP_MIN_HOLD_SEC = float(os.getenv("DSCALP_MIN_HOLD_SEC", "120"))           # 120s min hold — allow real directional exposure
 DSCALP_MAX_HOLD_SEC = float(os.getenv("DSCALP_MAX_HOLD_SEC", "600"))           # 10 min max hold
 DSCALP_STOP_LOSS_CENTS = float(os.getenv("DSCALP_STOP_LOSS_CENTS", "5.0"))     # -5c stop loss (emergency only)
 # ---------------------------------------------------------------------------
@@ -2624,7 +2624,7 @@ class Bot:
 
     def _emit_diag_report(self):
         """Emit behavioral diagnostics every 60s — measures success vs F247 targets.
-        Targets: trades/min ~10-20, avg_trade_size ~$7+, median_hold ~300-600s, exit >= +3c."""
+        Targets: trades/min ~10-20, avg_trade_size ~$7+, median_hold >=120s, exit >= +3c."""
         import statistics as _stats
         now_t = time.time()
         elapsed_min = max(0.1, (now_t - self._diag_report_last_ts) / 60.0)
@@ -2721,7 +2721,7 @@ class Bot:
         # Status indicators: check vs target
         tpm_ok = "OK" if 10 <= trades_per_min <= 20 else "!!"
         size_ok = "OK" if avg_trade_size >= 7.0 else "!!"
-        hold_ok = "OK" if med_hold >= 300 else ("--" if med_hold == 0 else "!!")
+        hold_ok = "OK" if med_hold >= 120 else ("--" if med_hold == 0 else "!!")
         exit_ok = "OK" if med_exit >= 3.0 else ("--" if med_exit == 0 else "!!")
         par_ok = "OK" if parity_fill_pct <= 0.30 else "!!"
 
@@ -3283,6 +3283,22 @@ class Bot:
             cur_spot = recent[-1] if recent else 0
             return cur_spot >= threshold
 
+    def _spot_move_10s_bps(self, slug: str) -> float:
+        """Absolute spot move over the last 10 seconds, in bps."""
+        spot_hist = self._spot_history.get(slug, [])
+        if len(spot_hist) < 2:
+            return 0.0
+        now = time.time()
+        cutoff = now - 10.0
+        recent = [(ts, s) for ts, s in spot_hist if ts > cutoff]
+        if len(recent) < 2:
+            return 0.0
+        first_spot = recent[0][1]
+        last_spot = recent[-1][1]
+        if first_spot <= 0:
+            return 0.0
+        return abs(last_spot - first_spot) / first_spot * 10000.0
+
     # =================================================================
     # RATE LIMITER — hard per-slug throttling
     # =================================================================
@@ -3332,8 +3348,8 @@ class Bot:
     # =================================================================
     def _dscalp_entries(self, ctx: dict):
         """Directional scalp entry (PRIMARY engine, F247-style).
-        Entry requires: (delta >= 12bps OR price in bottom 30% of 5m range)
-        AND spread <= 2c AND cache_age <= 250ms. Min $5 per entry."""
+        Entry requires: (delta >= 15bps OR spot_move_10s >= 8bps)
+        AND spread <= 2c AND cache_age <= 250ms. Min $6 per entry."""
         m, st = ctx["m"], ctx["st"]
         t_min = ctx["t_min"]
         delta_bps = ctx["delta_bps"]
@@ -3379,10 +3395,10 @@ class Bot:
         if book.spread * 100 > DSCALP_MAX_SPREAD_CENTS:
             return
 
-        # ── ENTRY SIGNAL: delta >= threshold OR price in cheap range ──
+        # ── ENTRY SIGNAL: delta >= 15bps OR spot moved >= 8bps in 10s ──
         delta_ok = abs_delta_bps >= DSCALP_DELTA_MIN_BPS
-        range_ok = self._is_price_in_cheap_range(m.slug, outcome, book.ask)
-        if not delta_ok and not range_ok:
+        spot_move_ok = self._spot_move_10s_bps(m.slug) >= DSCALP_SPOT_MOVE_10S_BPS
+        if not delta_ok and not spot_move_ok:
             return
 
         # Velocity must be supportive (agree with direction)
@@ -3420,7 +3436,7 @@ class Bot:
             pos.max_favorable_mid = book.mid
 
         # Log intent with signal type
-        entry_signal = "delta" if delta_ok else "range"
+        entry_signal = "delta" if delta_ok else "spot_move"
         regime = "low_vol" if self._regime_is_low_vol.get(m.slug, False) else "normal"
         write_jsonl({"event_type": "DSCALP_ENTRY",
                       "ts_ms": int(now_t * 1000),
@@ -3462,6 +3478,7 @@ class Bot:
             "qty": total_qty,
             "tp1_done": self._dscalp_positions.get(m.slug, {}).get("tp1_done", False),
             "tp2_done": self._dscalp_positions.get(m.slug, {}).get("tp2_done", False),
+            "tp3_done": self._dscalp_positions.get(m.slug, {}).get("tp3_done", False),
         }
         self._dscalp_invested_usd[m.slug] = invested + actual_cost
         self._dscalp_last_entry_ts[m.slug] = now_t
@@ -3483,7 +3500,8 @@ class Bot:
 
     def _dscalp_manage_exits(self, m: MarketRef, st: MarketState, ctx: dict):
         """Manage directional scalp exits: TP ladder + timeout + stop loss.
-        ENFORCES 60s minimum hold unless emergency (stop loss)."""
+        ENFORCES 120s minimum hold unless emergency (stop loss).
+        TP ladder: +3c/+6c/+9c at 25% each, remainder for timeout/trailing."""
         dpos = self._dscalp_positions.get(m.slug)
         if dpos is None:
             return
@@ -3528,9 +3546,9 @@ class Bot:
                           "pnl_cents": round(pnl_cents, 2), "hold_sec": round(hold_sec, 1)})
             return
 
-        # ── MINIMUM HOLD FLOOR: 60s unless emergency (stop loss above) ──
+        # ── MINIMUM HOLD FLOOR: 120s unless emergency (stop loss above) ──
         if hold_sec < DSCALP_MIN_HOLD_SEC:
-            return  # allow directional imbalance to persist
+            return  # allow real directional exposure — no early exit
 
         # ── Timeout exit ──
         if hold_sec >= DSCALP_MAX_HOLD_SEC:
@@ -3555,7 +3573,7 @@ class Bot:
                           "pnl_cents": round(pnl_cents, 2), "hold_sec": round(hold_sec, 1)})
             return
 
-        # ── TP1: +3c, sell 30% ──
+        # ── TP1: +3c, sell 25% ──
         if pnl_cents >= DSCALP_TP1_CENTS and not dpos["tp1_done"]:
             sell_qty = min(pos.qty * DSCALP_TP1_FRAC, pos.qty)
             if sell_qty >= MIN_QTY:
@@ -3574,7 +3592,7 @@ class Bot:
                               "hold_sec": round(hold_sec, 1)})
             dpos["tp1_done"] = True
 
-        # ── TP2: +5c, sell 30% ──
+        # ── TP2: +6c, sell 25% ──
         if pnl_cents >= DSCALP_TP2_CENTS and not dpos["tp2_done"]:
             sell_qty = min(pos.qty * DSCALP_TP2_FRAC, pos.qty)
             if sell_qty >= MIN_QTY:
@@ -3593,29 +3611,24 @@ class Bot:
                               "hold_sec": round(hold_sec, 1)})
             dpos["tp2_done"] = True
 
-        # ── TP3: +7c, sell remainder ──
-        if pnl_cents >= DSCALP_TP3_CENTS:
-            sell_qty = pos.qty
+        # ── TP3: +9c, sell 25% — remainder rides to timeout or trailing stop ──
+        if pnl_cents >= DSCALP_TP3_CENTS and not dpos.get("tp3_done"):
+            sell_qty = min(pos.qty * DSCALP_TP3_FRAC, pos.qty)
             if sell_qty >= MIN_QTY:
                 sell_price = book.bid
                 self._do_sell(m, st, outcome, sell_qty, sell_price,
                               reason="DSCALP_TP3", leg="DSCALP", ctx=ctx, use_maker=True)
                 self._diag_dscalp_tp3 += 1
                 self._diag_dscalp_exits += 1
-                self._diag_dscalp_hold_times.append(hold_sec)
-                self._diag_dscalp_exit_cents.append(pnl_cents)
                 self._diag_directional_fills_min += 1
                 self._diag_total_fills_min += 1
-                self._true_cost_tx_count += 1
-                self._true_cost_fill_count += 1
-                self._true_cost_fill_count_min += 1
                 self._throttle_record_trade()
                 self._diag_trade_sizes.append(sell_qty * sell_price)
                 write_jsonl({"event_type": "DSCALP_TP3", "ts_ms": int(now_t * 1000),
                               "slug": m.slug, "outcome": outcome,
-                              "pnl_cents": round(pnl_cents, 2), "hold_sec": round(hold_sec, 1)})
-            self._dscalp_positions.pop(m.slug, None)
-            self._dscalp_invested_usd.pop(m.slug, None)
+                              "pnl_cents": round(pnl_cents, 2), "sell_qty": round(sell_qty, 1),
+                              "hold_sec": round(hold_sec, 1)})
+            dpos["tp3_done"] = True
 
     def _core_entries(self, ctx: dict):
         m, st = ctx["m"], ctx["st"]
@@ -4963,8 +4976,8 @@ class Bot:
             edge_c = (1.000 - est_combined) * 100 - fee_cents
             return edge_c >= target_edge * 0.3, edge_c
 
-        # ── Tick 1 escalation: +1 tick at HEDGE_TICK1_MS (200ms) ──
-        if age_ms >= HEDGE_TICK1_MS and not hedge["tick1_done"] and missing_book.bid > 0:
+        # ── Tick 1 escalation: +1 tick at HEDGE_TICK1_MS (DISABLED — no micro-neutralizing) ──
+        if HEDGE_TICK_ESCALATION_ENABLED and age_ms >= HEDGE_TICK1_MS and not hedge["tick1_done"] and missing_book.bid > 0:
             esc_price = clamp_to_tick(missing_book.bid + 0.001)
             ok, edge_c = _edge_ok(esc_price)
             if ok and esc_price < missing_book.ask:
@@ -4990,8 +5003,8 @@ class Bot:
                           "cache_age_ms": round(cache_age, 0),
                           "edge_cents": round(edge_c, 3)})
 
-        # ── Tick 2 escalation: +3 ticks at HEDGE_TICK2_MS (350ms) ──
-        if age_ms >= HEDGE_TICK2_MS and not hedge["tick2_done"] and missing_book.bid > 0:
+        # ── Tick 2 escalation: +3 ticks at HEDGE_TICK2_MS (DISABLED — no micro-neutralizing) ──
+        if HEDGE_TICK_ESCALATION_ENABLED and age_ms >= HEDGE_TICK2_MS and not hedge["tick2_done"] and missing_book.bid > 0:
             esc_price = clamp_to_tick(missing_book.bid + 0.003)
             ok, edge_c = _edge_ok(esc_price)
             if ok and esc_price < missing_book.ask:
@@ -5801,6 +5814,10 @@ class Bot:
                               "qty": round(pos.qty, 1), "tp_tighten": tp_tighten})
 
             # --- DERISK with RESCUE-TO-STRADDLE (cooldown + change detection) ---
+            # Skip derisk entirely during directional hold floor
+            _dpos_derisk = self._dscalp_positions.get(m.slug)
+            if _dpos_derisk and (time.time() - _dpos_derisk["entry_ts"]) < DSCALP_MIN_HOLD_SEC:
+                continue  # protect directional exposure during hold floor
             derisk_triggered = False
             if outcome == "Up" and delta_bps < +DERISK_CROSS_BPS:
                 derisk_triggered = True
@@ -5893,7 +5910,11 @@ class Bot:
                         pending_pairs_count = len([p for p in self._parity_pending_pairs
                                                     if p.get("slug") == m.slug]) if hasattr(self, '_parity_pending_pairs') else 0
                         rescue_block_reason = None
-                        if emergency:
+                        # Block rescue during directional hold floor
+                        _dpos = self._dscalp_positions.get(m.slug)
+                        if _dpos and (time.time() - _dpos["entry_ts"]) < DSCALP_MIN_HOLD_SEC:
+                            rescue_block_reason = "dscalp_hold_floor"
+                        elif emergency:
                             rescue_block_reason = "emergency"
                         elif not DERISK_RESCUE_TO_STRADDLE:
                             rescue_block_reason = "disabled"
