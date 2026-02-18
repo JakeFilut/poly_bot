@@ -441,10 +441,18 @@ OM_CANCEL_FREEZE_SEC = float(os.getenv("OM_CANCEL_FREEZE_SEC", "30"))           
 # Flatten verification (Safety Item 4)
 OM_FLATTEN_VERIFY_ENABLED = bool(os.getenv("OM_FLATTEN_VERIFY_ENABLED", "True") not in ("", "0", "False", "false"))
 OM_FLATTEN_CROSS_MAX_RETRIES = int(os.getenv("OM_FLATTEN_CROSS_MAX_RETRIES", "3"))
-# State drift detector (Safety Item 5)
+# State drift detector (Safety Item 5) — enhanced: API positions vs internal
 OM_DRIFT_CHECK_INTERVAL_SEC = float(os.getenv("OM_DRIFT_CHECK_INTERVAL_SEC", "60"))
 OM_DRIFT_QTY_TOLERANCE = float(os.getenv("OM_DRIFT_QTY_TOLERANCE", "5.0"))         # shares tolerance
 OM_DRIFT_PAUSE_SEC = float(os.getenv("OM_DRIFT_PAUSE_SEC", "120"))                 # pause entries on drift
+OM_DRIFT_POSITION_CHECK = bool(os.getenv("OM_DRIFT_POSITION_CHECK", "True") not in ("", "0", "False", "false"))
+# PnL attribution reporting interval
+PNL_REPORT_INTERVAL_SEC = float(os.getenv("PNL_REPORT_INTERVAL_SEC", "900"))       # every 15 min
+# Auto-disable slug if pnl_30m < -$X
+SLUG_AUTO_DISABLE_ENABLED = bool(os.getenv("SLUG_AUTO_DISABLE_ENABLED", "True") not in ("", "0", "False", "false"))
+SLUG_AUTO_DISABLE_LOSS_USD = float(os.getenv("SLUG_AUTO_DISABLE_LOSS_USD", "15.0"))   # -$15 triggers disable
+SLUG_AUTO_DISABLE_WINDOW_SEC = float(os.getenv("SLUG_AUTO_DISABLE_WINDOW_SEC", "1800"))  # 30 min rolling window
+SLUG_AUTO_DISABLE_DURATION_SEC = float(os.getenv("SLUG_AUTO_DISABLE_DURATION_SEC", "7200"))  # 2 hour disable
 # =============================================================================
 # UTIL / LOGGING — thin wrappers around Logger instance
 # =============================================================================
@@ -1231,6 +1239,47 @@ class PolymarketClient:
         except Exception:
             return []
 
+    def get_live_positions(self) -> Dict[str, Dict[str, float]]:
+        """Fetch live token positions from the CLOB / conditional-tokens API.
+        Returns: {token_id: {"size": float, "avg_price": float}} or empty dict."""
+        if not self._clob or not self._wallet_address:
+            return {}
+        try:
+            # py_clob_client >=0.15 has get_balances / get_complement
+            if hasattr(self._clob, 'get_balances'):
+                balances = self._clob.get_balances()
+                if isinstance(balances, list):
+                    return {b.get("asset_id", ""): {
+                        "size": float(b.get("size", 0) or 0),
+                        "avg_price": float(b.get("avg_price", 0) or 0),
+                    } for b in balances if b.get("asset_id")}
+            # Fallback: REST call to CLOB positions endpoint
+            url = f"{self.clob_host}/positions?user={self._wallet_address}"
+            r = self.session.get(url, timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, list):
+                    return {p.get("asset_id", p.get("token_id", "")): {
+                        "size": float(p.get("size", 0) or 0),
+                        "avg_price": float(p.get("avg_price", 0) or 0),
+                    } for p in data if p.get("asset_id") or p.get("token_id")}
+            return {}
+        except Exception:
+            return {}
+
+    def get_usdc_balance(self) -> Optional[float]:
+        """Fetch USDC balance from CLOB API. Returns None if unavailable."""
+        if not self._clob or not self._wallet_address:
+            return None
+        try:
+            if hasattr(self._clob, 'get_balance_allowance'):
+                ba = self._clob.get_balance_allowance()
+                if isinstance(ba, dict):
+                    return float(ba.get("balance", 0) or 0) / 1e6  # USDC has 6 decimals
+            return None
+        except Exception:
+            return None
+
 # =============================================================================
 # BOT CORE
 # =============================================================================
@@ -1374,9 +1423,18 @@ class Bot:
         self._om_cancel_ts_slug: Dict[str, List[float]] = {}     # slug -> [cancel_ts, ...]
         self._om_cancel_freeze_until: float = 0.0                # global freeze on quoting
         self._om_last_replace_ts: Dict[str, float] = {}          # (slug+outcome+side) -> last replace ts
-        # Safety Item 5: state drift detector
+        # Safety Item 5: state drift detector — enhanced with position compare
         self._om_last_drift_check_ts: float = 0.0
         self._om_drift_pause_until: float = 0.0
+        self._om_drift_count: int = 0                        # total drift events
+        self._om_drift_position_mismatches: int = 0          # position-level mismatches
+        # PnL attribution: 15m interval reporting
+        self._pnl_report_last_ts: float = 0.0
+        self._pnl_total_slug_pause_sec: float = 0.0          # cumulative slug pause time
+        self._pnl_total_drift_pause_sec: float = 0.0         # cumulative drift pause time
+        # Auto-disable slug state
+        self._slug_realized_pnl_window: Dict[str, List[Tuple[float, float]]] = {}  # slug -> [(ts, pnl_usd)]
+        self._slug_auto_disabled_until: Dict[str, float] = {}  # slug -> disable expiry ts
         self._diag_quote_submit_count = 0
         self._diag_quote_cancel_count = 0
         self._diag_quote_replace_count = 0
@@ -2178,6 +2236,13 @@ class Bot:
             return {"filled": False, "fill_qty": 0, "fill_price": 0.0,
                     "usdc_cost": 0.0, "order_id": ""}
 
+        # Slug auto-disable: block entries for slugs with bad rolling PnL
+        if self._slug_auto_disabled(m.slug):
+            write_jsonl({"event_type": "OM_BUY_BLOCKED_SLUG_AUTO_DISABLED",
+                          "slug": m.slug, "outcome": outcome, "reason": reason})
+            return {"filled": False, "fill_qty": 0, "fill_price": 0.0,
+                    "usdc_cost": 0.0, "order_id": ""}
+
         result = self._om_submit_order(
             token_id=token_id, slug=m.slug, outcome=outcome,
             side="BUY", price=price, qty=qty, reason=reason,
@@ -2326,9 +2391,19 @@ class Bot:
             write_jsonl({"event_type": "OM_LOAD_ORDERS_ERROR", "err": str(e)[:200]})
 
     def _om_startup_reconcile(self):
-        """On startup: list CLOB orders, adopt tracked ones, cancel unknown ones."""
+        """On startup: reconcile orders + positions + balance against live API state.
+        1. List CLOB orders: adopt tracked, cancel unknown orphans
+        2. Fetch live positions: compare qty per token to internal state
+        3. Fetch USDC balance: compare to internal cash_usdc
+        4. If mismatch -> pause entries, emit STARTUP_RECONCILE_REPORT"""
         if not self.client._clob:
             return
+
+        startup_pause = False
+        position_mismatches = []
+        balance_mismatch = None
+
+        # ── Phase 1: Order reconciliation ──
         try:
             clob_orders = self.client.get_open_orders()
         except Exception as e:
@@ -2345,7 +2420,7 @@ class Bot:
         canceled_unknown = 0
         reconciled_fills = 0
 
-        # 1. For tracked orders that still exist on CLOB: reconcile fills
+        # 1a. For tracked orders that still exist on CLOB: reconcile fills
         for oid in list(self._om_open_orders.keys()):
             if oid in clob_ids:
                 result = self._om_poll_and_reconcile(oid)
@@ -2353,17 +2428,14 @@ class Bot:
                     reconciled_fills += 1
                 adopted += 1
             else:
-                # Order no longer on CLOB — it was filled or expired while we were down
                 entry = self._om_open_orders[oid]
-                # Assume fully filled (conservative: position state was already applied
-                # for any partial fills before crash, remainder is unknown)
                 write_jsonl({"event_type": "OM_STARTUP_ORDER_GONE",
                               "order_id": oid, "slug": entry["slug"],
                               "outcome": entry["outcome"], "side": entry["side"],
                               "filled_qty": entry["filled_qty"], "total_qty": entry["qty"]})
                 self._om_open_orders.pop(oid, None)
 
-        # 2. For CLOB orders NOT in our tracking: cancel them (orphans)
+        # 1b. For CLOB orders NOT in our tracking: cancel them (orphans)
         tracked = set(self._om_open_orders.keys())
         for oid, o in clob_ids.items():
             if oid not in tracked:
@@ -2379,12 +2451,88 @@ class Bot:
                     write_jsonl({"event_type": "OM_STARTUP_ORPHAN_CANCEL_ERROR",
                                   "order_id": oid, "err": str(e)[:120]})
 
-        write_jsonl({"event_type": "OM_STARTUP_RECONCILE_DONE",
-                      "clob_orders": len(clob_ids),
-                      "adopted": adopted,
-                      "canceled_unknown": canceled_unknown,
-                      "reconciled_fills": reconciled_fills,
-                      "tracked_remaining": len(self._om_open_orders)})
+        # ── Phase 2: Position reconciliation ──
+        live_positions = self.client.get_live_positions()
+        if live_positions:
+            # Build internal position map: token_id -> qty
+            internal_qty_by_token: Dict[str, float] = {}
+            for slug, st in self.market_states.items():
+                m_data = self.client._market_cache.get(slug, {})
+                up_id = m_data.get("up_id", "")
+                dn_id = m_data.get("down_id", "")
+                for outcome, tid in [("Up", up_id), ("Down", dn_id)]:
+                    if tid:
+                        internal_qty_by_token[tid] = st.positions[outcome].qty
+
+            # Compare
+            for tid, live_data in live_positions.items():
+                live_qty = live_data.get("size", 0.0)
+                internal_qty = internal_qty_by_token.get(tid, 0.0)
+                diff = abs(live_qty - internal_qty)
+                if diff > OM_DRIFT_QTY_TOLERANCE:
+                    position_mismatches.append({
+                        "token_id": tid[-12:],
+                        "live_qty": round(live_qty, 1),
+                        "internal_qty": round(internal_qty, 1),
+                        "diff": round(diff, 1),
+                    })
+                    startup_pause = True
+
+            # Also check: internal positions that have no live counterpart
+            for tid, iqty in internal_qty_by_token.items():
+                if iqty > OM_DRIFT_QTY_TOLERANCE and tid not in live_positions:
+                    position_mismatches.append({
+                        "token_id": tid[-12:],
+                        "live_qty": 0.0,
+                        "internal_qty": round(iqty, 1),
+                        "diff": round(iqty, 1),
+                        "note": "internal_only",
+                    })
+                    startup_pause = True
+
+        # ── Phase 3: Balance check ──
+        live_balance = self.client.get_usdc_balance()
+        if live_balance is not None:
+            balance_diff = abs(live_balance - self.cash_usdc)
+            if balance_diff > 10.0:  # >$10 discrepancy
+                balance_mismatch = {
+                    "live_usdc": round(live_balance, 2),
+                    "internal_usdc": round(self.cash_usdc, 2),
+                    "diff": round(balance_diff, 2),
+                }
+                startup_pause = True
+                # Adopt live balance as truth
+                self.cash_usdc = live_balance
+
+        # ── Phase 4: Pause if mismatch ──
+        if startup_pause:
+            self._om_drift_pause_until = time.time() + OM_DRIFT_PAUSE_SEC
+            write_jsonl({"event_type": "STARTUP_RECONCILE_MISMATCH",
+                          "position_mismatches": position_mismatches,
+                          "balance_mismatch": balance_mismatch,
+                          "pause_sec": OM_DRIFT_PAUSE_SEC})
+
+        # ── Emit STARTUP_RECONCILE_REPORT ──
+        write_jsonl({
+            "event_type": "STARTUP_RECONCILE_REPORT",
+            "clob_orders": len(clob_ids),
+            "adopted": adopted,
+            "canceled_unknown": canceled_unknown,
+            "reconciled_fills": reconciled_fills,
+            "tracked_remaining": len(self._om_open_orders),
+            "live_positions_fetched": len(live_positions),
+            "position_mismatches": len(position_mismatches),
+            "balance_mismatch": balance_mismatch is not None,
+            "startup_pause": startup_pause,
+        })
+        print(f"  STARTUP RECONCILE: orders={len(clob_ids)} adopted={adopted} "
+              f"orphans_canceled={canceled_unknown} fills_reconciled={reconciled_fills}")
+        if position_mismatches:
+            print(f"  !! POSITION MISMATCH: {len(position_mismatches)} tokens — "
+                  f"entries paused {OM_DRIFT_PAUSE_SEC}s")
+        if balance_mismatch:
+            print(f"  !! BALANCE MISMATCH: live=${balance_mismatch['live_usdc']:.2f} "
+                  f"internal=${balance_mismatch['internal_usdc']:.2f} — adopted live")
 
     # =========================================================================
     # Safety Item 2: Per-Slug No-Progress Circuit Breaker
@@ -2572,8 +2720,8 @@ class Bot:
     # =========================================================================
 
     def _om_check_state_drift(self):
-        """Compare internal position state against CLOB order state.
-        If mismatch beyond tolerance, log STATE_DRIFT and pause entries."""
+        """Compare internal state against live API: orders + positions.
+        If mismatch beyond tolerance -> log STATE_DRIFT, disable entries, reconcile."""
         if MODE == "LOG" or not self.client._clob:
             return
 
@@ -2582,7 +2730,10 @@ class Bot:
             return
         self._om_last_drift_check_ts = now_ts
 
-        # 1. Compare tracked open orders vs CLOB reality
+        drift_detected = False
+        position_drifts = []
+
+        # ── Phase 1: Compare tracked open orders vs CLOB reality ──
         try:
             clob_orders = self.client.get_open_orders()
         except Exception:
@@ -2595,16 +2746,10 @@ class Bot:
                 clob_ids.add(oid)
 
         tracked_ids = set(self._om_open_orders.keys())
-
-        # Orders we think are open but CLOB says are gone
         ghost_orders = tracked_ids - clob_ids
-        # Orders CLOB has that we don't track (orphans — handled by orphan scan)
         orphan_orders = clob_ids - tracked_ids
 
-        drift_detected = False
-
         if ghost_orders:
-            # These orders disappeared — might have filled or been cancelled externally
             for oid in ghost_orders:
                 entry = self._om_open_orders.get(oid, {})
                 write_jsonl({"event_type": "STATE_DRIFT_GHOST_ORDER",
@@ -2614,34 +2759,79 @@ class Bot:
                               "side": entry.get("side", ""),
                               "filled_qty": entry.get("filled_qty", 0),
                               "total_qty": entry.get("qty", 0)})
-                # Try to reconcile one last time before removing
                 self._om_poll_and_reconcile(oid)
-                # If still tracked (poll didn't remove it), force-remove
                 if oid in self._om_open_orders:
                     self._om_open_orders.pop(oid, None)
             drift_detected = True
 
-        # 2. Cross-check internal position qty consistency
-        # Sum up all pending BUY fills that haven't been applied
-        pending_buy_qty: Dict[str, Dict[str, float]] = {}  # slug -> outcome -> qty
-        pending_sell_qty: Dict[str, Dict[str, float]] = {}
-        for entry in self._om_open_orders.values():
-            remaining = max(0, entry["qty"] - entry["filled_qty"])
-            if remaining > 0:
-                d = pending_buy_qty if entry["side"] == "BUY" else pending_sell_qty
-                d.setdefault(entry["slug"], {}).setdefault(entry["outcome"], 0.0)
-                d[entry["slug"]][entry["outcome"]] += remaining
+        # ── Phase 2: Compare API positions vs internal qty by slug/outcome ──
+        if OM_DRIFT_POSITION_CHECK:
+            live_positions = self.client.get_live_positions()
+            if live_positions:
+                # Build internal map: token_id -> (slug, outcome, internal_qty)
+                internal_map: Dict[str, Tuple[str, str, float]] = {}
+                for slug, st in self.market_states.items():
+                    m_data = self.client._market_cache.get(slug, {})
+                    up_id = m_data.get("up_id", "")
+                    dn_id = m_data.get("down_id", "")
+                    for outcome, tid in [("Up", up_id), ("Down", dn_id)]:
+                        if tid:
+                            internal_map[tid] = (slug, outcome, st.positions[outcome].qty)
 
+                for tid, live_data in live_positions.items():
+                    live_qty = live_data.get("size", 0.0)
+                    if tid in internal_map:
+                        slug, outcome, internal_qty = internal_map[tid]
+                        diff = abs(live_qty - internal_qty)
+                        if diff > OM_DRIFT_QTY_TOLERANCE:
+                            position_drifts.append({
+                                "slug": slug, "outcome": outcome,
+                                "live_qty": round(live_qty, 1),
+                                "internal_qty": round(internal_qty, 1),
+                                "diff": round(diff, 1),
+                            })
+                            # Reconcile: adopt live qty if larger (fills we missed)
+                            if live_qty > internal_qty:
+                                st = self.market_states.get(slug)
+                                if st:
+                                    st.positions[outcome].qty = live_qty
+                                    write_jsonl({"event_type": "STATE_DRIFT_QTY_ADOPTED",
+                                                  "slug": slug, "outcome": outcome,
+                                                  "old_qty": round(internal_qty, 1),
+                                                  "new_qty": round(live_qty, 1)})
+
+                # Check internal positions with no live counterpart
+                for tid, (slug, outcome, iqty) in internal_map.items():
+                    if iqty > OM_DRIFT_QTY_TOLERANCE and tid not in live_positions:
+                        position_drifts.append({
+                            "slug": slug, "outcome": outcome,
+                            "live_qty": 0.0,
+                            "internal_qty": round(iqty, 1),
+                            "diff": round(iqty, 1),
+                            "note": "phantom_internal",
+                        })
+
+                if position_drifts:
+                    drift_detected = True
+                    self._om_drift_position_mismatches += len(position_drifts)
+
+        # ── Phase 3: React to drift ──
         if drift_detected:
-            write_jsonl({"event_type": "STATE_DRIFT",
-                          "ghost_orders": len(ghost_orders),
-                          "orphan_orders": len(orphan_orders),
-                          "pending_buy_slugs": len(pending_buy_qty),
-                          "pending_sell_slugs": len(pending_sell_qty)})
-            # Pause entries briefly to let reconciliation settle
+            self._om_drift_count += 1
+            write_jsonl({
+                "event_type": "STATE_DRIFT",
+                "ghost_orders": len(ghost_orders),
+                "orphan_orders": len(orphan_orders),
+                "position_drifts": position_drifts,
+                "position_drift_count": len(position_drifts),
+                "total_drift_events": self._om_drift_count,
+            })
+            # Disable entries until reconciliation settles
             self._om_drift_pause_until = now_ts + OM_DRIFT_PAUSE_SEC
+            self._pnl_total_drift_pause_sec += OM_DRIFT_PAUSE_SEC
             write_jsonl({"event_type": "STATE_DRIFT_PAUSE",
-                          "pause_sec": OM_DRIFT_PAUSE_SEC})
+                          "pause_sec": OM_DRIFT_PAUSE_SEC,
+                          "total_drift_pauses": self._om_drift_count})
 
     def _om_drift_paused(self) -> bool:
         """True if entries are paused due to state drift."""
@@ -3002,10 +3192,12 @@ class Bot:
                 # 4c. Order Manager: reconcile open orders, TTL, orphan scan
                 self._om_reconcile_all()
 
-                # 4d. Safety checks: no-progress, state drift, LIVE_SANITY
+                # 4d. Safety checks: no-progress, state drift, LIVE_SANITY, PnL attribution
                 self._om_check_slug_progress()
                 self._om_check_state_drift()
                 self._om_emit_live_sanity()
+                self._emit_pnl_attribution()  # self-timed at PNL_REPORT_INTERVAL_SEC (15m)
+                self._check_slug_auto_disable()  # auto-disable slugs with bad PnL
 
                 # 5. Save state periodically (every STATE_SAVE_INTERVAL_SEC)
                 now = time.time()
@@ -3765,43 +3957,67 @@ class Bot:
         self._diag_dscalp_exit_cents.clear()
 
     def _emit_pnl_attribution(self):
-        """Per-hour PnL attribution + expectancy diagnostics.
-        Emits: gross_exit_cents, avg_entry, avg_exit, median_exit_cents,
-        winrate, median_hold, derisk_count, orphan_cancel_count, PnL by reason."""
+        """PnL attribution report — runs every PNL_REPORT_INTERVAL_SEC (15m default) + hourly.
+        Emits: realized_pnl by reason (TP/rescue/recycle/derisk/flatten),
+        winrate, median_exit_cents, median_hold_sec, derisk detail, pause totals."""
         import statistics as _stats
         now_t = time.time()
 
-        all_exit_cents = self._diag_dscalp_exit_cents
-        all_hold_times = self._diag_dscalp_hold_times
-        n_exits = len(all_exit_cents)
-
-        if n_exits == 0:
-            write_jsonl({"event_type": "PNL_ATTRIBUTION", "ts_ms": int(now_t * 1000),
-                          "n_exits": 0, "status": "no_exits"})
+        # Self-timed: run every 15 min (plus called at hourly diag)
+        if now_t - self._pnl_report_last_ts < PNL_REPORT_INTERVAL_SEC:
             return
+        self._pnl_report_last_ts = now_t
 
-        gross_exit_cents = sum(all_exit_cents)
-        avg_exit_cents = _stats.mean(all_exit_cents)
-        med_exit_cents = _stats.median(all_exit_cents)
-        winners = [c for c in all_exit_cents if c > 0]
-        losers = [c for c in all_exit_cents if c <= 0]
-        winrate = len(winners) / n_exits if n_exits else 0.0
-        avg_win = _stats.mean(winners) if winners else 0.0
-        avg_loss = _stats.mean(losers) if losers else 0.0
-        med_hold = _stats.median(all_hold_times) if all_hold_times else 0.0
-        expectancy = avg_exit_cents  # per-trade expected value in cents
+        all_exit_cents = list(self._diag_dscalp_exit_cents)  # snapshot
+        all_hold_times = list(self._diag_dscalp_hold_times)
+        n_exits = len(all_exit_cents)
 
         # PnL by reason
         pnl_by_reason = {}
         for reason, entries in self._diag_exit_by_reason.items():
             pnl_list = [e[0] for e in entries]
+            hold_list = [e[1] for e in entries]
+            usd_list = [e[2] for e in entries if e[2] > 0]
             n = len(pnl_list)
             pnl_by_reason[reason] = {
                 "count": n,
                 "total_cents": round(sum(pnl_list), 2),
                 "avg_cents": round(_stats.mean(pnl_list), 2) if pnl_list else 0.0,
                 "median_cents": round(_stats.median(pnl_list), 2) if pnl_list else 0.0,
+                "median_hold_sec": round(_stats.median(hold_list), 1) if hold_list else 0.0,
+                "total_usd": round(sum(usd_list), 2) if usd_list else 0.0,
             }
+
+        # Derisk detail
+        derisk_reasons = pnl_by_reason.copy()
+        derisk_entries = []
+        for reason, entries in self._diag_exit_by_reason.items():
+            if "derisk" in reason:
+                derisk_entries.extend(entries)
+        derisk_loss_cents = [e[0] for e in derisk_entries]
+        avg_derisk_loss = _stats.mean(derisk_loss_cents) if derisk_loss_cents else 0.0
+
+        # Pause time totals
+        slug_pause_sec = sum(
+            max(0, t - now_t) for t in self._om_slug_paused_until.values()
+        ) + self._pnl_total_slug_pause_sec
+        drift_pause_sec = self._pnl_total_drift_pause_sec
+
+        # Core metrics
+        if n_exits > 0:
+            gross_exit_cents = sum(all_exit_cents)
+            avg_exit_cents = _stats.mean(all_exit_cents)
+            med_exit_cents = _stats.median(all_exit_cents)
+            winners = [c for c in all_exit_cents if c > 0]
+            losers = [c for c in all_exit_cents if c <= 0]
+            winrate = len(winners) / n_exits
+            avg_win = _stats.mean(winners) if winners else 0.0
+            avg_loss = _stats.mean(losers) if losers else 0.0
+            med_hold = _stats.median(all_hold_times) if all_hold_times else 0.0
+            expectancy = avg_exit_cents
+        else:
+            gross_exit_cents = avg_exit_cents = med_exit_cents = 0.0
+            winrate = avg_win = avg_loss = med_hold = expectancy = 0.0
 
         report = {
             "event_type": "PNL_ATTRIBUTION",
@@ -3815,8 +4031,11 @@ class Bot:
             "avg_loss_cents": round(avg_loss, 2),
             "expectancy_cents": round(expectancy, 2),
             "median_hold_sec": round(med_hold, 1),
-            "derisk_count_hour": self._diag_derisk_count_hour,
+            # Derisk detail
+            "derisk_count": self._diag_derisk_count_hour,
+            "avg_derisk_loss_cents": round(avg_derisk_loss, 2),
             "derisk_reasons": dict(self._diag_derisk_reasons),
+            # Exit breakdown
             "orphan_cancel_count": self._om_orphan_canceled_count,
             "tp1_count": self._diag_dscalp_tp1,
             "tp2_count": self._diag_dscalp_tp2,
@@ -3824,7 +4043,15 @@ class Bot:
             "breakeven_count": self._diag_dscalp_breakeven_exits,
             "timeout_count": self._diag_dscalp_timeout_exits,
             "stop_count": self._diag_dscalp_stop_exits,
+            # PnL by reason (the knob-tuning data)
             "pnl_by_reason": pnl_by_reason,
+            # Pause time totals
+            "slug_pause_total_sec": round(slug_pause_sec, 1),
+            "drift_pause_total_sec": round(drift_pause_sec, 1),
+            "drift_events": self._om_drift_count,
+            "position_mismatches": self._om_drift_position_mismatches,
+            # Auto-disabled slugs
+            "auto_disabled_slugs": [s for s, t in self._slug_auto_disabled_until.items() if now_t < t],
         }
         write_jsonl(report)
 
@@ -3835,14 +4062,65 @@ class Bot:
         print(f"  EXIT: tp1={self._diag_dscalp_tp1} tp2={self._diag_dscalp_tp2} "
               f"tp3={self._diag_dscalp_tp3} be={self._diag_dscalp_breakeven_exits} "
               f"timeout={self._diag_dscalp_timeout_exits} stop={self._diag_dscalp_stop_exits} "
-              f"derisk={self._diag_derisk_count_hour}")
+              f"derisk={self._diag_derisk_count_hour} avg_drsk={avg_derisk_loss:+.1f}c")
         if pnl_by_reason:
             parts = [f"{r}={d['total_cents']:+.1f}c({d['count']})"
                      for r, d in sorted(pnl_by_reason.items(), key=lambda x: -abs(x[1]['total_cents']))]
             print(f"  BY_REASON: {' '.join(parts)}")
+        paused_slugs = [s for s, t in self._slug_auto_disabled_until.items() if now_t < t]
+        if paused_slugs:
+            print(f"  AUTO_DISABLED: {', '.join(paused_slugs)}")
+        print(f"  PAUSES: slug={slug_pause_sec:.0f}s  drift={drift_pause_sec:.0f}s  "
+              f"drift_events={self._om_drift_count}")
 
-        # Reset per-hour exit attribution
-        self._diag_exit_by_reason.clear()
+        # Do NOT clear _diag_exit_by_reason here — let it accumulate for hourly rollup
+        # It gets cleared at hour boundary by the hourly reset
+
+    # ── Slug Auto-Disable ────────────────────────────────────────────
+    def _check_slug_auto_disable(self):
+        """Auto-disable slugs with bad rolling 30m PnL.
+        If a slug's realized PnL over the last SLUG_AUTO_DISABLE_WINDOW_SEC < -SLUG_AUTO_DISABLE_LOSS_USD,
+        disable entries for that slug for SLUG_AUTO_DISABLE_DURATION_SEC."""
+        if not SLUG_AUTO_DISABLE_ENABLED:
+            return
+        now_t = time.time()
+        cutoff = now_t - SLUG_AUTO_DISABLE_WINDOW_SEC
+
+        for slug in list(self._slug_realized_pnl_window.keys()):
+            # Prune old entries
+            entries = self._slug_realized_pnl_window[slug]
+            entries[:] = [(ts, pnl) for ts, pnl in entries if ts >= cutoff]
+            if not entries:
+                self._slug_realized_pnl_window.pop(slug, None)
+                continue
+
+            # Already disabled — skip
+            if self._slug_auto_disabled_until.get(slug, 0) > now_t:
+                continue
+
+            rolling_pnl = sum(pnl for _, pnl in entries)
+            if rolling_pnl < -SLUG_AUTO_DISABLE_LOSS_USD:
+                disable_until = now_t + SLUG_AUTO_DISABLE_DURATION_SEC
+                self._slug_auto_disabled_until[slug] = disable_until
+                self._pnl_total_slug_pause_sec += SLUG_AUTO_DISABLE_DURATION_SEC
+                write_jsonl({
+                    "event_type": "SLUG_AUTO_DISABLED",
+                    "slug": slug,
+                    "rolling_pnl_usd": round(rolling_pnl, 2),
+                    "window_sec": SLUG_AUTO_DISABLE_WINDOW_SEC,
+                    "disable_duration_sec": SLUG_AUTO_DISABLE_DURATION_SEC,
+                    "disable_until": disable_until,
+                    "n_exits": len(entries),
+                })
+                print(f"  ⚠ SLUG_AUTO_DISABLED {slug}  "
+                      f"rolling_pnl=${rolling_pnl:+.2f} over {SLUG_AUTO_DISABLE_WINDOW_SEC:.0f}s  "
+                      f"disabled for {SLUG_AUTO_DISABLE_DURATION_SEC/3600:.1f}h")
+
+    def _slug_auto_disabled(self, slug: str) -> bool:
+        """Return True if slug is currently auto-disabled due to bad PnL."""
+        if not SLUG_AUTO_DISABLE_ENABLED:
+            return False
+        return self._slug_auto_disabled_until.get(slug, 0) > time.time()
 
     def _print_balance_summary(self):
         """Print balance and open positions to console."""
@@ -4654,9 +4932,14 @@ class Bot:
                                 delta_bps, abs_delta_bps),
         )
 
-    def _record_exit_reason(self, reason: str, pnl_cents: float, hold_sec: float, usdc_size: float = 0.0):
-        """Record an exit for per-hour PnL attribution."""
+    def _record_exit_reason(self, reason: str, pnl_cents: float, hold_sec: float,
+                            usdc_size: float = 0.0, slug: str = ""):
+        """Record an exit for per-hour PnL attribution + per-slug rolling PnL."""
         self._diag_exit_by_reason.setdefault(reason, []).append((pnl_cents, hold_sec, usdc_size))
+        # Track per-slug realized PnL for auto-disable
+        if slug and SLUG_AUTO_DISABLE_ENABLED:
+            pnl_usd = pnl_cents * usdc_size / 100.0 if usdc_size > 0 else 0.0
+            self._slug_realized_pnl_window.setdefault(slug, []).append((time.time(), pnl_usd))
 
     def _dscalp_manage_exits(self, m: MarketRef, st: MarketState, ctx: dict):
         """Manage directional scalp exits: TP ladder + timeout + stop loss.
@@ -4699,7 +4982,7 @@ class Bot:
             self._throttle_record_trade()
             self._dscalp_positions.pop(m.slug, None)
             self._dscalp_invested_usd.pop(m.slug, None)
-            self._record_exit_reason("stop_loss", pnl_cents, hold_sec, sell_qty * sell_price)
+            self._record_exit_reason("stop_loss", pnl_cents, hold_sec, sell_qty * sell_price, slug=m.slug)
             write_jsonl({"event_type": "DSCALP_STOP", "ts_ms": int(now_t * 1000),
                           "slug": m.slug, "outcome": outcome,
                           "pnl_cents": round(pnl_cents, 2), "hold_sec": round(hold_sec, 1)})
@@ -4729,7 +5012,7 @@ class Bot:
                 self._dscalp_positions.pop(m.slug, None)
                 self._dscalp_invested_usd.pop(m.slug, None)
                 self._diag_dscalp_breakeven_exits += 1
-                self._record_exit_reason("breakeven", pnl_cents, hold_sec, sell_qty * be_price)
+                self._record_exit_reason("breakeven", pnl_cents, hold_sec, sell_qty * be_price, slug=m.slug)
                 write_jsonl({"event_type": "DSCALP_BREAKEVEN", "ts_ms": int(now_t * 1000),
                               "slug": m.slug, "outcome": outcome,
                               "pnl_cents": round(pnl_cents, 2), "hold_sec": round(hold_sec, 1),
@@ -4754,7 +5037,7 @@ class Bot:
             self._throttle_record_trade()
             self._dscalp_positions.pop(m.slug, None)
             self._dscalp_invested_usd.pop(m.slug, None)
-            self._record_exit_reason("timeout", pnl_cents, hold_sec, sell_qty * sell_price)
+            self._record_exit_reason("timeout", pnl_cents, hold_sec, sell_qty * sell_price, slug=m.slug)
             write_jsonl({"event_type": "DSCALP_TIMEOUT", "ts_ms": int(now_t * 1000),
                           "slug": m.slug, "outcome": outcome,
                           "pnl_cents": round(pnl_cents, 2), "hold_sec": round(hold_sec, 1)})
@@ -4773,7 +5056,7 @@ class Bot:
                 self._diag_total_fills_min += 1
                 self._throttle_record_trade()
                 self._diag_trade_sizes.append(sell_qty * sell_price)
-                self._record_exit_reason("scalp_tp1", pnl_cents, hold_sec, sell_qty * sell_price)
+                self._record_exit_reason("scalp_tp1", pnl_cents, hold_sec, sell_qty * sell_price, slug=m.slug)
                 write_jsonl({"event_type": "DSCALP_TP1", "ts_ms": int(now_t * 1000),
                               "slug": m.slug, "outcome": outcome,
                               "pnl_cents": round(pnl_cents, 2), "sell_qty": round(sell_qty, 1),
@@ -4793,7 +5076,7 @@ class Bot:
                 self._diag_total_fills_min += 1
                 self._throttle_record_trade()
                 self._diag_trade_sizes.append(sell_qty * sell_price)
-                self._record_exit_reason("scalp_tp2", pnl_cents, hold_sec, sell_qty * sell_price)
+                self._record_exit_reason("scalp_tp2", pnl_cents, hold_sec, sell_qty * sell_price, slug=m.slug)
                 write_jsonl({"event_type": "DSCALP_TP2", "ts_ms": int(now_t * 1000),
                               "slug": m.slug, "outcome": outcome,
                               "pnl_cents": round(pnl_cents, 2), "sell_qty": round(sell_qty, 1),
@@ -4813,7 +5096,7 @@ class Bot:
                 self._diag_total_fills_min += 1
                 self._throttle_record_trade()
                 self._diag_trade_sizes.append(sell_qty * sell_price)
-                self._record_exit_reason("scalp_tp3", pnl_cents, hold_sec, sell_qty * sell_price)
+                self._record_exit_reason("scalp_tp3", pnl_cents, hold_sec, sell_qty * sell_price, slug=m.slug)
                 write_jsonl({"event_type": "DSCALP_TP3", "ts_ms": int(now_t * 1000),
                               "slug": m.slug, "outcome": outcome,
                               "pnl_cents": round(pnl_cents, 2), "sell_qty": round(sell_qty, 1),
@@ -7315,7 +7598,7 @@ class Bot:
                                 self._do_sell(m, st, outcome, sell_qty, book.bid,
                                               reason="DERISK_EMERGENCY", leg="DERISK", ctx=ctx)
                                 _pnl_est = (book.bid - pos.vwap) * 100 if pos.vwap > 0 else 0.0
-                                self._record_exit_reason("derisk_emergency", _pnl_est, 0.0, sell_qty * book.bid)
+                                self._record_exit_reason("derisk_emergency", _pnl_est, 0.0, sell_qty * book.bid, slug=m.slug)
                             else:
                                 self._diag_maker_count += 1
                                 self._diag_rescue_fallback_sells += 1
@@ -7324,7 +7607,7 @@ class Bot:
                                               reason="DERISK_MAKER", leg="DERISK", ctx=ctx,
                                               use_maker=True)
                                 _pnl_est = (maker_price - pos.vwap) * 100 if pos.vwap > 0 else 0.0
-                                self._record_exit_reason("derisk_maker", _pnl_est, 0.0, sell_qty * maker_price)
+                                self._record_exit_reason("derisk_maker", _pnl_est, 0.0, sell_qty * maker_price, slug=m.slug)
                         elif not rescue_done and derisk_decision == "defer_to_hedge":
                             # Trigger hedge state machine for opposite leg instead of selling
                             if m.slug not in self._quote_unpaired:
