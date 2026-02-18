@@ -41,7 +41,8 @@ class LiveSanityReporter:
                 partial_fill_count, unpaired_events_last_min, exposure_per_slug,
                 kill_switch_active, total_kill_activations, ttl_cancels,
                 confirmed_fills, confirmed_submits, cap_blocks_last_min,
-                drift_detected, no_progress_pauses
+                drift_detected, no_progress_pauses, mode,
+                buys_allowed, entry_window_remaining_sec, live_safe_max_order_usd
         """
         now = time.time()
         if now - self._last_report_ts < OM_SANITY_REPORT_INTERVAL_SEC:
@@ -62,8 +63,18 @@ class LiveSanityReporter:
         top_slugs = sorted(exposure.items(), key=lambda x: -x[1])[:5]
         top_str = " ".join(f"{s}=${v:.0f}" for s, v in top_slugs) if top_slugs else "none"
 
+        # LIVE_SAFE fields
+        mode = stats.get("mode", "LIVE")
+        buys_str = ""
+        if mode == "LIVE_SAFE":
+            buys_ok = "YES" if stats.get("buys_allowed") else "NO"
+            remaining = stats.get("entry_window_remaining_sec", 0)
+            max_usd = stats.get("live_safe_max_order_usd", 0)
+            buys_str = f"buys={buys_ok}({remaining:.0f}s)  max_order=${max_usd:.2f}  "
+
         print(
             f"  [LIVE_SANITY] "
+            f"{buys_str}"
             f"open_orders={stats.get('open_orders_count', 0)}  "
             f"orphan_cx={stats.get('orphan_cancels_last_min', 0)}  "
             f"api_err={stats.get('api_errors_last_min', 0)}  "

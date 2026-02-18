@@ -14,7 +14,7 @@ import math
 # =============================================================================
 # CONFIG
 # =============================================================================
-MODE = os.getenv("MODE", "LOG").upper()         # LOG or LIVE
+MODE = os.getenv("MODE", "LOG").upper()         # LOG, LIVE_SAFE, or LIVE
 BANKROLL_START_USDC = float(os.getenv("BANKROLL_START_USDC", "1000.0"))  # only used in LOG
 RUN_ID = uuid.uuid4().hex[:12]  # unique per run -- included in all logs + file names
 
@@ -457,3 +457,9 @@ OM_MAX_PER_SLUG_USD = float(os.getenv("OM_MAX_PER_SLUG_USD", "60"))             
 
 # Sanity report
 OM_SANITY_REPORT_INTERVAL_SEC = float(os.getenv("OM_SANITY_REPORT_INTERVAL_SEC", "60"))  # report every 60s
+
+# ---------------------------------------------------------------------------
+# LIVE_SAFE mode — time-limited entry window + trade-size limiter
+# ---------------------------------------------------------------------------
+LIVE_SAFE_ENTRY_WINDOW_SEC = float(os.getenv("LIVE_SAFE_ENTRY_WINDOW_SEC", "300"))        # buys allowed for 300s after start
+LIVE_SAFE_MAX_ORDER_USD = float(os.getenv("LIVE_SAFE_MAX_ORDER_USD", "2.00"))             # max buy order size in LIVE_SAFE
