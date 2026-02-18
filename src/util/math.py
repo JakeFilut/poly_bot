@@ -3,19 +3,7 @@ from __future__ import annotations
 
 import math
 
-# EDGE_K is a trading parameter; import from the canonical config location
-# so the value stays in one place.  During the refactor the constant lives in
-# the original monolith — we reference it lazily to avoid circular imports.
-_EDGE_K_DEFAULT = 0.05  # fallback: matches the monolith's hard-coded value
-
-
-def _get_edge_k() -> float:
-    """Return EDGE_K, trying the config module first."""
-    try:
-        from src.util.config import EDGE_K  # type: ignore[import-untyped]
-        return EDGE_K
-    except Exception:
-        return _EDGE_K_DEFAULT
+from src.config.settings import EDGE_K
 
 
 # ---------------------------------------------------------------------------
@@ -45,4 +33,4 @@ def safe_float(x, default=None):
 # ---------------------------------------------------------------------------
 def _p_up_model(delta_bps: float) -> float:
     """Implied probability of Up outcome via sigmoid on delta_bps."""
-    return 1.0 / (1.0 + math.exp(-_get_edge_k() * delta_bps))
+    return 1.0 / (1.0 + math.exp(-EDGE_K * delta_bps))

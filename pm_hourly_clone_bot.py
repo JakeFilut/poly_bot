@@ -32,25 +32,7 @@ from dataclasses import dataclass, asdict
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
 import requests
-# =============================================================================
-# CONFIG
-# =============================================================================
-MODE = os.getenv("MODE", "LOG").upper()         # LOG or LIVE
-BANKROLL_START_USDC = float(os.getenv("BANKROLL_START_USDC", "1000.0"))  # only used in LOG
-RUN_ID = uuid.uuid4().hex[:12]  # unique per run — included in all logs + file names
 
-# ---------------------------------------------------------------------------
-# Paths — resolved relative to this file's location
-#   poly_bot/          <- _PROJECT_DIR
-#   ../keys/.env       <- where your private key lives
-#   ../logs/poly_bot/  <- where all logs go
-# ---------------------------------------------------------------------------
-_PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
-_KEYS_DIR    = os.path.join(os.path.dirname(_PROJECT_DIR), "keys")
-_LOG_DIR     = os.path.join(os.path.dirname(_PROJECT_DIR), "logs", "poly_bot")
-os.makedirs(_LOG_DIR, exist_ok=True)
-
-STATE_FILE = os.getenv("STATE_FILE", os.path.join(_LOG_DIR, "state.json"))
 # Import the new Logger (replaces old write_jsonl / log_csv)
 from logger import (
     Logger, SCHEMA_VERSION, BOT_VERSION, MIN_QTY as _LOG_MIN_QTY,
@@ -59,405 +41,37 @@ from logger import (
     infer_maker_taker, spread_capture_fields,
 )
 
-# =============================================================================
-# NEW MODULAR IMPORTS (Pass 1 — coexist with monolith definitions)
-# These will gradually replace the inline definitions above/below.
-# =============================================================================
-from src.config import settings as _settings          # noqa: F401
-from src.bot.context import (                          # noqa: F401
-    MarketRef as _MarketRef,
-    BookTop as _BookTop,
-    Position as _Position,
-    MarketState as _MarketState,
+# MODULAR IMPORTS — config, data structures, utils, strategy, feeds, gating
+from src.config.settings import *                       # noqa: F403 — all config constants
+from src.config.settings import (                       # private names not exported by *
+    _PROJECT_DIR, _KEYS_DIR, _LOG_DIR, _THR_TABLE,
 )
-from src.util.time import (                            # noqa: F401
-    utc_now as _utc_now,
-    iso_z as _iso_z,
-    parse_hour_start_from_slug as _parse_hour_start,
-    minutes_into_hour as _minutes_into_hour,
-)
-from src.util.math import (                            # noqa: F401
-    clamp as _clamp,
-    clamp_to_tick as _clamp_to_tick,
-    safe_float as _safe_float,
-)
-from src.strategy.f247_like import (                   # noqa: F401
-    entry_threshold_bps as _entry_threshold_bps,
-    price_cap as _price_cap,
-    dynamic_cap as _dynamic_cap,
-    spread_limit as _spread_limit,
-    taker_gate_allows as _taker_gate_allows,
-    whipsaw_ok as _whipsaw_ok,
-    parity_net_edge_cents as _parity_net_edge_cents,
-    parity_liquidity_ok as _parity_liquidity_ok,
-    compute_fee_usdc as _compute_fee_usdc,
-)
-from src.strategy.sizing import (                      # noqa: F401
-    sizing_mult as _sizing_mult,
-    zscore as _zscore,
-    delta_velocity_bps_per_min as _delta_velocity_bps_per_min,
-)
-from src.gating.gates import GateEvaluator, GateResult  # noqa: F401
-from src.gating.velocity import VelocityEstimator       # noqa: F401
-from src.gating.low_vol import (                        # noqa: F401
-    LowVolDetector, LowVolThrottler, LowVolResult,
-)
-from src.gating.report import GateReporter              # noqa: F401
-from src.trading.order_manager import OrderManager       # noqa: F401
-from src.trading.portfolio import (                     # noqa: F401
-    compute_equity as _compute_equity,
-    clean_dust as _clean_dust,
-)
-from src.trading.risk import (                          # noqa: F401
-    market_cost_usdc as _market_cost_usdc,
-    crypto_cost_usdc as _crypto_cost_usdc,
-)
-from src.bot.app import BotApp                          # noqa: F401
+MIN_QTY = _LOG_MIN_QTY  # override: logger's MIN_QTY takes precedence
 
-# Markets / coins
-CRYPTOS = ["BTC", "ETH", "SOL", "XRP"]
-# Polling / evaluation
-EVAL_EVERY_SEC = float(os.getenv("EVAL_EVERY_SEC", "0.0"))
-ORDER_REPRICE_SEC = float(os.getenv("ORDER_REPRICE_SEC", "10.0"))
-# Time window within each hour (minutes)
-TRADE_START_MIN = 2.0
-TRADE_STOP_ADD_MIN = 57.0
-TRADE_HARD_STOP_MIN = 59.25
-# -----------------------------------------------------------------------------
-# Entry thresholds (bps) — coin-specific, time-varying
-# -----------------------------------------------------------------------------
-PROFILE = "F247_LIKE"
-# Coin-specific threshold tables: coin -> {early, mid, late}
-_THR_TABLE = {
-    "BTC": {"early": 7, "mid": 10, "late": 4},
-    "SOL": {"early": 7, "mid": 10, "late": 4},
-    "ETH": {"early": 6, "mid":  7, "late": 6},
-    "XRP": {"early": 6, "mid":  7, "late": 6},
-}
-# Price cap curve (max price you will pay to BUY), piecewise by time bucket
-CAP_0_5   = 0.67
-CAP_5_15  = 0.82
-CAP_15_30 = 0.90
-CAP_30_45 = 0.96
-CAP_45_60 = 0.97
-# Drift persistence & velocity (hidden edge)
-PERSISTENCE_SEC = 0.0           # no persistence delay (f247 parity)
-MIN_DELTA_VEL_BPS_PER_MIN = 1.0 # require some "push" to scale size (not to enter)
-# Volatility normalization
-Z_WINDOW_SEC = 300.0            # 5 minutes for zscore
-Z_ENTRY_MIN = 1.0               # only enter if zscore >= 1.0 (optional gate)
-Z_ENTRY_ENABLED = False
-# Orderbook imbalance
-IMB_ENABLED = False
-IMB_LEVELS = 5
-IMB_MIN = 1.15                  # bidDepth/askDepth must exceed this for with-drift buys
-IMB_MAX_SPREAD = 0.02           # cross only when spread <= 2c; maker posting ok wider
-MAKER_MAX_SPREAD = 0.06         # allow maker posting up to 6c spread
-# Pullback entry
-PULLBACK_ENABLED = False
-PULLBACK_CENTS = 0.02           # wait for 2c pullback from recent extreme
-PULLBACK_LOOKBACK_SEC = 90.0
-# Cooldowns — ultra-low, just anti-spam (F247 mode)
-def entry_cooldown_sec(coin: str, t_min: float) -> float:
-    """F247-parity cooldown: 0.5s uniform. Fast re-entry after burst."""
-    return 0.5
-REENTRY_COOLDOWN_SEC = 1.0        # fast re-entry (f247 parity)
-# Base clip sizing (USDC cost) as % of bankroll
-BASE_CLIP_PCT = 0.0035  # 0.35% bankroll per tick (~$3.50 on $1k)
-EARLY_SIZE_MULT = 0.80   # less timid in first 10 min
-# Size multipliers by abs_delta_bps
-SIZING_MULTIPLIERS = [
-    (8,   15, 1.25),
-    (15,  25, 1.75),
-    (25,  40, 2.25),
-    (40,  75, 2.75),
-    (75,  10_000, 3.50),
-]
-# Exit ladder (scale out)
-TP1 = 0.03; TP1_SELL_FRAC = 0.25
-TP2 = 0.05; TP2_SELL_FRAC = 0.25
-TP3 = 0.07; TP3_SELL_FRAC = 0.25
-CORE_KEEP_FRAC = 0.25
-# De-risk on drift reversal (bps)
-DERISK_CROSS_BPS = 5.0
-DERISK_SELL_FRAC_PER_TICK = 0.35
-DERISK_COOLDOWN_SEC = 10.0      # min seconds between DERISK actions on same position
-DERISK_MID_CHANGE_CENTS = 0.01  # or mid must move >= 1c since last derisk
-# Maker-first DERISK — stop panic taker sells
-DERISK_MAKER_REFRESH_MS = 250          # cancel/replace maker every 250ms
-DERISK_TAKER_EMERGENCY_ONLY = True     # only taker derisk in emergency
-INVENTORY_EMERGENCY_SHARES = 300       # above this = emergency taker derisk
-DERISK_TAKER_EDGE_EXTRA_BPS = 25      # edge must exceed thr+25 for taker derisk
-DERISK_TAKER_EDGE_WORSEN_SEC = 1.0    # edge must be worsening for 1s
-# ---------------------------------------------------------------------------
-# Taker gating — ONLY cross if BOTH conditions met (entry + exit)
-# ---------------------------------------------------------------------------
-TAKER_MAX_SPREAD_CENTS = 1.0           # spread <= 1c
-TAKER_MIN_EDGE_EXTRA_BPS = 12         # abs(edge_bps) >= thr + 12
-# ---------------------------------------------------------------------------
-# Whipsaw / anti-chop filter
-# ---------------------------------------------------------------------------
-ENTRY_MIN_STABLE_SIGN_MS = 400         # delta sign must be stable 400ms
-BLOCK_IF_VEL_OPPOSES = True            # block if velocity opposes delta
-VEL_OPPOSE_THRESHOLD = 2.0            # bps/min threshold for opposition
-# ---------------------------------------------------------------------------
-# No-flip rule — prevent immediate direction reversal
-# ---------------------------------------------------------------------------
-NO_FLIP_COOLDOWN_SEC = 3.0            # don't reverse direction within 3s
-NO_FLIP_OVERRIDE_EXTRA_BPS = 20       # unless edge >= thr + 20
-# Late scalp engine
-LATE_SCALP_ENABLED = True
-LATE_SCALP_T_START = 40.0
-LATE_SCALP_T_END   = 58.0
-LATE_SCALP_PRICE_MAX = 0.80
-LATE_SCALP_ABSDELTA_MIN = 5.0
-LATE_SCALP_ABSDELTA_MAX = 20.0
-LATE_SCALP_TP_CENTS = 0.03      # aim +3c
-LATE_SCALP_MAX_HOLD_MIN = 6.0   # aggressive F247 — flip fast
-# Risk caps
-MAX_COST_PER_MARKET_PCT = 0.015   # 1.5% bankroll per market-hour
-MAX_COST_PER_CRYPTO_PCT = 0.035   # 3.5% bankroll per crypto across markets
-# ---------------------------------------------------------------------------
-# Risk / stop-loss configuration (log-only mode)
-# ---------------------------------------------------------------------------
-LOG_MODE = True                       # paper / logging mode — no real orders
-ENFORCE_STOP_LOSS = False             # MUST remain False in LOG mode
-STOP_LOSS_PCT_PER_HOUR = 0.02        # 2% equity drawdown per 1-hour window
-STOP_LOSS_PCT_PER_DAY  = 0.06        # 6% equity drawdown per calendar day
-SHADOW_STOP_SIM = True                # simulate what would have happened if stop was enforced
-# Execution policy
-POST_ONLY_WHEN_POSSIBLE = True
-MAX_CROSS_SLIPPAGE = 0.01         # cross at most 1c if absolutely needed
-LAYER_ORDERS = True
-LAYER_COUNT = 3
-LAYER_STEP = 0.01                 # 1c ladder
-MIN_ORDER_USDC = 0.25             # f247 does tiny prints
-MIN_QTY = _LOG_MIN_QTY  # from logger — below this, position is dust
-EDGE_K = 0.05    # sigmoid steepness: delta_bps -> P(Up)
-# -----------------------------------------------------------------------------
-# Probe → Scale state machine
-# -----------------------------------------------------------------------------
-PROBE_SIZE_FRAC = 0.25        # probe = max($1, clip * 0.25)
-PROBE_CONFIRM_SEC = 0.3       # 300ms — near-instant confirmation (F247)
-# Count-based burst engine (f247-tuned: less spam, bigger steps)
-BURST_ORDERS = 8                       # max micro-orders per burst
-BURST_INTERVAL_MS = 180                # micro-order every 180ms
-BURST_STEP_USD_MIN = 0.75             # micro-order floor
-BURST_STEP_USD_MAX = 6.00             # micro-order ceiling
-BURST_MIN_EDGE_EXTRA_BPS = 6          # only burst if edge >= thr + 6, else probe only
-BURST_STOP_IF_PRICE_MOVES_CENTS = 0.02  # stop if price moves 2c against us
-BURST_STOP_IF_EDGE_DROPS_BPS = 6.0     # hard edge collapse
-BURST_EDGE_BELOW_HOLD_MS = 500         # edge below threshold must persist 500ms to stop
-BURST_SPREAD_HARD_LIMIT = 0.12         # absolute max spread for any order type
-BURST_CROSS_MAX_SPREAD = 0.01          # cross at ask ONLY when spread <= 1c (used by taker gate)
-# Dynamic price cap boost
-CAP_BOOST_EDGE_THRESHOLD = 10.0  # edge_bps above which cap starts boosting
-CAP_BOOST_MAX = 0.08             # max +8 cents boost (aggressive chase)
-CAP_BOOST_EDGE_FULL = 30.0       # edge_bps at which full boost is applied
-# ---------------------------------------------------------------------------
-# Parity (straddle) arbitrage engine — Up + Down ≈ 1.000
-# ---------------------------------------------------------------------------
-PARITY_BUY_ENABLED = True                # buy cheap straddle (up_ask + dn_ask < 1)
-PARITY_SELL_ENABLED = True               # sell rich straddle (up_bid + dn_bid > 1)
-PARITY_MAX_USD_PER_SLUG = 40.0          # max total straddle investment per slug
-PARITY_STEP_USD = 2.00                   # per-leg size per parity order
-PARITY_COOLDOWN_MS = 250                 # min time between parity orders per slug
-PARITY_MAKER_REFRESH_MS = 200            # cancel/replace maker every 200ms
-PARITY_TAKER_ALLOWED_SPREAD_CENTS = 1.0  # allow taker only when spread <= 1c
-# Fee-aware parity edge (CRITICAL)
-MAKER_FEE_BPS = float(os.getenv("MAKER_FEE_BPS", "0.5"))   # configurable: Poly CLOB ≈0-0.5 bps maker
-TAKER_FEE_BPS = float(os.getenv("TAKER_FEE_BPS", "2.0"))   # configurable: Poly CLOB ≈2 bps taker
-PARITY_BUY_MIN_EDGE_NET_CENTS = 1.0     # min NET edge after fees/slippage to buy straddle
-PARITY_SELL_MIN_EDGE_NET_CENTS = 1.0    # min NET edge after fees/slippage to sell straddle
-PARITY_EDGE_BUFFER_CENTS = 0.25         # safety buffer on top of min edge thresholds
-# Partial-fill protection
-PAIR_FILL_TIMEOUT_MS = 1200              # max time to wait for second leg fill
-# Maker queue discipline (reduce cancel spam)
-MIN_REPLACE_INTERVAL_MS = 200            # min time between cancel/replace on same order
-MAKER_ORDER_TIMEOUT_MS = 3000            # cancel maker order if unfilled after 3s
-# Locked inventory recycle
-LOCKED_MAX_HOLD_SEC = 180                # max seconds to hold locked straddle before recycling
-RECYCLE_MIN_PROFIT_NET_CENTS = 0.5      # min net-of-fee profit to trigger recycle sell
-RECYCLE_STEP_USD = 2.0                   # per-leg sell size during recycle
-# Liquidity + staleness guards
-MAX_SPREAD_FOR_PARITY_CENTS = 10.0      # block parity if either leg spread > 10c
-MIN_TOP_LIQ_USD = 1.0                   # block parity if best bid/ask size < $1 (F247 trades tiny clips)
-PARITY_MAX_CACHE_AGE_MS = 600           # block parity if cache > 600ms stale
-# End-of-hour parity flattening
-PARITY_STOP_NEW_MIN = 57.0              # stop opening NEW parity trades after minute 57
-PARITY_FLATTEN_START_MIN = 59.0         # begin flattening locked + unpaired parity inventory
-PARITY_HARD_FLATTEN_MIN = 59.25         # force taker flatten (if time_to_close<20s or emergency)
-# ---------------------------------------------------------------------------
-# Parity QUOTING mode — continuously post maker bids on BOTH legs
-# ---------------------------------------------------------------------------
-PARITY_QUOTE_ENABLED = True
-PARITY_QUOTE_TARGET_EDGE_NET_CENTS_BASE = 1.0  # min edge target (aggressive — pay up)
-PARITY_QUOTE_TARGET_EDGE_NET_CENTS_MAX  = 2.0  # max edge target (selective)
-PARITY_QUOTE_STEP_USD = 2.0              # per-leg bid size (equal USD both legs)
-PARITY_QUOTE_MAX_USD_PER_SLUG = 40.0    # max total quoting investment per slug
-PARITY_QUOTE_REFRESH_MS = 250           # refresh interval for quote repricing
-PARITY_QUOTE_ONLY_IF_LIQ_OK = True      # require liquidity guards for quoting
-# Unpaired quote management
-QUOTE_UNPAIRED_ESCALATE_AFTER_MS = 800  # raise missing leg bid by 1 tick if still net edge ok
-QUOTE_UNPAIRED_MAX_SEC = 6.0            # after this, unwind or pause quoting this slug
-QUOTE_PAUSE_AFTER_UNPAIRED_SEC = 15.0   # pause quoting this slug after forced unpaired unwind
-# Adverse selection guard
-ADVERSE_SPOT_MOVE_BPS_THRESHOLD = 20.0  # degrade quoting if spot moved > 20 bps in 10s
-ADVERSE_LOOKBACK_SEC = 10.0             # lookback window for spot move detection
-ADVERSE_PAUSE_SEC = 10.0                # hard-pause quoting only if move is accelerating
-ADVERSE_DEGRADE_SEC = 10.0              # degrade duration: MAX target + 50% step reduction
-ADVERSE_ACCEL_BPS_PER_MIN = 40.0        # velocity threshold to escalate degrade -> hard-pause
-# ---------------------------------------------------------------------------
-# FAST_CLONE mode — tighter timing to match F247 speed
-# ---------------------------------------------------------------------------
-FAST_CLONE = bool(os.getenv("FAST_CLONE", "True") not in ("", "0", "False", "false"))
-# One-sided auto-hedge — faster escalation than unpaired management
-HEDGE_TICK_ESCALATION_ENABLED = False   # DISABLED: no micro-neutralizing
-HEDGE_TICK1_MS = 200                    # +1 tick after 200ms (disabled by flag above)
-HEDGE_TICK2_MS = 350                    # +3 ticks after 350ms (disabled by flag above)
-HEDGE_EARLY_CROSS_MS = 1500            # taker cross after 1500ms (no rushing)
-HEDGE_CROSS_MS = 2000                   # taker cross after 2000ms (fallback)
-HEDGE_MIN_CROSS_EDGE_CENTS = 0.5       # min net edge for taker cross (both early+late)
-HEDGE_EARLY_CROSS_EDGE_CENTS = 0.5     # min net edge for early taker cross (500ms)
-HEDGE_MAX_CROSS_SPREAD_CENTS = 2.0     # max spread for taker cross (cents)
-HEDGE_STALE_CACHE_MS = 450.0           # block hedge actions if cache > 450ms
-# ---------------------------------------------------------------------------
-# Imbalance caps — keep net exposure near neutral (F247 style)
-# ---------------------------------------------------------------------------
-IMBALANCE_CAP_SHARES = 30              # hard cap: abs(up_qty - dn_qty) per slug
-IMBALANCE_SOFT_CAP_SHARES = 20         # soft cap: start reducing new orders above this
-# ---------------------------------------------------------------------------
-# Derisk RESCUE-TO-STRADDLE — convert losing one-sided to straddle
-# ---------------------------------------------------------------------------
-DERISK_RESCUE_TO_STRADDLE = True
-RESCUE_MIN_EDGE_NET_CENTS = 0.5         # min net edge for straddle completion to be worth it
-RESCUE_MAX_USD_PER_SLUG = 20.0          # max USD to spend completing straddle per slug
-RESCUE_STEP_USD = 2.0                    # per-order size for rescue buys
-MIN_PAIR_QTY = 5.0                       # both legs must exceed this to count as "already paired"
-# ---------------------------------------------------------------------------
-# Directional lean overlay (on top of parity, for exits)
-# ---------------------------------------------------------------------------
-LEAN_EXIT_PRIORITY = True                # prioritize exits on "wrong" side
-LEAN_MAX_IMBALANCE_SHARES = 30           # cap how unbalanced Up vs Down can get (align with IMBALANCE_CAP_SHARES)
-# Spread rule relaxation
-SPREAD_RELAXED_MAX = 0.12         # 12 cents during burst (F247 tolerant)
-# Fast take-profit — skim faster than before
-FAST_TP_AFTER_SEC = 25.0
-FAST_TP_CENTS = 0.02
-FAST_TP_SELL_PCT = 0.30           # sell 30%
-# Inventory pressure controls
-INVENTORY_CAP_SHARES_PER_MARKET = 250
-# Correlation exposure scaling (reduces correlated stacking)
-CORR_SCALE_ENABLED = True
-BTC_LEAD = True
-BTC_EXPOSURE_REDUCE_OTHERS = 0.50  # up to 50% size reduction if BTC exposure high
-# ---------------------------------------------------------------------------
-# Background data refresh — sub-second loop architecture
-# ---------------------------------------------------------------------------
-MARKET_DISCOVERY_INTERVAL_SEC = 10.0   # re-discover markets via Gamma API every 10s
-BOOK_REFRESH_PRIORITY_MS = 100         # active markets: 100ms (positions / probing / scaling)
-BOOK_REFRESH_IDLE_MS = 400             # idle markets: 400ms (no positions, IDLE state)
-BOOK_STALE_MS = 1500                   # data older than this is stale — skip processing
-STATE_SAVE_INTERVAL_SEC = 5.0          # flush state.json every 5s (not every loop)
-BG_POOL_WORKERS = 16                   # bg threads — covers priority + idle markets
-BG_POOL_MIN_WORKERS = 12               # minimum pool size
-MAIN_LOOP_TARGET_MS = 75              # 75ms decision loop target (f247 parity)
-BG_REFRESH_STARVE_CYCLES = 2           # if pending for > N cycles, force-submit
-# Burst freshness gate — micro-orders must have fresh data
-BURST_FRESHNESS_MAX_MS = 500           # max cache age to place a micro-order
-BURST_FRESHNESS_WAIT_MS = 250          # max time to wait for fresh data if stale
-# ---------------------------------------------------------------------------
-# FAST_CLONE speed overrides — tighter loops, faster hedging
-# ---------------------------------------------------------------------------
-if FAST_CLONE:
-    MAIN_LOOP_TARGET_MS = 80
-    BOOK_REFRESH_PRIORITY_MS = 80
-    BOOK_REFRESH_IDLE_MS = 150
-    BOOK_STALE_MS = 700
-    MIN_REPLACE_INTERVAL_MS = 100
-    PARITY_MAKER_REFRESH_MS = 120
-    QUOTE_UNPAIRED_ESCALATE_AFTER_MS = 250
-    QUOTE_UNPAIRED_MAX_SEC = 2.0
-    HEDGE_TICK1_MS = 200
-    HEDGE_TICK2_MS = 350
-    HEDGE_EARLY_CROSS_MS = 1500
-    HEDGE_CROSS_MS = 2000
-# ---------------------------------------------------------------------------
-# RATE LIMITING / CHURN CONTROL — hard caps per slug (F247 cadence)
-# ---------------------------------------------------------------------------
-RATE_LIMIT_ENABLED = bool(os.getenv("RATE_LIMIT_ENABLED", "True") not in ("", "0", "False", "false"))
-MIN_ORDER_INTERVAL_MS = float(os.getenv("MIN_ORDER_INTERVAL_MS", "500"))       # min ms between ANY orders on same slug
-MAX_ORDER_SUBMITS_PER_MIN = int(os.getenv("MAX_ORDER_SUBMITS_PER_MIN", "60"))  # hard cap submits/min per slug — no bursting
-QUOTE_REFRESH_SKIP_IF_SAME = True                                               # skip refresh if price unchanged
-QUOTE_REFRESH_MIN_TICK_MOVE = 0.001                                              # require >= 1 tick move to refresh
-QUOTE_REFRESH_MIN_ELAPSED_MS = float(os.getenv("QUOTE_REFRESH_MIN_ELAPSED_MS", "500"))  # min ms between refreshes
-# ---------------------------------------------------------------------------
-# DIRECTIONAL SCALP MODE — PRIMARY engine (F247-style, priority #1)
-# Strategy stack: 1) Directional Scalp  2) Inventory Repair  3) Parity (throttled)
-# ---------------------------------------------------------------------------
-DIRECTIONAL_SCALP_ENABLED = bool(os.getenv("DIRECTIONAL_SCALP_ENABLED", "True") not in ("", "0", "False", "false"))
-# Entry gates (explicit — must meet delta OR spot_move condition)
-DSCALP_DELTA_MIN_BPS = float(os.getenv("DSCALP_DELTA_MIN_BPS", "15.0"))        # min abs_delta_bps for entry (raised for conviction)
-DSCALP_SPOT_MOVE_10S_BPS = float(os.getenv("DSCALP_SPOT_MOVE_10S_BPS", "8.0"))  # OR: spot moved >= 8bps in last 10s
-DSCALP_VEL_MIN_BPS_PER_MIN = float(os.getenv("DSCALP_VEL_MIN_BPS_PER_MIN", "1.0"))  # min velocity (supportive, not hard gate)
-DSCALP_MAX_SPREAD_CENTS = float(os.getenv("DSCALP_MAX_SPREAD_CENTS", "2.0"))   # max spread for entry
-DSCALP_MAX_CACHE_AGE_MS = float(os.getenv("DSCALP_MAX_CACHE_AGE_MS", "250"))   # max cache age for entry
-# Sizing — one entry = one meaningful position, no micro-splits
-DSCALP_STEP_USD = float(os.getenv("DSCALP_STEP_USD", "7.0"))                   # per-order size (~F247's $7.4 avg)
-DSCALP_STEP_USD_MIN = float(os.getenv("DSCALP_STEP_USD_MIN", "6.0"))           # minimum entry size (no $1 clips)
-DSCALP_MAX_USD_PER_SLUG = float(os.getenv("DSCALP_MAX_USD_PER_SLUG", "30.0"))  # max directional per slug
-DSCALP_COOLDOWN_MS = float(os.getenv("DSCALP_COOLDOWN_MS", "4000"))            # 4s between entries (target ~15 trades/min)
-# Exit ladder
-DSCALP_TP1_CENTS = float(os.getenv("DSCALP_TP1_CENTS", "3.0"))                 # +3c: sell 25%
-DSCALP_TP1_FRAC = float(os.getenv("DSCALP_TP1_FRAC", "0.25"))
-DSCALP_TP2_CENTS = float(os.getenv("DSCALP_TP2_CENTS", "6.0"))                 # +6c: sell 25%
-DSCALP_TP2_FRAC = float(os.getenv("DSCALP_TP2_FRAC", "0.25"))
-DSCALP_TP3_CENTS = float(os.getenv("DSCALP_TP3_CENTS", "9.0"))                 # +9c: sell 25%, remainder for timeout/trailing
-DSCALP_TP3_FRAC = float(os.getenv("DSCALP_TP3_FRAC", "0.25"))
-DSCALP_MIN_HOLD_SEC = float(os.getenv("DSCALP_MIN_HOLD_SEC", "120"))           # 120s min hold — allow real directional exposure
-DSCALP_MAX_HOLD_SEC = float(os.getenv("DSCALP_MAX_HOLD_SEC", "600"))           # 10 min max hold
-DSCALP_STOP_LOSS_CENTS = float(os.getenv("DSCALP_STOP_LOSS_CENTS", "5.0"))     # -5c stop loss (emergency only)
-# ---------------------------------------------------------------------------
-# PARITY SUPPRESSION — parity is #3 priority, hard-capped
-# ---------------------------------------------------------------------------
-PARITY_DEFER_TO_DIRECTIONAL = True                                               # always defer when directional active
-PARITY_BLOCK_IF_ADVERSE = True                                                   # block parity when adverse guard active
-PARITY_STANDDOWN_AFTER_DSCALP_SEC = float(os.getenv("PARITY_STANDDOWN_AFTER_DSCALP_SEC", "30"))  # parity stands down X sec after dscalp fires
-PARITY_IMBALANCE_BLOCK_SHARES = float(os.getenv("PARITY_IMBALANCE_BLOCK_SHARES", "5.0"))  # block parity if net imbal >= this
-PARITY_MAX_FILL_PCT = float(os.getenv("PARITY_MAX_FILL_PCT", "0.30"))           # target: parity < 30% of total fills
-PARITY_MAX_WHEN_DIRECTIONAL_USD = float(os.getenv("PARITY_MAX_WHEN_DIRECTIONAL_USD", "0.0"))  # $0 parity when directional active
-# ---------------------------------------------------------------------------
-# GLOBAL THROTTLE — target trades/min
-# ---------------------------------------------------------------------------
-TARGET_TRADES_PER_MIN = float(os.getenv("TARGET_TRADES_PER_MIN", "15"))          # target ~15 trades/min (F247 = ~12)
-THROTTLE_LOOKBACK_SEC = float(os.getenv("THROTTLE_LOOKBACK_SEC", "60"))          # rolling window for trades/min calc
-# ---------------------------------------------------------------------------
-# REGIME AWARENESS — volatility-adaptive activity
-# ---------------------------------------------------------------------------
-REGIME_VOL_LOOKBACK_SEC = float(os.getenv("REGIME_VOL_LOOKBACK_SEC", "60"))      # 60s rolling window
-REGIME_LOW_VOL_THRESHOLD = float(os.getenv("REGIME_LOW_VOL_THRESHOLD", "3.0"))   # bps std_dev below this = low vol
-REGIME_LOW_VOL_REDUCTION = float(os.getenv("REGIME_LOW_VOL_REDUCTION", "0.50"))  # reduce activity 50% in low vol
-# ---------------------------------------------------------------------------
-# TRUE COST TRACKER — tx counting and fee estimation
-# ---------------------------------------------------------------------------
-TRUE_COST_ENABLED = True
-TRUE_COST_EST_GAS_PER_TX_USD = float(os.getenv("TRUE_COST_EST_GAS_PER_TX_USD", "0.001"))  # est gas per tx
-TRUE_COST_EST_FEE_BPS = float(os.getenv("TRUE_COST_EST_FEE_BPS", "2.0"))                  # avg fee bps per fill
-# =============================================================================
+from src.bot.context import MarketRef, BookTop, Position, MarketState
+from src.util.time import (
+    utc_now, iso_z, parse_hour_start_from_slug, minutes_into_hour,
+    _phase, _hour_label_et, MONTHS,
+)
+from src.util.math import clamp, clamp_to_tick, safe_float, _p_up_model
+from src.strategy.f247_like import (
+    entry_threshold_bps, price_cap, dynamic_cap, spread_limit,
+    taker_gate_allows, whipsaw_ok, persistence_ok,
+    parity_net_edge_cents, parity_liquidity_ok, compute_fee_usdc,
+)
+from src.strategy.sizing import sizing_mult, zscore, delta_velocity_bps_per_min
+from src.gating.gates import GateEvaluator, GateResult
+from src.gating.velocity import VelocityEstimator
+from src.gating.low_vol import LowVolDetector, LowVolThrottler, LowVolResult
+from src.gating.report import GateReporter
+from src.trading.order_manager import OrderManager
+from src.trading.portfolio import compute_equity, clean_dust
+from src.trading.risk import market_cost_usdc, crypto_cost_usdc
+from src.feeds.polymarket import PolymarketClient, set_jsonl_writer
+from src.bot.app import BotApp
+
 # UTIL / LOGGING — thin wrappers around Logger instance
-# =============================================================================
-# The global `_LOGGER` is initialised in Bot.__init__().
 _LOGGER: Optional["Logger"] = None
-
-def utc_now() -> datetime:
-    return datetime.now(timezone.utc)
-def iso_z(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-def clamp(x: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, x))
-def clamp_to_tick(price: float, tick: float = 0.001) -> float:
-    """Round price DOWN to nearest tick (Polymarket uses $0.001 ticks)."""
-    return math.floor(price / tick) * tick
 
 def write_jsonl(event: dict) -> None:
     """Legacy shim — delegates to _LOGGER._write_jsonl if available."""
@@ -468,774 +82,25 @@ def write_jsonl(event: dict) -> None:
         event["run_id"] = RUN_ID
         print(f"[{event.get('event_type','')}] (pre-logger)")
 
-def _hour_label_et(hour_start_utc_str: str) -> str:
-    """Convert '2026-02-14T18:00:00Z' -> '2026-02-14 13:00 ET'."""
-    try:
-        import pytz
-        dt = datetime.strptime(hour_start_utc_str, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-        et = pytz.timezone("US/Eastern")
-        dt_et = dt.astimezone(et)
-        return dt_et.strftime("%Y-%m-%d %H:%M ET")
-    except Exception:
-        return hour_start_utc_str
-def _p_up_model(delta_bps: float) -> float:
-    """Implied probability of Up outcome via sigmoid on delta_bps."""
-    return 1.0 / (1.0 + math.exp(-EDGE_K * delta_bps))
-def _phase(t_min: float) -> str:
-    """Time band within the hour window."""
-    if t_min < 10.0:
-        return "OPENING"
-    if t_min < 50.0:
-        return "MID"
-    return "CLOSING"
-def safe_float(x, default=None):
-    try:
-        return float(x)
-    except Exception:
-        return default
-# =============================================================================
-# DATA STRUCTURES
-# =============================================================================
-@dataclass
-class MarketRef:
-    crypto: str
-    slug: str
-    market_id: str              # polymarket market identifier (token / condition id)
-    outcome_up_id: str          # token id for UP
-    outcome_down_id: str        # token id for DOWN
-    hour_open: float            # open reference price for the hour
-    hour_start_utc: datetime    # hour start timestamp
-@dataclass
-class BookTop:
-    bid: float
-    ask: float
-    bid_sz: float
-    ask_sz: float
-    spread: float
-    imb: float                 # bid_depth/ask_depth over N levels (approx)
-    mid: float
-    # Depth at price increments (cumulative size within Xc of best)
-    depth_1c_bid: float = 0.0
-    depth_1c_ask: float = 0.0
-    depth_2c_bid: float = 0.0
-    depth_2c_ask: float = 0.0
-    depth_5c_bid: float = 0.0
-    depth_5c_ask: float = 0.0
-@dataclass
-class Position:
-    qty: float = 0.0
-    cost_usdc: float = 0.0      # total cost spent (for paper)
-    vwap: float = 0.0
-    tp1_done: bool = False
-    tp2_done: bool = False
-    tp3_done: bool = False
-    opened_at: Optional[str] = None
-    last_trade_ts: Optional[str] = None
-    scalp_mode: bool = False
-    scalp_open_ts: Optional[str] = None
-    position_id: Optional[str] = None       # UUID lifecycle: first entry → fully flat
-    trade_id: Optional[str] = None          # persistent across entry → TP1 → TP2 → cleanup
-    entry_decision_id: Optional[str] = None # decision_id of original entry (parent)
-    parent_order_id: Optional[str] = None   # client_order_id of entry order (for exit legs)
-    entry_mid: float = 0.0                  # mid price at entry time
-    max_favorable_mid: float = 0.0          # best mid seen while holding
-    max_adverse_mid: float = 1.0            # worst mid seen while holding
-    last_derisk_ts: Optional[str] = None    # ISO timestamp of last DERISK sell
-    last_derisk_mid: float = 0.0            # mid price at last DERISK action
-    fast_tp_done: bool = False              # FAST_TP fires only once per position
-@dataclass
-class MarketState:
-    slug: str
-    crypto: str
-    hour_open: float
-    hour_start_utc: str
-    last_entry_ts: Optional[str] = None
-    last_reentry_ts: Optional[str] = None
-    peak_abs_delta_bps: float = 0.0
-    hour_index: int = 0                          # monotonic counter per crypto
-    delta_hist: List[Tuple[str, float]] = None   # (iso, delta_bps)
-    price_hist: List[Tuple[str, float]] = None   # (iso, binance_spot)
-    positions: Dict[str, Position] = None        # "Up" / "Down"
-    def __post_init__(self):
-        if self.delta_hist is None: self.delta_hist = []
-        if self.price_hist is None: self.price_hist = []
-        if self.positions is None: self.positions = {"Up": Position(), "Down": Position()}
-# =============================================================================
-# TIME / PARSING HELPERS
-# =============================================================================
-MONTHS = {
-    "january": 1, "february": 2, "march": 3, "april": 4,
-    "may": 5, "june": 6, "july": 7, "august": 8,
-    "september": 9, "october": 10, "november": 11, "december": 12,
-}
-def parse_hour_start_from_slug(slug: str, year: int = None) -> datetime:
-    """
-    Parse slug like: bitcoin-up-or-down-february-14-9pm-et
-    Returns hour start UTC.
-    """
-    import re
-    import pytz
-    et = pytz.timezone("US/Eastern")
-    if year is None:
-        year = utc_now().year
-    m = re.search(r"-(january|february|march|april|may|june|july|august|september|october|november|december)-(\d{1,2})-(\d{1,2})(am|pm)-et$", slug)
-    if not m:
-        raise ValueError(f"Cannot parse hour from slug: {slug}")
-    month = MONTHS[m.group(1)]
-    day = int(m.group(2))
-    hour12 = int(m.group(3))
-    ampm = m.group(4)
-    hour = hour12 % 12 + (12 if ampm == "pm" else 0)
-    dt_local = et.localize(datetime(year, month, day, hour, 0, 0))
-    return dt_local.astimezone(timezone.utc)
-def minutes_into_hour(hour_start_utc: datetime, now_utc: datetime) -> float:
-    return (now_utc - hour_start_utc).total_seconds() / 60.0
-# =============================================================================
-# STRATEGY FUNCTIONS (the exact logic)
-# =============================================================================
-def entry_threshold_bps(coin: str, t_min: float) -> float:
-    # F247_LIKE: coin-specific thresholds only
-    tbl = _THR_TABLE.get(coin, {"early": 8, "mid": 10, "late": 6})
-    if TRADE_START_MIN <= t_min < 15:
-        thr = tbl["early"]
-    elif 15 <= t_min < 45:
-        thr = tbl["mid"]
-    elif 45 <= t_min <= 57:
-        thr = tbl["late"]
-    else:
-        return 10_000
-    # Special rule: XRP min 30-40 reduce by 2 bps (F247 aggressive)
-    if coin == "XRP" and 30 <= t_min < 40:
-        thr = max(1, thr - 2)
-    return thr
-def price_cap(t_min: float) -> float:
-    if 0 <= t_min < 5:   return CAP_0_5
-    if 5 <= t_min < 15:  return CAP_5_15
-    if 15 <= t_min < 30: return CAP_15_30
-    if 30 <= t_min < 45: return CAP_30_45
-    if 45 <= t_min < 60: return CAP_45_60
-    return 0.0
-def dynamic_cap(t_min: float, abs_edge_bps: float) -> float:
-    """Price cap with dynamic boost based on edge strength."""
-    base = price_cap(t_min)
-    if abs_edge_bps <= CAP_BOOST_EDGE_THRESHOLD:
-        return base
-    frac = min(1.0, (abs_edge_bps - CAP_BOOST_EDGE_THRESHOLD) /
-               max(1.0, CAP_BOOST_EDGE_FULL - CAP_BOOST_EDGE_THRESHOLD))
-    boost = frac * CAP_BOOST_MAX
-    return min(0.99, base + boost)
-def spread_limit(t_min: float, abs_edge_bps: float, coin: str, in_burst: bool = False) -> float:
-    """Return max allowed spread for entry gating.
-    Crossing only when spread <= 2c (IMB_MAX_SPREAD).
-    Maker posting allowed up to MAKER_MAX_SPREAD (6c).
-    During burst: controlled by burst engine's own maker/taker logic."""
-    if in_burst:
-        return BURST_SPREAD_HARD_LIMIT  # burst engine manages its own spread logic
-    # Allow entry up to MAKER_MAX_SPREAD — burst engine will decide maker vs taker
-    thr = entry_threshold_bps(coin, t_min)
-    if 45 <= t_min <= 57 or abs_edge_bps >= thr + 10:
-        return SPREAD_RELAXED_MAX
-    return MAKER_MAX_SPREAD
-def sizing_mult(abs_delta_bps: float) -> float:
-    for lo, hi, mult in SIZING_MULTIPLIERS:
-        if lo <= abs_delta_bps < hi:
-            return mult
-    return 0.0
-def zscore(delta_series: List[Tuple[str, float]]) -> float:
-    """
-    Z-score of latest delta vs last ~Z_WINDOW_SEC.
-    """
-    if len(delta_series) < 10:
-        return 0.0
-    now = utc_now()
-    cutoff = now - timedelta(seconds=Z_WINDOW_SEC)
-    vals = []
-    for ts_iso, d in reversed(delta_series):
-        try:
-            t = datetime.strptime(ts_iso, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-        except Exception:
-            continue
-        if t < cutoff:
-            break
-        vals.append(d)
-    if len(vals) < 10:
-        return 0.0
-    mu = sum(vals) / len(vals)
-    var = sum((x - mu) ** 2 for x in vals) / max(1, len(vals) - 1)
-    sd = math.sqrt(var) if var > 1e-12 else 0.0
-    if sd <= 1e-12:
-        return 0.0
-    return (vals[0] - mu) / sd  # vals[0] is latest because we appended reversed
-def delta_velocity_bps_per_min(delta_series: List[Tuple[str, float]], lookback_sec: float = 30.0) -> float:
-    if len(delta_series) < 2:
-        return 0.0
-    now = utc_now()
-    target = now - timedelta(seconds=lookback_sec)
-    latest_ts, latest_d = delta_series[-1]
-    latest_t = datetime.strptime(latest_ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-    # find nearest prior point
-    prior_d = None
-    prior_t = None
-    for ts_iso, d in reversed(delta_series[:-1]):
-        t = datetime.strptime(ts_iso, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-        if t <= target:
-            prior_d = d
-            prior_t = t
-            break
-    if prior_d is None or prior_t is None:
-        return 0.0
-    dt_min = (latest_t - prior_t).total_seconds() / 60.0
-    if dt_min <= 1e-6:
-        return 0.0
-    return (latest_d - prior_d) / dt_min
-def persistence_ok(signal_series: List[Tuple[str, bool]]) -> bool:
-    """
-    signal_series holds (ts_iso, signal_bool) for last entries.
-    True if signal has been continuously True for >= PERSISTENCE_SEC.
-    """
-    if not signal_series:
-        return False
-    now = utc_now()
-    cutoff = now - timedelta(seconds=PERSISTENCE_SEC)
-    # Must find that all points since cutoff are True
-    for ts_iso, s in reversed(signal_series):
-        t = datetime.strptime(ts_iso, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-        if t < cutoff:
-            break
-        if not s:
-            return False
-    # Also ensure we have coverage back to cutoff
-    oldest_ts = signal_series[0][0]
-    try:
-        oldest_t = datetime.strptime(oldest_ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-    except Exception:
-        return False
-    return oldest_t <= cutoff or len(signal_series) > 10
+def _parse_iso_z(s: str) -> datetime:
+    """Parse ISO-8601 UTC string like '2025-01-01T00:00:00Z' → aware datetime."""
+    return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
 
-def taker_gate_allows(spread_cents: float, abs_edge_bps: float, thr_bps: float) -> bool:
-    """Return True only if taker (crossing) is permitted.
-    BOTH conditions must be true: spread <= 1c AND edge >= thr + 12."""
-    return (spread_cents <= TAKER_MAX_SPREAD_CENTS and
-            abs_edge_bps >= thr_bps + TAKER_MIN_EDGE_EXTRA_BPS)
 
-def whipsaw_ok(delta_bps: float, vel: float,
-               edge_sign_since: Optional[float]) -> Tuple[bool, str]:
-    """Return (allowed, block_reason). Blocks entry in chop conditions."""
-    # 1. Sign stability: delta sign must be unchanged for >= ENTRY_MIN_STABLE_SIGN_MS
-    if edge_sign_since is None:
-        return False, "sign_no_history"
-    elapsed_ms = (time.time() - edge_sign_since) * 1000
-    if elapsed_ms < ENTRY_MIN_STABLE_SIGN_MS:
-        return False, f"sign_unstable({elapsed_ms:.0f}ms<{ENTRY_MIN_STABLE_SIGN_MS}ms)"
-    # 2. Velocity alignment: vel must not oppose delta_bps
-    if BLOCK_IF_VEL_OPPOSES and abs(vel) >= VEL_OPPOSE_THRESHOLD:
-        delta_sign = 1 if delta_bps > 0 else -1
-        vel_sign = 1 if vel > 0 else -1
-        if delta_sign != vel_sign:
-            return False, f"vel_opposes(delta={delta_bps:+.1f},vel={vel:+.1f})"
-    return True, ""
+def _p50_p90(vals) -> Tuple[float, float]:
+    """Return (median, 90th-percentile) of a numeric list, or (0, 0) if empty."""
+    if not vals:
+        return 0.0, 0.0
+    s = sorted(vals)
+    return s[len(s) // 2], s[min(int(len(s) * 0.9), len(s) - 1)]
 
-def parity_net_edge_cents(raw_edge_cents: float, up_book: "BookTop", dn_book: "BookTop",
-                          is_buy: bool) -> Tuple[float, float, float]:
-    """Compute net parity edge after estimated fees and slippage.
-    Returns (net_edge_cents, total_fee_cents, total_slippage_cents).
-    For BUY straddle: we cross both asks (taker) or post bids (maker).
-    For SELL straddle: we cross both bids (taker) or post asks (maker)."""
-    total_fee_cents = 0.0
-    total_slippage_cents = 0.0
-    for book in (up_book, dn_book):
-        spread_cents = book.spread * 100
-        use_taker = spread_cents <= PARITY_TAKER_ALLOWED_SPREAD_CENTS
-        if use_taker:
-            # Taker: fee + half-spread slippage
-            fee = TAKER_FEE_BPS / 100.0  # bps -> cents (approx: 1 bps on $0.50 ~ 0.005c)
-            slippage = spread_cents / 2.0
-        else:
-            # Maker: fee only, no slippage (we're at best price)
-            fee = MAKER_FEE_BPS / 100.0
-            slippage = 0.0
-        total_fee_cents += fee
-        total_slippage_cents += slippage
-    net = raw_edge_cents - total_fee_cents - total_slippage_cents
-    return net, total_fee_cents, total_slippage_cents
 
-def compute_fee_usdc(notional_usdc: float, maker_taker: str) -> float:
-    """Compute fee in USDC for a given notional and maker/taker type."""
-    if maker_taker == "maker":
-        return notional_usdc * MAKER_FEE_BPS / 10000.0
-    elif maker_taker == "taker":
-        return notional_usdc * TAKER_FEE_BPS / 10000.0
-    # If unknown, assume taker (conservative)
-    return notional_usdc * TAKER_FEE_BPS / 10000.0
-
-def parity_liquidity_ok(up_book: "BookTop", dn_book: "BookTop") -> Tuple[bool, str]:
-    """Check liquidity and spread guards for parity entry.
-    Returns (ok, block_reason)."""
-    for label, book in [("up", up_book), ("dn", dn_book)]:
-        spread_cents = book.spread * 100
-        if spread_cents > MAX_SPREAD_FOR_PARITY_CENTS:
-            return False, f"{label}_spread({spread_cents:.1f}c>{MAX_SPREAD_FOR_PARITY_CENTS}c)"
-        # Check top-of-book liquidity in USD
-        bid_usd = book.bid_sz * book.bid if book.bid > 0 else 0.0
-        ask_usd = book.ask_sz * book.ask if book.ask > 0 else 0.0
-        if bid_usd < MIN_TOP_LIQ_USD:
-            return False, f"{label}_bid_liq(${bid_usd:.1f}<${MIN_TOP_LIQ_USD})"
-        if ask_usd < MIN_TOP_LIQ_USD:
-            return False, f"{label}_ask_liq(${ask_usd:.1f}<${MIN_TOP_LIQ_USD})"
-    return True, ""
-
-# =============================================================================
-# POLYMARKET ADAPTER — wired to real CLOB via py_clob_client + Binance spot
-# =============================================================================
-class PolymarketClient:
-    """
-    Live Polymarket CLOB client.
-    Uses POLYMARKET_PRIVATE_KEY from .env (same key as the pruned repo).
-    Market discovery via Gamma API, spot/open via Binance public API,
-    orderbook via CLOB /book endpoint, orders via py_clob_client SDK.
-
-    In LOG mode order placement returns paper ids; everything else is live data.
-    """
-
-    CRYPTO_FULL_NAMES = {
-        "BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana", "XRP": "xrp",
-    }
-    BINANCE_SYMBOLS = {
-        "BTC": "BTCUSDT", "ETH": "ETHUSDT", "SOL": "SOLUSDT", "XRP": "XRPUSDT",
-    }
-
-    def __init__(self):
-        from dotenv import load_dotenv
-        # Try keys dir first (../keys/.env), then repo root (.env)
-        _env_keys = os.path.join(_KEYS_DIR, ".env")
-        if os.path.exists(_env_keys):
-            load_dotenv(_env_keys)
-        else:
-            load_dotenv()  # fallback: searches CWD and parents
-
-        self.session = requests.Session()
-        self.gamma_url = "https://gamma-api.polymarket.com"
-        self.clob_host = "https://clob.polymarket.com"
-        self._clob = None           # ClobClient (lazy — only needed for LIVE orders)
-        self._wallet_address = None
-
-        # Market cache: slug -> {up_id, down_id, market_id, ...}
-        self._market_cache: Dict[str, dict] = {}
-        self._market_cache_ts: Dict[str, float] = {}
-        self._cache_ttl = 45  # seconds
-
-        # Binance hour-open cache: crypto -> (open, fetched_hour_start_ts)
-        self._hour_open_cache: Dict[str, Tuple[float, int]] = {}
-
-        private_key = os.getenv("POLYMARKET_PRIVATE_KEY", "").strip()
-        if private_key:
-            self._init_clob(private_key)
-        elif MODE == "LIVE":
-            print("ERROR: POLYMARKET_PRIVATE_KEY required for LIVE mode")
-            sys.exit(1)
-
-    # ------------------------------------------------------------------ #
-    # CLOB client initialisation (same pattern as src/clients)
-    # ------------------------------------------------------------------ #
-    def _init_clob(self, private_key: str):
-        try:
-            from py_clob_client.client import ClobClient
-            from py_clob_client.constants import POLYGON
-        except ImportError:
-            print("ERROR: pip install py-clob-client")
-            sys.exit(1)
-        except Exception as e:
-            print(f"ERROR: Failed to import py_clob_client: {e}")
-            print("Try: pip install --upgrade py-clob-client httpx click")
-            sys.exit(1)
-
-        self._clob = ClobClient(
-            host=self.clob_host,
-            key=private_key,
-            chain_id=POLYGON,
-            signature_type=0,       # EOA wallet
-        )
-        self._wallet_address = self._clob.get_address()
-        print(f"[pm] Wallet: {self._wallet_address}")
-
-        # Derive API creds for order status / cancel
-        try:
-            creds = self._clob.create_or_derive_api_creds()
-            if creds:
-                self._clob = ClobClient(
-                    host=self.clob_host,
-                    key=private_key,
-                    chain_id=POLYGON,
-                    creds=creds,
-                    signature_type=0,
-                    funder=self._wallet_address,
-                )
-                print(f"[pm] API Key: {creds.api_key[:8]}...")
-        except Exception as e:
-            print(f"[pm] WARN: API credential derivation failed: {e}")
-
-    # ================================================================== #
-    #  1.  MARKET DISCOVERY
-    # ================================================================== #
-    def get_current_hour_markets(self) -> List[MarketRef]:
-        """
-        Discover current-hour crypto Up/Down markets on Polymarket.
-        Builds the slug in ET time, hits Gamma API /events/slug/{slug},
-        extracts token IDs for Up and Down outcomes.
-        """
-        import pytz
-
-        now_utc = utc_now()
-        et = pytz.timezone("US/Eastern")
-        now_et = now_utc.astimezone(et)
-
-        hour_start_utc = now_utc.replace(minute=0, second=0, microsecond=0)
-
-        month_name = now_et.strftime("%B").lower()   # "february"
-        day_str    = str(now_et.day)                 # "14" (no zero-pad)
-        hour12     = now_et.hour % 12 or 12          # 1-12
-        ampm       = "am" if now_et.hour < 12 else "pm"
-
-        markets: List[MarketRef] = []
-
-        for crypto in CRYPTOS:
-            full = self.CRYPTO_FULL_NAMES[crypto]
-            slug = f"{full}-up-or-down-{month_name}-{day_str}-{hour12}{ampm}-et"
-
-            try:
-                data = self._resolve_market(slug)
-                if data is None:
-                    continue
-
-                _, hour_open = self.get_binance_spot_and_hour_open(crypto)
-
-                markets.append(MarketRef(
-                    crypto=crypto,
-                    slug=slug,
-                    market_id=data["market_id"],
-                    outcome_up_id=data["up_id"],
-                    outcome_down_id=data["down_id"],
-                    hour_open=hour_open,
-                    hour_start_utc=hour_start_utc,
-                ))
-            except Exception as e:
-                write_jsonl({"event_type":"MARKET_DISCOVERY_ERROR", "crypto": crypto,
-                             "slug": slug, "err": str(e)})
-        return markets
-
-    def _resolve_market(self, slug: str) -> Optional[dict]:
-        """Fetch event by slug from Gamma API; cache results."""
-        now = time.time()
-        if slug in self._market_cache:
-            if now - self._market_cache_ts.get(slug, 0) < self._cache_ttl:
-                return self._market_cache[slug]
-
-        event = self._gamma_event_by_slug(slug)
-        if event is None:
-            return None
-
-        market_list = event.get("markets", [])
-        if not isinstance(market_list, list) or not market_list:
-            market_list = [event]
-        market = market_list[0]
-
-        # Parse outcomes / token IDs (may be JSON strings or lists)
-        outcomes_raw = market.get("outcomes")
-        tokens_raw   = market.get("clobTokenIds")
-        outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else (outcomes_raw or [])
-        tokens   = json.loads(tokens_raw)   if isinstance(tokens_raw, str)   else (tokens_raw or [])
-
-        if len(outcomes) < 2 or len(tokens) < 2:
-            return None
-
-        up_id, down_id = None, None
-        for i, out in enumerate(outcomes):
-            if i >= len(tokens):
-                continue
-            label = str(out).upper()
-            if "UP" in label or "YES" in label:
-                up_id = str(tokens[i])
-            elif "DOWN" in label or "NO" in label:
-                down_id = str(tokens[i])
-        if not up_id or not down_id:
-            up_id, down_id = str(tokens[0]), str(tokens[1])
-
-        market_id = str(market.get("id") or market.get("conditionId") or slug)
-
-        result = {"up_id": up_id, "down_id": down_id, "market_id": market_id}
-        self._market_cache[slug] = result
-        self._market_cache_ts[slug] = now
-        return result
-
-    def _gamma_event_by_slug(self, slug: str) -> Optional[dict]:
-        url = f"{self.gamma_url}/events/slug/{slug}"
-        try:
-            r = self.session.get(url, timeout=10)
-            if r.status_code == 200:
-                return r.json()
-        except Exception:
-            pass
-        return None
-
-    # ================================================================== #
-    #  2.  BINANCE SPOT & HOUR-OPEN
-    # ================================================================== #
-    # CoinGecko IDs for fallback price fetching
-    COINGECKO_IDS = {
-        "BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana", "XRP": "ripple",
-    }
-
-    # Binance data API — the public mirror Polymarket hourly markets resolve against.
-    # api.binance.com is geo-blocked in the US; data-api.binance.vision is not.
-    BINANCE_BASE = "https://data-api.binance.vision"
-
-    def get_binance_spot_and_hour_open(self, crypto: str) -> Tuple[float, float]:
-        """
-        Return (spot, hour_open) from Binance data API.
-        Uses data-api.binance.vision (same source Polymarket resolves against).
-        Falls back to CoinGecko if Binance is unreachable.
-        """
-        sym = self.BINANCE_SYMBOLS[crypto]
-
-        # --- spot ---
-        spot = 0.0
-        try:
-            r = self.session.get(
-                f"{self.BINANCE_BASE}/api/v3/ticker/price",
-                params={"symbol": sym}, timeout=5,
-            )
-            if r.status_code == 200:
-                spot = float(r.json()["price"])
-        except Exception:
-            pass
-
-        # --- CoinGecko fallback ---
-        if spot == 0.0:
-            cg_id = self.COINGECKO_IDS.get(crypto)
-            if cg_id:
-                try:
-                    r = self.session.get(
-                        "https://api.coingecko.com/api/v3/simple/price",
-                        params={"ids": cg_id, "vs_currencies": "usd"},
-                        timeout=5,
-                    )
-                    if r.status_code == 200:
-                        spot = float(r.json()[cg_id]["usd"])
-                except Exception:
-                    pass
-
-        # --- hour open (cached per hour boundary) ---
-        current_hour_ts = int(utc_now().timestamp()) // 3600 * 3600
-        cached = self._hour_open_cache.get(crypto)
-        if cached and cached[1] == current_hour_ts:
-            return (spot if spot > 0 else cached[0], cached[0])
-
-        hour_open = spot  # fallback if kline fetch fails
-        try:
-            hour_ms = current_hour_ts * 1000
-            r = self.session.get(
-                f"{self.BINANCE_BASE}/api/v3/klines",
-                params={"symbol": sym, "interval": "1h",
-                        "startTime": hour_ms, "limit": 1},
-                timeout=5,
-            )
-            if r.status_code == 200:
-                kline = r.json()[0]
-                hour_open = float(kline[1])  # index 1 = candle open
-        except Exception:
-            pass
-
-        if hour_open > 0:
-            self._hour_open_cache[crypto] = (hour_open, current_hour_ts)
-        return (spot, hour_open)
-
-    # ================================================================== #
-    #  3.  ORDERBOOK — top-of-book with depth imbalance
-    # ================================================================== #
-    def get_top_of_book(self, token_id: str, levels: int = 5) -> BookTop:
-        """
-        Fetch CLOB orderbook and return BookTop with best bid/ask,
-        sizes, spread, mid-price, and N-level depth imbalance ratio.
-        """
-        empty = BookTop(bid=0.0, ask=1.0, bid_sz=0.0, ask_sz=0.0,
-                        spread=1.0, imb=0.0, mid=0.5,
-                        depth_1c_bid=0.0, depth_1c_ask=0.0,
-                        depth_2c_bid=0.0, depth_2c_ask=0.0,
-                        depth_5c_bid=0.0, depth_5c_ask=0.0)
-        url = f"{self.clob_host}/book"
-        try:
-            r = self.session.get(url, params={"token_id": token_id}, timeout=2)
-            if r.status_code != 200:
-                return empty
-            data = r.json()
-        except Exception:
-            return empty
-
-        raw_bids = data.get("bids") or []
-        raw_asks = data.get("asks") or []
-
-        # Sort: bids descending by price, asks ascending
-        bids = sorted(raw_bids, key=lambda x: float(x.get("price", 0)), reverse=True)
-        asks = sorted(raw_asks, key=lambda x: float(x.get("price", 999)))
-
-        best_bid = float(bids[0]["price"]) if bids else 0.0
-        best_ask = float(asks[0]["price"]) if asks else 1.0
-        bid_sz   = float(bids[0]["size"])  if bids else 0.0
-        ask_sz   = float(asks[0]["size"])  if asks else 0.0
-
-        spread = best_ask - best_bid
-        mid    = (best_bid + best_ask) / 2.0
-
-        # N-level depth imbalance = total_bid_depth / total_ask_depth
-        bid_depth = sum(float(b.get("size", 0)) for b in bids[:levels])
-        ask_depth = sum(float(a.get("size", 0)) for a in asks[:levels])
-        imb = bid_depth / ask_depth if ask_depth > 0 else 999.0
-
-        # Depth at price increments (cumulative size within Xc of best)
-        def _cum_depth(orders, ref_price, cents, side_is_bid):
-            total = 0.0
-            for o in orders:
-                px = float(o.get("price", 0))
-                if side_is_bid and px >= ref_price - cents:
-                    total += float(o.get("size", 0))
-                elif not side_is_bid and px <= ref_price + cents:
-                    total += float(o.get("size", 0))
-            return total
-
-        d1b = _cum_depth(bids, best_bid, 0.01, True)
-        d1a = _cum_depth(asks, best_ask, 0.01, False)
-        d2b = _cum_depth(bids, best_bid, 0.02, True)
-        d2a = _cum_depth(asks, best_ask, 0.02, False)
-        d5b = _cum_depth(bids, best_bid, 0.05, True)
-        d5a = _cum_depth(asks, best_ask, 0.05, False)
-
-        return BookTop(
-            bid=best_bid, ask=best_ask,
-            bid_sz=bid_sz, ask_sz=ask_sz,
-            spread=spread, imb=imb, mid=mid,
-            depth_1c_bid=d1b, depth_1c_ask=d1a,
-            depth_2c_bid=d2b, depth_2c_ask=d2a,
-            depth_5c_bid=d5b, depth_5c_ask=d5a,
-        )
-
-    # ================================================================== #
-    #  4.  ORDER PLACEMENT / CANCEL
-    # ================================================================== #
-    def place_limit_order(self, token_id: str, side: str, price: float,
-                          size: float, post_only: bool = True) -> dict:
-        """
-        Place a limit order on the CLOB.
-        Returns dict with fill info: {order_id, filled, fill_qty, fill_price, status}.
-        In LOG mode returns a paper result.
-        """
-        if MODE == "LOG":
-            pid = f"paper_{int(time.time()*1000)}_{random.randint(100,999)}"
-            return {"order_id": pid, "filled": True, "fill_qty": int(float(size)),
-                    "fill_price": price, "status": "matched"}
-
-        if not self._clob:
-            raise RuntimeError("CLOB client not initialised (missing POLYMARKET_PRIVATE_KEY)")
-
-        from py_clob_client.clob_types import OrderArgs, OrderType
-
-        price = max(0.01, min(0.99, price))
-        qty   = int(float(size))
-        if qty < 1:
-            return {"order_id": "", "filled": False, "fill_qty": 0,
-                    "fill_price": 0.0, "status": "rejected"}
-
-        order_type = OrderType.GTC  # limit / resting order
-
-        try:
-            args = OrderArgs(
-                price=price,
-                size=qty,
-                side=side.upper(),
-                token_id=token_id,
-            )
-            signed   = self._clob.create_order(args)
-            response = self._clob.post_order(signed, order_type)
-
-            if response and isinstance(response, dict):
-                oid = response.get("orderID", "")
-                status = response.get("status", "").lower()
-                size_matched = response.get("size_matched") or 0
-                tx_hashes = (response.get("transactionsHashes", [])
-                             or response.get("transactionHashes", []))
-
-                filled = False
-                fill_qty = 0
-                if status == "matched" or tx_hashes:
-                    filled = True
-                    fill_qty = int(size_matched) if size_matched else qty
-                elif status == "live" and oid:
-                    fill_qty = self._poll_order_fill(oid, qty, timeout=5)
-                    filled = fill_qty > 0
-
-                write_jsonl({"event_type":"ORDER_PLACED", "order_id": oid,
-                             "token_id": token_id[-12:], "side": side,
-                             "price": price, "qty": qty,
-                             "status": status, "filled": filled,
-                             "fill_qty": fill_qty})
-                return {"order_id": oid, "filled": filled, "fill_qty": fill_qty,
-                        "fill_price": price, "status": status}
-        except Exception as e:
-            write_jsonl({"event_type":"ORDER_ERROR", "err": str(e)[:200],
-                         "token_id": token_id[-12:], "side": side,
-                         "price": price, "qty": qty})
-        return {"order_id": "", "filled": False, "fill_qty": 0,
-                "fill_price": 0.0, "status": "error"}
-
-    def _poll_order_fill(self, order_id: str, expected_qty: int,
-                         timeout: int = 5) -> int:
-        """Poll CLOB briefly for GTC order fill. Returns filled qty (0 if not filled)."""
-        start = time.time()
-        while time.time() - start < timeout:
-            try:
-                order = self._clob.get_order(order_id)
-                if order and isinstance(order, dict):
-                    status = order.get("status", "").lower()
-                    if status in ("matched", "filled"):
-                        return int(order.get("size_matched", expected_qty)
-                                   or expected_qty)
-                    if status in ("cancelled", "canceled", "expired"):
-                        return 0
-            except Exception:
-                pass
-            time.sleep(1)
-        return 0
-
-    def cancel_order(self, order_id: str) -> None:
-        """Cancel a single order by id."""
-        if MODE == "LOG":
-            return
-        if not self._clob:
-            return
-        try:
-            self._clob.cancel(order_id)
-        except Exception as e:
-            write_jsonl({"event_type":"CANCEL_ERROR", "order_id": order_id, "err": str(e)[:120]})
-
-    def get_open_orders(self) -> List[dict]:
-        """Return currently open/live orders."""
-        if not self._clob:
-            return []
-        try:
-            result = self._clob.get_orders()
-            if isinstance(result, list):
-                return [o for o in result
-                        if isinstance(o, dict) and o.get("status", "").upper() in ("LIVE", "OPEN")]
-            return []
-        except Exception:
-            return []
-
-# =============================================================================
 # BOT CORE
-# =============================================================================
 class Bot:
     def __init__(self):
         global _LOGGER
         self.client = PolymarketClient()
+        set_jsonl_writer(write_jsonl)  # wire module-level callback for CLOB logging
         self.running = True
         self.cash_usdc = BANKROLL_START_USDC
         self.realized_pnl_usdc = 0.0  # cumulative realized P&L (sells + settlements)
@@ -1501,7 +366,7 @@ class Bot:
                 self.day_start = datetime.strptime(saved_day, "%Y-%m-%d").date()
             saved_hour = raw.get("hour_window")
             if saved_hour:
-                self._hour_window = datetime.strptime(saved_hour, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                self._hour_window = _parse_iso_z(saved_hour)
             ms = raw.get("market_states", {})
             pos_fields = {f.name for f in Position.__dataclass_fields__.values()}
             ms_fields = {f.name for f in MarketState.__dataclass_fields__.values()}
@@ -2160,14 +1025,7 @@ class Bot:
         maker_fill_rate = (self._diag_maker_fills / max(1, self._diag_maker_orders_placed)
                            if self._diag_maker_orders_placed > 0 else 0.0)
         # Maker fill latency percentiles
-        maker_lat_p50 = 0.0
-        maker_lat_p90 = 0.0
-        if self._diag_maker_fill_latencies:
-            sorted_lat = sorted(self._diag_maker_fill_latencies)
-            p50_idx = len(sorted_lat) // 2
-            p90_idx = int(len(sorted_lat) * 0.9)
-            maker_lat_p50 = sorted_lat[min(p50_idx, len(sorted_lat) - 1)]
-            maker_lat_p90 = sorted_lat[min(p90_idx, len(sorted_lat) - 1)]
+        maker_lat_p50, maker_lat_p90 = _p50_p90(self._diag_maker_fill_latencies)
         # Similarity/tempo stats
         trade_ts = sorted(self._diag_parity_trade_timestamps)
         paired_trades_per_min = len(trade_ts)
@@ -2443,22 +1301,10 @@ class Bot:
         med_signal_to_fill_ms = (statistics.median(self._clone_signal_to_fill)
                                  if self._clone_signal_to_fill else 0.0)
         # maker queue time percentiles (submit_ts -> fill_ts)
-        queue_p50 = 0.0
-        queue_p90 = 0.0
-        if self._diag_maker_queue_times:
-            sorted_qt = sorted(self._diag_maker_queue_times)
-            p50_idx = len(sorted_qt) // 2
-            p90_idx = int(len(sorted_qt) * 0.9)
-            queue_p50 = sorted_qt[min(p50_idx, len(sorted_qt) - 1)]
-            queue_p90 = sorted_qt[min(p90_idx, len(sorted_qt) - 1)]
+        queue_p50, queue_p90 = _p50_p90(self._diag_maker_queue_times)
 
         # ── 2. Hold time distribution for paired inventory ──
-        hold_p50 = 0.0
-        hold_p90 = 0.0
-        if self._clone_hold_times:
-            sorted_ht = sorted(self._clone_hold_times)
-            hold_p50 = sorted_ht[len(sorted_ht) // 2]
-            hold_p90 = sorted_ht[int(len(sorted_ht) * 0.9)]
+        hold_p50, hold_p90 = _p50_p90(self._clone_hold_times)
         # Also compute current hold times from active locked positions
         active_hold_secs = []
         now_t = time.time()
@@ -2501,20 +1347,10 @@ class Bot:
                         + [s for s in self.market_states]):
             # Cache age p50/p90
             ages = self._tempo_cache_ages.get(slug, [])
-            ca_p50 = 0.0
-            ca_p90 = 0.0
-            if ages:
-                sa = sorted(ages)
-                ca_p50 = sa[len(sa) // 2]
-                ca_p90 = sa[min(int(len(sa) * 0.9), len(sa) - 1)]
+            ca_p50, ca_p90 = _p50_p90(ages)
             # BG fetch duration p50/p90
             fetch_durs = self._bg_fetch_durations.get(slug, [])
-            bf_p50 = 0.0
-            bf_p90 = 0.0
-            if fetch_durs:
-                sf = sorted(fetch_durs)
-                bf_p50 = sf[len(sf) // 2]
-                bf_p90 = sf[min(int(len(sf) * 0.9), len(sf) - 1)]
+            bf_p50, bf_p90 = _p50_p90(fetch_durs)
             # Per-slug pair completion KPI
             slug_unpaired = self._diag_slug_unpaired_events.get(slug, 0)
             slug_p500 = self._diag_slug_paired_500ms.get(slug, 0)
@@ -2711,14 +1547,8 @@ class Bot:
             if "xrp" in slug.lower():
                 xrp_ages = ages_list
 
-        def _percentiles(vals):
-            if not vals:
-                return 0.0, 0.0
-            s = sorted(vals)
-            return s[len(s) // 2], s[min(int(len(s) * 0.9), len(s) - 1)]
-
-        sol_p50, sol_p90 = _percentiles(sol_ages)
-        xrp_p50, xrp_p90 = _percentiles(xrp_ages)
+        sol_p50, sol_p90 = _p50_p90(sol_ages)
+        xrp_p50, xrp_p90 = _p50_p90(xrp_ages)
 
         # ── True cost ──
         hour_elapsed = max(0.01, (now_t - self._true_cost_hour_start_ts) / 3600.0)
@@ -2839,6 +1669,44 @@ class Bot:
         rpnl_str = f"+${self.realized_pnl_usdc:.2f}" if self.realized_pnl_usdc >= 0 else f"-${abs(self.realized_pnl_usdc):.2f}"
         print(f"\n  --- Cash: ${self.cash_usdc:.2f}  |  Equity: ${equity:.2f}  |  Invested: ${total_cost:.2f}"
               f"  |  Day P&L: {pnl_str}  |  Total P&L: {rpnl_str}  |  Positions: {pos_str} ---\n")
+    def _log_hour_label(self, slug, st, final_price, effective_close,
+                        hour_direction, delta_bps,
+                        position_direction="NONE", would_win=None,
+                        positions_held=None):
+        """Emit HOUR_LABEL truth-label event (shared by settled and no-position paths)."""
+        data = {
+            "event_type": "HOUR_LABEL", "slug": slug, "crypto": st.crypto,
+            "hour_start_utc": st.hour_start_utc,
+            "hour_label_et": _hour_label_et(st.hour_start_utc),
+            "hour_index": st.hour_index,
+            "hour_open": round(st.hour_open, 2),
+            "hour_final_price": round(final_price, 2),
+            "effective_hour_close": round(effective_close, 2),
+            "hour_close_source": "NEXT_HOUR_OPEN",
+            "hour_direction": hour_direction,
+            "settlement_delta_bps": round(delta_bps, 3),
+            "won_up": hour_direction == "Up",
+            "won_down": hour_direction == "Down",
+            "position_direction_at_entry": position_direction,
+            "would_win_if_held_to_settle": would_win,
+        }
+        if positions_held is not None:
+            data["positions_held"] = positions_held
+        write_jsonl(data)
+    def _cleanup_market_slug(self, slug: str):
+        """Remove all per-slug state when a market hour ends."""
+        self.market_states.pop(slug, None)
+        self.signal_hist.pop(slug, None)
+        self.last_book.pop(slug, None)
+        self.recent_extreme_price.pop(slug, None)
+        self.entry_sm.pop(slug, None)
+        self._data_cache.pop(slug, None)
+        self._pending_fetches.pop(slug, None)
+        self._parity_last_order_ts.pop(slug, None)
+        self._parity_invested_usd.pop(slug, None)
+        self._parity_locked_since.pop(slug, None)
+        self._parity_maker_orders.pop(slug, None)
+        self._parity_pending_pairs[:] = [p for p in self._parity_pending_pairs if p["slug"] != slug]
     def _resolve_ended_hours(self, current_markets: List[MarketRef]):
         """
         Resolve positions for hours that have ended.
@@ -2855,35 +1723,10 @@ class Bot:
                     sp, nho = self.client.get_binance_spot_and_hour_open(st.crypto)
                     sd = (sp - st.hour_open) / max(st.hour_open, 1e-9) * 10000.0
                     w = "Up" if sp >= st.hour_open else "Down"
-                    write_jsonl({
-                        "event_type": "HOUR_LABEL", "slug": slug, "crypto": st.crypto,
-                        "hour_start_utc": st.hour_start_utc,
-                        "hour_label_et": _hour_label_et(st.hour_start_utc),
-                        "hour_index": st.hour_index,
-                        "hour_open": round(st.hour_open, 2),
-                        "hour_final_price": round(sp, 2),
-                        "effective_hour_close": round(nho, 2),
-                        "hour_close_source": "NEXT_HOUR_OPEN",
-                        "hour_direction": w,
-                        "settlement_delta_bps": round(sd, 3),
-                        "won_up": w == "Up", "won_down": w == "Down",
-                        "position_direction_at_entry": "NONE",
-                        "would_win_if_held_to_settle": None,
-                    })
+                    self._log_hour_label(slug, st, sp, nho, w, sd)
                 except Exception:
                     pass
-                self.market_states.pop(slug, None)
-                self.signal_hist.pop(slug, None)
-                self.last_book.pop(slug, None)
-                self.recent_extreme_price.pop(slug, None)
-                self.entry_sm.pop(slug, None)
-                self._data_cache.pop(slug, None)
-                self._pending_fetches.pop(slug, None)
-                self._parity_last_order_ts.pop(slug, None)
-                self._parity_invested_usd.pop(slug, None)
-                self._parity_locked_since.pop(slug, None)
-                self._parity_maker_orders.pop(slug, None)
-                self._parity_pending_pairs[:] = [p for p in self._parity_pending_pairs if p["slug"] != slug]
+                self._cleanup_market_slug(slug)
                 continue
             # Determine winner by checking final Binance price vs hour open
             # spot here = next hour's opening price (close proxy for the prior hour)
@@ -2938,42 +1781,16 @@ class Bot:
                 "equity": round(self._equity(), 2),
             })
             # HOUR_LABEL — truth labels for settlement analysis
-            # What position direction did we actually hold?
             held_up = any(d["outcome"] == "Up" for d in pos_details)
             held_down = any(d["outcome"] == "Down" for d in pos_details)
             position_direction = "Up" if (held_up and not held_down) else ("Down" if (held_down and not held_up) else ("BOTH" if (held_up and held_down) else "NONE"))
             hour_direction = "Up" if close_proxy >= st.hour_open else "Down"
             would_win = position_direction == hour_direction if position_direction in ("Up", "Down") else None
-            write_jsonl({
-                "event_type": "HOUR_LABEL", "slug": slug, "crypto": st.crypto,
-                "hour_start_utc": st.hour_start_utc,
-                "hour_label_et": _hour_label_et(st.hour_start_utc),
-                "hour_index": st.hour_index,
-                "hour_open": round(st.hour_open, 2),
-                "hour_final_price": round(close_proxy, 2),
-                "effective_hour_close": round(next_hour_open, 2),
-                "hour_close_source": "NEXT_HOUR_OPEN",
-                "hour_direction": hour_direction,
-                "settlement_delta_bps": round(settlement_delta_bps, 3),
-                "won_up": hour_direction == "Up",
-                "won_down": hour_direction == "Down",
-                "position_direction_at_entry": position_direction,
-                "would_win_if_held_to_settle": would_win,
-                "positions_held": pos_details,
-            })
+            self._log_hour_label(slug, st, close_proxy, next_hour_open,
+                                 hour_direction, settlement_delta_bps,
+                                 position_direction, would_win, pos_details)
             # Clean up ended market
-            self.market_states.pop(slug, None)
-            self.signal_hist.pop(slug, None)
-            self.last_book.pop(slug, None)
-            self.recent_extreme_price.pop(slug, None)
-            self.entry_sm.pop(slug, None)
-            self._data_cache.pop(slug, None)
-            self._pending_fetches.pop(slug, None)
-            self._parity_last_order_ts.pop(slug, None)
-            self._parity_invested_usd.pop(slug, None)
-            self._parity_locked_since.pop(slug, None)
-            self._parity_maker_orders.pop(slug, None)
-            self._parity_pending_pairs[:] = [p for p in self._parity_pending_pairs if p["slug"] != slug]
+            self._cleanup_market_slug(slug)
     def _get_markets(self) -> List[MarketRef]:
         # In practice: discover the current hour markets
         return self.client.get_current_hour_markets()
@@ -3032,7 +1849,7 @@ class Bot:
         up_book, dn_book = data["up_book"], data["dn_book"]
         st = self.market_states[m.slug]
         now = utc_now()
-        hour_start = datetime.strptime(st.hour_start_utc, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        hour_start = _parse_iso_z(st.hour_start_utc)
         t_min = minutes_into_hour(hour_start, now)
         if t_min >= TRADE_HARD_STOP_MIN:
             self.last_book[m.slug]["Up"] = up_book
@@ -3728,12 +2545,12 @@ class Bot:
         if sm["state"] == "COOLDOWN":
             cooldown_active = True
         elif st.last_entry_ts:
-            last = datetime.strptime(st.last_entry_ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            last = _parse_iso_z(st.last_entry_ts)
             cd = entry_cooldown_sec(m.crypto, t_min)
             cooldown_active = (utc_now() - last).total_seconds() < cd
         # Exit COOLDOWN state when cooldown expires
         if sm["state"] == "COOLDOWN" and st.last_entry_ts:
-            last = datetime.strptime(st.last_entry_ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            last = _parse_iso_z(st.last_entry_ts)
             cd = entry_cooldown_sec(m.crypto, t_min)
             if (utc_now() - last).total_seconds() >= cd:
                 self._sm_transition(m.slug, "IDLE", "cooldown_expired", ctx)
@@ -5732,7 +4549,7 @@ class Bot:
             return
         now_iso = iso_z(utc_now())
         if st.last_reentry_ts:
-            last = datetime.strptime(st.last_reentry_ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            last = _parse_iso_z(st.last_reentry_ts)
             if (utc_now() - last).total_seconds() < REENTRY_COOLDOWN_SEC:
                 return
         clip = self._calc_clip(m.crypto, t_min, abs_delta_bps) * 0.50
@@ -5820,7 +4637,7 @@ class Bot:
             if not book:
                 continue
             if pos.scalp_mode and pos.scalp_open_ts:
-                opened = datetime.strptime(pos.scalp_open_ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                opened = _parse_iso_z(pos.scalp_open_ts)
                 if (utc_now() - opened).total_seconds() / 60.0 > LATE_SCALP_MAX_HOLD_MIN:
                     self._do_sell(m, st, outcome, pos.qty, book.bid,
                                   reason="SCALP_TIMEOUT", leg="SCALP_TIMEOUT", ctx=ctx)
@@ -5844,7 +4661,7 @@ class Bot:
                         should_inv_sell = True
                     else:
                         try:
-                            last_dt = datetime.strptime(pos.last_derisk_ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                            last_dt = _parse_iso_z(pos.last_derisk_ts)
                             elapsed = (now_t - last_dt).total_seconds()
                         except Exception:
                             elapsed = 999.0
@@ -5889,7 +4706,7 @@ class Bot:
                         should_derisk = True  # first derisk for this position
                     else:
                         try:
-                            last_dt = datetime.strptime(pos.last_derisk_ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                            last_dt = _parse_iso_z(pos.last_derisk_ts)
                             elapsed = (now_t - last_dt).total_seconds()
                         except Exception:
                             elapsed = 999.0
@@ -6123,7 +4940,7 @@ class Bot:
             # --- FAST_TP: early partial take-profit (once per position) ---
             if not pos.fast_tp_done and pos.opened_at:
                 try:
-                    opened_dt = datetime.strptime(pos.opened_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                    opened_dt = _parse_iso_z(pos.opened_at)
                     pos_age_sec = (utc_now() - opened_dt).total_seconds()
                 except Exception:
                     pos_age_sec = 0.0
@@ -6190,7 +5007,7 @@ class Bot:
         # Build a minimal ctx if caller didn't pass one
         if ctx is None:
             t_min = minutes_into_hour(
-                datetime.strptime(st.hour_start_utc, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc),
+                _parse_iso_z(st.hour_start_utc),
                 utc_now())
             ctx = {"hour_start_utc": st.hour_start_utc, "hour_open": st.hour_open,
                    "t_min": t_min, "phase": _phase(t_min),
@@ -6244,7 +5061,7 @@ class Bot:
                 time_held = 0.0
                 if pos.opened_at:
                     try:
-                        opened_dt = datetime.strptime(pos.opened_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                        opened_dt = _parse_iso_z(pos.opened_at)
                         time_held = (utc_now() - opened_dt).total_seconds()
                     except Exception:
                         pass
@@ -6287,7 +5104,7 @@ class Bot:
                 time_held = 0.0
                 if pos.opened_at:
                     try:
-                        opened_dt = datetime.strptime(pos.opened_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                        opened_dt = _parse_iso_z(pos.opened_at)
                         time_held = (utc_now() - opened_dt).total_seconds()
                     except Exception:
                         pass
@@ -6342,9 +5159,7 @@ class Bot:
                 self._do_sell(m, st, outcome, pos.qty,
                               max(book.bid, book.ask - MAX_CROSS_SLIPPAGE),
                               reason="CLEANUP", leg="CLEANUP")
-# =============================================================================
 # MAIN
-# =============================================================================
 def main():
     if MODE not in ("LOG", "LIVE"):
         print("MODE must be LOG or LIVE")
