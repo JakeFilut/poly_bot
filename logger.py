@@ -379,7 +379,7 @@ class Logger:
             "t_min": round(t_min, 3),
             "spot": round(spot, 2), "hour_open": round(hour_open, 2),
             "delta_bps": round(delta_bps, 3), "abs_delta_bps": round(abs_delta_bps, 3),
-            "vel": round(vel, 3), "z": round(z, 3),
+            "vel": round(vel, 3) if vel is not None else None, "z": round(z, 3),
             "up_bid": round(up_bid, 4), "up_ask": round(up_ask, 4),
             "up_mid": round(up_mid, 4), "up_spread": round(up_spread, 4), "up_imb": round(up_imb, 3),
             "dn_bid": round(dn_bid, 4), "dn_ask": round(dn_ask, 4),
@@ -530,7 +530,7 @@ class Logger:
             "spot": ctx.get("spot", ""), "hour_open": ctx.get("hour_open", ""),
             "delta_bps": ctx.get("delta_bps", ""),
             "abs_delta_bps": ctx.get("abs_delta_bps", ""),
-            "delta_vel_bps_per_min": ctx.get("vel", ""),
+            "delta_vel_bps_per_min": ctx.get("vel") if ctx.get("vel") is not None else "",
             "zscore": ctx.get("z", ""),
             "phase": ctx.get("phase", ""),
             "seconds_to_close": ctx.get("seconds_to_close", ""),
@@ -548,8 +548,10 @@ class Logger:
     def _console_print(self, event: Dict[str, Any]):
         etype = event.get("event_type", "")
         if etype == "SNAPSHOT_COMPACT":
+            _vel = event.get('vel')
+            _vel_s = f"{_vel:+6.1f}" if _vel is not None else "  None"
             print(f"  {event.get('crypto', ''):4s}  delta={event.get('delta_bps', 0):+7.1f}bps  "
-                  f"vel={event.get('vel', 0):+6.1f}  "
+                  f"vel={_vel_s}  "
                   f"up_ask={event.get('up_ask', 0):.3f}  "
                   f"dn_ask={event.get('dn_ask', 0):.3f}  "
                   f"t={event.get('t_min', 0):.1f}m")

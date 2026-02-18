@@ -677,13 +677,13 @@ def zscore(delta_series: List[Tuple[str, float]]) -> float:
         return 0.0
     return (vals[0] - mu) / sd  # vals[0] is latest because we appended reversed
 def delta_velocity_bps_per_min(delta_series: List[Tuple[str, float]], lookback_sec: float = 30.0) -> float:
+    """Legacy wrapper — returns 0.0 for back-compat with call sites that don't expect None."""
     if len(delta_series) < 2:
         return 0.0
     now = utc_now()
     target = now - timedelta(seconds=lookback_sec)
     latest_ts, latest_d = delta_series[-1]
     latest_t = datetime.strptime(latest_ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-    # find nearest prior point
     prior_d = None
     prior_t = None
     for ts_iso, d in reversed(delta_series[:-1]):
@@ -698,6 +698,28 @@ def delta_velocity_bps_per_min(delta_series: List[Tuple[str, float]], lookback_s
     if dt_min <= 1e-6:
         return 0.0
     return (latest_d - prior_d) / dt_min
+
+def spot_velocity_bps_per_min(spot_hist: List[Tuple[float, float]], lookback_sec: float = 30.0) -> Optional[float]:
+    """Compute velocity from spot history: vel_bps_per_min = ((spot_now - spot_old)/spot_old)*10000 / (dt/60s).
+    Returns None if insufficient history (<2 points or dt < 200ms)."""
+    if len(spot_hist) < 2:
+        return None
+    ts_now, spot_now = spot_hist[-1]
+    # Find oldest point within lookback window
+    cutoff = ts_now - lookback_sec
+    ts_old, spot_old = spot_hist[0]
+    for ts, sp in spot_hist:
+        if ts >= cutoff:
+            ts_old, spot_old = ts, sp
+            break
+    # If the "oldest within window" IS the latest point, use oldest overall
+    if ts_old >= ts_now - 0.001:
+        ts_old, spot_old = spot_hist[0]
+    dt_ms = (ts_now - ts_old) * 1000.0
+    if dt_ms < 200.0 or spot_old <= 0:
+        return None
+    dt_min = (ts_now - ts_old) / 60.0
+    return ((spot_now - spot_old) / spot_old) * 10000.0 / dt_min
 def persistence_ok(signal_series: List[Tuple[str, bool]]) -> bool:
     """
     signal_series holds (ts_iso, signal_bool) for last entries.
@@ -728,7 +750,7 @@ def taker_gate_allows(spread_cents: float, abs_edge_bps: float, thr_bps: float) 
     return (spread_cents <= TAKER_MAX_SPREAD_CENTS and
             abs_edge_bps >= thr_bps + TAKER_MIN_EDGE_EXTRA_BPS)
 
-def whipsaw_ok(delta_bps: float, vel: float,
+def whipsaw_ok(delta_bps: float, vel: Optional[float],
                edge_sign_since: Optional[float]) -> Tuple[bool, str]:
     """Return (allowed, block_reason). Blocks entry in chop conditions."""
     # 1. Sign stability: delta sign must be unchanged for >= ENTRY_MIN_STABLE_SIGN_MS
@@ -738,7 +760,8 @@ def whipsaw_ok(delta_bps: float, vel: float,
     if elapsed_ms < ENTRY_MIN_STABLE_SIGN_MS:
         return False, f"sign_unstable({elapsed_ms:.0f}ms<{ENTRY_MIN_STABLE_SIGN_MS}ms)"
     # 2. Velocity alignment: vel must not oppose delta_bps
-    if BLOCK_IF_VEL_OPPOSES and abs(vel) >= VEL_OPPOSE_THRESHOLD:
+    #    If vel is None (unknown), skip this check — allow entry
+    if vel is not None and BLOCK_IF_VEL_OPPOSES and abs(vel) >= VEL_OPPOSE_THRESHOLD:
         delta_sign = 1 if delta_bps > 0 else -1
         vel_sign = 1 if vel > 0 else -1
         if delta_sign != vel_sign:
@@ -1388,8 +1411,13 @@ class Bot:
         self._diag_adverse_guard_degrades = 0
         # Per-slug degrade state: slug -> degrade_until_ts (soft mode: MAX target + 50% step)
         self._quote_degraded_until: Dict[str, float] = {}
-        # Per-slug spot history for adverse selection: slug -> [(epoch_ts, spot)]
+        # Per-slug spot history for adverse selection + velocity + regime: slug -> [(epoch_ts, spot)]
         self._spot_history: Dict[str, List[Tuple[float, float]]] = {}
+        # VELOCITY_DIAG: last emit ts per slug (1/min)
+        self._vel_diag_last_ts: Dict[str, float] = {}
+        # Warm-up: timestamp of bootstrap completion + last hour roll
+        self._bootstrap_done_ts: float = 0.0
+        self._last_hour_roll_ts: float = 0.0
         # Rescue invested tracking: slug -> USD spent on rescue buys
         self._rescue_invested_usd: Dict[str, float] = {}
         # Similarity/tempo stats: timestamps of all parity trades this minute
@@ -1708,6 +1736,7 @@ class Bot:
             })
             # ── Reset for new hour ──
             self._hour_window = current_hour
+            self._last_hour_roll_ts = time.time()
             self.hourly_pnl_usdc = 0.0
             self.hour_start_equity = equity_now
             self._hour_risk_stop_hit = False
@@ -3100,6 +3129,8 @@ class Bot:
                             m_ref = futures[fut]
                             self.logger.log_event({"event_type": "INIT_PREFETCH_ERROR",
                                                    "slug": m_ref.slug, "err": str(e)})
+            self._bootstrap_done_ts = time.time()
+            self._last_hour_roll_ts = self._bootstrap_done_ts
             write_jsonl({"event_type": "INIT_BOOTSTRAP_DONE",
                           "markets": len(self._cached_markets),
                           "cached": len(self._data_cache)})
@@ -4296,7 +4327,7 @@ class Bot:
         self.recent_extreme_price.setdefault(m.slug, {"Up": None, "Down": None})
     def _make_tick_ctx(self, m: MarketRef, st: MarketState, spot: float, hour_open: float,
                        t_min: float, delta_bps: float, abs_delta_bps: float,
-                       vel: float, z: float, up_book: BookTop, dn_book: BookTop) -> dict:
+                       vel: Optional[float], z: float, up_book: BookTop, dn_book: BookTop) -> dict:
         """Build shared per-tick context dict used by entries, exits, and logging."""
         effective_delta = abs_delta_bps * (t_min / 60.0)
         normalized_delta = abs_delta_bps / max(st.peak_abs_delta_bps, 1.0)
@@ -4356,12 +4387,12 @@ class Bot:
         st.delta_hist = st.delta_hist[-STATE_HIST_MAX:]
         st.price_hist.append((iso_z(now), spot))
         st.price_hist = st.price_hist[-STATE_HIST_MAX:]
-        # Lightweight spot history for adverse selection (epoch-based, cheap to query)
+        # Lightweight spot history for adverse selection + velocity + regime (epoch-based)
         spot_ts = time.time()
         slug_spot_hist = self._spot_history.setdefault(m.slug, [])
         slug_spot_hist.append((spot_ts, spot))
-        # Trim to last 30s of data (ample for 10s lookback)
-        cutoff = spot_ts - 30.0
+        # Trim to last 120s (supports 60s regime lookback + 30s velocity lookback)
+        cutoff = spot_ts - 120.0
         while slug_spot_hist and slug_spot_hist[0][0] < cutoff:
             slug_spot_hist.pop(0)
         # Track significant spot moves for signal-to-fill latency (clone metrics)
@@ -4372,8 +4403,29 @@ class Bot:
                 self._clone_last_spot_move[m.slug] = (spot_ts, spot)
         else:
             self._clone_last_spot_move[m.slug] = (spot_ts, spot)
-        vel = delta_velocity_bps_per_min(st.delta_hist, lookback_sec=30.0)
+        vel = spot_velocity_bps_per_min(slug_spot_hist, lookback_sec=30.0)  # None if insufficient data
         z = zscore(st.delta_hist) if Z_ENTRY_ENABLED else 0.0
+
+        # ── VELOCITY_DIAG: 1/min per slug (temporary debug) ──
+        _vd_last = self._vel_diag_last_ts.get(m.slug, 0.0)
+        if spot_ts - _vd_last >= 60.0:
+            self._vel_diag_last_ts[m.slug] = spot_ts
+            _oldest_ts = slug_spot_hist[0][0] if slug_spot_hist else 0.0
+            _newest_ts = slug_spot_hist[-1][0] if slug_spot_hist else 0.0
+            _spot_old = slug_spot_hist[0][1] if slug_spot_hist else 0.0
+            _spot_new = slug_spot_hist[-1][1] if slug_spot_hist else 0.0
+            write_jsonl({
+                "event_type": "VELOCITY_DIAG",
+                "slug": m.slug, "crypto": m.crypto,
+                "sample_count": len(slug_spot_hist),
+                "oldest_ts": round(_oldest_ts, 3),
+                "newest_ts": round(_newest_ts, 3),
+                "dt_ms": round((_newest_ts - _oldest_ts) * 1000, 0),
+                "spot_old": round(_spot_old, 4),
+                "spot_new": round(_spot_new, 4),
+                "computed_vel": round(vel, 3) if vel is not None else None,
+            })
+
         self.last_book[m.slug]["Up"] = up_book
         self.last_book[m.slug]["Down"] = dn_book
         self._update_extremes(m.slug, up_book, dn_book)
@@ -4577,8 +4629,21 @@ class Bot:
     # =================================================================
     # REGIME AWARENESS — volatility-adaptive activity
     # =================================================================
+    WARMUP_BYPASS_SEC = 20.0  # seconds after bootstrap/hour-roll to bypass low-vol gating
+
+    def _in_warmup(self) -> bool:
+        """Return True if we're within WARMUP_BYPASS_SEC of bootstrap or hour roll."""
+        now = time.time()
+        since_bootstrap = now - self._bootstrap_done_ts if self._bootstrap_done_ts > 0 else 999.0
+        since_hour_roll = now - self._last_hour_roll_ts if self._last_hour_roll_ts > 0 else 999.0
+        return min(since_bootstrap, since_hour_roll) < self.WARMUP_BYPASS_SEC
+
     def _update_regime(self, slug: str):
         """Compute rolling 60s spot volatility and determine regime."""
+        # During warm-up, force non-low-vol so quoting/entries can start
+        if self._in_warmup():
+            self._regime_is_low_vol[slug] = False
+            return
         spot_hist = self._spot_history.get(slug, [])
         if len(spot_hist) < 5:
             self._regime_is_low_vol[slug] = False
@@ -4819,10 +4884,12 @@ class Bot:
             return
 
         # Velocity must be supportive (agree with direction)
-        if outcome == "Up" and vel < DSCALP_VEL_MIN_BPS_PER_MIN:
-            return
-        if outcome == "Down" and vel > -DSCALP_VEL_MIN_BPS_PER_MIN:
-            return
+        # If vel is None (unknown/warming up), skip this gate — allow entry
+        if vel is not None:
+            if outcome == "Up" and vel < DSCALP_VEL_MIN_BPS_PER_MIN:
+                return
+            if outcome == "Down" and vel > -DSCALP_VEL_MIN_BPS_PER_MIN:
+                return
 
         # Size: $5-10 per entry, no micro-splits
         remaining = DSCALP_MAX_USD_PER_SLUG - invested
@@ -4865,11 +4932,29 @@ class Bot:
                       "qty": round(order_qty, 1),
                       "step_usd": round(step_usd, 2),
                       "delta_bps": round(delta_bps, 1),
-                      "vel": round(vel, 2),
+                      "vel": round(vel, 2) if vel is not None else None,
                       "cache_age_ms": round(cache_age, 0),
                       "spread_cents": round(spread_cents, 2),
                       "edge_cents": round(effective_edge_cents, 2),
                       "min_edge_cents": min_edge})
+
+        # CSV: ORDER_INTENT + ORDER_SUBMIT
+        _bk_fields = build_book_fields(ctx["up_book"], ctx["dn_book"], outcome)
+        self.logger.log_order_intent(
+            engine="DSCALP", reason="DSCALP_ENTRY",
+            decision_id=decision_id, position_id=pos.position_id,
+            crypto=m.crypto, slug=m.slug, outcome=outcome,
+            side="BUY", qty=order_qty, target_price=buy_price,
+            usdc_cost=step_usd, ctx=ctx, book_fields=_bk_fields,
+        )
+        self.logger.log_order_submit(
+            engine="DSCALP", reason="DSCALP_ENTRY",
+            decision_id=decision_id, position_id=pos.position_id,
+            client_order_id=client_oid,
+            crypto=m.crypto, slug=m.slug, outcome=outcome,
+            side="BUY", qty=order_qty, target_price=buy_price,
+            usdc_cost=step_usd, ctx=ctx, book_fields=_bk_fields,
+        )
 
         # Execute buy (unified: paper in LOG, live order manager in LIVE)
         buy_result = self._exec_buy(st, m, outcome, buy_price, order_qty,
@@ -4919,17 +5004,18 @@ class Bot:
         self._diag_dscalp_entries += 1
         st.last_entry_ts = iso_z(utc_now())
 
+        _vel_s = f"{vel:.1f}" if vel is not None else "None"
         self.logger.log_order_fill(
-            engine="DSCALP", slug=m.slug, crypto=m.crypto,
-            hour_start_utc=ctx["hour_start_utc"], t_min=t_min,
-            outcome=outcome, side="BUY", qty=actual_qty,
+            engine="DSCALP", reason="DSCALP_ENTRY",
+            decision_id=decision_id, client_order_id=client_oid,
+            position_id=pos.position_id,
+            crypto=m.crypto, slug=m.slug, outcome=outcome,
+            side="BUY", qty=actual_qty,
             fill_price=actual_price, usdc_cost=actual_cost,
-            maker_taker="maker", decision_id=decision_id,
-            client_order_id=client_oid, position_id=pos.position_id,
-            notes=f"dscalp_entry vel={vel:.1f}",
-            **build_book_fields(ctx["up_book"], ctx["dn_book"],
-                                ctx.get("spot", 0), ctx.get("hour_open", 0),
-                                delta_bps, abs_delta_bps),
+            maker_taker="maker",
+            ctx=ctx,
+            book_fields=build_book_fields(ctx["up_book"], ctx["dn_book"], outcome),
+            extra={"notes": f"dscalp_entry vel={_vel_s}"},
         )
 
     def _record_exit_reason(self, reason: str, pnl_cents: float, hold_sec: float,
@@ -5161,7 +5247,7 @@ class Bot:
         # Sizing
         mult = sizing_mult(abs_delta_bps)
         clip = self._calc_clip(m.crypto, t_min, abs_delta_bps)
-        if mult >= 2.0 and vel < MIN_DELTA_VEL_BPS_PER_MIN:
+        if vel is not None and mult >= 2.0 and vel < MIN_DELTA_VEL_BPS_PER_MIN:
             clip *= 0.6
         if CORR_SCALE_ENABLED and BTC_LEAD and m.crypto != "BTC":
             btc_cost = self._crypto_cost_usdc("BTC")
