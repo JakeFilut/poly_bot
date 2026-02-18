@@ -204,7 +204,7 @@ CAP_BOOST_EDGE_FULL = 30.0       # edge_bps at which full boost is applied
 PARITY_BUY_ENABLED = True                # buy cheap straddle (up_ask + dn_ask < 1)
 PARITY_SELL_ENABLED = True               # sell rich straddle (up_bid + dn_bid > 1)
 PARITY_MAX_USD_PER_SLUG = 40.0          # max total straddle investment per slug
-PARITY_STEP_USD = 2.00                   # per-leg size per parity order
+PARITY_STEP_USD = 2.50                   # per-leg size per parity order
 PARITY_COOLDOWN_MS = 250                 # min time between parity orders per slug
 PARITY_MAKER_REFRESH_MS = 200            # cancel/replace maker every 200ms
 PARITY_TAKER_ALLOWED_SPREAD_CENTS = 1.0  # allow taker only when spread <= 1c
@@ -212,8 +212,8 @@ PARITY_TAKER_ALLOWED_SPREAD_CENTS = 1.0  # allow taker only when spread <= 1c
 # Fee-aware parity edge (CRITICAL)
 MAKER_FEE_BPS = float(os.getenv("MAKER_FEE_BPS", "0.5"))   # configurable: Poly CLOB ~0-0.5 bps maker
 TAKER_FEE_BPS = float(os.getenv("TAKER_FEE_BPS", "2.0"))   # configurable: Poly CLOB ~2 bps taker
-PARITY_BUY_MIN_EDGE_NET_CENTS = 1.0     # min NET edge after fees/slippage to buy straddle
-PARITY_SELL_MIN_EDGE_NET_CENTS = 1.0    # min NET edge after fees/slippage to sell straddle
+PARITY_BUY_MIN_EDGE_NET_CENTS = 1.75    # min NET edge after fees/slippage to buy straddle
+PARITY_SELL_MIN_EDGE_NET_CENTS = 1.75   # min NET edge after fees/slippage to sell straddle
 PARITY_EDGE_BUFFER_CENTS = 0.25         # safety buffer on top of min edge thresholds
 
 # Partial-fill protection
@@ -226,7 +226,7 @@ MAKER_ORDER_TIMEOUT_MS = 3000            # cancel maker order if unfilled after 
 # Locked inventory recycle
 LOCKED_MAX_HOLD_SEC = 180                # max seconds to hold locked straddle before recycling
 RECYCLE_MIN_PROFIT_NET_CENTS = 0.5      # min net-of-fee profit to trigger recycle sell
-RECYCLE_STEP_USD = 2.0                   # per-leg sell size during recycle
+RECYCLE_STEP_USD = 2.5                   # per-leg sell size during recycle
 
 # Liquidity + staleness guards
 MAX_SPREAD_FOR_PARITY_CENTS = 10.0      # block parity if either leg spread > 10c
@@ -244,7 +244,7 @@ PARITY_HARD_FLATTEN_MIN = 59.25         # force taker flatten (if time_to_close<
 PARITY_QUOTE_ENABLED = True
 PARITY_QUOTE_TARGET_EDGE_NET_CENTS_BASE = 1.0  # min edge target (aggressive -- pay up)
 PARITY_QUOTE_TARGET_EDGE_NET_CENTS_MAX  = 2.0  # max edge target (selective)
-PARITY_QUOTE_STEP_USD = 2.0              # per-leg bid size (equal USD both legs)
+PARITY_QUOTE_STEP_USD = 2.5              # per-leg bid size (equal USD both legs)
 PARITY_QUOTE_MAX_USD_PER_SLUG = 40.0    # max total quoting investment per slug
 PARITY_QUOTE_REFRESH_MS = 250           # refresh interval for quote repricing
 PARITY_QUOTE_ONLY_IF_LIQ_OK = True      # require liquidity guards for quoting
@@ -289,7 +289,7 @@ IMBALANCE_SOFT_CAP_SHARES = 20         # soft cap: start reducing new orders abo
 DERISK_RESCUE_TO_STRADDLE = True
 RESCUE_MIN_EDGE_NET_CENTS = 0.5         # min net edge for straddle completion to be worth it
 RESCUE_MAX_USD_PER_SLUG = 20.0          # max USD to spend completing straddle per slug
-RESCUE_STEP_USD = 2.0                    # per-order size for rescue buys
+RESCUE_STEP_USD = 2.5                    # per-order size for rescue buys
 MIN_PAIR_QTY = 5.0                       # both legs must exceed this to count as "already paired"
 
 # ---------------------------------------------------------------------------
@@ -380,11 +380,12 @@ DSCALP_COOLDOWN_MS = float(os.getenv("DSCALP_COOLDOWN_MS", "4000"))            #
 # Exit ladder
 DSCALP_TP1_CENTS = float(os.getenv("DSCALP_TP1_CENTS", "3.0"))                 # +3c: sell 25%
 DSCALP_TP1_FRAC = float(os.getenv("DSCALP_TP1_FRAC", "0.25"))
-DSCALP_TP2_CENTS = float(os.getenv("DSCALP_TP2_CENTS", "6.0"))                 # +6c: sell 25%
+DSCALP_TP2_CENTS = float(os.getenv("DSCALP_TP2_CENTS", "5.0"))                 # +5c: sell 25%
 DSCALP_TP2_FRAC = float(os.getenv("DSCALP_TP2_FRAC", "0.25"))
-DSCALP_TP3_CENTS = float(os.getenv("DSCALP_TP3_CENTS", "9.0"))                 # +9c: sell 25%, remainder for timeout/trailing
+DSCALP_TP3_CENTS = float(os.getenv("DSCALP_TP3_CENTS", "7.0"))                 # +7c: sell 25%, remainder for timeout/trailing
 DSCALP_TP3_FRAC = float(os.getenv("DSCALP_TP3_FRAC", "0.25"))
-DSCALP_MIN_HOLD_SEC = float(os.getenv("DSCALP_MIN_HOLD_SEC", "120"))           # 120s min hold -- allow real directional exposure
+DSCALP_EARLY_TP_CENTS = float(os.getenv("DSCALP_EARLY_TP_CENTS", "2.0"))       # +2c early exit ONLY on spread collapse or velocity reversal
+DSCALP_MIN_HOLD_SEC = float(os.getenv("DSCALP_MIN_HOLD_SEC", "90"))            # 90s min hold -- bypass for emergency/spread-collapse/reversal
 DSCALP_MAX_HOLD_SEC = float(os.getenv("DSCALP_MAX_HOLD_SEC", "600"))           # 10 min max hold
 DSCALP_STOP_LOSS_CENTS = float(os.getenv("DSCALP_STOP_LOSS_CENTS", "5.0"))     # -5c stop loss (emergency only)
 
@@ -403,6 +404,9 @@ PARITY_MAX_WHEN_DIRECTIONAL_USD = float(os.getenv("PARITY_MAX_WHEN_DIRECTIONAL_U
 # ---------------------------------------------------------------------------
 TARGET_TRADES_PER_MIN = float(os.getenv("TARGET_TRADES_PER_MIN", "15"))          # target ~15 trades/min (F247 = ~12)
 THROTTLE_LOOKBACK_SEC = float(os.getenv("THROTTLE_LOOKBACK_SEC", "60"))          # rolling window for trades/min calc
+# Per-slug entry throttle (prevents over-trading any single market)
+MIN_ENTRY_INTERVAL_MS = float(os.getenv("MIN_ENTRY_INTERVAL_MS", "350"))         # min ms between entries on same slug
+MAX_ENTRIES_PER_MIN_PER_SLUG = int(os.getenv("MAX_ENTRIES_PER_MIN_PER_SLUG", "40"))  # hard cap per slug per minute
 
 # ---------------------------------------------------------------------------
 # REGIME AWARENESS -- volatility-adaptive activity
