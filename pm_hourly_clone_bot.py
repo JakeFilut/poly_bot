@@ -2298,6 +2298,11 @@ class Bot:
         if book.spread * 100 > DSCALP_MAX_SPREAD_CENTS:
             return
 
+        # Entry edge gate: outcome mid must be >= 2c above 50c neutral
+        entry_edge_cents = (book.mid - 0.50) * 100
+        if entry_edge_cents < DSCALP_MIN_ENTRY_EDGE_CENTS:
+            return
+
         # ── ENTRY SIGNAL: delta >= 15bps OR spot moved >= 8bps in 10s ──
         delta_ok = abs_delta_bps >= DSCALP_DELTA_MIN_BPS
         spot_move_ok = self._spot_move_10s_bps(m.slug) >= DSCALP_SPOT_MOVE_10S_BPS
@@ -2452,13 +2457,13 @@ class Bot:
             return
 
         # ── MINIMUM HOLD FLOOR: 90s unless emergency bypass ──
-        # Detect spread blowout (> 4c = liquidity evaporating)
+        # Detect spread blowout (> 6c = liquidity evaporating)
         spread_cents = book.spread * 100
-        spread_collapsed = spread_cents > 4.0
-        # Detect strong velocity reversal (> 7 bps/min against position — not noise)
+        spread_collapsed = spread_cents > DSCALP_EARLY_TP_SPREAD_THRESH
+        # Detect velocity reversal (> 4 bps/min against position)
         vel = ctx.get("vel", 0.0)
         vel_reversed = (outcome == "Up" and vel < -DSCALP_VEL_REVERSAL_BPS) or (outcome == "Down" and vel > DSCALP_VEL_REVERSAL_BPS)
-        # Early +3c taker exit: only when real danger (spread blowout or strong reversal)
+        # Early +2c taker exit: only when real danger (spread blowout OR strong reversal)
         if hold_sec < DSCALP_MIN_HOLD_SEC:
             if pnl_cents >= DSCALP_EARLY_TP_CENTS and (spread_collapsed or vel_reversed):
                 sell_qty = pos.qty

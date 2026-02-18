@@ -369,6 +369,7 @@ DSCALP_DELTA_MIN_BPS = float(os.getenv("DSCALP_DELTA_MIN_BPS", "15.0"))        #
 DSCALP_SPOT_MOVE_10S_BPS = float(os.getenv("DSCALP_SPOT_MOVE_10S_BPS", "8.0"))  # OR: spot moved >= 8bps in last 10s
 DSCALP_VEL_MIN_BPS_PER_MIN = float(os.getenv("DSCALP_VEL_MIN_BPS_PER_MIN", "1.0"))  # min velocity (supportive, not hard gate)
 DSCALP_MAX_SPREAD_CENTS = float(os.getenv("DSCALP_MAX_SPREAD_CENTS", "2.0"))   # max spread for entry
+DSCALP_MIN_ENTRY_EDGE_CENTS = float(os.getenv("DSCALP_MIN_ENTRY_EDGE_CENTS", "2.0"))  # min edge: outcome mid must be >=2c above 50c neutral
 DSCALP_MAX_CACHE_AGE_MS = float(os.getenv("DSCALP_MAX_CACHE_AGE_MS", "250"))   # max cache age for entry
 
 # Sizing -- one entry = one meaningful position, no micro-splits
@@ -380,12 +381,13 @@ DSCALP_COOLDOWN_MS = float(os.getenv("DSCALP_COOLDOWN_MS", "4000"))            #
 # Exit ladder
 DSCALP_TP1_CENTS = float(os.getenv("DSCALP_TP1_CENTS", "3.0"))                 # +3c: sell 25%
 DSCALP_TP1_FRAC = float(os.getenv("DSCALP_TP1_FRAC", "0.25"))
-DSCALP_TP2_CENTS = float(os.getenv("DSCALP_TP2_CENTS", "5.0"))                 # +5c: sell 25%
+DSCALP_TP2_CENTS = float(os.getenv("DSCALP_TP2_CENTS", "6.0"))                 # +6c: sell 25%
 DSCALP_TP2_FRAC = float(os.getenv("DSCALP_TP2_FRAC", "0.25"))
-DSCALP_TP3_CENTS = float(os.getenv("DSCALP_TP3_CENTS", "7.0"))                 # +7c: sell 25%, remainder for timeout/trailing
+DSCALP_TP3_CENTS = float(os.getenv("DSCALP_TP3_CENTS", "8.0"))                 # +8c: sell 25%, remainder for timeout/trailing
 DSCALP_TP3_FRAC = float(os.getenv("DSCALP_TP3_FRAC", "0.25"))
-DSCALP_EARLY_TP_CENTS = float(os.getenv("DSCALP_EARLY_TP_CENTS", "3.0"))       # +3c early exit (taker) — buffer for taker fees/slippage (~0.5-1.5c)
-DSCALP_VEL_REVERSAL_BPS = float(os.getenv("DSCALP_VEL_REVERSAL_BPS", "7.0"))   # velocity reversal threshold (bps/min against position)
+DSCALP_EARLY_TP_CENTS = float(os.getenv("DSCALP_EARLY_TP_CENTS", "2.0"))       # +2c early exit (taker) — fires only on real danger
+DSCALP_EARLY_TP_SPREAD_THRESH = float(os.getenv("DSCALP_EARLY_TP_SPREAD_THRESH", "6.0"))  # spread blowout threshold for early exit (cents)
+DSCALP_VEL_REVERSAL_BPS = float(os.getenv("DSCALP_VEL_REVERSAL_BPS", "4.0"))   # velocity reversal threshold (bps/min against position)
 DSCALP_MIN_HOLD_SEC = float(os.getenv("DSCALP_MIN_HOLD_SEC", "90"))            # 90s min hold -- bypass for emergency/spread-collapse/reversal
 DSCALP_MAX_HOLD_SEC = float(os.getenv("DSCALP_MAX_HOLD_SEC", "600"))           # 10 min max hold
 DSCALP_STOP_LOSS_CENTS = float(os.getenv("DSCALP_STOP_LOSS_CENTS", "5.0"))     # -5c stop loss (emergency only)
