@@ -72,6 +72,7 @@ from src.execution.orphan_scanner import OrphanScanner
 from src.execution.safety_caps import SafetyCaps
 from src.execution.unpaired_resolver import UnpairedResolver
 from src.execution.live_sanity_report import LiveSanityReporter
+from src.execution.state_drift_checker import StateDriftChecker
 from src.feeds.polymarket import PolymarketClient, set_jsonl_writer
 from src.bot.app import BotApp
 
@@ -325,6 +326,8 @@ class Bot:
         self._exec_safety = SafetyCaps(write_jsonl)
         self._exec_unpaired = UnpairedResolver(write_jsonl)
         self._exec_reporter = LiveSanityReporter(write_jsonl)
+        self._exec_drift = StateDriftChecker(
+            self.client.get_open_orders, self.client.get_balances, write_jsonl)
         # Background data refresh infrastructure (sub-second loop)
         # Dynamic pool: max(BG_POOL_MIN_WORKERS, 3 * markets_count)
         dynamic_workers = max(BG_POOL_MIN_WORKERS, BG_POOL_WORKERS)
@@ -967,6 +970,13 @@ class Bot:
                     self._exec_safety.update_orphan_count(
                         self._exec_orphan.orphan_cancels_this_min)
                     self._exec_safety.tick()
+                    # State drift check (every 60s)
+                    self._exec_drift.tick(
+                        self._exec_tracker.get_tracked_order_ids(),
+                        self._get_internal_positions(),
+                        self._get_token_to_slug_outcome())
+                    self._exec_safety.set_drift_paused(
+                        self._exec_drift.is_drifted())
 
                 # 5. Save state periodically (every STATE_SAVE_INTERVAL_SEC)
                 now = time.time()
@@ -1687,6 +1697,7 @@ class Bot:
             self._exec_orphan.reset_minute_counters()
             self._exec_safety.reset_minute_counters()
             self._exec_unpaired.reset_minute_counters()
+            self._exec_drift.reset_minute_counters()
 
     def _emit_live_sanity_report(self):
         """Emit LIVE_SANITY_REPORT with execution health diagnostics."""
@@ -1710,6 +1721,9 @@ class Bot:
             "confirmed_submits": self._exec_tracker.confirmed_submits,
             "kill_switch_active": self._exec_safety.is_kill_active(),
             "total_kill_activations": self._exec_safety.total_kill_activations,
+            "cap_blocks_last_min": self._exec_safety.cap_blocks_this_min,
+            "drift_detected": self._exec_drift.is_drifted(),
+            "no_progress_pauses": self._exec_safety.no_progress_pauses_total,
             "exposure_per_slug": exposure,
         })
 
@@ -2925,6 +2939,26 @@ class Bot:
     # -----------------------------------------------------------------
     # Burst execution engine
     # -----------------------------------------------------------------
+    def _get_internal_positions(self) -> dict:
+        """Build {slug: {"Up": qty, "Down": qty}} from internal state."""
+        result = {}
+        for slug, st in self.market_states.items():
+            up_qty = st.positions["Up"].qty if st.positions["Up"].qty >= MIN_QTY else 0.0
+            dn_qty = st.positions["Down"].qty if st.positions["Down"].qty >= MIN_QTY else 0.0
+            if up_qty > 0 or dn_qty > 0:
+                result[slug] = {"Up": up_qty, "Down": dn_qty}
+        return result
+
+    def _get_token_to_slug_outcome(self) -> dict:
+        """Build {token_id: (slug, outcome)} from cached markets."""
+        result = {}
+        for m in self._cached_markets:
+            if m.outcome_up_id:
+                result[m.outcome_up_id] = (m.slug, "Up")
+            if m.outcome_down_id:
+                result[m.outcome_down_id] = (m.slug, "Down")
+        return result
+
     def _exec_safety_can_enter(self, slug: str) -> bool:
         """LIVE-only execution safety gate. Returns True if entry is allowed."""
         if MODE != "LIVE":
@@ -3098,8 +3132,10 @@ class Bot:
                                                      this_qty, post_only=post_only)
                 oid = fill.get("order_id", "")
                 self._exec_tracker.on_submit(oid, m.slug, outcome, "BUY", order_price, this_qty, "ENTRY_BURST")
+                self._exec_safety.record_slug_submit(m.slug)
                 if fill.get("filled"):
                     self._exec_tracker.on_fill(oid, fill["fill_qty"])
+                    self._exec_safety.record_slug_fill(m.slug)
                     self._live_buy(st, outcome, fill["fill_price"], fill["fill_qty"],
                                    fill["fill_price"] * fill["fill_qty"])
                     mt = infer_maker_taker("BUY", fill["fill_price"], fresh_book)
@@ -5237,9 +5273,11 @@ class Bot:
         fill_result = self.client.place_limit_order(token_id, "SELL", price, qty, post_only=use_maker)
         oid = fill_result.get("order_id", "")
         self._exec_tracker.on_submit(oid, m.slug, outcome, "SELL", price, qty, reason)
+        self._exec_safety.record_slug_submit(m.slug)
         if fill_result.get("filled"):
             actual_qty = fill_result["fill_qty"]
             actual_price = fill_result["fill_price"]
+            self._exec_safety.record_slug_fill(m.slug)
             self._exec_tracker.on_fill(oid, actual_qty)
             # True cost: count fill only after confirmed fill
             self._true_cost_fill_count += 1

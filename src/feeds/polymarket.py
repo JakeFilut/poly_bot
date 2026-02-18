@@ -492,3 +492,19 @@ class PolymarketClient:
             return []
         except Exception:
             return []
+
+    def get_balances(self) -> List[dict]:
+        """Return token balances from the CLOB (for position verification).
+
+        Returns list of dicts: [{token_id, balance, ...}, ...]
+        Returns [] in LOG mode or on error.
+        """
+        if not self._clob:
+            return []
+        try:
+            result = self._clob.get_balances()
+            if isinstance(result, list):
+                return result
+            return []
+        except Exception:
+            return []

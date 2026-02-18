@@ -1,10 +1,11 @@
 """Orphan order scanner — detects and cancels stale CLOB orders.
 
-Responsibility (items 4, 5 from spec):
+Responsibilities:
   - Every OM_ORPHAN_SCAN_INTERVAL_SEC: query CLOB open orders
   - If an order is not in our tracked set -> cancel it (orphan)
-  - On startup in LIVE mode: cancel ALL open orders (clean slate)
-  - Log: ORPHAN_CANCEL, STARTUP_ORPHAN_CANCEL
+  - On startup in LIVE mode: cancel ALL open orders, then re-fetch
+    to confirm 0 remain (retries up to OM_STARTUP_VERIFY_RETRIES)
+  - Log: ORPHAN_CANCEL, STARTUP_ORPHAN_CANCEL, STARTUP_VERIFY_*
 
 Does NOT alter any trading behaviour.
 """
@@ -14,9 +15,18 @@ import time
 import logging
 from typing import Callable, List, Set
 
-from src.config.settings import OM_ORPHAN_SCAN_INTERVAL_SEC
+from src.config.settings import (
+    OM_ORPHAN_SCAN_INTERVAL_SEC,
+    OM_STARTUP_VERIFY_RETRIES,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_oid(order: dict) -> str:
+    """Extract order ID from a CLOB order dict (handles multiple key names)."""
+    return (order.get("id") or order.get("orderID")
+            or order.get("order_id", ""))
 
 
 class OrphanScanner:
@@ -39,12 +49,15 @@ class OrphanScanner:
         self.orphan_cancels_this_min = 0
         self.total_orphan_cancels = 0
         self.startup_cancels = 0
+        self.startup_verified = False
 
     def startup_cleanup(self):
-        """Cancel all open CLOB orders on startup (clean slate for LIVE mode).
+        """Cancel all open CLOB orders on startup, then verify 0 remain.
 
         Call once during bot.run() initialization when MODE == "LIVE".
+        Retries verification up to OM_STARTUP_VERIFY_RETRIES times.
         """
+        # Phase 1: cancel everything
         try:
             open_orders = self._get_open_orders()
         except Exception as e:
@@ -56,7 +69,7 @@ class OrphanScanner:
             return
 
         for order in open_orders:
-            oid = order.get("id") or order.get("orderID") or order.get("order_id", "")
+            oid = _extract_oid(order)
             if not oid:
                 continue
             try:
@@ -78,6 +91,58 @@ class OrphanScanner:
 
         if self.startup_cancels > 0:
             logger.info("STARTUP: cancelled %d orphan orders", self.startup_cancels)
+            print(f"  [STARTUP] Cancelled {self.startup_cancels} stale orders")
+
+        # Phase 2: verify 0 orders remain
+        for attempt in range(1, OM_STARTUP_VERIFY_RETRIES + 1):
+            time.sleep(1.0)  # brief delay for cancels to propagate
+            try:
+                remaining = self._get_open_orders()
+            except Exception as e:
+                self._write_jsonl({
+                    "event_type": "STARTUP_VERIFY_ERROR",
+                    "attempt": attempt,
+                    "err": str(e)[:200],
+                    "ts_ms": int(time.time() * 1000),
+                })
+                continue
+
+            if not remaining:
+                self.startup_verified = True
+                self._write_jsonl({
+                    "event_type": "STARTUP_VERIFY_OK",
+                    "attempt": attempt,
+                    "cancelled": self.startup_cancels,
+                    "ts_ms": int(time.time() * 1000),
+                })
+                print(f"  [STARTUP] Verified 0 open orders (attempt {attempt})")
+                return
+
+            # Still have orders — cancel stragglers
+            for order in remaining:
+                oid = _extract_oid(order)
+                if oid:
+                    try:
+                        self._cancel_order(oid)
+                        self.startup_cancels += 1
+                    except Exception:
+                        pass
+
+            self._write_jsonl({
+                "event_type": "STARTUP_VERIFY_RETRY",
+                "attempt": attempt,
+                "remaining": len(remaining),
+                "ts_ms": int(time.time() * 1000),
+            })
+
+        # Exhausted retries
+        self._write_jsonl({
+            "event_type": "STARTUP_VERIFY_FAILED",
+            "attempts": OM_STARTUP_VERIFY_RETRIES,
+            "ts_ms": int(time.time() * 1000),
+        })
+        print(f"  [STARTUP] WARNING: could not verify 0 orders after "
+              f"{OM_STARTUP_VERIFY_RETRIES} retries")
 
     def tick(self, tracked_order_ids: Set[str]):
         """Periodic scan: compare CLOB open orders vs tracked set, cancel orphans.
@@ -101,7 +166,7 @@ class OrphanScanner:
             return
 
         for order in open_orders:
-            oid = order.get("id") or order.get("orderID") or order.get("order_id", "")
+            oid = _extract_oid(order)
             if not oid:
                 continue
             if oid not in tracked_order_ids:

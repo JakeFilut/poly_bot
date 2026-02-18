@@ -1,13 +1,15 @@
 """LIVE_SANITY_REPORT — periodic diagnostic output for LIVE mode.
 
-Responsibility (item 9 from spec):
-  Every 60s print:
-    - open_orders_count
-    - orphan_cancels_last_min
-    - api_errors_last_min
-    - partial_fill_count
-    - unpaired_events_last_min
-    - exposure_per_slug
+Every 60s print:
+  - open_orders_count
+  - orphan_cancels_last_min
+  - api_errors_last_min
+  - partial_fill_count
+  - unpaired_events_last_min
+  - cap_blocks_last_min
+  - drift_detected
+  - no_progress_pauses
+  - exposure_per_slug
 
 Diagnostics only — no strategy impact.
 """
@@ -38,7 +40,8 @@ class LiveSanityReporter:
                 open_orders_count, orphan_cancels_last_min, api_errors_last_min,
                 partial_fill_count, unpaired_events_last_min, exposure_per_slug,
                 kill_switch_active, total_kill_activations, ttl_cancels,
-                confirmed_fills, confirmed_submits
+                confirmed_fills, confirmed_submits, cap_blocks_last_min,
+                drift_detected, no_progress_pauses
         """
         now = time.time()
         if now - self._last_report_ts < OM_SANITY_REPORT_INTERVAL_SEC:
@@ -67,6 +70,8 @@ class LiveSanityReporter:
             f"partial={stats.get('partial_fill_count', 0)}  "
             f"unpaired={stats.get('unpaired_events_last_min', 0)}  "
             f"ttl_cx={stats.get('ttl_cancels', 0)}  "
+            f"cap_blk={stats.get('cap_blocks_last_min', 0)}  "
+            f"drift={'YES' if stats.get('drift_detected') else 'no'}  "
             f"kill={'ON' if stats.get('kill_switch_active') else 'off'}  "
             f"exposure=${total_usd:.0f}  top=[{top_str}]"
         )

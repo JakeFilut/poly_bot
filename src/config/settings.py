@@ -430,12 +430,20 @@ TRUE_COST_EST_FEE_BPS = float(os.getenv("TRUE_COST_EST_FEE_BPS", "2.0"))        
 # ---------------------------------------------------------------------------
 
 # Order TTL & cancel retry
-OM_MAKER_ORDER_TTL_MS = float(os.getenv("OM_MAKER_ORDER_TTL_MS", "10000"))         # cancel unfilled limit after 10s
+OM_MAKER_ORDER_TTL_MS = float(os.getenv("OM_MAKER_ORDER_TTL_MS", "3000"))          # cancel unfilled limit after 3s (hourly markets move fast)
 OM_CANCEL_MAX_RETRIES = int(os.getenv("OM_CANCEL_MAX_RETRIES", "3"))               # retry cancel up to 3x
 OM_CANCEL_RETRY_DELAY_MS = float(os.getenv("OM_CANCEL_RETRY_DELAY_MS", "500"))    # delay between cancel retries
 
 # Orphan scanner
-OM_ORPHAN_SCAN_INTERVAL_SEC = float(os.getenv("OM_ORPHAN_SCAN_INTERVAL_SEC", "30"))  # scan CLOB every 30s
+OM_ORPHAN_SCAN_INTERVAL_SEC = float(os.getenv("OM_ORPHAN_SCAN_INTERVAL_SEC", "12"))  # scan CLOB every 12s
+
+# State drift checker
+OM_DRIFT_CHECK_INTERVAL_SEC = float(os.getenv("OM_DRIFT_CHECK_INTERVAL_SEC", "60"))  # compare API vs internal every 60s
+OM_STARTUP_VERIFY_RETRIES = int(os.getenv("OM_STARTUP_VERIFY_RETRIES", "3"))        # re-fetch after cancel to confirm 0
+
+# No-progress pause (per-slug)
+OM_NO_PROGRESS_SUBMITS = int(os.getenv("OM_NO_PROGRESS_SUBMITS", "40"))             # submits in 60s with 0 fills -> pause
+OM_NO_PROGRESS_PAUSE_SEC = float(os.getenv("OM_NO_PROGRESS_PAUSE_SEC", "120"))     # pause slug for 120s
 
 # Kill-switch thresholds (execution errors only — sells always allowed)
 OM_KILL_API_ERROR_THRESHOLD_PER_MIN = int(os.getenv("OM_KILL_API_ERROR_THRESHOLD_PER_MIN", "10"))
