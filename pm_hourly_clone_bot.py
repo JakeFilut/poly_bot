@@ -325,6 +325,46 @@ if FAST_CLONE:
     HEDGE_TICK2_MS = 350
     HEDGE_EARLY_CROSS_MS = 500
     HEDGE_CROSS_MS = 800
+# ---------------------------------------------------------------------------
+# RATE LIMITING / CHURN CONTROL — hard caps per slug (F247 cadence)
+# ---------------------------------------------------------------------------
+RATE_LIMIT_ENABLED = bool(os.getenv("RATE_LIMIT_ENABLED", "True") not in ("", "0", "False", "false"))
+MIN_ORDER_INTERVAL_MS = float(os.getenv("MIN_ORDER_INTERVAL_MS", "400"))       # min ms between ANY orders on same slug
+MAX_ORDER_SUBMITS_PER_MIN = int(os.getenv("MAX_ORDER_SUBMITS_PER_MIN", "120")) # hard cap submits/min per slug
+QUOTE_REFRESH_SKIP_IF_SAME = True                                               # skip refresh if price unchanged
+QUOTE_REFRESH_MIN_TICK_MOVE = 0.001                                              # require >= 1 tick move to refresh
+QUOTE_REFRESH_MIN_ELAPSED_MS = float(os.getenv("QUOTE_REFRESH_MIN_ELAPSED_MS", "500"))  # min ms between refreshes
+# ---------------------------------------------------------------------------
+# DIRECTIONAL SCALP MODE — primary engine (F247-style)
+# ---------------------------------------------------------------------------
+DIRECTIONAL_SCALP_ENABLED = bool(os.getenv("DIRECTIONAL_SCALP_ENABLED", "True") not in ("", "0", "False", "false"))
+DSCALP_CHEAP_THRESHOLD = float(os.getenv("DSCALP_CHEAP_THRESHOLD", "0.45"))    # entry only if price <= this
+DSCALP_DELTA_MIN_BPS = float(os.getenv("DSCALP_DELTA_MIN_BPS", "5.0"))         # min abs_delta_bps for entry
+DSCALP_VEL_MIN_BPS_PER_MIN = float(os.getenv("DSCALP_VEL_MIN_BPS_PER_MIN", "1.5"))  # min velocity for entry
+DSCALP_MAX_SPREAD_CENTS = float(os.getenv("DSCALP_MAX_SPREAD_CENTS", "2.0"))   # max spread for entry
+DSCALP_MAX_CACHE_AGE_MS = float(os.getenv("DSCALP_MAX_CACHE_AGE_MS", "250"))   # max cache age for entry
+DSCALP_STEP_USD = float(os.getenv("DSCALP_STEP_USD", "5.0"))                   # per-order size (closer to F247's $7.4)
+DSCALP_MAX_USD_PER_SLUG = float(os.getenv("DSCALP_MAX_USD_PER_SLUG", "30.0"))  # max directional per slug
+DSCALP_COOLDOWN_MS = float(os.getenv("DSCALP_COOLDOWN_MS", "2000"))            # ms between scalp entries per slug
+# Directional scalp exit ladder
+DSCALP_TP1_CENTS = float(os.getenv("DSCALP_TP1_CENTS", "3.0"))                 # +3c: sell 30%
+DSCALP_TP1_FRAC = float(os.getenv("DSCALP_TP1_FRAC", "0.30"))
+DSCALP_TP2_CENTS = float(os.getenv("DSCALP_TP2_CENTS", "5.0"))                 # +5c: sell 30%
+DSCALP_TP2_FRAC = float(os.getenv("DSCALP_TP2_FRAC", "0.30"))
+DSCALP_TP3_CENTS = float(os.getenv("DSCALP_TP3_CENTS", "7.0"))                 # +7c: sell remainder
+DSCALP_TP3_FRAC = float(os.getenv("DSCALP_TP3_FRAC", "1.0"))
+DSCALP_MAX_HOLD_SEC = float(os.getenv("DSCALP_MAX_HOLD_SEC", "600"))           # 10 min max hold
+DSCALP_STOP_LOSS_CENTS = float(os.getenv("DSCALP_STOP_LOSS_CENTS", "5.0"))     # -5c stop loss
+# Parity demotion — secondary/repair only
+PARITY_DEFER_TO_DIRECTIONAL = bool(os.getenv("PARITY_DEFER_TO_DIRECTIONAL", "True") not in ("", "0", "False", "false"))
+PARITY_BLOCK_IF_ADVERSE = True                                                   # block parity when adverse guard active
+PARITY_MAX_WHEN_DIRECTIONAL_USD = float(os.getenv("PARITY_MAX_WHEN_DIRECTIONAL_USD", "10.0"))  # reduce parity cap when directional active
+# ---------------------------------------------------------------------------
+# TRUE COST TRACKER — tx counting and fee estimation
+# ---------------------------------------------------------------------------
+TRUE_COST_ENABLED = True
+TRUE_COST_EST_GAS_PER_TX_USD = float(os.getenv("TRUE_COST_EST_GAS_PER_TX_USD", "0.001"))  # est gas per tx
+TRUE_COST_EST_FEE_BPS = float(os.getenv("TRUE_COST_EST_FEE_BPS", "2.0"))                  # avg fee bps per fill
 # =============================================================================
 # UTIL / LOGGING — thin wrappers around Logger instance
 # =============================================================================
@@ -1265,6 +1305,36 @@ class Bot:
         # ── Pending fetch streak tracking ──
         self._diag_pending_fetch_streak: Dict[str, int] = {}
         self._diag_pending_fetch_streak_max: int = 0
+        # ── Rate limiter state ──
+        self._rate_last_order_ts: Dict[str, float] = {}     # slug -> last order submit timestamp
+        self._rate_submit_count: Dict[str, int] = {}        # slug -> submits this minute
+        self._rate_submit_window_start: Dict[str, float] = {}  # slug -> minute window start ts
+        self._rate_blocked_interval = 0                      # diag: blocked by MIN_ORDER_INTERVAL_MS
+        self._rate_blocked_cap = 0                           # diag: blocked by MAX_ORDER_SUBMITS_PER_MIN
+        # ── Directional scalp state ──
+        self._dscalp_positions: Dict[str, dict] = {}  # slug -> {outcome, entry_price, entry_ts, qty, tp1_done, tp2_done}
+        self._dscalp_last_entry_ts: Dict[str, float] = {}   # slug -> last entry timestamp
+        self._dscalp_invested_usd: Dict[str, float] = {}    # slug -> total invested USD
+        # Directional scalp diagnostics
+        self._diag_dscalp_entries = 0
+        self._diag_dscalp_tp1 = 0
+        self._diag_dscalp_tp2 = 0
+        self._diag_dscalp_tp3 = 0
+        self._diag_dscalp_timeout_exits = 0
+        self._diag_dscalp_stop_exits = 0
+        self._diag_dscalp_hold_times: List[float] = []    # seconds
+        self._diag_dscalp_exit_cents: List[float] = []     # profit/loss in cents
+        # ── True cost tracker ──
+        self._true_cost_tx_count = 0                         # total tx count (fills + cancels)
+        self._true_cost_fill_count = 0                       # fills this hour
+        self._true_cost_fill_count_min = 0                   # fills this minute
+        self._true_cost_submit_count = 0                     # submits this minute
+        self._true_cost_cancel_count = 0                     # cancels this minute
+        self._true_cost_hour_start_ts = time.time()
+        # ── DIAG report tracking ──
+        self._diag_report_last_ts = time.time()
+        self._diag_derisk_count_min = 0
+        self._diag_unpaired_count_min = 0
         # ── F247 similarity / CLONE_REPORT tracking ──
         # pair delays: list of ms between Up and Down fills for same slug
         self._clone_pair_delays: List[float] = []
@@ -1932,6 +2002,7 @@ class Bot:
                 # 8. Tempo parity diagnostics (every 60s)
                 if now - self._tempo_last_report_ts >= 60.0:
                     self._emit_clone_report()   # must run BEFORE tempo_report resets counters
+                    self._emit_diag_report()    # F247-style behavioral diagnostics
                     self._emit_tempo_report()
                     self._tempo_last_report_ts = now
             except Exception as e:
@@ -2517,6 +2588,120 @@ class Bot:
         for pid in stale_ids:
             self._pair_tracker.pop(pid, None)
 
+    def _emit_diag_report(self):
+        """Emit F247-style behavioral diagnostics every 60s.
+        Metrics: fills/min, submits/min, median hold secs, median exit cents,
+        unpaired rate, derisk rate, SOL/XRP cache_age p50/p90."""
+        import statistics as _stats
+        now_t = time.time()
+        elapsed_min = max(0.1, (now_t - self._diag_report_last_ts) / 60.0)
+
+        fills_min = self._true_cost_fill_count_min / elapsed_min
+        submits_min = self._true_cost_submit_count / elapsed_min
+
+        # Median hold from directional scalps
+        med_hold = (_stats.median(self._diag_dscalp_hold_times)
+                    if self._diag_dscalp_hold_times else 0.0)
+        # Median exit cents from directional scalps
+        med_exit = (_stats.median(self._diag_dscalp_exit_cents)
+                    if self._diag_dscalp_exit_cents else 0.0)
+
+        # Unpaired rate: unpaired_unwinds / total fills
+        total_fills = max(1, self._true_cost_fill_count_min)
+        unpaired_rate = self._diag_unpaired_count_min / total_fills
+        derisk_rate = self._diag_derisk_count_min / total_fills
+
+        # SOL/XRP cache age
+        sol_ages = self._tempo_cache_ages.get("will-sol-reach", [])
+        xrp_ages = self._tempo_cache_ages.get("will-xrp-reach", [])
+        # Also search partial slug matches
+        for slug, ages_list in self._tempo_cache_ages.items():
+            if "sol" in slug.lower() and not sol_ages:
+                sol_ages = ages_list
+            if "xrp" in slug.lower() and not xrp_ages:
+                xrp_ages = ages_list
+
+        def _percentiles(vals):
+            if not vals:
+                return 0.0, 0.0
+            s = sorted(vals)
+            return s[len(s) // 2], s[min(int(len(s) * 0.9), len(s) - 1)]
+
+        sol_p50, sol_p90 = _percentiles(sol_ages)
+        xrp_p50, xrp_p90 = _percentiles(xrp_ages)
+
+        # True cost
+        hour_elapsed = max(0.01, (now_t - self._true_cost_hour_start_ts) / 3600.0)
+        fills_per_hour = self._true_cost_fill_count / hour_elapsed
+        tx_per_hour = self._true_cost_tx_count / hour_elapsed
+        est_cost_per_hour = (self._true_cost_tx_count * TRUE_COST_EST_GAS_PER_TX_USD
+                             + self._true_cost_fill_count * TRUE_COST_EST_FEE_BPS / 10000.0 * 5.0)  # assume avg $5 fill
+
+        diag_data = {
+            "event_type": "DIAG_REPORT",
+            "ts_ms": int(now_t * 1000),
+            "fills_per_min": round(fills_min, 1),
+            "submits_per_min": round(submits_min, 1),
+            "median_hold_sec": round(med_hold, 1),
+            "median_exit_cents": round(med_exit, 2),
+            "unpaired_rate": round(unpaired_rate, 3),
+            "derisk_rate": round(derisk_rate, 3),
+            "sol_cache_p50_ms": round(sol_p50, 0),
+            "sol_cache_p90_ms": round(sol_p90, 0),
+            "xrp_cache_p50_ms": round(xrp_p50, 0),
+            "xrp_cache_p90_ms": round(xrp_p90, 0),
+            # True cost
+            "fills_per_hour": round(fills_per_hour, 0),
+            "tx_per_hour": round(tx_per_hour, 0),
+            "est_cost_per_hour_usd": round(est_cost_per_hour, 4),
+            # Rate limiter
+            "rate_blocked_interval": self._rate_blocked_interval,
+            "rate_blocked_cap": self._rate_blocked_cap,
+            # Directional scalp
+            "dscalp_entries": self._diag_dscalp_entries,
+            "dscalp_tp1": self._diag_dscalp_tp1,
+            "dscalp_tp2": self._diag_dscalp_tp2,
+            "dscalp_tp3": self._diag_dscalp_tp3,
+            "dscalp_timeouts": self._diag_dscalp_timeout_exits,
+            "dscalp_stops": self._diag_dscalp_stop_exits,
+            "dscalp_active_positions": len(self._dscalp_positions),
+        }
+        write_jsonl(diag_data)
+
+        # Console output
+        print(f"  DIAG: fills/min={fills_min:.1f}  submits/min={submits_min:.1f}  "
+              f"hold={med_hold:.0f}s  exit={med_exit:+.1f}c  "
+              f"unpaired={unpaired_rate:.0%}  derisk={derisk_rate:.0%}")
+        print(f"  CACHE: SOL p50/p90={sol_p50:.0f}/{sol_p90:.0f}ms  "
+              f"XRP p50/p90={xrp_p50:.0f}/{xrp_p90:.0f}ms")
+        print(f"  COST: fills/hr={fills_per_hour:.0f}  tx/hr={tx_per_hour:.0f}  "
+              f"est=${est_cost_per_hour:.4f}/hr")
+        print(f"  DSCALP: entries={self._diag_dscalp_entries}  "
+              f"tp1={self._diag_dscalp_tp1}  tp2={self._diag_dscalp_tp2}  "
+              f"tp3={self._diag_dscalp_tp3}  "
+              f"timeout={self._diag_dscalp_timeout_exits}  stop={self._diag_dscalp_stop_exits}  "
+              f"active={len(self._dscalp_positions)}")
+        print(f"  RATE: blocked_interval={self._rate_blocked_interval}  "
+              f"blocked_cap={self._rate_blocked_cap}")
+
+        # Reset per-minute counters
+        self._diag_report_last_ts = now_t
+        self._true_cost_fill_count_min = 0
+        self._true_cost_submit_count = 0
+        self._true_cost_cancel_count = 0
+        self._diag_derisk_count_min = 0
+        self._diag_unpaired_count_min = 0
+        self._rate_blocked_interval = 0
+        self._rate_blocked_cap = 0
+        self._diag_dscalp_entries = 0
+        self._diag_dscalp_tp1 = 0
+        self._diag_dscalp_tp2 = 0
+        self._diag_dscalp_tp3 = 0
+        self._diag_dscalp_timeout_exits = 0
+        self._diag_dscalp_stop_exits = 0
+        self._diag_dscalp_hold_times.clear()
+        self._diag_dscalp_exit_cents.clear()
+
     def _print_balance_summary(self):
         """Print balance and open positions to console."""
         total_cost = 0.0
@@ -2843,18 +3028,30 @@ class Bot:
         ctx.update(risk_fields)
         # manage exits first (inventory recycling)
         self._manage_exits(m, st, t_min, delta_bps, ctx)
+        # Directional scalp exits (TP ladder + timeout + stop loss)
+        if DIRECTIONAL_SCALP_ENABLED:
+            self._dscalp_manage_exits(m, st, ctx)
         # Directional lean exit overlay (unload wrong-side inventory)
         self._directional_lean_exits(m, st, t_min, delta_bps, ctx)
-        # Parity arb engine: runs every tick (handles flattening, pending pairs,
-        # recycle even after TRADE_STOP_ADD_MIN; new-trade gating is internal)
-        self._parity_arb(ctx)
+        # Parity arb engine: gated when directional is active
+        has_directional = m.slug in self._dscalp_positions
+        if PARITY_DEFER_TO_DIRECTIONAL and has_directional:
+            # Only run parity for pending pairs + recycle + flatten — no new quotes
+            self._parity_arb(ctx, new_quotes_blocked=True)
+        elif PARITY_BLOCK_IF_ADVERSE and self._adverse_guard_active(m.slug):
+            self._parity_arb(ctx, new_quotes_blocked=True)
+        else:
+            self._parity_arb(ctx)
         # stop adding risk after minute 57
         if t_min > TRADE_STOP_ADD_MIN:
             return
         # risk gate (market/crypto caps enforced; stop-loss is log-only)
         if not self._risk_ok(st):
             return
-        # Core engine: drift-direction entries
+        # PRIMARY: Directional scalp entries (F247-style)
+        if DIRECTIONAL_SCALP_ENABLED:
+            self._dscalp_entries(ctx)
+        # Core engine: drift-direction entries (secondary)
         self._core_entries(ctx)
         # Late scalp engine: cheap side scalps
         if LATE_SCALP_ENABLED:
@@ -2885,6 +3082,295 @@ class Bot:
         write_jsonl({"event_type": "SM_TRANSITION", "slug": slug,
                       "from": old, "to": new_state, "reason": reason,
                       "t_min": round(ctx["t_min"], 3) if ctx else 0})
+
+    # =================================================================
+    # RATE LIMITER — hard per-slug throttling
+    # =================================================================
+    def _rate_limit_ok(self, slug: str) -> bool:
+        """Check if we can submit another order for this slug.
+        Returns True if OK, False if blocked."""
+        if not RATE_LIMIT_ENABLED:
+            return True
+        now = time.time()
+        now_ms = now * 1000
+
+        # Check MIN_ORDER_INTERVAL_MS
+        last_ts = self._rate_last_order_ts.get(slug, 0.0)
+        if (now_ms - last_ts * 1000) < MIN_ORDER_INTERVAL_MS:
+            self._rate_blocked_interval += 1
+            return False
+
+        # Check MAX_ORDER_SUBMITS_PER_MIN
+        window_start = self._rate_submit_window_start.get(slug, now)
+        if now - window_start > 60.0:
+            # Reset window
+            self._rate_submit_window_start[slug] = now
+            self._rate_submit_count[slug] = 0
+        count = self._rate_submit_count.get(slug, 0)
+        if count >= MAX_ORDER_SUBMITS_PER_MIN:
+            self._rate_blocked_cap += 1
+            return False
+
+        return True
+
+    def _rate_limit_record(self, slug: str):
+        """Record an order submission for rate limiting."""
+        now = time.time()
+        self._rate_last_order_ts[slug] = now
+        self._rate_submit_count[slug] = self._rate_submit_count.get(slug, 0) + 1
+        self._true_cost_submit_count += 1
+
+    def _adverse_guard_active(self, slug: str) -> bool:
+        """Check if adverse selection guard is currently blocking for this slug."""
+        paused_until = self._quote_paused_until.get(slug, 0.0)
+        degraded_until = self._quote_degraded_until.get(slug, 0.0)
+        now = time.time()
+        return now < paused_until or now < degraded_until
+
+    # =================================================================
+    # DIRECTIONAL SCALP MODE — F247-style momentum entries
+    # =================================================================
+    def _dscalp_entries(self, ctx: dict):
+        """Directional scalp entry: buy one side when price is cheap and
+        spot velocity strongly favors that direction."""
+        m, st = ctx["m"], ctx["st"]
+        t_min = ctx["t_min"]
+        delta_bps = ctx["delta_bps"]
+        abs_delta_bps = ctx["abs_delta_bps"]
+        vel = ctx["vel"]
+        up_book: BookTop = ctx["up_book"]
+        dn_book: BookTop = ctx["dn_book"]
+        now_t = time.time()
+
+        # Cooldown
+        last_entry = self._dscalp_last_entry_ts.get(m.slug, 0.0)
+        if (now_t - last_entry) * 1000 < DSCALP_COOLDOWN_MS:
+            return
+
+        # Already at max position for this slug
+        invested = self._dscalp_invested_usd.get(m.slug, 0.0)
+        if invested >= DSCALP_MAX_USD_PER_SLUG:
+            return
+
+        # Rate limit
+        if not self._rate_limit_ok(m.slug):
+            return
+
+        # Determine direction from delta + velocity
+        if abs_delta_bps < DSCALP_DELTA_MIN_BPS:
+            return
+        if abs(vel) < DSCALP_VEL_MIN_BPS_PER_MIN:
+            return
+
+        # Direction: follow the drift (same as core_entries)
+        outcome = ctx["drift_dir"]
+        book = up_book if outcome == "Up" else dn_book
+
+        # Cache freshness gate
+        cache_age = self._cache_age_ms(m.slug)
+        if cache_age > DSCALP_MAX_CACHE_AGE_MS:
+            return
+
+        # Cheap threshold: only enter if price <= threshold
+        if book.ask > DSCALP_CHEAP_THRESHOLD:
+            return
+
+        # Spread gate
+        if book.spread * 100 > DSCALP_MAX_SPREAD_CENTS:
+            return
+
+        # Velocity must agree with direction
+        if outcome == "Up" and vel < DSCALP_VEL_MIN_BPS_PER_MIN:
+            return
+        if outcome == "Down" and vel > -DSCALP_VEL_MIN_BPS_PER_MIN:
+            return
+
+        # Size: closer to F247's avg $7.4
+        step_usd = min(DSCALP_STEP_USD, DSCALP_MAX_USD_PER_SLUG - invested)
+        if step_usd < MIN_ORDER_USDC:
+            return
+
+        # Place maker buy
+        buy_price = book.bid  # maker at best bid
+        if buy_price <= 0.01:
+            return
+
+        order_qty = step_usd / buy_price
+        if order_qty < 1:
+            return
+
+        # Use existing buy infrastructure
+        token_id = m.outcome_up_id if outcome == "Up" else m.outcome_down_id
+        pos = st.positions[outcome]
+        decision_id = new_decision_id()
+        client_oid = new_order_id()
+        if pos.position_id is None:
+            pos.position_id = new_position_id()
+            pos.trade_id = uuid.uuid4().hex
+            pos.entry_decision_id = decision_id
+            pos.parent_order_id = client_oid
+            pos.entry_mid = book.mid
+            pos.max_favorable_mid = book.mid
+
+        # Log intent
+        write_jsonl({"event_type": "DSCALP_ENTRY",
+                      "ts_ms": int(now_t * 1000),
+                      "slug": m.slug, "crypto": m.crypto,
+                      "outcome": outcome,
+                      "price": round(buy_price, 4),
+                      "qty": round(order_qty, 1),
+                      "step_usd": round(step_usd, 2),
+                      "delta_bps": round(delta_bps, 1),
+                      "vel": round(vel, 2),
+                      "cache_age_ms": round(cache_age, 0),
+                      "spread_cents": round(book.spread * 100, 2)})
+
+        # Execute buy (paper mode: instant fill)
+        self._paper_buy(st, outcome, order_qty, buy_price)
+        actual_cost = order_qty * buy_price
+        self._rate_limit_record(m.slug)
+        self._true_cost_fill_count += 1
+        self._true_cost_fill_count_min += 1
+        self._true_cost_tx_count += 1
+
+        # Track directional scalp position
+        self._dscalp_positions[m.slug] = {
+            "outcome": outcome,
+            "entry_price": buy_price,
+            "entry_ts": now_t,
+            "qty": order_qty + self._dscalp_positions.get(m.slug, {}).get("qty", 0),
+            "tp1_done": False,
+            "tp2_done": False,
+        }
+        self._dscalp_invested_usd[m.slug] = invested + actual_cost
+        self._dscalp_last_entry_ts[m.slug] = now_t
+        self._diag_dscalp_entries += 1
+        st.last_entry_ts = iso_z(utc_now())
+
+        self.logger.log_order_fill(
+            engine="DSCALP", slug=m.slug, crypto=m.crypto,
+            hour_start_utc=ctx["hour_start_utc"], t_min=t_min,
+            outcome=outcome, side="BUY", qty=order_qty,
+            fill_price=buy_price, usdc_cost=actual_cost,
+            maker_taker="maker", decision_id=decision_id,
+            client_order_id=client_oid, position_id=pos.position_id,
+            notes=f"dscalp_entry vel={vel:.1f}",
+            **build_book_fields(ctx["up_book"], ctx["dn_book"],
+                                ctx.get("spot", 0), ctx.get("hour_open", 0),
+                                delta_bps, abs_delta_bps),
+        )
+
+    def _dscalp_manage_exits(self, m: MarketRef, st: MarketState, ctx: dict):
+        """Manage directional scalp exits: TP ladder + timeout + stop loss."""
+        dpos = self._dscalp_positions.get(m.slug)
+        if dpos is None:
+            return
+
+        now_t = time.time()
+        outcome = dpos["outcome"]
+        entry_price = dpos["entry_price"]
+        entry_ts = dpos["entry_ts"]
+        hold_sec = now_t - entry_ts
+
+        book = ctx["up_book"] if outcome == "Up" else ctx["dn_book"]
+        pos = st.positions[outcome]
+        if pos.qty < MIN_QTY:
+            # Position gone — cleanup
+            self._dscalp_positions.pop(m.slug, None)
+            self._dscalp_invested_usd.pop(m.slug, None)
+            return
+
+        current_mid = book.mid
+        pnl_cents = (current_mid - entry_price) * 100
+
+        # ── Stop loss ──
+        if pnl_cents <= -DSCALP_STOP_LOSS_CENTS and hold_sec > 5:
+            sell_qty = pos.qty
+            sell_price = max(book.bid, 0.01)
+            self._do_sell(m, st, outcome, sell_qty, sell_price,
+                          reason="DSCALP_STOP", leg="DSCALP", ctx=ctx, use_maker=False)
+            self._diag_dscalp_stop_exits += 1
+            self._diag_dscalp_hold_times.append(hold_sec)
+            self._diag_dscalp_exit_cents.append(pnl_cents)
+            self._true_cost_tx_count += 1
+            self._true_cost_fill_count += 1
+            self._true_cost_fill_count_min += 1
+            self._dscalp_positions.pop(m.slug, None)
+            self._dscalp_invested_usd.pop(m.slug, None)
+            write_jsonl({"event_type": "DSCALP_STOP", "ts_ms": int(now_t * 1000),
+                          "slug": m.slug, "outcome": outcome,
+                          "pnl_cents": round(pnl_cents, 2), "hold_sec": round(hold_sec, 1)})
+            return
+
+        # ── Timeout exit ──
+        if hold_sec >= DSCALP_MAX_HOLD_SEC:
+            sell_qty = pos.qty
+            sell_price = max(book.bid, 0.01)
+            self._do_sell(m, st, outcome, sell_qty, sell_price,
+                          reason="DSCALP_TIMEOUT", leg="DSCALP", ctx=ctx, use_maker=True)
+            self._diag_dscalp_timeout_exits += 1
+            self._diag_dscalp_hold_times.append(hold_sec)
+            self._diag_dscalp_exit_cents.append(pnl_cents)
+            self._true_cost_tx_count += 1
+            self._true_cost_fill_count += 1
+            self._true_cost_fill_count_min += 1
+            self._dscalp_positions.pop(m.slug, None)
+            self._dscalp_invested_usd.pop(m.slug, None)
+            write_jsonl({"event_type": "DSCALP_TIMEOUT", "ts_ms": int(now_t * 1000),
+                          "slug": m.slug, "outcome": outcome,
+                          "pnl_cents": round(pnl_cents, 2), "hold_sec": round(hold_sec, 1)})
+            return
+
+        # ── TP1: +3c, sell 30% ──
+        if pnl_cents >= DSCALP_TP1_CENTS and not dpos["tp1_done"]:
+            sell_qty = min(pos.qty * DSCALP_TP1_FRAC, pos.qty)
+            if sell_qty >= MIN_QTY:
+                sell_price = book.bid
+                self._do_sell(m, st, outcome, sell_qty, sell_price,
+                              reason="DSCALP_TP1", leg="DSCALP", ctx=ctx, use_maker=True)
+                self._diag_dscalp_tp1 += 1
+                self._true_cost_tx_count += 1
+                self._true_cost_fill_count += 1
+                self._true_cost_fill_count_min += 1
+                write_jsonl({"event_type": "DSCALP_TP1", "ts_ms": int(now_t * 1000),
+                              "slug": m.slug, "outcome": outcome,
+                              "pnl_cents": round(pnl_cents, 2), "sell_qty": round(sell_qty, 1)})
+            dpos["tp1_done"] = True
+
+        # ── TP2: +5c, sell 30% ──
+        if pnl_cents >= DSCALP_TP2_CENTS and not dpos["tp2_done"]:
+            sell_qty = min(pos.qty * DSCALP_TP2_FRAC, pos.qty)
+            if sell_qty >= MIN_QTY:
+                sell_price = book.bid
+                self._do_sell(m, st, outcome, sell_qty, sell_price,
+                              reason="DSCALP_TP2", leg="DSCALP", ctx=ctx, use_maker=True)
+                self._diag_dscalp_tp2 += 1
+                self._true_cost_tx_count += 1
+                self._true_cost_fill_count += 1
+                self._true_cost_fill_count_min += 1
+                write_jsonl({"event_type": "DSCALP_TP2", "ts_ms": int(now_t * 1000),
+                              "slug": m.slug, "outcome": outcome,
+                              "pnl_cents": round(pnl_cents, 2), "sell_qty": round(sell_qty, 1)})
+            dpos["tp2_done"] = True
+
+        # ── TP3: +7c, sell remainder ──
+        if pnl_cents >= DSCALP_TP3_CENTS:
+            sell_qty = pos.qty
+            if sell_qty >= MIN_QTY:
+                sell_price = book.bid
+                self._do_sell(m, st, outcome, sell_qty, sell_price,
+                              reason="DSCALP_TP3", leg="DSCALP", ctx=ctx, use_maker=True)
+                self._diag_dscalp_tp3 += 1
+                self._diag_dscalp_hold_times.append(hold_sec)
+                self._diag_dscalp_exit_cents.append(pnl_cents)
+                self._true_cost_tx_count += 1
+                self._true_cost_fill_count += 1
+                self._true_cost_fill_count_min += 1
+                write_jsonl({"event_type": "DSCALP_TP3", "ts_ms": int(now_t * 1000),
+                              "slug": m.slug, "outcome": outcome,
+                              "pnl_cents": round(pnl_cents, 2), "hold_sec": round(hold_sec, 1)})
+            self._dscalp_positions.pop(m.slug, None)
+            self._dscalp_invested_usd.pop(m.slug, None)
 
     def _core_entries(self, ctx: dict):
         m, st = ctx["m"], ctx["st"]
@@ -3380,12 +3866,13 @@ class Bot:
     # PARITY (STRADDLE) ARBITRAGE ENGINE  (v2: fee-aware, partial-fill
     # protected, maker-disciplined, with locked recycle)
     # =================================================================
-    def _parity_arb(self, ctx: dict):
+    def _parity_arb(self, ctx: dict, new_quotes_blocked: bool = False):
         """Fee-aware parity arbitrage with partial-fill protection.
         1. Compute raw + net (after fees/slippage) edges
         2. Liquidity/staleness guards
         3. Execute paired orders with pair_id tracking
-        4. Handle pending partial fills from prior ticks"""
+        4. Handle pending partial fills from prior ticks
+        If new_quotes_blocked=True, only handle pending, recycle, flatten — no new quotes/orders."""
         m, st = ctx["m"], ctx["st"]
         t_min = ctx["t_min"]
         up_book: BookTop = ctx["up_book"]
@@ -3399,7 +3886,7 @@ class Bot:
         self._parity_recycle_locked(m, st, ctx)
 
         # ── Parity QUOTING mode (continuously post maker bids on both legs) ──
-        if PARITY_QUOTE_ENABLED and t_min < PARITY_STOP_NEW_MIN:
+        if PARITY_QUOTE_ENABLED and t_min < PARITY_STOP_NEW_MIN and not new_quotes_blocked:
             self._parity_quote(m, st, ctx)
 
         # ── End-of-hour flattening (runs even after PARITY_STOP_NEW_MIN) ──
@@ -3423,8 +3910,8 @@ class Bot:
         ctx["parity_net_buy_cents"] = buy_net
         ctx["parity_net_sell_cents"] = sell_net
 
-        # ── Stop new parity trades after PARITY_STOP_NEW_MIN ──
-        if t_min >= PARITY_STOP_NEW_MIN:
+        # ── Stop new parity trades after PARITY_STOP_NEW_MIN or when blocked ──
+        if t_min >= PARITY_STOP_NEW_MIN or new_quotes_blocked:
             return
 
         # ── Cooldown gate ──
@@ -3982,9 +4469,16 @@ class Bot:
         if cache_age > PARITY_MAX_CACHE_AGE_MS:
             return
 
-        # ── Investment cap ──
+        # ── Rate limit check ──
+        if not self._rate_limit_ok(m.slug):
+            return
+
+        # ── Investment cap (reduced when directional scalp active) ──
         invested = self._parity_invested_usd.get(m.slug, 0.0)
-        if invested >= PARITY_QUOTE_MAX_USD_PER_SLUG:
+        cap = PARITY_QUOTE_MAX_USD_PER_SLUG
+        if PARITY_DEFER_TO_DIRECTIONAL and m.slug in self._dscalp_positions:
+            cap = min(cap, PARITY_MAX_WHEN_DIRECTIONAL_USD)
+        if invested >= cap:
             return
 
         # ── Dynamic target edge ──
@@ -4032,8 +4526,12 @@ class Bot:
                 elif outbid and elapsed_ms >= 100:
                     # 100ms+ outbid: match best_bid
                     effective_price = clamp_to_tick(book.bid)
-                elif not outbid and price_diff < 0.001 and elapsed_ms < PARITY_QUOTE_REFRESH_MS:
-                    continue  # no need to refresh yet
+                elif not outbid and elapsed_ms < QUOTE_REFRESH_MIN_ELAPSED_MS:
+                    continue  # rate-limited: not outbid + too soon
+                elif (not outbid and QUOTE_REFRESH_SKIP_IF_SAME
+                      and price_diff < QUOTE_REFRESH_MIN_TICK_MOVE
+                      and elapsed_ms < PARITY_QUOTE_REFRESH_MS):
+                    continue  # no need to refresh: price unchanged
 
             # Check that effective_price still yields net edge
             other_price = target_dn if outcome == "Up" else target_up
@@ -4356,6 +4854,7 @@ class Bot:
                                   ctx=ctx, use_maker=True)
                     self._diag_unpaired_unwind_usd += unwind_price * pos.qty
                     self._diag_hedge_unwind += 1
+                    self._diag_unpaired_count_min += 1
             self._quote_paused_until[m.slug] = now_t + QUOTE_PAUSE_AFTER_UNPAIRED_SEC
             self._diag_quote_pause_count += 1
             self._diag_slug_timeouts[m.slug] = self._diag_slug_timeouts.get(m.slug, 0) + 1
@@ -4413,6 +4912,8 @@ class Bot:
                    "quote_step_usd_used": round(quote_step_usd_used, 2)},
         )
         # ── Order lifecycle: track submit ──
+        self._rate_limit_record(m.slug)
+        self._true_cost_tx_count += 1
         placed_ts_ms = int(placed_ts * 1000)
         self._last_quote_oid = client_oid
         self._diag_quote_submit_count += 1
@@ -5073,6 +5574,7 @@ class Bot:
                             should_derisk = True
                     if should_derisk:
                         self._diag_derisk_count += 1
+                        self._diag_derisk_count_min += 1
                         thr = entry_threshold_bps(m.crypto, t_min)
                         abs_edge = abs(ctx.get("delta_bps", 0))
                         seconds_to_close = ctx.get("seconds_to_close", 999.0)
@@ -5385,6 +5887,10 @@ class Bot:
             side="SELL", qty=qty, target_price=target_price or price,
             usdc_cost=usdc_cost, ctx=ctx, book_fields=bk_fields,
         )
+        # True cost tracking
+        self._true_cost_tx_count += 1
+        self._true_cost_fill_count += 1
+        self._true_cost_fill_count_min += 1
         if MODE == "LOG":
             pnl = self._paper_sell(st, outcome, price, qty)
             mt = infer_maker_taker("SELL", price, ref_book) if ref_book else ""
