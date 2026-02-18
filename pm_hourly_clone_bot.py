@@ -388,6 +388,28 @@ REGIME_LOW_VOL_REDUCTION = float(os.getenv("REGIME_LOW_VOL_REDUCTION", "0.50")) 
 TRUE_COST_ENABLED = True
 TRUE_COST_EST_GAS_PER_TX_USD = float(os.getenv("TRUE_COST_EST_GAS_PER_TX_USD", "0.001"))  # est gas per tx
 TRUE_COST_EST_FEE_BPS = float(os.getenv("TRUE_COST_EST_FEE_BPS", "2.0"))                  # avg fee bps per fill
+# ---------------------------------------------------------------------------
+# ORDER MANAGER — live order lifecycle (Phase 1-7 hardening)
+# ---------------------------------------------------------------------------
+OM_MAKER_ORDER_TTL_MS = float(os.getenv("OM_MAKER_ORDER_TTL_MS", "3000"))               # cancel maker if no new fills after TTL
+OM_MAX_ACTIVE_PER_SLUG_SIDE = int(os.getenv("OM_MAX_ACTIVE_PER_SLUG_SIDE", "1"))        # max concurrent orders per (slug, side)
+OM_MAX_OPEN_ORDERS = int(os.getenv("OM_MAX_OPEN_ORDERS", "50"))                          # global cap on open orders
+OM_ORPHAN_SCAN_INTERVAL_SEC = float(os.getenv("OM_ORPHAN_SCAN_INTERVAL_SEC", "15"))      # scan CLOB for orphans every N sec
+OM_SUBMIT_MAX_RETRIES = int(os.getenv("OM_SUBMIT_MAX_RETRIES", "3"))                     # retry submit on transient error
+OM_SUBMIT_BACKOFF_MS = [100, 250, 500]                                                    # backoff per retry
+OM_CANCEL_MAX_RETRIES = int(os.getenv("OM_CANCEL_MAX_RETRIES", "3"))
+OM_CANCEL_BACKOFF_MS = [100, 250, 500]
+OM_RECONCILE_MAX_PER_TICK = int(os.getenv("OM_RECONCILE_MAX_PER_TICK", "10"))            # max orders to poll per main-loop tick
+OM_KILL_ORPHAN_THRESHOLD_PER_MIN = int(os.getenv("OM_KILL_ORPHAN_THRESHOLD_PER_MIN", "10"))  # kill-switch: orphans/min
+OM_KILL_API_ERROR_THRESHOLD_PER_MIN = int(os.getenv("OM_KILL_API_ERROR_THRESHOLD_PER_MIN", "20"))  # kill-switch: errors/min
+OM_KILL_COOLDOWN_SEC = float(os.getenv("OM_KILL_COOLDOWN_SEC", "60"))                    # disable entries for N sec after kill-switch
+# Hedge escalation in LIVE mode (Phase 5)
+OM_HEDGE_ESCALATION_LIVE = bool(os.getenv("OM_HEDGE_ESCALATION_LIVE", "True") not in ("", "0", "False", "false"))
+OM_HEDGE_TICK1_MS = 200       # +1 tick after 200ms
+OM_HEDGE_TICK2_MS = 350       # +3 ticks after 350ms
+OM_HEDGE_CROSS_MS = 500       # taker cross after 500ms
+OM_HEDGE_CROSS_MIN_EDGE_CENTS = 0.5
+OM_HEDGE_CROSS_MAX_SPREAD_CENTS = 2.0
 # =============================================================================
 # UTIL / LOGGING — thin wrappers around Logger instance
 # =============================================================================
@@ -1289,6 +1311,23 @@ class Bot:
         # ── Order lifecycle tracking ──
         # Active orders: order_id -> {slug, outcome, side, price, qty, submit_ts, reason}
         self._active_orders: Dict[str, dict] = {}
+        # ── Central Order Manager (LIVE hardening) ──
+        # Tracked open orders: order_id -> {slug, outcome, side, price, qty, filled_qty,
+        #   reason, maker, created_ms, last_check_ms, status, st_ref, token_id}
+        self._om_open_orders: Dict[str, dict] = {}
+        self._om_last_orphan_scan_ts: float = 0.0
+        self._om_orphan_canceled_count: int = 0
+        self._om_orphan_canceled_min: int = 0
+        self._om_submit_fail_count: int = 0
+        self._om_submit_fail_min: int = 0
+        self._om_cancel_fail_count: int = 0
+        self._om_cancel_fail_min: int = 0
+        self._om_partial_fill_events: int = 0
+        self._om_partial_fill_events_min: int = 0
+        self._om_api_errors_min: int = 0
+        self._om_kill_switch_until: float = 0.0  # entries disabled until this ts
+        self._om_last_sanity_ts: float = 0.0
+        self._om_sanity_interval_sec: float = 60.0
         self._diag_quote_submit_count = 0
         self._diag_quote_cancel_count = 0
         self._diag_quote_replace_count = 0
@@ -1672,6 +1711,472 @@ class Bot:
             pos.last_derisk_ts = None
             pos.last_derisk_mid = 0.0
             pos.fast_tp_done = False
+
+    # =========================================================================
+    # ORDER MANAGER — Central live-order lifecycle (Phases 0-7)
+    # =========================================================================
+
+    def _om_kill_switch_active(self) -> bool:
+        """True if kill-switch has disabled entries."""
+        return time.time() < self._om_kill_switch_until
+
+    def _om_has_open_order(self, slug: str, outcome: str, side: str) -> Optional[str]:
+        """Return order_id if there is already an open order for (slug, outcome, side), else None."""
+        for oid, o in self._om_open_orders.items():
+            if o["slug"] == slug and o["outcome"] == outcome and o["side"] == side and o["status"] == "open":
+                return oid
+        return None
+
+    def _om_open_count(self) -> int:
+        return len(self._om_open_orders)
+
+    def _om_submit_order(self, token_id: str, slug: str, outcome: str, side: str,
+                         price: float, qty: float, reason: str, maker: bool = True,
+                         st: Optional[MarketState] = None) -> dict:
+        """Submit an order to the CLOB with retry+backoff. Track in _om_open_orders.
+        Returns {order_id, filled, fill_qty, fill_price, status}.
+        Counters: tx_count++ on successful submit, fill_count++ only on confirmed fill."""
+        if MODE == "LOG":
+            pid = f"paper_{int(time.time()*1000)}_{random.randint(100,999)}"
+            return {"order_id": pid, "filled": True, "fill_qty": int(float(qty)),
+                    "fill_price": price, "status": "matched"}
+
+        # Global cap check
+        if self._om_open_count() >= OM_MAX_OPEN_ORDERS:
+            write_jsonl({"event_type": "OM_SUBMIT_BLOCKED", "reason": "max_open_orders",
+                          "slug": slug, "side": side, "open_count": self._om_open_count()})
+            return {"order_id": "", "filled": False, "fill_qty": 0, "fill_price": 0.0, "status": "blocked"}
+
+        # Per-slug-side cap check
+        existing_oid = self._om_has_open_order(slug, outcome, side)
+        if existing_oid:
+            write_jsonl({"event_type": "OM_SUBMIT_BLOCKED", "reason": "duplicate_order",
+                          "slug": slug, "outcome": outcome, "side": side,
+                          "existing_oid": existing_oid})
+            return {"order_id": "", "filled": False, "fill_qty": 0, "fill_price": 0.0, "status": "blocked"}
+
+        # Submit with retry
+        last_err = ""
+        for attempt in range(OM_SUBMIT_MAX_RETRIES):
+            try:
+                result = self.client.place_limit_order(token_id, side, price, qty, post_only=maker)
+                oid = result.get("order_id", "")
+                status = result.get("status", "")
+                filled = result.get("filled", False)
+                fill_qty = result.get("fill_qty", 0)
+                fill_price = result.get("fill_price", 0.0)
+
+                # Successful submit — count tx
+                if oid:
+                    self._true_cost_tx_count += 1
+                    self._true_cost_submit_count += 1
+
+                # If fully filled immediately, count fill and do NOT track as open
+                if filled and fill_qty >= int(float(qty)):
+                    self._true_cost_fill_count += 1
+                    self._true_cost_fill_count_min += 1
+                    write_jsonl({"event_type": "OM_ORDER_FILLED_IMMEDIATE",
+                                  "order_id": oid, "slug": slug, "outcome": outcome,
+                                  "side": side, "price": fill_price, "qty": fill_qty,
+                                  "reason": reason})
+                    return result
+
+                # Partial fill or resting — track in open orders
+                if oid:
+                    now_ms = int(time.time() * 1000)
+                    self._om_open_orders[oid] = {
+                        "slug": slug, "outcome": outcome, "side": side,
+                        "price": price, "qty": int(float(qty)),
+                        "filled_qty": fill_qty if fill_qty else 0,
+                        "reason": reason, "maker": maker,
+                        "created_ms": now_ms, "last_check_ms": now_ms,
+                        "status": "open", "token_id": token_id,
+                        "st_slug": st.slug if st else slug,
+                        "cancel_pending": False,
+                    }
+                    # If partial fill happened, count that fill
+                    if fill_qty and fill_qty > 0:
+                        self._true_cost_fill_count += 1
+                        self._true_cost_fill_count_min += 1
+                        self._om_partial_fill_events += 1
+                        self._om_partial_fill_events_min += 1
+                    write_jsonl({"event_type": "OM_ORDER_TRACKED",
+                                  "order_id": oid, "slug": slug, "outcome": outcome,
+                                  "side": side, "price": price, "qty": int(float(qty)),
+                                  "filled_qty": fill_qty or 0,
+                                  "status": status, "reason": reason})
+                    # Return with actual fill state (may be partial or unfilled)
+                    return {"order_id": oid, "filled": filled, "fill_qty": fill_qty,
+                            "fill_price": fill_price, "status": status}
+
+                # No order_id returned but no exception — API rejected silently
+                if status == "error":
+                    self._om_api_errors_min += 1
+                    last_err = f"api_rejected: {status}"
+                    # Fall through to retry
+                else:
+                    return result
+
+            except Exception as e:
+                last_err = str(e)[:200]
+                self._om_api_errors_min += 1
+                write_jsonl({"event_type": "OM_SUBMIT_ERROR", "attempt": attempt + 1,
+                              "slug": slug, "side": side, "err": last_err})
+
+            # Backoff before retry
+            if attempt < OM_SUBMIT_MAX_RETRIES - 1:
+                backoff_ms = OM_SUBMIT_BACKOFF_MS[min(attempt, len(OM_SUBMIT_BACKOFF_MS) - 1)]
+                time.sleep(backoff_ms / 1000.0)
+
+        # All retries exhausted
+        self._om_submit_fail_count += 1
+        self._om_submit_fail_min += 1
+        write_jsonl({"event_type": "OM_SUBMIT_FAILED", "slug": slug, "outcome": outcome,
+                      "side": side, "price": price, "qty": qty, "reason": reason,
+                      "last_err": last_err, "retries": OM_SUBMIT_MAX_RETRIES})
+        return {"order_id": "", "filled": False, "fill_qty": 0, "fill_price": 0.0, "status": "submit_failed"}
+
+    def _om_poll_and_reconcile(self, order_id: str) -> dict:
+        """Poll a single open order and reconcile fills. Returns updated order info.
+        Applies position state changes for any new fills detected."""
+        entry = self._om_open_orders.get(order_id)
+        if not entry:
+            return {"status": "not_tracked"}
+
+        if MODE == "LOG":
+            # Paper mode: orders fill instantly, nothing to reconcile
+            self._om_open_orders.pop(order_id, None)
+            return {"status": "matched", "filled_qty": entry["qty"]}
+
+        try:
+            order = self.client._clob.get_order(order_id) if self.client._clob else None
+            if not order or not isinstance(order, dict):
+                entry["last_check_ms"] = int(time.time() * 1000)
+                return {"status": "unknown"}
+
+            clob_status = order.get("status", "").lower()
+            size_matched = int(order.get("size_matched", 0) or 0)
+            old_filled = entry["filled_qty"]
+            delta_qty = max(0, size_matched - old_filled)
+
+            if delta_qty > 0:
+                # New fills detected — apply to position state
+                entry["filled_qty"] = size_matched
+                self._true_cost_fill_count += 1
+                self._true_cost_fill_count_min += 1
+                if delta_qty < (entry["qty"] - old_filled):
+                    self._om_partial_fill_events += 1
+                    self._om_partial_fill_events_min += 1
+
+                # Apply fill to position
+                slug = entry["slug"]
+                outcome = entry["outcome"]
+                fill_price = entry["price"]  # best available; CLOB may not give avg
+                usdc_delta = fill_price * delta_qty
+
+                st = self.market_states.get(slug)
+                if st:
+                    if entry["side"] == "BUY":
+                        self._live_buy(st, outcome, fill_price, delta_qty, usdc_delta)
+                    else:
+                        self._live_sell(st, outcome, fill_price, delta_qty)
+
+                write_jsonl({"event_type": "OM_RECONCILE_FILL",
+                              "order_id": order_id, "slug": slug, "outcome": outcome,
+                              "side": entry["side"], "delta_qty": delta_qty,
+                              "total_filled": size_matched, "total_qty": entry["qty"],
+                              "fill_price": fill_price})
+
+            if clob_status in ("matched", "filled"):
+                # Fully filled — remove from tracking
+                self._om_open_orders.pop(order_id, None)
+                return {"status": "filled", "filled_qty": size_matched}
+            elif clob_status in ("cancelled", "canceled", "expired"):
+                self._om_open_orders.pop(order_id, None)
+                return {"status": "cancelled", "filled_qty": size_matched}
+
+            entry["last_check_ms"] = int(time.time() * 1000)
+            return {"status": clob_status, "filled_qty": size_matched}
+
+        except Exception as e:
+            self._om_api_errors_min += 1
+            write_jsonl({"event_type": "OM_RECONCILE_ERROR", "order_id": order_id,
+                          "err": str(e)[:200]})
+            entry["last_check_ms"] = int(time.time() * 1000)
+            return {"status": "error"}
+
+    def _om_cancel_order(self, order_id: str, reason: str = "ttl") -> bool:
+        """Cancel an order with retry+backoff. Returns True if cancel succeeded or order gone."""
+        entry = self._om_open_orders.get(order_id)
+        if not entry:
+            return True
+        if MODE == "LOG":
+            self._om_open_orders.pop(order_id, None)
+            return True
+
+        for attempt in range(OM_CANCEL_MAX_RETRIES):
+            try:
+                self.client._clob.cancel(order_id)
+                self._true_cost_cancel_count += 1
+                self._om_open_orders.pop(order_id, None)
+                write_jsonl({"event_type": "OM_ORDER_CANCELED", "order_id": order_id,
+                              "slug": entry["slug"], "outcome": entry["outcome"],
+                              "side": entry["side"], "reason": reason,
+                              "filled_qty": entry["filled_qty"], "total_qty": entry["qty"]})
+                return True
+            except Exception as e:
+                self._om_api_errors_min += 1
+                write_jsonl({"event_type": "OM_CANCEL_ERROR", "order_id": order_id,
+                              "attempt": attempt + 1, "err": str(e)[:200]})
+                if attempt < OM_CANCEL_MAX_RETRIES - 1:
+                    backoff_ms = OM_CANCEL_BACKOFF_MS[min(attempt, len(OM_CANCEL_BACKOFF_MS) - 1)]
+                    time.sleep(backoff_ms / 1000.0)
+
+        # Mark cancel_pending for retry next tick
+        entry["cancel_pending"] = True
+        self._om_cancel_fail_count += 1
+        self._om_cancel_fail_min += 1
+        write_jsonl({"event_type": "OM_CANCEL_FAILED", "order_id": order_id,
+                      "slug": entry["slug"], "reason": reason})
+        return False
+
+    def _om_reprice_order(self, order_id: str, new_price: float, reason: str = "reprice") -> Optional[str]:
+        """Cancel old order and submit replacement at new_price. Returns new order_id or None."""
+        entry = self._om_open_orders.get(order_id)
+        if not entry:
+            return None
+
+        # Snapshot unfilled remainder
+        remaining_qty = max(0, entry["qty"] - entry["filled_qty"])
+        if remaining_qty < 1:
+            self._om_cancel_order(order_id, "reprice_no_remainder")
+            return None
+
+        old_price = entry["price"]
+        slug = entry["slug"]
+        outcome = entry["outcome"]
+        side = entry["side"]
+
+        # Cancel old
+        if not self._om_cancel_order(order_id, f"reprice:{reason}"):
+            return None  # will retry next tick
+
+        # Submit new with remaining qty
+        st = self.market_states.get(slug)
+        result = self._om_submit_order(
+            token_id=entry["token_id"], slug=slug, outcome=outcome,
+            side=side, price=new_price, qty=remaining_qty,
+            reason=entry["reason"], maker=entry["maker"], st=st)
+
+        new_oid = result.get("order_id", "")
+        if new_oid:
+            write_jsonl({"event_type": "OM_ORDER_REPLACED",
+                          "old_id": order_id, "new_id": new_oid,
+                          "slug": slug, "outcome": outcome, "side": side,
+                          "old_price": old_price, "new_price": new_price,
+                          "remaining_qty": remaining_qty})
+        return new_oid if new_oid else None
+
+    def _om_reconcile_all(self):
+        """Main-loop maintenance: reconcile open orders, cancel stale, detect orphans."""
+        if MODE == "LOG":
+            return
+
+        now_ms = int(time.time() * 1000)
+        now_ts = time.time()
+        checked = 0
+
+        # 1. Reconcile + TTL enforcement on tracked orders
+        stale_to_cancel = []
+        cancel_pending_retry = []
+        for oid, entry in list(self._om_open_orders.items()):
+            if checked >= OM_RECONCILE_MAX_PER_TICK:
+                break
+
+            # Retry pending cancels first
+            if entry.get("cancel_pending"):
+                cancel_pending_retry.append(oid)
+                continue
+
+            # Poll for fill updates
+            self._om_poll_and_reconcile(oid)
+            checked += 1
+
+            # TTL check: if no new fills for TTL period, mark for cancel
+            if oid in self._om_open_orders:  # still tracked (not fully filled)
+                age_ms = now_ms - entry["created_ms"]
+                since_last_check = now_ms - entry["last_check_ms"]
+                if age_ms > OM_MAKER_ORDER_TTL_MS and entry["maker"]:
+                    stale_to_cancel.append(oid)
+
+        # Cancel stale orders
+        for oid in stale_to_cancel:
+            self._om_cancel_order(oid, "ttl_expired")
+
+        # Retry pending cancels
+        for oid in cancel_pending_retry:
+            self._om_cancel_order(oid, "cancel_retry")
+
+        # 2. Periodic orphan scan (every OM_ORPHAN_SCAN_INTERVAL_SEC)
+        if now_ts - self._om_last_orphan_scan_ts >= OM_ORPHAN_SCAN_INTERVAL_SEC:
+            self._om_scan_orphans()
+            self._om_last_orphan_scan_ts = now_ts
+
+        # 3. Kill-switch evaluation
+        if (self._om_orphan_canceled_min > OM_KILL_ORPHAN_THRESHOLD_PER_MIN or
+                self._om_api_errors_min > OM_KILL_API_ERROR_THRESHOLD_PER_MIN):
+            if not self._om_kill_switch_active():
+                self._om_kill_switch_until = now_ts + OM_KILL_COOLDOWN_SEC
+                write_jsonl({"event_type": "OM_KILL_SWITCH_TRIGGERED",
+                              "orphans_min": self._om_orphan_canceled_min,
+                              "api_errors_min": self._om_api_errors_min,
+                              "cooldown_sec": OM_KILL_COOLDOWN_SEC})
+                # Cancel all open orders and flatten
+                for oid in list(self._om_open_orders.keys()):
+                    self._om_cancel_order(oid, "kill_switch")
+
+    def _om_scan_orphans(self):
+        """Scan CLOB for orders not in our tracking — cancel them."""
+        if MODE == "LOG" or not self.client._clob:
+            return
+        try:
+            clob_orders = self.client.get_open_orders()
+            tracked_ids = set(self._om_open_orders.keys())
+            for o in clob_orders:
+                oid = o.get("id") or o.get("orderID") or o.get("order_id", "")
+                if oid and oid not in tracked_ids:
+                    # Orphan detected — cancel it
+                    try:
+                        self.client._clob.cancel(oid)
+                        self._om_orphan_canceled_count += 1
+                        self._om_orphan_canceled_min += 1
+                        write_jsonl({"event_type": "OM_ORPHAN_CANCELED",
+                                      "order_id": oid,
+                                      "status": o.get("status", ""),
+                                      "side": o.get("side", ""),
+                                      "price": o.get("price", ""),
+                                      "size": o.get("size", "")})
+                    except Exception as e:
+                        write_jsonl({"event_type": "OM_ORPHAN_CANCEL_ERROR",
+                                      "order_id": oid, "err": str(e)[:120]})
+        except Exception as e:
+            write_jsonl({"event_type": "OM_ORPHAN_SCAN_ERROR", "err": str(e)[:200]})
+
+    # ── Phase 0: Unified buy execution ──
+
+    def _exec_buy(self, st: MarketState, m, outcome: str, price: float,
+                  qty: float, reason: str, prefer_maker: bool = True,
+                  ctx: Optional[dict] = None) -> dict:
+        """Unified buy execution for ALL engines. Paper or live.
+        Returns {filled: bool, fill_qty, fill_price, usdc_cost, order_id}."""
+        token_id = m.outcome_up_id if outcome == "Up" else m.outcome_down_id
+        usdc_cost = price * qty
+
+        if MODE == "LOG":
+            self._paper_buy(st, outcome, price, qty, usdc_cost)
+            return {"filled": True, "fill_qty": int(float(qty)), "fill_price": price,
+                    "usdc_cost": usdc_cost, "order_id": f"paper_{int(time.time()*1000)}"}
+
+        # LIVE mode — use order manager
+        if self._om_kill_switch_active():
+            write_jsonl({"event_type": "OM_BUY_BLOCKED_KILLSWITCH",
+                          "slug": m.slug, "outcome": outcome, "reason": reason})
+            return {"filled": False, "fill_qty": 0, "fill_price": 0.0,
+                    "usdc_cost": 0.0, "order_id": ""}
+
+        result = self._om_submit_order(
+            token_id=token_id, slug=m.slug, outcome=outcome,
+            side="BUY", price=price, qty=qty, reason=reason,
+            maker=prefer_maker, st=st)
+
+        oid = result.get("order_id", "")
+        filled = result.get("filled", False)
+        fill_qty = result.get("fill_qty", 0)
+        fill_price = result.get("fill_price", price)
+
+        if filled and fill_qty > 0:
+            actual_cost = fill_price * fill_qty
+            self._live_buy(st, outcome, fill_price, fill_qty, actual_cost)
+            return {"filled": True, "fill_qty": fill_qty, "fill_price": fill_price,
+                    "usdc_cost": actual_cost, "order_id": oid}
+
+        # Order resting or partially filled — position update happens via reconciliation
+        return {"filled": False, "fill_qty": fill_qty, "fill_price": fill_price,
+                "usdc_cost": fill_price * fill_qty if fill_qty else 0.0, "order_id": oid}
+
+    def _exec_sell(self, st: MarketState, m, outcome: str, price: float,
+                   qty: float, reason: str, prefer_maker: bool = True,
+                   ctx: Optional[dict] = None) -> dict:
+        """Unified sell execution. Paper or live.
+        Returns {filled: bool, fill_qty, fill_price, pnl, order_id}."""
+        token_id = m.outcome_up_id if outcome == "Up" else m.outcome_down_id
+
+        if MODE == "LOG":
+            pnl = self._paper_sell(st, outcome, price, qty)
+            return {"filled": True, "fill_qty": int(float(qty)), "fill_price": price,
+                    "pnl": pnl, "order_id": f"paper_{int(time.time()*1000)}"}
+
+        # LIVE mode — use order manager
+        result = self._om_submit_order(
+            token_id=token_id, slug=m.slug, outcome=outcome,
+            side="SELL", price=price, qty=qty, reason=reason,
+            maker=prefer_maker, st=st)
+
+        oid = result.get("order_id", "")
+        filled = result.get("filled", False)
+        fill_qty = result.get("fill_qty", 0)
+        fill_price = result.get("fill_price", price)
+
+        if filled and fill_qty > 0:
+            pnl = self._live_sell(st, outcome, fill_price, fill_qty)
+            return {"filled": True, "fill_qty": fill_qty, "fill_price": fill_price,
+                    "pnl": pnl, "order_id": oid}
+
+        # Order resting — reconciliation handles fills
+        return {"filled": False, "fill_qty": fill_qty, "fill_price": fill_price,
+                "pnl": 0.0, "order_id": oid}
+
+    def _om_emit_live_sanity(self):
+        """Emit LIVE_SANITY report every minute — order manager health metrics."""
+        now_ts = time.time()
+        if now_ts - self._om_last_sanity_ts < self._om_sanity_interval_sec:
+            return
+        self._om_last_sanity_ts = now_ts
+
+        # Calculate avg order age
+        ages = []
+        for entry in self._om_open_orders.values():
+            age_ms = int(now_ts * 1000) - entry["created_ms"]
+            ages.append(age_ms)
+        avg_age_ms = sum(ages) / len(ages) if ages else 0.0
+
+        write_jsonl({
+            "event_type": "LIVE_SANITY",
+            "open_orders_count": len(self._om_open_orders),
+            "orphan_canceled_count": self._om_orphan_canceled_count,
+            "orphan_canceled_min": self._om_orphan_canceled_min,
+            "partial_fill_events": self._om_partial_fill_events,
+            "partial_fill_events_min": self._om_partial_fill_events_min,
+            "submit_fail_count": self._om_submit_fail_count,
+            "submit_fail_min": self._om_submit_fail_min,
+            "cancel_fail_count": self._om_cancel_fail_count,
+            "cancel_fail_min": self._om_cancel_fail_min,
+            "api_errors_min": self._om_api_errors_min,
+            "avg_order_age_ms": round(avg_age_ms, 1),
+            "tx_count": self._true_cost_tx_count,
+            "fill_count": self._true_cost_fill_count,
+            "fill_count_min": self._true_cost_fill_count_min,
+            "kill_switch_active": self._om_kill_switch_active(),
+            "kill_switch_until": round(max(0, self._om_kill_switch_until - now_ts), 1),
+        })
+
+        # Reset per-minute counters
+        self._om_orphan_canceled_min = 0
+        self._om_partial_fill_events_min = 0
+        self._om_submit_fail_min = 0
+        self._om_cancel_fail_min = 0
+        self._om_api_errors_min = 0
+
     # -----------------------------
     # Risk checks (log-only alerts)
     # -----------------------------
@@ -2020,6 +2525,12 @@ class Bot:
                     if age < float('inf'):
                         self._tempo_cache_ages.setdefault(m.slug, []).append(age)
 
+                # 4c. Order Manager: reconcile open orders, TTL, orphan scan
+                self._om_reconcile_all()
+
+                # 4d. LIVE_SANITY report (every 60s)
+                self._om_emit_live_sanity()
+
                 # 5. Save state periodically (every STATE_SAVE_INTERVAL_SEC)
                 now = time.time()
                 if now - self._last_save_ts >= STATE_SAVE_INTERVAL_SEC:
@@ -2067,6 +2578,12 @@ class Bot:
 
         # ── Shutdown ──
         self._bg_running = False
+        # Cancel all tracked open orders before shutdown
+        if MODE != "LOG" and self._om_open_orders:
+            write_jsonl({"event_type": "OM_SHUTDOWN_CANCEL_ALL",
+                          "open_orders": len(self._om_open_orders)})
+            for oid in list(self._om_open_orders.keys()):
+                self._om_cancel_order(oid, "shutdown")
         self._bg_executor.shutdown(wait=False)
         self.logger.log_event({"event_type": "STOPPED", "cash": self.cash_usdc,
                                "realized_pnl": self.realized_pnl_usdc,
@@ -3454,25 +3971,40 @@ class Bot:
                       "cache_age_ms": round(cache_age, 0),
                       "spread_cents": round(book.spread * 100, 2)})
 
-        # Execute buy (paper mode: instant fill)
-        self._paper_buy(st, outcome, order_qty, buy_price)
-        actual_cost = order_qty * buy_price
+        # Execute buy (unified: paper in LOG, live order manager in LIVE)
+        buy_result = self._exec_buy(st, m, outcome, buy_price, order_qty,
+                                     reason="DSCALP_ENTRY", prefer_maker=True, ctx=ctx)
+        if not buy_result.get("filled"):
+            # Order resting or failed — reconciliation loop handles fills later
+            # Still record rate-limit to prevent spam
+            self._rate_limit_record(m.slug)
+            if buy_result.get("order_id"):
+                write_jsonl({"event_type": "DSCALP_ENTRY_RESTING",
+                              "slug": m.slug, "outcome": outcome,
+                              "order_id": buy_result["order_id"],
+                              "price": buy_price, "qty": round(order_qty, 1)})
+            return
+        actual_cost = buy_result["usdc_cost"]
+        actual_qty = buy_result["fill_qty"]
+        actual_price = buy_result["fill_price"]
         self._rate_limit_record(m.slug)
         self._throttle_record_trade()
-        self._true_cost_fill_count += 1
-        self._true_cost_fill_count_min += 1
-        self._true_cost_tx_count += 1
+        # Counters updated by _om_submit_order/_exec_buy for LIVE; manual for LOG
+        if MODE == "LOG":
+            self._true_cost_fill_count += 1
+            self._true_cost_fill_count_min += 1
+            self._true_cost_tx_count += 1
         self._diag_directional_fills_min += 1
         self._diag_total_fills_min += 1
         self._diag_trade_sizes.append(actual_cost)
 
         # Track directional scalp position
         existing_qty = self._dscalp_positions.get(m.slug, {}).get("qty", 0)
-        existing_entry = self._dscalp_positions.get(m.slug, {}).get("entry_price", buy_price)
+        existing_entry = self._dscalp_positions.get(m.slug, {}).get("entry_price", actual_price)
         # VWAP the entry price if adding to existing position
-        total_qty = order_qty + existing_qty
-        vwap_price = ((existing_entry * existing_qty + buy_price * order_qty) / total_qty
-                      if total_qty > 0 else buy_price)
+        total_qty = actual_qty + existing_qty
+        vwap_price = ((existing_entry * existing_qty + actual_price * actual_qty) / total_qty
+                      if total_qty > 0 else actual_price)
         self._dscalp_positions[m.slug] = {
             "outcome": outcome,
             "entry_price": vwap_price,
@@ -3490,8 +4022,8 @@ class Bot:
         self.logger.log_order_fill(
             engine="DSCALP", slug=m.slug, crypto=m.crypto,
             hour_start_utc=ctx["hour_start_utc"], t_min=t_min,
-            outcome=outcome, side="BUY", qty=order_qty,
-            fill_price=buy_price, usdc_cost=actual_cost,
+            outcome=outcome, side="BUY", qty=actual_qty,
+            fill_price=actual_price, usdc_cost=actual_cost,
             maker_taker="maker", decision_id=decision_id,
             client_order_id=client_oid, position_id=pos.position_id,
             notes=f"dscalp_entry vel={vel:.1f}",
@@ -3537,9 +4069,7 @@ class Bot:
             self._diag_dscalp_exits += 1
             self._diag_directional_fills_min += 1
             self._diag_total_fills_min += 1
-            self._true_cost_tx_count += 1
-            self._true_cost_fill_count += 1
-            self._true_cost_fill_count_min += 1
+            # tx/fill counters now handled by _do_sell -> _exec_sell -> _om_submit_order
             self._throttle_record_trade()
             self._dscalp_positions.pop(m.slug, None)
             self._dscalp_invested_usd.pop(m.slug, None)
@@ -3564,9 +4094,7 @@ class Bot:
             self._diag_dscalp_exit_cents.append(pnl_cents)
             self._diag_directional_fills_min += 1
             self._diag_total_fills_min += 1
-            self._true_cost_tx_count += 1
-            self._true_cost_fill_count += 1
-            self._true_cost_fill_count_min += 1
+            # tx/fill counters now handled by _do_sell -> _exec_sell -> _om_submit_order
             self._throttle_record_trade()
             self._dscalp_positions.pop(m.slug, None)
             self._dscalp_invested_usd.pop(m.slug, None)
@@ -4100,6 +4628,19 @@ class Bot:
                     )
                     total_filled_usd += fill["fill_price"] * fill["fill_qty"]
                     burst_count += 1
+                elif fill.get("order_id"):
+                    # Track unfilled burst order in order manager
+                    oid = fill["order_id"]
+                    now_ms = int(time.time() * 1000)
+                    self._om_open_orders[oid] = {
+                        "slug": m.slug, "outcome": outcome, "side": "BUY",
+                        "price": order_price, "qty": int(float(this_qty)),
+                        "filled_qty": fill.get("fill_qty", 0) or 0,
+                        "reason": "ENTRY_BURST", "maker": post_only,
+                        "created_ms": now_ms, "last_check_ms": now_ms,
+                        "status": "open", "token_id": token_id,
+                        "st_slug": m.slug, "cancel_pending": False,
+                    }
 
             # Track diagnostics
             if use_taker:
@@ -4978,8 +5519,9 @@ class Bot:
             edge_c = (1.000 - est_combined) * 100 - fee_cents
             return edge_c >= target_edge * 0.3, edge_c
 
-        # ── Tick 1 escalation: +1 tick at HEDGE_TICK1_MS (DISABLED — no micro-neutralizing) ──
-        if HEDGE_TICK_ESCALATION_ENABLED and age_ms >= HEDGE_TICK1_MS and not hedge["tick1_done"] and missing_book.bid > 0:
+        # ── Tick 1 escalation: +1 tick at HEDGE_TICK1_MS ──
+        _hedge_esc_enabled = HEDGE_TICK_ESCALATION_ENABLED or (MODE == "LIVE" and OM_HEDGE_ESCALATION_LIVE)
+        if _hedge_esc_enabled and age_ms >= OM_HEDGE_TICK1_MS and not hedge["tick1_done"] and missing_book.bid > 0:
             esc_price = clamp_to_tick(missing_book.bid + 0.001)
             ok, edge_c = _edge_ok(esc_price)
             if ok and esc_price < missing_book.ask:
@@ -5005,8 +5547,8 @@ class Bot:
                           "cache_age_ms": round(cache_age, 0),
                           "edge_cents": round(edge_c, 3)})
 
-        # ── Tick 2 escalation: +3 ticks at HEDGE_TICK2_MS (DISABLED — no micro-neutralizing) ──
-        if HEDGE_TICK_ESCALATION_ENABLED and age_ms >= HEDGE_TICK2_MS and not hedge["tick2_done"] and missing_book.bid > 0:
+        # ── Tick 2 escalation: +3 ticks at HEDGE_TICK2_MS ──
+        if _hedge_esc_enabled and age_ms >= OM_HEDGE_TICK2_MS and not hedge["tick2_done"] and missing_book.bid > 0:
             esc_price = clamp_to_tick(missing_book.bid + 0.003)
             ok, edge_c = _edge_ok(esc_price)
             if ok and esc_price < missing_book.ask:
@@ -5032,13 +5574,16 @@ class Bot:
                           "cache_age_ms": round(cache_age, 0),
                           "edge_cents": round(edge_c, 3)})
 
-        # ── Early taker cross: at HEDGE_EARLY_CROSS_MS (500ms) — primary completion ──
-        if (age_ms >= HEDGE_EARLY_CROSS_MS and not hedge.get("early_cross_done")
+        # ── Early taker cross: at OM_HEDGE_CROSS_MS (500ms in LIVE) — primary completion ──
+        _cross_ms = OM_HEDGE_CROSS_MS if (MODE == "LIVE" and OM_HEDGE_ESCALATION_LIVE) else HEDGE_EARLY_CROSS_MS
+        _cross_min_edge = OM_HEDGE_CROSS_MIN_EDGE_CENTS if (MODE == "LIVE" and OM_HEDGE_ESCALATION_LIVE) else HEDGE_EARLY_CROSS_EDGE_CENTS
+        _cross_max_spread = OM_HEDGE_CROSS_MAX_SPREAD_CENTS if (MODE == "LIVE" and OM_HEDGE_ESCALATION_LIVE) else HEDGE_MAX_CROSS_SPREAD_CENTS
+        if (age_ms >= _cross_ms and not hedge.get("early_cross_done")
                 and not hedge["cross_done"] and missing_book.ask > 0):
             cross_price = missing_book.ask
             spread_cents = (missing_book.ask - missing_book.bid) * 100 if missing_book.bid > 0 else 999
             ok, edge_c = _edge_ok(cross_price)
-            if edge_c >= HEDGE_EARLY_CROSS_EDGE_CENTS and spread_cents <= HEDGE_MAX_CROSS_SPREAD_CENTS:
+            if edge_c >= _cross_min_edge and spread_cents <= _cross_max_spread:
                 leg_usd = min(dynamic_step_usd,
                               (PARITY_QUOTE_MAX_USD_PER_SLUG -
                                self._parity_invested_usd.get(m.slug, 0.0)) / 2.0)
@@ -5091,7 +5636,20 @@ class Bot:
                                       "cache_age_ms": round(cache_age, 0),
                                       "age_ms": round(age_ms, 0)})
             else:
-                # Edge collapsed — unwind the filled leg
+                # Edge collapsed — unwind the filled leg (maker-first with TTL)
+                filled_pos = st.positions[filled_outcome]
+                filled_book = up_book if filled_outcome == "Up" else dn_book
+                if filled_pos.qty >= MIN_QTY and filled_book and filled_book.bid > 0:
+                    unwind_price = max(filled_book.bid, filled_book.ask - 0.001)
+                    self._do_sell(m, st, filled_outcome, filled_pos.qty, unwind_price,
+                                  reason="HEDGE_EDGE_COLLAPSE_UNWIND", leg="HEDGE",
+                                  ctx=ctx, use_maker=True)
+                    self._diag_hedge_unwind += 1
+                # Also cancel any resting missing-leg order
+                for oid, oentry in list(self._om_open_orders.items()):
+                    if (oentry["slug"] == m.slug and oentry["outcome"] == missing_outcome
+                            and oentry["side"] == "BUY"):
+                        self._om_cancel_order(oid, "hedge_edge_collapse")
                 write_jsonl({"event_type": "HEDGE_EDGE_COLLAPSE",
                               "ts_ms": int(now_t * 1000),
                               "slug": m.slug, "crypto": m.crypto,
@@ -5339,6 +5897,22 @@ class Bot:
                 self._parity_invested_usd[m.slug] = self._parity_invested_usd.get(m.slug, 0.0) + actual_cost
                 self._parity_last_order_ts[m.slug] = time.time()
                 return actual_cost
+            # Order not filled — track in order manager so it doesn't become orphan
+            oid = fill.get("order_id", "")
+            if oid:
+                now_ms = int(time.time() * 1000)
+                self._om_open_orders[oid] = {
+                    "slug": m.slug, "outcome": outcome, "side": "BUY",
+                    "price": bid_price, "qty": int(float(order_qty)),
+                    "filled_qty": fill.get("fill_qty", 0) or 0,
+                    "reason": "PARITY_QUOTE", "maker": True,
+                    "created_ms": now_ms, "last_check_ms": now_ms,
+                    "status": "open", "token_id": token_id,
+                    "st_slug": m.slug, "cancel_pending": False,
+                }
+                write_jsonl({"event_type": "OM_PARITY_QUOTE_RESTING",
+                              "order_id": oid, "slug": m.slug, "outcome": outcome,
+                              "price": bid_price, "qty": int(float(order_qty))})
             return 0.0
 
     def _parity_buy_leg(self, m: MarketRef, st: MarketState,
@@ -5485,6 +6059,22 @@ class Bot:
                     if ms:
                         ms["filled"] = True
                 return actual_cost
+            # Order not filled — track in order manager so it doesn't become orphan
+            oid = fill.get("order_id", "")
+            if oid:
+                now_ms = int(time.time() * 1000)
+                self._om_open_orders[oid] = {
+                    "slug": m.slug, "outcome": outcome, "side": "BUY",
+                    "price": order_price, "qty": int(float(order_qty)),
+                    "filled_qty": fill.get("fill_qty", 0) or 0,
+                    "reason": "PARITY_BUY", "maker": not use_taker,
+                    "created_ms": now_ms, "last_check_ms": now_ms,
+                    "status": "open", "token_id": token_id,
+                    "st_slug": m.slug, "cancel_pending": False,
+                }
+                write_jsonl({"event_type": "OM_PARITY_LEG_RESTING",
+                              "order_id": oid, "slug": m.slug, "outcome": outcome,
+                              "price": order_price, "qty": int(float(order_qty))})
             return 0.0
 
     # =================================================================
@@ -6161,15 +6751,25 @@ class Bot:
             side="SELL", qty=qty, target_price=target_price or price,
             usdc_cost=usdc_cost, ctx=ctx, book_fields=bk_fields,
         )
-        # True cost tracking
-        self._true_cost_tx_count += 1
-        self._true_cost_fill_count += 1
-        self._true_cost_fill_count_min += 1
-        if MODE == "LOG":
-            pnl = self._paper_sell(st, outcome, price, qty)
-            mt = infer_maker_taker("SELL", price, ref_book) if ref_book else ""
-            sc = spread_capture_fields("SELL", price, ref_book) if ref_book else {}
-            sell_notional = price * qty
+        # Execute sell via unified path (handles paper + live)
+        sell_result = self._exec_sell(st, m, outcome, price, qty,
+                                       reason=reason, prefer_maker=use_maker, ctx=ctx)
+        filled = sell_result.get("filled", False)
+        actual_qty = sell_result.get("fill_qty", 0)
+        actual_price = sell_result.get("fill_price", price)
+        pnl = sell_result.get("pnl", 0.0)
+
+        # Counters: only increment on confirmed fill
+        if filled and actual_qty > 0:
+            if MODE == "LOG":
+                self._true_cost_tx_count += 1
+                self._true_cost_fill_count += 1
+                self._true_cost_fill_count_min += 1
+            # LIVE counters handled by _om_submit_order
+
+            mt = infer_maker_taker("SELL", actual_price, ref_book) if ref_book else ""
+            sc = spread_capture_fields("SELL", actual_price, ref_book) if ref_book else {}
+            sell_notional = actual_price * actual_qty
             fee = compute_fee_usdc(sell_notional, mt if mt else ("maker" if use_maker else "taker"))
             net_pnl = pnl - fee
             # ORDER_FILL
@@ -6178,7 +6778,7 @@ class Bot:
                 decision_id=decision_id, client_order_id=client_oid,
                 position_id=position_id, parent_order_id=parent_oid,
                 crypto=m.crypto, slug=m.slug, outcome=outcome,
-                side="SELL", qty=qty, fill_price=price,
+                side="SELL", qty=actual_qty, fill_price=actual_price,
                 usdc_cost=usdc_cost, fees_usdc=fee,
                 maker_taker=mt, did_cross=sc.get("did_cross", ""),
                 realized_pnl_usdc=pnl, net_pnl_usdc=net_pnl,
@@ -6206,51 +6806,15 @@ class Bot:
                     "max_favorable_bps": round(mfe, 3), "max_adverse_bps": round(mae, 3),
                     "exit_reason": reason,
                 }, also_csv=True)
-            return
-        fill_result = self.client.place_limit_order(token_id, "SELL", price, qty, post_only=use_maker)
-        if fill_result.get("filled"):
-            actual_qty = fill_result["fill_qty"]
-            actual_price = fill_result["fill_price"]
-            pnl = self._live_sell(st, outcome, actual_price, actual_qty)
-            mt = infer_maker_taker("SELL", actual_price, ref_book) if ref_book else ""
-            sc = spread_capture_fields("SELL", actual_price, ref_book) if ref_book else {}
-            sell_notional = actual_price * actual_qty
-            fee = compute_fee_usdc(sell_notional, mt if mt else ("maker" if use_maker else "taker"))
-            net_pnl = pnl - fee
-            self.logger.log_order_fill(
-                engine="EXIT", reason=reason,
-                decision_id=decision_id, client_order_id=client_oid,
-                position_id=position_id, parent_order_id=parent_oid,
-                crypto=m.crypto, slug=m.slug, outcome=outcome,
-                side="SELL", qty=actual_qty, fill_price=actual_price,
-                usdc_cost=usdc_cost, fees_usdc=fee,
-                maker_taker=mt, did_cross=sc.get("did_cross", ""),
-                realized_pnl_usdc=pnl, net_pnl_usdc=net_pnl,
-                unrealized_pnl_usdc=0.0, vwap=pos.vwap,
-                ctx=ctx, book_fields=bk_fields,
-            )
-            if pos.qty < MIN_QTY and pos.entry_mid > 0:
-                time_held = 0.0
-                if pos.opened_at:
-                    try:
-                        opened_dt = datetime.strptime(pos.opened_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-                        time_held = (utc_now() - opened_dt).total_seconds()
-                    except Exception:
-                        pass
-                mfe = (pos.max_favorable_mid - pos.entry_mid) * 10000.0 / max(pos.entry_mid, 1e-9)
-                mae = (pos.entry_mid - pos.max_adverse_mid) * 10000.0 / max(pos.entry_mid, 1e-9)
-                self.logger.log_event({
-                    "event_type": "ROUND_TRIP_CLOSE",
-                    "position_id": position_id,
-                    "slug": m.slug, "crypto": m.crypto, "outcome": outcome,
-                    "hour_start_utc": st.hour_start_utc,
-                    "gross_pnl_usdc": round(pnl, 4), "net_pnl_usdc": round(net_pnl, 4),
-                    "time_in_position_sec": round(time_held, 1),
-                    "max_favorable_bps": round(mfe, 3), "max_adverse_bps": round(mae, 3),
-                    "exit_reason": reason,
-                }, also_csv=True)
+        elif not filled and sell_result.get("order_id"):
+            # Order resting — will be reconciled by _om_reconcile_all
+            write_jsonl({"event_type": "SELL_ORDER_RESTING",
+                          "order_id": sell_result["order_id"],
+                          "slug": m.slug, "outcome": outcome,
+                          "reason": reason, "price": price, "qty": qty})
     def _place_layered_buy(self, m: MarketRef, outcome: str, qty: float, ask: float) -> dict:
-        """Place layered buy orders. Returns {total_filled, total_cost, avg_price}."""
+        """Place layered buy orders. Returns {total_filled, total_cost, avg_price}.
+        Unfilled orders are tracked in _om_open_orders for reconciliation."""
         token_id = m.outcome_up_id if outcome == "Up" else m.outcome_down_id
         result = {"total_filled": 0, "total_cost": 0.0, "avg_price": 0.0}
         if not LAYER_ORDERS:
@@ -6259,6 +6823,19 @@ class Bot:
                 result["total_filled"] = r["fill_qty"]
                 result["total_cost"] = r["fill_price"] * r["fill_qty"]
                 result["avg_price"] = r["fill_price"]
+            elif r.get("order_id") and MODE != "LOG":
+                # Track unfilled GTC order
+                oid = r["order_id"]
+                now_ms = int(time.time() * 1000)
+                self._om_open_orders[oid] = {
+                    "slug": m.slug, "outcome": outcome, "side": "BUY",
+                    "price": ask, "qty": int(float(qty)),
+                    "filled_qty": r.get("fill_qty", 0) or 0,
+                    "reason": "LAYERED_BUY", "maker": POST_ONLY_WHEN_POSSIBLE,
+                    "created_ms": now_ms, "last_check_ms": now_ms,
+                    "status": "open", "token_id": token_id,
+                    "st_slug": m.slug, "cancel_pending": False,
+                }
             return result
         # Split qty across layers around ask and slightly below
         per = qty / LAYER_COUNT
@@ -6268,6 +6845,18 @@ class Bot:
             if r.get("filled"):
                 result["total_filled"] += r["fill_qty"]
                 result["total_cost"] += r["fill_price"] * r["fill_qty"]
+            elif r.get("order_id") and MODE != "LOG":
+                oid = r["order_id"]
+                now_ms = int(time.time() * 1000)
+                self._om_open_orders[oid] = {
+                    "slug": m.slug, "outcome": outcome, "side": "BUY",
+                    "price": px, "qty": int(float(per)),
+                    "filled_qty": r.get("fill_qty", 0) or 0,
+                    "reason": "LAYERED_BUY", "maker": POST_ONLY_WHEN_POSSIBLE,
+                    "created_ms": now_ms, "last_check_ms": now_ms,
+                    "status": "open", "token_id": token_id,
+                    "st_slug": m.slug, "cancel_pending": False,
+                }
         if result["total_filled"] > 0:
             result["avg_price"] = result["total_cost"] / result["total_filled"]
         return result
