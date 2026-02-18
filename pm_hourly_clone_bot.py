@@ -118,15 +118,16 @@ SIZING_MULTIPLIERS = [
     (75,  10_000, 3.50),
 ]
 # Exit ladder (scale out)
-TP1 = 0.03; TP1_SELL_FRAC = 0.25
-TP2 = 0.05; TP2_SELL_FRAC = 0.25
-TP3 = 0.07; TP3_SELL_FRAC = 0.25
-CORE_KEEP_FRAC = 0.25
+TP1 = 0.04; TP1_SELL_FRAC = 0.30          # +4c (raised from +3c)
+TP2 = 0.06; TP2_SELL_FRAC = 0.30          # +6c (raised from +5c)
+TP3 = 0.08; TP3_SELL_FRAC = 0.40          # +8c (raised from +7c)
+CORE_KEEP_FRAC = 0.00                     # no remainder — full exit at TP3
 # De-risk on drift reversal (bps)
 DERISK_CROSS_BPS = 5.0
 DERISK_SELL_FRAC_PER_TICK = 0.35
 DERISK_COOLDOWN_SEC = 10.0      # min seconds between DERISK actions on same position
 DERISK_MID_CHANGE_CENTS = 0.01  # or mid must move >= 1c since last derisk
+MAX_DERISK_PER_HOUR = int(os.getenv("MAX_DERISK_PER_HOUR", "10"))  # cap derisks to prevent bleed
 # Maker-first DERISK — stop panic taker sells
 DERISK_MAKER_REFRESH_MS = 250          # cancel/replace maker every 250ms
 DERISK_TAKER_EMERGENCY_ONLY = True     # only taker derisk in emergency
@@ -150,13 +151,13 @@ VEL_OPPOSE_THRESHOLD = 2.0            # bps/min threshold for opposition
 NO_FLIP_COOLDOWN_SEC = 3.0            # don't reverse direction within 3s
 NO_FLIP_OVERRIDE_EXTRA_BPS = 20       # unless edge >= thr + 20
 # Late scalp engine
-LATE_SCALP_ENABLED = True
+LATE_SCALP_ENABLED = bool(os.getenv("PARITY_ENABLED", "False") not in ("", "0", "False", "false"))  # OFF unless parity on
 LATE_SCALP_T_START = 40.0
 LATE_SCALP_T_END   = 58.0
 LATE_SCALP_PRICE_MAX = 0.80
 LATE_SCALP_ABSDELTA_MIN = 5.0
 LATE_SCALP_ABSDELTA_MAX = 20.0
-LATE_SCALP_TP_CENTS = 0.03      # aim +3c
+LATE_SCALP_TP_CENTS = 0.04      # aim +4c (raised from +3c)
 LATE_SCALP_MAX_HOLD_MIN = 6.0   # aggressive F247 — flip fast
 # Risk caps
 MAX_COST_PER_MARKET_PCT = 0.015   # 1.5% bankroll per market-hour
@@ -175,7 +176,7 @@ MAX_CROSS_SLIPPAGE = 0.01         # cross at most 1c if absolutely needed
 LAYER_ORDERS = True
 LAYER_COUNT = 3
 LAYER_STEP = 0.01                 # 1c ladder
-MIN_ORDER_USDC = 0.25             # f247 does tiny prints
+MIN_ORDER_USDC = float(os.getenv("MIN_ORDER_USDC", "5.0"))  # raised from $0.25 — tiny clips amplify noise+churn
 MIN_QTY = _LOG_MIN_QTY  # from logger — below this, position is dust
 EDGE_K = 0.05    # sigmoid steepness: delta_bps -> P(Up)
 # -----------------------------------------------------------------------------
@@ -201,8 +202,9 @@ CAP_BOOST_EDGE_FULL = 30.0       # edge_bps at which full boost is applied
 # ---------------------------------------------------------------------------
 # Parity (straddle) arbitrage engine — Up + Down ≈ 1.000
 # ---------------------------------------------------------------------------
-PARITY_BUY_ENABLED = True                # buy cheap straddle (up_ask + dn_ask < 1)
-PARITY_SELL_ENABLED = True               # sell rich straddle (up_bid + dn_bid > 1)
+PARITY_ENABLED = bool(os.getenv("PARITY_ENABLED", "False") not in ("", "0", "False", "false"))  # OFF by default — dscalp only
+PARITY_BUY_ENABLED = PARITY_ENABLED      # buy cheap straddle (up_ask + dn_ask < 1)
+PARITY_SELL_ENABLED = PARITY_ENABLED     # sell rich straddle (up_bid + dn_bid > 1)
 PARITY_MAX_USD_PER_SLUG = 40.0          # max total straddle investment per slug
 PARITY_STEP_USD = 2.00                   # per-leg size per parity order
 PARITY_COOLDOWN_MS = 250                 # min time between parity orders per slug
@@ -234,7 +236,7 @@ PARITY_HARD_FLATTEN_MIN = 59.25         # force taker flatten (if time_to_close<
 # ---------------------------------------------------------------------------
 # Parity QUOTING mode — continuously post maker bids on BOTH legs
 # ---------------------------------------------------------------------------
-PARITY_QUOTE_ENABLED = True
+PARITY_QUOTE_ENABLED = PARITY_ENABLED    # OFF unless PARITY_ENABLED=true
 PARITY_QUOTE_TARGET_EDGE_NET_CENTS_BASE = 1.0  # min edge target (aggressive — pay up)
 PARITY_QUOTE_TARGET_EDGE_NET_CENTS_MAX  = 2.0  # max edge target (selective)
 PARITY_QUOTE_STEP_USD = 2.0              # per-leg bid size (equal USD both legs)
@@ -273,7 +275,7 @@ IMBALANCE_SOFT_CAP_SHARES = 20         # soft cap: start reducing new orders abo
 # ---------------------------------------------------------------------------
 # Derisk RESCUE-TO-STRADDLE — convert losing one-sided to straddle
 # ---------------------------------------------------------------------------
-DERISK_RESCUE_TO_STRADDLE = True
+DERISK_RESCUE_TO_STRADDLE = PARITY_ENABLED  # rescue adds parity-like exposure — off when parity off
 RESCUE_MIN_EDGE_NET_CENTS = 0.5         # min net edge for straddle completion to be worth it
 RESCUE_MAX_USD_PER_SLUG = 20.0          # max USD to spend completing straddle per slug
 RESCUE_STEP_USD = 2.0                    # per-order size for rescue buys
@@ -286,9 +288,9 @@ LEAN_MAX_IMBALANCE_SHARES = 30           # cap how unbalanced Up vs Down can get
 # Spread rule relaxation
 SPREAD_RELAXED_MAX = 0.12         # 12 cents during burst (F247 tolerant)
 # Fast take-profit — skim faster than before
-FAST_TP_AFTER_SEC = 25.0
-FAST_TP_CENTS = 0.02
-FAST_TP_SELL_PCT = 0.30           # sell 30%
+FAST_TP_AFTER_SEC = 60.0              # raised: don't skim early (was 25s)
+FAST_TP_CENTS = 0.04                  # raised: +4c min (was +2c)
+FAST_TP_SELL_PCT = 0.20              # reduced: sell 20% (was 30%)
 # Inventory pressure controls
 INVENTORY_CAP_SHARES_PER_MARKET = 250
 # Correlation exposure scaling (reduces correlated stacking)
@@ -330,37 +332,52 @@ if FAST_CLONE:
 # RATE LIMITING / CHURN CONTROL — hard caps per slug (F247 cadence)
 # ---------------------------------------------------------------------------
 RATE_LIMIT_ENABLED = bool(os.getenv("RATE_LIMIT_ENABLED", "True") not in ("", "0", "False", "false"))
-MIN_ORDER_INTERVAL_MS = float(os.getenv("MIN_ORDER_INTERVAL_MS", "400"))       # min ms between ANY orders on same slug
-MAX_ORDER_SUBMITS_PER_MIN = int(os.getenv("MAX_ORDER_SUBMITS_PER_MIN", "120")) # hard cap submits/min per slug
+MIN_ORDER_INTERVAL_MS = float(os.getenv("MIN_ORDER_INTERVAL_MS", "500"))       # min ms between ANY orders on same slug (raised from 400)
+MAX_ORDER_SUBMITS_PER_MIN = int(os.getenv("MAX_ORDER_SUBMITS_PER_MIN", "120")) # hard cap submits/min globally
+MAX_SUBMITS_PER_MIN_PER_SLUG = int(os.getenv("MAX_SUBMITS_PER_MIN_PER_SLUG", "120"))  # per-slug cap
 QUOTE_REFRESH_SKIP_IF_SAME = True                                               # skip refresh if price unchanged
 QUOTE_REFRESH_MIN_TICK_MOVE = 0.001                                              # require >= 1 tick move to refresh
 QUOTE_REFRESH_MIN_ELAPSED_MS = float(os.getenv("QUOTE_REFRESH_MIN_ELAPSED_MS", "500"))  # min ms between refreshes
+# Reprice guard: only reprice when justified (outbid OR price moved >= 1 tick OR TTL expired)
+REPRICE_MIN_PRICE_MOVE = float(os.getenv("REPRICE_MIN_PRICE_MOVE", "0.001"))     # 1 tick minimum to trigger reprice
+REPRICE_REQUIRE_OUTBID = bool(os.getenv("REPRICE_REQUIRE_OUTBID", "True") not in ("", "0", "False", "false"))
 # ---------------------------------------------------------------------------
 # DIRECTIONAL SCALP MODE — PRIMARY engine (F247-style, priority #1)
 # Strategy stack: 1) Directional Scalp  2) Inventory Repair  3) Parity (throttled)
 # ---------------------------------------------------------------------------
 DIRECTIONAL_SCALP_ENABLED = bool(os.getenv("DIRECTIONAL_SCALP_ENABLED", "True") not in ("", "0", "False", "false"))
-# Entry gates (explicit — must meet delta OR spot_move condition)
+# Entry gates (explicit — must meet delta OR spot_move condition + edge_cents)
 DSCALP_DELTA_MIN_BPS = float(os.getenv("DSCALP_DELTA_MIN_BPS", "15.0"))        # min abs_delta_bps for entry (raised for conviction)
 DSCALP_SPOT_MOVE_10S_BPS = float(os.getenv("DSCALP_SPOT_MOVE_10S_BPS", "8.0"))  # OR: spot moved >= 8bps in last 10s
 DSCALP_VEL_MIN_BPS_PER_MIN = float(os.getenv("DSCALP_VEL_MIN_BPS_PER_MIN", "1.0"))  # min velocity (supportive, not hard gate)
 DSCALP_MAX_SPREAD_CENTS = float(os.getenv("DSCALP_MAX_SPREAD_CENTS", "2.0"))   # max spread for entry
 DSCALP_MAX_CACHE_AGE_MS = float(os.getenv("DSCALP_MAX_CACHE_AGE_MS", "250"))   # max cache age for entry
+# Edge filter: require meaningful gap between expected exit and entry
+DSCALP_MIN_EDGE_CENTS = float(os.getenv("DSCALP_MIN_EDGE_CENTS", "4.0"))       # min edge (delta_bps * price / 100) for entry
+DSCALP_MIN_EDGE_CENTS_SOL = float(os.getenv("DSCALP_MIN_EDGE_CENTS_SOL", "5.0"))   # SOL: more volatile, need wider edge
+DSCALP_MIN_EDGE_CENTS_XRP = float(os.getenv("DSCALP_MIN_EDGE_CENTS_XRP", "5.0"))   # XRP: same
+DSCALP_MIN_EDGE_CENTS_BTC = float(os.getenv("DSCALP_MIN_EDGE_CENTS_BTC", "4.0"))   # BTC: tighter spreads
+# No-trade zone: block entry if data feeds disagree or are stale
+DSCALP_FEED_DISAGREE_BPS = float(os.getenv("DSCALP_FEED_DISAGREE_BPS", "30.0"))    # block if Binance vs Chainlink > 30bps apart
+DSCALP_FEED_STALE_SEC = float(os.getenv("DSCALP_FEED_STALE_SEC", "5.0"))           # block if any feed > 5s stale
 # Sizing — one entry = one meaningful position, no micro-splits
 DSCALP_STEP_USD = float(os.getenv("DSCALP_STEP_USD", "8.0"))                   # per-order size (target avg $7-8)
 DSCALP_STEP_USD_MIN = float(os.getenv("DSCALP_STEP_USD_MIN", "6.0"))           # minimum entry size (no $1 clips)
 DSCALP_MAX_USD_PER_SLUG = float(os.getenv("DSCALP_MAX_USD_PER_SLUG", "30.0"))  # max directional per slug
 DSCALP_COOLDOWN_MS = float(os.getenv("DSCALP_COOLDOWN_MS", "4000"))            # 4s between entries (target ~15 trades/min)
 # Exit ladder
-DSCALP_TP1_CENTS = float(os.getenv("DSCALP_TP1_CENTS", "3.0"))                 # +3c: sell 25%
-DSCALP_TP1_FRAC = float(os.getenv("DSCALP_TP1_FRAC", "0.25"))
-DSCALP_TP2_CENTS = float(os.getenv("DSCALP_TP2_CENTS", "6.0"))                 # +6c: sell 25%
-DSCALP_TP2_FRAC = float(os.getenv("DSCALP_TP2_FRAC", "0.25"))
-DSCALP_TP3_CENTS = float(os.getenv("DSCALP_TP3_CENTS", "9.0"))                 # +9c: sell 25%, remainder for timeout/trailing
-DSCALP_TP3_FRAC = float(os.getenv("DSCALP_TP3_FRAC", "0.25"))
+DSCALP_TP1_CENTS = float(os.getenv("DSCALP_TP1_CENTS", "4.0"))                 # +4c: sell 30% (raised from +3c)
+DSCALP_TP1_FRAC = float(os.getenv("DSCALP_TP1_FRAC", "0.30"))
+DSCALP_TP2_CENTS = float(os.getenv("DSCALP_TP2_CENTS", "6.0"))                 # +6c: sell 30%
+DSCALP_TP2_FRAC = float(os.getenv("DSCALP_TP2_FRAC", "0.30"))
+DSCALP_TP3_CENTS = float(os.getenv("DSCALP_TP3_CENTS", "8.0"))                 # +8c: sell 40% (remainder)
+DSCALP_TP3_FRAC = float(os.getenv("DSCALP_TP3_FRAC", "0.40"))
 DSCALP_MIN_HOLD_SEC = float(os.getenv("DSCALP_MIN_HOLD_SEC", "120"))           # 120s min hold — allow real directional exposure
 DSCALP_MAX_HOLD_SEC = float(os.getenv("DSCALP_MAX_HOLD_SEC", "600"))           # 10 min max hold
 DSCALP_STOP_LOSS_CENTS = float(os.getenv("DSCALP_STOP_LOSS_CENTS", "5.0"))     # -5c stop loss (emergency only)
+# Breakeven exit: after MAX_HOLD_SEC/2 (300s), try maker exit at entry+1c before timeout
+DSCALP_BREAKEVEN_AFTER_SEC = float(os.getenv("DSCALP_BREAKEVEN_AFTER_SEC", "300"))  # try breakeven after 5 min
+DSCALP_BREAKEVEN_CENTS = float(os.getenv("DSCALP_BREAKEVEN_CENTS", "1.0"))     # exit at entry + 1c
 # ---------------------------------------------------------------------------
 # PARITY SUPPRESSION — parity is #3 priority, hard-capped
 # ---------------------------------------------------------------------------
@@ -1256,6 +1273,8 @@ class Bot:
         self._diag_taker_count = 0
         self._diag_maker_count = 0
         self._diag_derisk_count = 0
+        self._diag_derisk_count_hour = 0     # per-hour cap for MAX_DERISK_PER_HOUR
+        self._diag_derisk_reasons: Dict[str, int] = {}  # reason -> count (for PnL attribution)
         self._diag_derisk_taker_count = 0
         self._diag_blocked_whipsaw = 0
         self._diag_blocked_taker_gate = 0
@@ -1417,6 +1436,9 @@ class Bot:
         self._diag_dscalp_stop_exits = 0
         self._diag_dscalp_hold_times: List[float] = []    # seconds
         self._diag_dscalp_exit_cents: List[float] = []     # profit/loss in cents
+        self._diag_dscalp_breakeven_exits = 0               # breakeven exits count
+        # Per-reason PnL attribution: reason -> [(pnl_cents, hold_sec, usdc_size)]
+        self._diag_exit_by_reason: Dict[str, List[Tuple[float, float, float]]] = {}
         # Parity fill tracking (for parity_fill_pct)
         self._diag_parity_fills_min = 0                      # parity fills this minute
         self._diag_directional_fills_min = 0                 # directional fills this minute
@@ -2003,6 +2025,11 @@ class Bot:
         slug = entry["slug"]
         outcome = entry["outcome"]
         side = entry["side"]
+
+        # Reprice guard: only reprice when justified
+        price_move = abs(new_price - old_price)
+        if REPRICE_REQUIRE_OUTBID and price_move < REPRICE_MIN_PRICE_MOVE:
+            return None  # price hasn't moved enough — skip
 
         # Safety Item 3: Replace interval throttle
         if not self._om_replace_interval_ok(slug, outcome, side):
@@ -2998,6 +3025,7 @@ class Bot:
                 if now - self._tempo_last_report_ts >= 60.0:
                     self._emit_clone_report()   # must run BEFORE tempo_report resets counters
                     self._emit_diag_report()    # F247-style behavioral diagnostics
+                    self._emit_pnl_attribution()  # per-hour PnL attribution + expectancy
                     self._emit_tempo_report()
                     self._tempo_last_report_ts = now
             except Exception as e:
@@ -3279,6 +3307,8 @@ class Bot:
         self._diag_taker_count = 0
         self._diag_maker_count = 0
         self._diag_derisk_count = 0
+        self._diag_derisk_count_hour = 0     # reset per-hour derisk cap
+        self._diag_derisk_reasons.clear()    # reset per-hour derisk reason distribution
         self._diag_derisk_taker_count = 0
         self._diag_blocked_whipsaw = 0
         self._diag_blocked_taker_gate = 0
@@ -3689,7 +3719,7 @@ class Bot:
         tpm_ok = "OK" if 10 <= trades_per_min <= 20 else "!!"
         size_ok = "OK" if avg_trade_size >= 7.0 else "!!"
         hold_ok = "OK" if med_hold >= 120 else ("--" if med_hold == 0 else "!!")
-        exit_ok = "OK" if med_exit >= 3.0 else ("--" if med_exit == 0 else "!!")
+        exit_ok = "OK" if med_exit >= 5.0 else ("--" if med_exit == 0 else "!!")
         par_ok = "OK" if parity_fill_pct <= 0.30 else "!!"
 
         print(f"  DIAG [{tpm_ok}] trades/min={trades_per_min:.1f}  "
@@ -3730,8 +3760,89 @@ class Bot:
         self._diag_dscalp_tp3 = 0
         self._diag_dscalp_timeout_exits = 0
         self._diag_dscalp_stop_exits = 0
+        self._diag_dscalp_breakeven_exits = 0
         self._diag_dscalp_hold_times.clear()
         self._diag_dscalp_exit_cents.clear()
+
+    def _emit_pnl_attribution(self):
+        """Per-hour PnL attribution + expectancy diagnostics.
+        Emits: gross_exit_cents, avg_entry, avg_exit, median_exit_cents,
+        winrate, median_hold, derisk_count, orphan_cancel_count, PnL by reason."""
+        import statistics as _stats
+        now_t = time.time()
+
+        all_exit_cents = self._diag_dscalp_exit_cents
+        all_hold_times = self._diag_dscalp_hold_times
+        n_exits = len(all_exit_cents)
+
+        if n_exits == 0:
+            write_jsonl({"event_type": "PNL_ATTRIBUTION", "ts_ms": int(now_t * 1000),
+                          "n_exits": 0, "status": "no_exits"})
+            return
+
+        gross_exit_cents = sum(all_exit_cents)
+        avg_exit_cents = _stats.mean(all_exit_cents)
+        med_exit_cents = _stats.median(all_exit_cents)
+        winners = [c for c in all_exit_cents if c > 0]
+        losers = [c for c in all_exit_cents if c <= 0]
+        winrate = len(winners) / n_exits if n_exits else 0.0
+        avg_win = _stats.mean(winners) if winners else 0.0
+        avg_loss = _stats.mean(losers) if losers else 0.0
+        med_hold = _stats.median(all_hold_times) if all_hold_times else 0.0
+        expectancy = avg_exit_cents  # per-trade expected value in cents
+
+        # PnL by reason
+        pnl_by_reason = {}
+        for reason, entries in self._diag_exit_by_reason.items():
+            pnl_list = [e[0] for e in entries]
+            n = len(pnl_list)
+            pnl_by_reason[reason] = {
+                "count": n,
+                "total_cents": round(sum(pnl_list), 2),
+                "avg_cents": round(_stats.mean(pnl_list), 2) if pnl_list else 0.0,
+                "median_cents": round(_stats.median(pnl_list), 2) if pnl_list else 0.0,
+            }
+
+        report = {
+            "event_type": "PNL_ATTRIBUTION",
+            "ts_ms": int(now_t * 1000),
+            "n_exits": n_exits,
+            "gross_exit_cents": round(gross_exit_cents, 2),
+            "avg_exit_cents": round(avg_exit_cents, 2),
+            "median_exit_cents": round(med_exit_cents, 2),
+            "winrate": round(winrate, 3),
+            "avg_win_cents": round(avg_win, 2),
+            "avg_loss_cents": round(avg_loss, 2),
+            "expectancy_cents": round(expectancy, 2),
+            "median_hold_sec": round(med_hold, 1),
+            "derisk_count_hour": self._diag_derisk_count_hour,
+            "derisk_reasons": dict(self._diag_derisk_reasons),
+            "orphan_cancel_count": self._om_orphan_canceled_count,
+            "tp1_count": self._diag_dscalp_tp1,
+            "tp2_count": self._diag_dscalp_tp2,
+            "tp3_count": self._diag_dscalp_tp3,
+            "breakeven_count": self._diag_dscalp_breakeven_exits,
+            "timeout_count": self._diag_dscalp_timeout_exits,
+            "stop_count": self._diag_dscalp_stop_exits,
+            "pnl_by_reason": pnl_by_reason,
+        }
+        write_jsonl(report)
+
+        # Console summary
+        print(f"  PNL: {n_exits} exits  gross={gross_exit_cents:+.1f}c  "
+              f"med={med_exit_cents:+.1f}c  win={winrate:.0%}  "
+              f"exp={expectancy:+.2f}c/trade  hold={med_hold:.0f}s")
+        print(f"  EXIT: tp1={self._diag_dscalp_tp1} tp2={self._diag_dscalp_tp2} "
+              f"tp3={self._diag_dscalp_tp3} be={self._diag_dscalp_breakeven_exits} "
+              f"timeout={self._diag_dscalp_timeout_exits} stop={self._diag_dscalp_stop_exits} "
+              f"derisk={self._diag_derisk_count_hour}")
+        if pnl_by_reason:
+            parts = [f"{r}={d['total_cents']:+.1f}c({d['count']})"
+                     for r, d in sorted(pnl_by_reason.items(), key=lambda x: -abs(x[1]['total_cents']))]
+            print(f"  BY_REASON: {' '.join(parts)}")
+
+        # Reset per-hour exit attribution
+        self._diag_exit_by_reason.clear()
 
     def _print_balance_summary(self):
         """Print balance and open positions to console."""
@@ -4066,13 +4177,19 @@ class Bot:
             self._dscalp_manage_exits(m, st, ctx)
         self._directional_lean_exits(m, st, t_min, delta_bps, ctx)
 
-        # ── PARITY: priority #3 — hard-gated by directional state ──
-        parity_blocked = self._should_block_parity(m, st)
-        if parity_blocked:
-            # Only run parity for pending pairs + recycle + flatten — NO new quotes
-            self._parity_arb(ctx, new_quotes_blocked=True)
+        # ── PARITY: priority #3 — OFF by default, only runs if PARITY_ENABLED=true ──
+        if PARITY_ENABLED:
+            parity_blocked = self._should_block_parity(m, st)
+            if parity_blocked:
+                # Only run parity for pending pairs + recycle + flatten — NO new quotes
+                self._parity_arb(ctx, new_quotes_blocked=True)
+            else:
+                self._parity_arb(ctx)
         else:
-            self._parity_arb(ctx)
+            # Even with parity off, still flatten any existing parity inventory
+            if any(st.positions[o].qty >= MIN_QTY for o in ["Up", "Down"]):
+                if t_min >= PARITY_FLATTEN_START_MIN:
+                    self._parity_arb(ctx, new_quotes_blocked=True)
 
         # stop adding risk after minute 57
         if t_min > TRADE_STOP_ADD_MIN:
@@ -4088,8 +4205,8 @@ class Bot:
         # ── PRIMARY: Directional scalp entries (priority #1) ──
         if DIRECTIONAL_SCALP_ENABLED:
             self._dscalp_entries(ctx)
-        # Core engine: drift-direction entries (secondary, only if directional didn't fire)
-        if m.slug not in self._dscalp_positions:
+        # Core engine: drift-direction entries (secondary — only if parity enabled)
+        if PARITY_ENABLED and m.slug not in self._dscalp_positions:
             self._core_entries(ctx)
         # Late scalp engine
         if LATE_SCALP_ENABLED and m.slug not in self._dscalp_positions:
@@ -4267,6 +4384,29 @@ class Bot:
             return 0.0
         return abs(last_spot - first_spot) / first_spot * 10000.0
 
+    def _feed_disagreement_bps(self, slug: str) -> float:
+        """Disagreement between Binance and Chainlink feeds in bps.
+        Returns 0 if feeds not available (allows trading)."""
+        cached = self._data_cache.get(slug)
+        if not cached:
+            return 0.0
+        binance_spot = cached.get("binance_spot") or cached.get("spot", 0.0)
+        chainlink_spot = cached.get("chainlink_spot", 0.0)
+        if binance_spot <= 0 or chainlink_spot <= 0:
+            return 0.0  # missing feed — don't block
+        return abs(binance_spot - chainlink_spot) / binance_spot * 10000.0
+
+    def _max_feed_age_sec(self, slug: str) -> float:
+        """Max age of any data feed for this slug, in seconds.
+        Returns 0 if no staleness info available (allows trading)."""
+        cached = self._data_cache.get(slug)
+        if not cached:
+            return 0.0
+        feed_ts = cached.get("feed_ts") or cached.get("last_update_ts", 0.0)
+        if feed_ts <= 0:
+            return 0.0
+        return max(0.0, time.time() - feed_ts)
+
     # =================================================================
     # RATE LIMITER — hard per-slug throttling
     # =================================================================
@@ -4360,7 +4500,38 @@ class Bot:
             return
 
         # Spread gate
-        if book.spread * 100 > DSCALP_MAX_SPREAD_CENTS:
+        spread_cents = book.spread * 100
+        if spread_cents > DSCALP_MAX_SPREAD_CENTS:
+            return
+
+        # Edge filter: require minimum directional edge (cents) for this coin
+        # edge = abs_delta_bps * mid_price / 100  (convert bps of price to cents of token)
+        # More practically: half-spread + expected move must justify TP target
+        crypto_lower = (m.crypto or "").lower()
+        if "sol" in crypto_lower:
+            min_edge = DSCALP_MIN_EDGE_CENTS_SOL
+        elif "xrp" in crypto_lower:
+            min_edge = DSCALP_MIN_EDGE_CENTS_XRP
+        elif "btc" in crypto_lower:
+            min_edge = DSCALP_MIN_EDGE_CENTS_BTC
+        else:
+            min_edge = DSCALP_MIN_EDGE_CENTS
+        # Edge estimate: directional signal strength in token cents
+        # For tokens priced 0.30-0.70, 1 bps of price ≈ 0.005c, so 15 bps ≈ 0.75c
+        # We use a more direct measure: abs_delta_bps as the signal strength
+        # and also factor in the book: if bid is well below mid, more edge
+        half_spread_cents = spread_cents / 2.0
+        signal_edge_cents = abs_delta_bps * book.mid / 100.0  # convert bps to cents
+        effective_edge_cents = signal_edge_cents - half_spread_cents  # net of half-spread cost
+        if effective_edge_cents < min_edge:
+            return
+
+        # No-trade zone: block if data feeds disagree or are stale
+        _feed_delta = self._feed_disagreement_bps(m.slug) if hasattr(self, '_feed_disagreement_bps') else 0.0
+        if _feed_delta > DSCALP_FEED_DISAGREE_BPS:
+            return
+        _feed_age = self._max_feed_age_sec(m.slug) if hasattr(self, '_max_feed_age_sec') else 0.0
+        if _feed_age > DSCALP_FEED_STALE_SEC:
             return
 
         # ── ENTRY SIGNAL: delta >= 15bps OR spot moved >= 8bps in 10s ──
@@ -4418,7 +4589,9 @@ class Bot:
                       "delta_bps": round(delta_bps, 1),
                       "vel": round(vel, 2),
                       "cache_age_ms": round(cache_age, 0),
-                      "spread_cents": round(book.spread * 100, 2)})
+                      "spread_cents": round(spread_cents, 2),
+                      "edge_cents": round(effective_edge_cents, 2),
+                      "min_edge_cents": min_edge})
 
         # Execute buy (unified: paper in LOG, live order manager in LIVE)
         buy_result = self._exec_buy(st, m, outcome, buy_price, order_qty,
@@ -4481,6 +4654,10 @@ class Bot:
                                 delta_bps, abs_delta_bps),
         )
 
+    def _record_exit_reason(self, reason: str, pnl_cents: float, hold_sec: float, usdc_size: float = 0.0):
+        """Record an exit for per-hour PnL attribution."""
+        self._diag_exit_by_reason.setdefault(reason, []).append((pnl_cents, hold_sec, usdc_size))
+
     def _dscalp_manage_exits(self, m: MarketRef, st: MarketState, ctx: dict):
         """Manage directional scalp exits: TP ladder + timeout + stop loss.
         ENFORCES 120s minimum hold unless emergency (stop loss).
@@ -4522,6 +4699,7 @@ class Bot:
             self._throttle_record_trade()
             self._dscalp_positions.pop(m.slug, None)
             self._dscalp_invested_usd.pop(m.slug, None)
+            self._record_exit_reason("stop_loss", pnl_cents, hold_sec, sell_qty * sell_price)
             write_jsonl({"event_type": "DSCALP_STOP", "ts_ms": int(now_t * 1000),
                           "slug": m.slug, "outcome": outcome,
                           "pnl_cents": round(pnl_cents, 2), "hold_sec": round(hold_sec, 1)})
@@ -4530,6 +4708,35 @@ class Bot:
         # ── MINIMUM HOLD FLOOR: 120s unless emergency (stop loss above) ──
         if hold_sec < DSCALP_MIN_HOLD_SEC:
             return  # allow real directional exposure — no early exit
+
+        # ── Breakeven exit: after 300s if not green, try maker at entry+1c ──
+        if (hold_sec >= DSCALP_BREAKEVEN_AFTER_SEC
+                and pnl_cents < DSCALP_TP1_CENTS
+                and pnl_cents > -DSCALP_STOP_LOSS_CENTS
+                and not dpos.get("breakeven_attempted")):
+            be_price = entry_price + DSCALP_BREAKEVEN_CENTS / 100.0
+            if book.bid >= be_price:
+                # Can exit at breakeven+1c — do it
+                sell_qty = pos.qty
+                self._do_sell(m, st, outcome, sell_qty, be_price,
+                              reason="DSCALP_BREAKEVEN", leg="DSCALP", ctx=ctx, use_maker=True)
+                self._diag_dscalp_exits += 1
+                self._diag_dscalp_hold_times.append(hold_sec)
+                self._diag_dscalp_exit_cents.append(pnl_cents)
+                self._diag_directional_fills_min += 1
+                self._diag_total_fills_min += 1
+                self._throttle_record_trade()
+                self._dscalp_positions.pop(m.slug, None)
+                self._dscalp_invested_usd.pop(m.slug, None)
+                self._diag_dscalp_breakeven_exits += 1
+                self._record_exit_reason("breakeven", pnl_cents, hold_sec, sell_qty * be_price)
+                write_jsonl({"event_type": "DSCALP_BREAKEVEN", "ts_ms": int(now_t * 1000),
+                              "slug": m.slug, "outcome": outcome,
+                              "pnl_cents": round(pnl_cents, 2), "hold_sec": round(hold_sec, 1),
+                              "be_price": round(be_price, 4)})
+                return
+            # Mark attempted so we don't keep trying every tick
+            dpos["breakeven_attempted"] = True
 
         # ── Timeout exit ──
         if hold_sec >= DSCALP_MAX_HOLD_SEC:
@@ -4547,6 +4754,7 @@ class Bot:
             self._throttle_record_trade()
             self._dscalp_positions.pop(m.slug, None)
             self._dscalp_invested_usd.pop(m.slug, None)
+            self._record_exit_reason("timeout", pnl_cents, hold_sec, sell_qty * sell_price)
             write_jsonl({"event_type": "DSCALP_TIMEOUT", "ts_ms": int(now_t * 1000),
                           "slug": m.slug, "outcome": outcome,
                           "pnl_cents": round(pnl_cents, 2), "hold_sec": round(hold_sec, 1)})
@@ -4565,13 +4773,14 @@ class Bot:
                 self._diag_total_fills_min += 1
                 self._throttle_record_trade()
                 self._diag_trade_sizes.append(sell_qty * sell_price)
+                self._record_exit_reason("scalp_tp1", pnl_cents, hold_sec, sell_qty * sell_price)
                 write_jsonl({"event_type": "DSCALP_TP1", "ts_ms": int(now_t * 1000),
                               "slug": m.slug, "outcome": outcome,
                               "pnl_cents": round(pnl_cents, 2), "sell_qty": round(sell_qty, 1),
                               "hold_sec": round(hold_sec, 1)})
             dpos["tp1_done"] = True
 
-        # ── TP2: +6c, sell 25% ──
+        # ── TP2: +6c, sell 30% ──
         if pnl_cents >= DSCALP_TP2_CENTS and not dpos["tp2_done"]:
             sell_qty = min(pos.qty * DSCALP_TP2_FRAC, pos.qty)
             if sell_qty >= MIN_QTY:
@@ -4584,13 +4793,14 @@ class Bot:
                 self._diag_total_fills_min += 1
                 self._throttle_record_trade()
                 self._diag_trade_sizes.append(sell_qty * sell_price)
+                self._record_exit_reason("scalp_tp2", pnl_cents, hold_sec, sell_qty * sell_price)
                 write_jsonl({"event_type": "DSCALP_TP2", "ts_ms": int(now_t * 1000),
                               "slug": m.slug, "outcome": outcome,
                               "pnl_cents": round(pnl_cents, 2), "sell_qty": round(sell_qty, 1),
                               "hold_sec": round(hold_sec, 1)})
             dpos["tp2_done"] = True
 
-        # ── TP3: +9c, sell 25% — remainder rides to timeout or trailing stop ──
+        # ── TP3: +8c, sell 40% — full exit ──
         if pnl_cents >= DSCALP_TP3_CENTS and not dpos.get("tp3_done"):
             sell_qty = min(pos.qty * DSCALP_TP3_FRAC, pos.qty)
             if sell_qty >= MIN_QTY:
@@ -4603,6 +4813,7 @@ class Bot:
                 self._diag_total_fills_min += 1
                 self._throttle_record_trade()
                 self._diag_trade_sizes.append(sell_qty * sell_price)
+                self._record_exit_reason("scalp_tp3", pnl_cents, hold_sec, sell_qty * sell_price)
                 write_jsonl({"event_type": "DSCALP_TP3", "ts_ms": int(now_t * 1000),
                               "slug": m.slug, "outcome": outcome,
                               "pnl_cents": round(pnl_cents, 2), "sell_qty": round(sell_qty, 1),
@@ -6887,8 +7098,18 @@ class Bot:
                         if elapsed >= DERISK_COOLDOWN_SEC or mid_moved:
                             should_derisk = True
                     if should_derisk:
+                        # MAX_DERISK_PER_HOUR cap — prevent bleed from excessive derisking
+                        if self._diag_derisk_count_hour >= MAX_DERISK_PER_HOUR:
+                            write_jsonl({"event_type": "DERISK_HOUR_CAP_HIT",
+                                          "slug": m.slug, "outcome": outcome,
+                                          "derisk_count_hour": self._diag_derisk_count_hour,
+                                          "cap": MAX_DERISK_PER_HOUR})
+                            pos.last_derisk_ts = iso_z(now_t)
+                            pos.last_derisk_mid = book.mid
+                            continue  # skip this derisk entirely
                         self._diag_derisk_count += 1
                         self._diag_derisk_count_min += 1
+                        self._diag_derisk_count_hour += 1
                         thr = entry_threshold_bps(m.crypto, t_min)
                         abs_edge = abs(ctx.get("delta_bps", 0))
                         seconds_to_close = ctx.get("seconds_to_close", 999.0)
@@ -7070,6 +7291,10 @@ class Bot:
                             "dn_qty": round(st.positions["Down"].qty, 1),
                         })
 
+                        # Track derisk reason distribution
+                        _dreason = derisk_decision if derisk_decision else "rescue_success"
+                        self._diag_derisk_reasons[_dreason] = self._diag_derisk_reasons.get(_dreason, 0) + 1
+
                         if not rescue_done and derisk_decision != "defer_to_hedge":
                             # Check for emergency taker conditions
                             emergency_taker = emergency
@@ -7089,6 +7314,8 @@ class Bot:
                                 self._diag_rescue_fallback_sells += 1
                                 self._do_sell(m, st, outcome, sell_qty, book.bid,
                                               reason="DERISK_EMERGENCY", leg="DERISK", ctx=ctx)
+                                _pnl_est = (book.bid - pos.vwap) * 100 if pos.vwap > 0 else 0.0
+                                self._record_exit_reason("derisk_emergency", _pnl_est, 0.0, sell_qty * book.bid)
                             else:
                                 self._diag_maker_count += 1
                                 self._diag_rescue_fallback_sells += 1
@@ -7096,6 +7323,8 @@ class Bot:
                                 self._do_sell(m, st, outcome, sell_qty, maker_price,
                                               reason="DERISK_MAKER", leg="DERISK", ctx=ctx,
                                               use_maker=True)
+                                _pnl_est = (maker_price - pos.vwap) * 100 if pos.vwap > 0 else 0.0
+                                self._record_exit_reason("derisk_maker", _pnl_est, 0.0, sell_qty * maker_price)
                         elif not rescue_done and derisk_decision == "defer_to_hedge":
                             # Trigger hedge state machine for opposite leg instead of selling
                             if m.slug not in self._quote_unpaired:
