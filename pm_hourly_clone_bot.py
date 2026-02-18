@@ -67,6 +67,12 @@ from src.gating.report import GateReporter
 from src.trading.order_manager import OrderManager
 from src.trading.portfolio import compute_equity, clean_dust
 from src.trading.risk import market_cost_usdc, crypto_cost_usdc
+from src.execution.order_tracker import LiveOrderTracker
+from src.execution.orphan_scanner import OrphanScanner
+from src.execution.safety_caps import SafetyCaps
+from src.execution.unpaired_resolver import UnpairedResolver
+from src.execution.live_sanity_report import LiveSanityReporter
+from src.execution.state_drift_checker import StateDriftChecker
 from src.feeds.polymarket import PolymarketClient, set_jsonl_writer
 from src.bot.app import BotApp
 
@@ -313,6 +319,17 @@ class Bot:
         # Probe → Scale state machine: slug -> {state, probe_ts, probe_ask, initial_edge_bps}
         self.entry_sm: Dict[str, dict] = {}   # IDLE / PROBING / SCALING / COOLDOWN
         self.hour_index_counters: Dict[str, int] = {c: 0 for c in CRYPTOS}  # crypto -> monotonic index
+        # ── LIVE execution safety modules (no-ops in LOG mode) ──
+        self._exec_tracker = LiveOrderTracker(self.client.cancel_order, write_jsonl)
+        self._exec_orphan = OrphanScanner(
+            self.client.get_open_orders, self.client.cancel_order, write_jsonl)
+        self._exec_safety = SafetyCaps(write_jsonl)
+        self._exec_unpaired = UnpairedResolver(write_jsonl)
+        self._exec_reporter = LiveSanityReporter(write_jsonl)
+        self._exec_drift = StateDriftChecker(
+            self.client.get_open_orders, self.client.get_balances, write_jsonl)
+        # ── LIVE_SAFE mode: monotonic process start for entry window ──
+        self._process_start_mono = time.monotonic()
         # Background data refresh infrastructure (sub-second loop)
         # Dynamic pool: max(BG_POOL_MIN_WORKERS, 3 * markets_count)
         dynamic_workers = max(BG_POOL_MIN_WORKERS, BG_POOL_WORKERS)
@@ -865,6 +882,15 @@ class Bot:
         except Exception as e:
             self.logger.log_event({"event_type": "INIT_BOOTSTRAP_ERROR", "err": str(e)})
 
+        # ── LIVE startup safety: cancel all stale CLOB orders ──
+        if MODE in ("LIVE", "LIVE_SAFE"):
+            self._exec_orphan.startup_cleanup()
+
+        if MODE == "LIVE_SAFE":
+            print(f"\n  [LIVE_SAFE] Entry window: {LIVE_SAFE_ENTRY_WINDOW_SEC:.0f}s  |  "
+                  f"Max order: ${LIVE_SAFE_MAX_ORDER_USD:.2f}  |  "
+                  f"Buys disabled after window; sells always allowed\n")
+
         # ══════════════════════════════════════════════════════════════════
         # NON-BLOCKING MAIN LOOP — reads from cache, never blocks on HTTP
         # Background pool continuously refreshes _data_cache
@@ -944,6 +970,21 @@ class Bot:
                     if age < float('inf'):
                         self._tempo_cache_ages.setdefault(m.slug, []).append(age)
 
+                # 4c. LIVE execution safety ticks (no-op in LOG)
+                if MODE in ("LIVE", "LIVE_SAFE"):
+                    self._exec_tracker.tick()
+                    self._exec_orphan.tick(self._exec_tracker.get_tracked_order_ids())
+                    self._exec_safety.update_orphan_count(
+                        self._exec_orphan.orphan_cancels_this_min)
+                    self._exec_safety.tick()
+                    # State drift check (every 60s)
+                    self._exec_drift.tick(
+                        self._exec_tracker.get_tracked_order_ids(),
+                        self._get_internal_positions(),
+                        self._get_token_to_slug_outcome())
+                    self._exec_safety.set_drift_paused(
+                        self._exec_drift.is_drifted())
+
                 # 5. Save state periodically (every STATE_SAVE_INTERVAL_SEC)
                 now = time.time()
                 if now - self._last_save_ts >= STATE_SAVE_INTERVAL_SEC:
@@ -963,6 +1004,8 @@ class Bot:
                     self._emit_clone_report()   # must run BEFORE tempo_report resets counters
                     self._emit_diag_report()    # F247-style behavioral diagnostics
                     self._emit_tempo_report()
+                    if MODE in ("LIVE", "LIVE_SAFE"):
+                        self._emit_live_sanity_report()
                     self._tempo_last_report_ts = now
             except Exception as e:
                 self.logger.log_event({"event_type": "LOOP_ERROR", "err": str(e)})
@@ -1655,6 +1698,45 @@ class Bot:
         self._diag_dscalp_stop_exits = 0
         self._diag_dscalp_hold_times.clear()
         self._diag_dscalp_exit_cents.clear()
+        # Execution safety minute resets (LIVE and LIVE_SAFE)
+        if MODE in ("LIVE", "LIVE_SAFE"):
+            self._exec_tracker.reset_minute_counters()
+            self._exec_orphan.reset_minute_counters()
+            self._exec_safety.reset_minute_counters()
+            self._exec_unpaired.reset_minute_counters()
+            self._exec_drift.reset_minute_counters()
+
+    def _emit_live_sanity_report(self):
+        """Emit LIVE_SANITY_REPORT with execution health diagnostics."""
+        exposure = {}
+        for slug, st in self.market_states.items():
+            slug_usd = sum(
+                st.positions[o].qty * st.positions[o].vwap
+                for o in ["Up", "Down"] if st.positions[o].qty >= MIN_QTY
+            )
+            slug_usd += self._dscalp_invested_usd.get(slug, 0.0)
+            if slug_usd > 0.01:
+                exposure[slug] = round(slug_usd, 2)
+        self._exec_reporter.tick({
+            "open_orders_count": self._exec_tracker.open_order_count(),
+            "orphan_cancels_last_min": self._exec_orphan.orphan_cancels_this_min,
+            "api_errors_last_min": self._exec_safety.api_errors_this_min,
+            "partial_fill_count": self._exec_tracker.partial_fill_count,
+            "unpaired_events_last_min": self._exec_unpaired.events_this_min,
+            "ttl_cancels": self._exec_tracker.ttl_cancels,
+            "confirmed_fills": self._exec_tracker.confirmed_fills,
+            "confirmed_submits": self._exec_tracker.confirmed_submits,
+            "kill_switch_active": self._exec_safety.is_kill_active(),
+            "total_kill_activations": self._exec_safety.total_kill_activations,
+            "cap_blocks_last_min": self._exec_safety.cap_blocks_this_min,
+            "drift_detected": self._exec_drift.is_drifted(),
+            "no_progress_pauses": self._exec_safety.no_progress_pauses_total,
+            "mode": MODE,
+            "buys_allowed": self._buys_allowed(),
+            "entry_window_remaining_sec": round(self._entry_window_remaining_sec(), 1),
+            "live_safe_max_order_usd": LIVE_SAFE_MAX_ORDER_USD if MODE == "LIVE_SAFE" else None,
+            "exposure_per_slug": exposure,
+        })
 
     def _print_balance_summary(self):
         """Print balance and open positions to console."""
@@ -2445,9 +2527,6 @@ class Bot:
             self._diag_dscalp_exits += 1
             self._diag_directional_fills_min += 1
             self._diag_total_fills_min += 1
-            self._true_cost_tx_count += 1
-            self._true_cost_fill_count += 1
-            self._true_cost_fill_count_min += 1
             self._throttle_record_trade()
             self._dscalp_positions.pop(m.slug, None)
             self._dscalp_invested_usd.pop(m.slug, None)
@@ -2476,9 +2555,6 @@ class Bot:
                 self._diag_dscalp_exit_cents.append(pnl_cents)
                 self._diag_directional_fills_min += 1
                 self._diag_total_fills_min += 1
-                self._true_cost_tx_count += 1
-                self._true_cost_fill_count += 1
-                self._true_cost_fill_count_min += 1
                 self._throttle_record_trade()
                 self._dscalp_positions.pop(m.slug, None)
                 self._dscalp_invested_usd.pop(m.slug, None)
@@ -2501,9 +2577,6 @@ class Bot:
             self._diag_dscalp_exit_cents.append(pnl_cents)
             self._diag_directional_fills_min += 1
             self._diag_total_fills_min += 1
-            self._true_cost_tx_count += 1
-            self._true_cost_fill_count += 1
-            self._true_cost_fill_count_min += 1
             self._throttle_record_trade()
             self._dscalp_positions.pop(m.slug, None)
             self._dscalp_invested_usd.pop(m.slug, None)
@@ -2740,6 +2813,8 @@ class Bot:
                 print(f"  [CLIP_FAIL] {m.crypto:5s} clip=${clip:.2f} < min=${MIN_ORDER_USDC}")
                 return
             # ---- Place PROBE order (taker-gated) ----
+            if not self._exec_safety_can_enter(m.slug):
+                return
             signal_detect_ts = time.time()
             sm["signal_detect_ts"] = signal_detect_ts
             # Record trade direction for no-flip rule
@@ -2750,7 +2825,10 @@ class Bot:
                 self._diag_blocked_taker_gate += 1
             probe_price = book.ask if probe_use_taker else book.bid
             probe_usd = max(MIN_ORDER_USDC, clip * PROBE_SIZE_FRAC)
-            probe_qty = probe_usd / max(1e-9, probe_price)
+            # LIVE_SAFE trade-size limiter
+            probe_usd, probe_qty = self._live_safe_cap_usd(probe_usd, probe_price)
+            if probe_qty < MIN_QTY:
+                return
             edge = ctx["edge_up"] if outcome == "Up" else ctx["edge_down"]
             self._hour_edges.append(edge)
             decision_id = new_decision_id()
@@ -2875,6 +2953,81 @@ class Bot:
     # -----------------------------------------------------------------
     # Burst execution engine
     # -----------------------------------------------------------------
+    def _get_internal_positions(self) -> dict:
+        """Build {slug: {"Up": qty, "Down": qty}} from internal state."""
+        result = {}
+        for slug, st in self.market_states.items():
+            up_qty = st.positions["Up"].qty if st.positions["Up"].qty >= MIN_QTY else 0.0
+            dn_qty = st.positions["Down"].qty if st.positions["Down"].qty >= MIN_QTY else 0.0
+            if up_qty > 0 or dn_qty > 0:
+                result[slug] = {"Up": up_qty, "Down": dn_qty}
+        return result
+
+    def _get_token_to_slug_outcome(self) -> dict:
+        """Build {token_id: (slug, outcome)} from cached markets."""
+        result = {}
+        for m in self._cached_markets:
+            if m.outcome_up_id:
+                result[m.outcome_up_id] = (m.slug, "Up")
+            if m.outcome_down_id:
+                result[m.outcome_down_id] = (m.slug, "Down")
+        return result
+
+    def _buys_allowed(self) -> bool:
+        """Check if BUY orders are currently allowed.
+        LOG: always True. LIVE: always True. LIVE_SAFE: only during entry window."""
+        if MODE != "LIVE_SAFE":
+            return True
+        return (time.monotonic() - self._process_start_mono) < LIVE_SAFE_ENTRY_WINDOW_SEC
+
+    def _entry_window_remaining_sec(self) -> float:
+        """Seconds remaining in LIVE_SAFE entry window. 0 if expired or not LIVE_SAFE."""
+        if MODE != "LIVE_SAFE":
+            return 0.0
+        remaining = LIVE_SAFE_ENTRY_WINDOW_SEC - (time.monotonic() - self._process_start_mono)
+        return max(0.0, remaining)
+
+    def _live_safe_cap_usd(self, order_usd: float, price: float) -> Tuple[float, float]:
+        """Apply LIVE_SAFE trade-size limiter to a BUY order.
+        Returns (capped_usd, capped_qty). If qty < MIN_QTY, returns (0, 0) to skip.
+        In non-LIVE_SAFE modes, returns original values unchanged."""
+        if MODE != "LIVE_SAFE":
+            qty = order_usd / max(1e-9, price)
+            return order_usd, qty
+        capped_usd = min(order_usd, LIVE_SAFE_MAX_ORDER_USD)
+        capped_qty = math.floor(capped_usd / max(1e-9, price) * 100) / 100  # floor to tick
+        if capped_qty < MIN_QTY:
+            return 0.0, 0.0
+        return capped_usd, capped_qty
+
+    def _exec_safety_can_enter(self, slug: str) -> bool:
+        """Execution safety gate for LIVE and LIVE_SAFE modes. Returns True if entry is allowed."""
+        if MODE == "LOG":
+            return True
+        # LIVE_SAFE: check entry window
+        if not self._buys_allowed():
+            return False
+        # Safety caps (apply to both LIVE and LIVE_SAFE)
+        total_usd = sum(
+            st.positions[o].qty * st.positions[o].vwap
+            for st in self.market_states.values()
+            for o in ["Up", "Down"] if st.positions[o].qty >= MIN_QTY
+        )
+        slug_st = self.market_states.get(slug)
+        slug_usd = 0.0
+        if slug_st:
+            slug_usd = sum(
+                slug_st.positions[o].qty * slug_st.positions[o].vwap
+                for o in ["Up", "Down"] if slug_st.positions[o].qty >= MIN_QTY
+            )
+        slug_usd += self._dscalp_invested_usd.get(slug, 0.0)
+        allowed, reason = self._exec_safety.can_enter(
+            slug, self._exec_tracker.open_order_count(), slug_usd, total_usd)
+        if not allowed:
+            write_jsonl({"event_type": "EXEC_ENTRY_BLOCKED", "slug": slug,
+                          "reason": reason, "ts_ms": int(time.time() * 1000)})
+        return allowed
+
     def _execute_burst_buy(self, m: MarketRef, st: MarketState, outcome: str,
                            base_clip_usd: float, ctx: dict, thr_bps: float = 0):
         """Count-based burst engine (f247-tuned: less spam, bigger steps).
@@ -2882,6 +3035,9 @@ class Bot:
         Taker-gated: only crosses if spread <= 1c AND abs(edge) >= thr + 12.
         Otherwise posts maker at best bid. Stops on edge collapse (sustained 500ms),
         price move 2c against, inventory cap, or hard spread limit."""
+        # LIVE safety cap check
+        if not self._exec_safety_can_enter(m.slug):
+            return
         burst_start_ts = time.time()
         up_book, dn_book = ctx["up_book"], ctx["dn_book"]
         book = up_book if outcome == "Up" else dn_book
@@ -2986,7 +3142,11 @@ class Bot:
             # ── Taker gate: only cross if spread <= 1c AND edge >= thr + 12 ──
             use_taker = taker_gate_allows(fresh_book.spread * 100, abs_live_delta, thr_bps)
             order_price = fresh_book.ask if use_taker else fresh_book.bid
-            this_qty = this_usd / max(1e-9, order_price)
+            # LIVE_SAFE trade-size limiter
+            this_usd, this_qty = self._live_safe_cap_usd(this_usd, order_price)
+            if this_qty < MIN_QTY:
+                stop_reason = "live_safe_size_cap"
+                break
             order_type = "taker" if use_taker else "maker"
 
             write_jsonl({"event_type": "BURST_MICRO_ORDER", "slug": m.slug,
@@ -3018,7 +3178,12 @@ class Bot:
                 post_only = not use_taker
                 fill = self.client.place_limit_order(token_id, "BUY", order_price,
                                                      this_qty, post_only=post_only)
+                oid = fill.get("order_id", "")
+                self._exec_tracker.on_submit(oid, m.slug, outcome, "BUY", order_price, this_qty, "ENTRY_BURST")
+                self._exec_safety.record_slug_submit(m.slug)
                 if fill.get("filled"):
+                    self._exec_tracker.on_fill(oid, fill["fill_qty"])
+                    self._exec_safety.record_slug_fill(m.slug)
                     self._live_buy(st, outcome, fill["fill_price"], fill["fill_qty"],
                                    fill["fill_price"] * fill["fill_qty"])
                     mt = infer_maker_taker("BUY", fill["fill_price"], fresh_book)
@@ -3037,6 +3202,8 @@ class Bot:
                     )
                     total_filled_usd += fill["fill_price"] * fill["fill_qty"]
                     burst_count += 1
+                elif fill.get("status") == "error":
+                    self._exec_safety.record_api_error()
 
             # Track diagnostics
             if use_taker:
@@ -3083,7 +3250,7 @@ class Bot:
         self._parity_recycle_locked(m, st, ctx)
 
         # ── Parity QUOTING mode (continuously post maker bids on both legs) ──
-        if PARITY_QUOTE_ENABLED and t_min < PARITY_STOP_NEW_MIN and not new_quotes_blocked:
+        if PARITY_QUOTE_ENABLED and t_min < PARITY_STOP_NEW_MIN and not new_quotes_blocked and self._buys_allowed():
             self._parity_quote(m, st, ctx)
 
         # ── End-of-hour flattening (runs even after PARITY_STOP_NEW_MIN) ──
@@ -3109,6 +3276,10 @@ class Bot:
 
         # ── Stop new parity trades after PARITY_STOP_NEW_MIN or when blocked ──
         if t_min >= PARITY_STOP_NEW_MIN or new_quotes_blocked:
+            return
+
+        # ── LIVE_SAFE entry window gate (buys only) ──
+        if not self._buys_allowed():
             return
 
         # ── Cooldown gate ──
@@ -3321,7 +3492,7 @@ class Bot:
                 raw_buy_edge = ctx.get("parity_raw_buy_cents", 0.0)
                 net_buy, _, _ = parity_net_edge_cents(raw_buy_edge, up_book, dn_book, True)
 
-                if net_buy >= PARITY_BUY_MIN_EDGE_NET_CENTS:
+                if net_buy >= PARITY_BUY_MIN_EDGE_NET_CENTS and self._buys_allowed():
                     # Edge still good — try to fill pending leg
                     filled = self._parity_buy_leg(m, st, pair["pending_outcome"],
                                                    pending_book, pair["filled_usd"],
@@ -3349,7 +3520,7 @@ class Bot:
             raw_buy_edge = ctx.get("parity_raw_buy_cents", 0.0)
             net_buy, _, _ = parity_net_edge_cents(raw_buy_edge, up_book, dn_book, True)
 
-            if net_buy >= PARITY_BUY_MIN_EDGE_NET_CENTS and pending_book.ask > 0:
+            if net_buy >= PARITY_BUY_MIN_EDGE_NET_CENTS and pending_book.ask > 0 and self._buys_allowed():
                 # Edge still good — force cross remaining leg (taker if spread<=1c)
                 filled = self._parity_buy_leg(m, st, pair["pending_outcome"],
                                                pending_book, pair["filled_usd"],
@@ -4078,8 +4249,9 @@ class Bot:
         pos = st.positions[outcome]
         placed_ts = time.time()
 
-        order_qty = leg_usd / max(1e-9, bid_price)
-        if order_qty < 1:
+        # LIVE_SAFE trade-size limiter
+        leg_usd, order_qty = self._live_safe_cap_usd(leg_usd, bid_price)
+        if order_qty < MIN_QTY or order_qty < 1:
             return 0.0
 
         decision_id = new_decision_id()
@@ -4332,8 +4504,9 @@ class Bot:
                 "filled": False,
             }
 
-        order_qty = leg_usd / max(1e-9, order_price)
-        if order_qty < 1:
+        # LIVE_SAFE trade-size limiter
+        leg_usd, order_qty = self._live_safe_cap_usd(leg_usd, order_price)
+        if order_qty < MIN_QTY or order_qty < 1:
             return 0.0
 
         decision_id = new_decision_id()
@@ -4604,6 +4777,8 @@ class Bot:
                       ctx=ctx, use_maker=not use_taker)
 
     def _late_scalps(self, ctx: dict):
+        if not self._buys_allowed():
+            return
         m, st = ctx["m"], ctx["st"]
         t_min = ctx["t_min"]
         delta_bps, abs_delta_bps = ctx["delta_bps"], ctx["abs_delta_bps"]
@@ -4627,7 +4802,10 @@ class Bot:
         clip = self._calc_clip(m.crypto, t_min, abs_delta_bps) * 0.50
         if clip < MIN_ORDER_USDC:
             return
-        qty = clip / max(1e-9, book.ask)
+        # LIVE_SAFE trade-size limiter
+        clip, qty = self._live_safe_cap_usd(clip, book.ask)
+        if qty < MIN_QTY:
+            return
         target_sell = min(0.999, book.ask + LATE_SCALP_TP_CENTS)
         decision_id = new_decision_id()
         client_oid = new_order_id()
@@ -4875,6 +5053,8 @@ class Bot:
                             rescue_block_reason = "threshold"
                         elif t_min >= PARITY_STOP_NEW_MIN:
                             rescue_block_reason = "near_close"
+                        elif not self._buys_allowed():
+                            rescue_block_reason = "buys_window_closed"
 
                         if rescue_block_reason is None:
                             # ── Execute rescue buy ──
@@ -5104,11 +5284,12 @@ class Bot:
             side="SELL", qty=qty, target_price=target_price or price,
             usdc_cost=usdc_cost, ctx=ctx, book_fields=bk_fields,
         )
-        # True cost tracking
+        # True cost: submit counted here (confirmed submit for both modes)
         self._true_cost_tx_count += 1
-        self._true_cost_fill_count += 1
-        self._true_cost_fill_count_min += 1
         if MODE == "LOG":
+            # Instant fill in paper mode — count fill immediately
+            self._true_cost_fill_count += 1
+            self._true_cost_fill_count_min += 1
             pnl = self._paper_sell(st, outcome, price, qty)
             mt = infer_maker_taker("SELL", price, ref_book) if ref_book else ""
             sc = spread_capture_fields("SELL", price, ref_book) if ref_book else {}
@@ -5151,9 +5332,17 @@ class Bot:
                 }, also_csv=True)
             return
         fill_result = self.client.place_limit_order(token_id, "SELL", price, qty, post_only=use_maker)
+        oid = fill_result.get("order_id", "")
+        self._exec_tracker.on_submit(oid, m.slug, outcome, "SELL", price, qty, reason)
+        self._exec_safety.record_slug_submit(m.slug)
         if fill_result.get("filled"):
             actual_qty = fill_result["fill_qty"]
             actual_price = fill_result["fill_price"]
+            self._exec_safety.record_slug_fill(m.slug)
+            self._exec_tracker.on_fill(oid, actual_qty)
+            # True cost: count fill only after confirmed fill
+            self._true_cost_fill_count += 1
+            self._true_cost_fill_count_min += 1
             pnl = self._live_sell(st, outcome, actual_price, actual_qty)
             mt = infer_maker_taker("SELL", actual_price, ref_book) if ref_book else ""
             sc = spread_capture_fields("SELL", actual_price, ref_book) if ref_book else {}
@@ -5192,6 +5381,8 @@ class Bot:
                     "max_favorable_bps": round(mfe, 3), "max_adverse_bps": round(mae, 3),
                     "exit_reason": reason,
                 }, also_csv=True)
+        elif fill_result.get("status") == "error":
+            self._exec_safety.record_api_error()
     def _place_layered_buy(self, m: MarketRef, outcome: str, qty: float, ask: float) -> dict:
         """Place layered buy orders. Returns {total_filled, total_cost, avg_price}."""
         token_id = m.outcome_up_id if outcome == "Up" else m.outcome_down_id
@@ -5232,10 +5423,42 @@ class Bot:
                               max(book.bid, book.ask - MAX_CROSS_SLIPPAGE),
                               reason="CLEANUP", leg="CLEANUP")
 # MAIN
+def _select_mode() -> str:
+    """Interactive CLI mode selection. Returns selected MODE string."""
+    global MODE
+    # If MODE was explicitly set via env (not default), skip prompt
+    env_mode = os.getenv("MODE", "").upper()
+    if env_mode in ("LOG", "LIVE_SAFE", "LIVE"):
+        return env_mode
+    print("\n  ╔══════════════════════════════════════╗")
+    print("  ║        SELECT RUNTIME MODE           ║")
+    print("  ╠══════════════════════════════════════╣")
+    print("  ║  1 = LOG        (paper only)         ║")
+    print("  ║  2 = LIVE_SAFE  (time-limited buys)  ║")
+    print("  ║  3 = LIVE       (full live trading)   ║")
+    print("  ╚══════════════════════════════════════╝\n")
+    while True:
+        choice = input("  Enter mode [1/2/3]: ").strip()
+        if choice == "1":
+            return "LOG"
+        elif choice == "2":
+            return "LIVE_SAFE"
+        elif choice == "3":
+            return "LIVE"
+        else:
+            print("  Invalid choice. Enter 1, 2, or 3.")
+
+
 def main():
-    if MODE not in ("LOG", "LIVE"):
-        print("MODE must be LOG or LIVE")
+    global MODE
+    MODE = _select_mode()
+    # Patch module-level MODE so all code sees the updated value
+    import src.config.settings as _settings_mod
+    _settings_mod.MODE = MODE
+    if MODE not in ("LOG", "LIVE_SAFE", "LIVE"):
+        print("MODE must be LOG, LIVE_SAFE, or LIVE")
         sys.exit(1)
+    print(f"\n  [MODE] Starting in {MODE} mode\n")
     bot = Bot()
     bot.run()
 if __name__ == "__main__":
