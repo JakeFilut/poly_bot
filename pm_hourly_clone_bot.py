@@ -58,6 +58,62 @@ from logger import (
     build_book_fields, new_decision_id, new_order_id, new_position_id,
     infer_maker_taker, spread_capture_fields,
 )
+
+# =============================================================================
+# NEW MODULAR IMPORTS (Pass 1 — coexist with monolith definitions)
+# These will gradually replace the inline definitions above/below.
+# =============================================================================
+from src.config import settings as _settings          # noqa: F401
+from src.bot.context import (                          # noqa: F401
+    MarketRef as _MarketRef,
+    BookTop as _BookTop,
+    Position as _Position,
+    MarketState as _MarketState,
+)
+from src.util.time import (                            # noqa: F401
+    utc_now as _utc_now,
+    iso_z as _iso_z,
+    parse_hour_start_from_slug as _parse_hour_start,
+    minutes_into_hour as _minutes_into_hour,
+)
+from src.util.math import (                            # noqa: F401
+    clamp as _clamp,
+    clamp_to_tick as _clamp_to_tick,
+    safe_float as _safe_float,
+)
+from src.strategy.f247_like import (                   # noqa: F401
+    entry_threshold_bps as _entry_threshold_bps,
+    price_cap as _price_cap,
+    dynamic_cap as _dynamic_cap,
+    spread_limit as _spread_limit,
+    taker_gate_allows as _taker_gate_allows,
+    whipsaw_ok as _whipsaw_ok,
+    parity_net_edge_cents as _parity_net_edge_cents,
+    parity_liquidity_ok as _parity_liquidity_ok,
+    compute_fee_usdc as _compute_fee_usdc,
+)
+from src.strategy.sizing import (                      # noqa: F401
+    sizing_mult as _sizing_mult,
+    zscore as _zscore,
+    delta_velocity_bps_per_min as _delta_velocity_bps_per_min,
+)
+from src.gating.gates import GateEvaluator, GateResult  # noqa: F401
+from src.gating.velocity import VelocityEstimator       # noqa: F401
+from src.gating.low_vol import (                        # noqa: F401
+    LowVolDetector, LowVolThrottler, LowVolResult,
+)
+from src.gating.report import GateReporter              # noqa: F401
+from src.trading.order_manager import OrderManager       # noqa: F401
+from src.trading.portfolio import (                     # noqa: F401
+    compute_equity as _compute_equity,
+    clean_dust as _clean_dust,
+)
+from src.trading.risk import (                          # noqa: F401
+    market_cost_usdc as _market_cost_usdc,
+    crypto_cost_usdc as _crypto_cost_usdc,
+)
+from src.bot.app import BotApp                          # noqa: F401
+
 # Markets / coins
 CRYPTOS = ["BTC", "ETH", "SOL", "XRP"]
 # Polling / evaluation
