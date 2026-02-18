@@ -2452,13 +2452,13 @@ class Bot:
             return
 
         # ── MINIMUM HOLD FLOOR: 90s unless emergency bypass ──
-        # Detect spread collapse: spread >= 3x the entry-time spread (or > 4c absolute)
+        # Detect spread blowout (> 4c = liquidity evaporating)
         spread_cents = book.spread * 100
         spread_collapsed = spread_cents > 4.0
-        # Detect velocity reversal: price momentum turned against our direction
+        # Detect strong velocity reversal (> 7 bps/min against position — not noise)
         vel = ctx.get("vel", 0.0)
-        vel_reversed = (outcome == "Up" and vel < -2.0) or (outcome == "Down" and vel > 2.0)
-        # Early +2c exit: only when spread collapses or velocity reverses (before min hold)
+        vel_reversed = (outcome == "Up" and vel < -DSCALP_VEL_REVERSAL_BPS) or (outcome == "Down" and vel > DSCALP_VEL_REVERSAL_BPS)
+        # Early +3c taker exit: only when real danger (spread blowout or strong reversal)
         if hold_sec < DSCALP_MIN_HOLD_SEC:
             if pnl_cents >= DSCALP_EARLY_TP_CENTS and (spread_collapsed or vel_reversed):
                 sell_qty = pos.qty
