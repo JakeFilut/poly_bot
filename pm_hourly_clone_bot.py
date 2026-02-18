@@ -254,6 +254,10 @@ class Bot:
         self._rate_submit_window_start: Dict[str, float] = {}  # slug -> minute window start ts
         self._rate_blocked_interval = 0                      # diag: blocked by MIN_ORDER_INTERVAL_MS
         self._rate_blocked_cap = 0                           # diag: blocked by MAX_ORDER_SUBMITS_PER_MIN
+        # Per-slug entry throttle (separate from order rate limiter)
+        self._entry_last_ts: Dict[str, float] = {}          # slug -> last entry timestamp
+        self._entry_count: Dict[str, int] = {}              # slug -> entries this minute
+        self._entry_window_start: Dict[str, float] = {}     # slug -> minute window start ts
         # ── Directional scalp state ──
         self._dscalp_positions: Dict[str, dict] = {}  # slug -> {outcome, entry_price, entry_ts, qty, tp1_done, tp2_done}
         self._dscalp_last_entry_ts: Dict[str, float] = {}   # slug -> last entry timestamp
@@ -2209,6 +2213,28 @@ class Bot:
         self._rate_submit_count[slug] = self._rate_submit_count.get(slug, 0) + 1
         self._true_cost_submit_count += 1
 
+    def _entry_throttle_ok(self, slug: str) -> bool:
+        """Per-slug entry throttle: MIN_ENTRY_INTERVAL_MS + MAX_ENTRIES_PER_MIN_PER_SLUG."""
+        now = time.time()
+        # Minimum interval between entries on same slug
+        last = self._entry_last_ts.get(slug, 0.0)
+        if (now - last) * 1000 < MIN_ENTRY_INTERVAL_MS:
+            return False
+        # Per-slug entries/min cap
+        ws = self._entry_window_start.get(slug, now)
+        if now - ws > 60.0:
+            self._entry_window_start[slug] = now
+            self._entry_count[slug] = 0
+        if self._entry_count.get(slug, 0) >= MAX_ENTRIES_PER_MIN_PER_SLUG:
+            return False
+        return True
+
+    def _entry_throttle_record(self, slug: str):
+        """Record an entry for per-slug throttle tracking."""
+        now = time.time()
+        self._entry_last_ts[slug] = now
+        self._entry_count[slug] = self._entry_count.get(slug, 0) + 1
+
     def _adverse_guard_active(self, slug: str) -> bool:
         """Check if adverse selection guard is currently blocking for this slug."""
         paused_until = self._quote_paused_until.get(slug, 0.0)
@@ -2244,6 +2270,10 @@ class Bot:
 
         # Rate limit
         if not self._rate_limit_ok(m.slug):
+            return
+
+        # Per-slug entry throttle
+        if not self._entry_throttle_ok(m.slug):
             return
 
         # Regime awareness: reduce activity in low-vol
@@ -2355,6 +2385,7 @@ class Bot:
         }
         self._dscalp_invested_usd[m.slug] = invested + actual_cost
         self._dscalp_last_entry_ts[m.slug] = now_t
+        self._entry_throttle_record(m.slug)
         self._diag_dscalp_entries += 1
         st.last_entry_ts = iso_z(utc_now())
 
@@ -2373,8 +2404,9 @@ class Bot:
 
     def _dscalp_manage_exits(self, m: MarketRef, st: MarketState, ctx: dict):
         """Manage directional scalp exits: TP ladder + timeout + stop loss.
-        ENFORCES 120s minimum hold unless emergency (stop loss).
-        TP ladder: +3c/+6c/+9c at 25% each, remainder for timeout/trailing."""
+        ENFORCES 90s minimum hold unless emergency (stop loss / spread collapse / reversal).
+        Early +2c exit only when spread collapses or velocity reverses.
+        TP ladder: +3c/+5c/+7c at 25% each, remainder for timeout/trailing."""
         dpos = self._dscalp_positions.get(m.slug)
         if dpos is None:
             return
@@ -2419,9 +2451,38 @@ class Bot:
                           "pnl_cents": round(pnl_cents, 2), "hold_sec": round(hold_sec, 1)})
             return
 
-        # ── MINIMUM HOLD FLOOR: 120s unless emergency (stop loss above) ──
+        # ── MINIMUM HOLD FLOOR: 90s unless emergency bypass ──
+        # Detect spread blowout (> 4c = liquidity evaporating)
+        spread_cents = book.spread * 100
+        spread_collapsed = spread_cents > 4.0
+        # Detect strong velocity reversal (> 7 bps/min against position — not noise)
+        vel = ctx.get("vel", 0.0)
+        vel_reversed = (outcome == "Up" and vel < -DSCALP_VEL_REVERSAL_BPS) or (outcome == "Down" and vel > DSCALP_VEL_REVERSAL_BPS)
+        # Early +3c taker exit: only when real danger (spread blowout or strong reversal)
         if hold_sec < DSCALP_MIN_HOLD_SEC:
-            return  # allow real directional exposure — no early exit
+            if pnl_cents >= DSCALP_EARLY_TP_CENTS and (spread_collapsed or vel_reversed):
+                sell_qty = pos.qty
+                sell_price = max(book.bid, 0.01)
+                reason_tag = "DSCALP_EARLY_TP_SPREAD" if spread_collapsed else "DSCALP_EARLY_TP_REVERSAL"
+                self._do_sell(m, st, outcome, sell_qty, sell_price,
+                              reason=reason_tag, leg="DSCALP", ctx=ctx, use_maker=False)
+                self._diag_dscalp_exits += 1
+                self._diag_dscalp_hold_times.append(hold_sec)
+                self._diag_dscalp_exit_cents.append(pnl_cents)
+                self._diag_directional_fills_min += 1
+                self._diag_total_fills_min += 1
+                self._true_cost_tx_count += 1
+                self._true_cost_fill_count += 1
+                self._true_cost_fill_count_min += 1
+                self._throttle_record_trade()
+                self._dscalp_positions.pop(m.slug, None)
+                self._dscalp_invested_usd.pop(m.slug, None)
+                write_jsonl({"event_type": reason_tag, "ts_ms": int(now_t * 1000),
+                              "slug": m.slug, "outcome": outcome,
+                              "pnl_cents": round(pnl_cents, 2), "hold_sec": round(hold_sec, 1),
+                              "spread_cents": round(spread_cents, 2), "vel": round(vel, 2)})
+                return
+            return  # still in min hold, no bypass triggered
 
         # ── Timeout exit ──
         if hold_sec >= DSCALP_MAX_HOLD_SEC:
@@ -2465,7 +2526,7 @@ class Bot:
                               "hold_sec": round(hold_sec, 1)})
             dpos["tp1_done"] = True
 
-        # ── TP2: +6c, sell 25% ──
+        # ── TP2: +5c, sell 25% ──
         if pnl_cents >= DSCALP_TP2_CENTS and not dpos["tp2_done"]:
             sell_qty = min(pos.qty * DSCALP_TP2_FRAC, pos.qty)
             if sell_qty >= MIN_QTY:
@@ -2484,7 +2545,7 @@ class Bot:
                               "hold_sec": round(hold_sec, 1)})
             dpos["tp2_done"] = True
 
-        # ── TP3: +9c, sell 25% — remainder rides to timeout or trailing stop ──
+        # ── TP3: +7c, sell 25% — remainder rides to timeout or trailing stop ──
         if pnl_cents >= DSCALP_TP3_CENTS and not dpos.get("tp3_done"):
             sell_qty = min(pos.qty * DSCALP_TP3_FRAC, pos.qty)
             if sell_qty >= MIN_QTY:
@@ -3051,6 +3112,10 @@ class Bot:
         if (now_t - last_ts) * 1000 < PARITY_COOLDOWN_MS:
             return
 
+        # ── Per-slug entry throttle ──
+        if not self._entry_throttle_ok(m.slug):
+            return
+
         # ── Staleness guard ──
         cache_age = self._cache_age_ms(m.slug)
         if cache_age > PARITY_MAX_CACHE_AGE_MS:
@@ -3103,6 +3168,7 @@ class Bot:
             if both_filled:
                 self._parity_invested_usd[m.slug] = invested + total_cost
                 self._parity_last_order_ts[m.slug] = time.time()
+                self._entry_throttle_record(m.slug)
                 self._diag_parity_trades += 1
                 self._diag_parity_edges.append(buy_net)
                 self._diag_parity_trade_timestamps.append(time.time())
@@ -3203,6 +3269,7 @@ class Bot:
 
             if total_proceeds > 0:
                 self._parity_last_order_ts[m.slug] = time.time()
+                self._entry_throttle_record(m.slug)
                 self._diag_parity_trades += 1
                 self._diag_parity_edges.append(sell_net)
                 self._diag_parity_trade_timestamps.append(time.time())
