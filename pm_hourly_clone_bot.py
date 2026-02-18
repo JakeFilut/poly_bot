@@ -330,6 +330,14 @@ class Bot:
             self.client.get_open_orders, self.client.get_balances, write_jsonl)
         # ── LIVE_SAFE mode: monotonic process start for entry window ──
         self._process_start_mono = time.monotonic()
+        # ── Per-slug PnL tracking ──
+        self._slug_realized_pnl: Dict[str, float] = {}       # slug -> cumulative realized PnL
+        self._slug_neg_exit_count: Dict[str, int] = {}        # slug -> total negative exit count (session)
+        # ── Loss-tail reduction guard ──
+        # slug -> [(ts, net_pnl, reason)] — rolling window of negative exits
+        self._slug_neg_exits: Dict[str, List[Tuple[float, float, str]]] = {}
+        # slug -> pause_until_ts (monotonic)
+        self._slug_entry_paused_until: Dict[str, float] = {}
         # Background data refresh infrastructure (sub-second loop)
         # Dynamic pool: max(BG_POOL_MIN_WORKERS, 3 * markets_count)
         dynamic_workers = max(BG_POOL_MIN_WORKERS, BG_POOL_WORKERS)
@@ -541,6 +549,8 @@ class Bot:
         self.cash_usdc += proceeds
         self.realized_pnl_usdc += pnl
         self.hourly_pnl_usdc += pnl
+        # Per-slug PnL
+        self._slug_realized_pnl[st.slug] = self._slug_realized_pnl.get(st.slug, 0.0) + pnl
         self._clean_dust(pos)
         # Shadow: exits still apply to existing shadow positions
         if self._shadow_active:
@@ -588,6 +598,8 @@ class Bot:
         self._clean_dust(pos)
         self._hour_trade_count += 1
         self._hour_net_pnl += pnl
+        # Per-slug PnL
+        self._slug_realized_pnl[st.slug] = self._slug_realized_pnl.get(st.slug, 0.0) + pnl
         return pnl
     @staticmethod
     def _clean_dust(pos: Position):
@@ -1004,6 +1016,7 @@ class Bot:
                     self._emit_clone_report()   # must run BEFORE tempo_report resets counters
                     self._emit_diag_report()    # F247-style behavioral diagnostics
                     self._emit_tempo_report()
+                    self._emit_slug_pnl_report()
                     if MODE in ("LIVE", "LIVE_SAFE"):
                         self._emit_live_sanity_report()
                     self._tempo_last_report_ts = now
@@ -1738,6 +1751,52 @@ class Bot:
             "exposure_per_slug": exposure,
         })
 
+    def _emit_slug_pnl_report(self):
+        """Emit per-slug PnL report every 60s. Shows realized PnL, negative exit counts,
+        and loss-tail pause status per slug."""
+        slug_data = {}
+        # Gather all slugs with PnL or positions
+        all_slugs = set(self._slug_realized_pnl.keys())
+        for slug, st in self.market_states.items():
+            if st.positions["Up"].qty >= MIN_QTY or st.positions["Down"].qty >= MIN_QTY:
+                all_slugs.add(slug)
+        if not all_slugs:
+            return
+        for slug in sorted(all_slugs):
+            pnl = self._slug_realized_pnl.get(slug, 0.0)
+            neg_count = self._slug_neg_exit_count.get(slug, 0)
+            paused = not self._slug_entry_allowed(slug)
+            st = self.market_states.get(slug)
+            crypto = st.crypto if st else "?"
+            up_qty = st.positions["Up"].qty if st else 0
+            dn_qty = st.positions["Down"].qty if st else 0
+            slug_data[slug] = {
+                "crypto": crypto,
+                "net_pnl_usdc": round(pnl, 4),
+                "neg_exit_count": neg_count,
+                "paused": paused,
+                "up_qty": round(up_qty, 1),
+                "dn_qty": round(dn_qty, 1),
+            }
+        write_jsonl({"event_type": "SLUG_PNL_REPORT",
+                      "ts_ms": int(time.time() * 1000),
+                      "slugs": slug_data})
+        # Console output: per-crypto aggregation + worst slugs
+        crypto_pnl: Dict[str, float] = {}
+        for slug, d in slug_data.items():
+            crypto_pnl[d["crypto"]] = crypto_pnl.get(d["crypto"], 0.0) + d["net_pnl_usdc"]
+        crypto_str = "  ".join(f"{c}={p:+.2f}" for c, p in sorted(crypto_pnl.items()))
+        # Show worst 3 slugs
+        worst = sorted(slug_data.items(), key=lambda x: x[1]["net_pnl_usdc"])[:3]
+        worst_str = "  ".join(
+            f"{d['crypto']}={d['net_pnl_usdc']:+.2f}(neg={d['neg_exit_count']}"
+            f"{',PAUSED' if d['paused'] else ''})"
+            for _, d in worst if d["net_pnl_usdc"] < 0
+        )
+        paused_slugs = [s for s, d in slug_data.items() if d["paused"]]
+        pause_str = f"  paused=[{','.join(paused_slugs)}]" if paused_slugs else ""
+        print(f"  [SLUG_PNL] {crypto_str}  worst=[{worst_str}]{pause_str}")
+
     def _print_balance_summary(self):
         """Print balance and open positions to console."""
         total_cost = 0.0
@@ -1879,7 +1938,10 @@ class Bot:
             self._cleanup_market_slug(slug)
     def _get_markets(self) -> List[MarketRef]:
         # In practice: discover the current hour markets
-        return self.client.get_current_hour_markets()
+        markets = self.client.get_current_hour_markets()
+        if not ENABLE_XRP:
+            markets = [m for m in markets if m.crypto != "XRP"]
+        return markets
     def _ensure_market_state(self, m: MarketRef):
         if m.slug not in self.market_states:
             idx = self.hour_index_counters.get(m.crypto, 0)
@@ -2066,8 +2128,9 @@ class Bot:
         else:
             self._parity_arb(ctx)
 
-        # stop adding risk after minute 57
-        if t_min > TRADE_STOP_ADD_MIN:
+        # stop adding risk after TRADE_STOP_ADD_MIN or within NO_NEW_ENTRIES_SEC_TO_CLOSE
+        seconds_to_close = ctx.get("seconds_to_close", 999.0)
+        if t_min > TRADE_STOP_ADD_MIN or seconds_to_close < NO_NEW_ENTRIES_SEC_TO_CLOSE:
             return
         # risk gate
         if not self._risk_ok(st):
@@ -2119,12 +2182,17 @@ class Bot:
     def _should_block_parity(self, m: MarketRef, st: MarketState) -> bool:
         """Determine if parity quoting should be blocked for this slug.
         Parity is blocked when:
+        0. XRP with parity disabled
         1. Directional inventory exists on this slug
         2. Directional scalp fired recently (standdown timer)
         3. Net imbalance >= threshold
         4. Adverse guard active
         5. Parity fill % exceeds target cap"""
         slug = m.slug
+
+        # 0. XRP parity disabled
+        if m.crypto == "XRP" and not XRP_PARITY_BUY_ENABLED:
+            return True
 
         # 1. Directional inventory active
         if slug in self._dscalp_positions:
@@ -2347,7 +2415,8 @@ class Bot:
 
         # Already at max position for this slug
         invested = self._dscalp_invested_usd.get(m.slug, 0.0)
-        if invested >= DSCALP_MAX_USD_PER_SLUG:
+        max_usd = XRP_MAX_USD_PER_SLUG if m.crypto == "XRP" else DSCALP_MAX_USD_PER_SLUG
+        if invested >= max_usd:
             return
 
         # Rate limit
@@ -3000,8 +3069,43 @@ class Bot:
             return 0.0, 0.0
         return capped_usd, capped_qty
 
+    def _record_negative_exit(self, slug: str, net_pnl: float, reason: str):
+        """Record a negative exit for loss-tail guard. Only tracks configured reasons."""
+        if reason not in LOSS_TAIL_NEGATIVE_EXIT_REASONS:
+            return
+        if net_pnl >= 0:
+            return
+        now_mono = time.monotonic()
+        hist = self._slug_neg_exits.setdefault(slug, [])
+        hist.append((now_mono, net_pnl, reason))
+        self._slug_neg_exit_count[slug] = self._slug_neg_exit_count.get(slug, 0) + 1
+        # Trim old entries outside lookback window
+        cutoff = now_mono - LOSS_TAIL_LOOKBACK_SEC
+        self._slug_neg_exits[slug] = [(t, p, r) for t, p, r in hist if t >= cutoff]
+        # Check if threshold exceeded → pause slug
+        if len(self._slug_neg_exits[slug]) >= LOSS_TAIL_NEG_EXIT_THRESHOLD:
+            pause_until = now_mono + LOSS_TAIL_PAUSE_SEC
+            self._slug_entry_paused_until[slug] = pause_until
+            write_jsonl({"event_type": "SLUG_PAUSED_NEGATIVE_EXITS",
+                          "ts_ms": int(time.time() * 1000),
+                          "slug": slug,
+                          "neg_exit_count": len(self._slug_neg_exits[slug]),
+                          "total_neg_pnl": round(sum(p for _, p, _ in self._slug_neg_exits[slug]), 4),
+                          "pause_sec": LOSS_TAIL_PAUSE_SEC,
+                          "reasons": [r for _, _, r in self._slug_neg_exits[slug]]})
+            # Clear history so we don't re-trigger immediately on resume
+            self._slug_neg_exits[slug] = []
+
+    def _slug_entry_allowed(self, slug: str) -> bool:
+        """Check if slug entries are paused by loss-tail guard. Sells always allowed."""
+        pause_until = self._slug_entry_paused_until.get(slug, 0.0)
+        return time.monotonic() >= pause_until
+
     def _exec_safety_can_enter(self, slug: str) -> bool:
-        """Execution safety gate for LIVE and LIVE_SAFE modes. Returns True if entry is allowed."""
+        """Execution safety gate. Returns True if entry is allowed."""
+        # Loss-tail guard (all modes)
+        if not self._slug_entry_allowed(slug):
+            return False
         if MODE == "LOG":
             return True
         # LIVE_SAFE: check entry window
@@ -3250,7 +3354,10 @@ class Bot:
         self._parity_recycle_locked(m, st, ctx)
 
         # ── Parity QUOTING mode (continuously post maker bids on both legs) ──
-        if PARITY_QUOTE_ENABLED and t_min < PARITY_STOP_NEW_MIN and not new_quotes_blocked and self._buys_allowed():
+        xrp_quote_ok = (m.crypto != "XRP" or XRP_PARITY_QUOTE_ENABLED)
+        if (PARITY_QUOTE_ENABLED and t_min < PARITY_QUOTE_STOP_MIN
+                and not new_quotes_blocked and self._buys_allowed()
+                and xrp_quote_ok and self._slug_entry_allowed(m.slug)):
             self._parity_quote(m, st, ctx)
 
         # ── End-of-hour flattening (runs even after PARITY_STOP_NEW_MIN) ──
@@ -3280,6 +3387,10 @@ class Bot:
 
         # ── LIVE_SAFE entry window gate (buys only) ──
         if not self._buys_allowed():
+            return
+
+        # ── Loss-tail slug pause ──
+        if not self._slug_entry_allowed(m.slug):
             return
 
         # ── Cooldown gate ──
@@ -3917,9 +4028,10 @@ class Bot:
             up_q = st.positions["Up"].qty
             dn_q = st.positions["Down"].qty
             imbalance = up_q - dn_q
-            if outcome == "Up" and imbalance > IMBALANCE_CAP_SHARES:
+            imb_cap = XRP_MAX_IMBALANCE_SHARES if m.crypto == "XRP" else IMBALANCE_CAP_SHARES
+            if outcome == "Up" and imbalance > imb_cap:
                 continue  # too much Up, skip
-            if outcome == "Down" and imbalance < -IMBALANCE_CAP_SHARES:
+            if outcome == "Down" and imbalance < -imb_cap:
                 continue  # too much Down, skip
 
             leg_usd = min(dynamic_step_usd,
@@ -4780,6 +4892,8 @@ class Bot:
         if not self._buys_allowed():
             return
         m, st = ctx["m"], ctx["st"]
+        if not self._slug_entry_allowed(m.slug):
+            return
         t_min = ctx["t_min"]
         delta_bps, abs_delta_bps = ctx["delta_bps"], ctx["abs_delta_bps"]
         up_book, dn_book = ctx["up_book"], ctx["dn_book"]
@@ -5296,6 +5410,8 @@ class Bot:
             sell_notional = price * qty
             fee = compute_fee_usdc(sell_notional, mt if mt else ("maker" if use_maker else "taker"))
             net_pnl = pnl - fee
+            # Loss-tail guard: track negative exits
+            self._record_negative_exit(m.slug, net_pnl, reason)
             # ORDER_FILL
             self.logger.log_order_fill(
                 engine="EXIT", reason=reason,
@@ -5349,6 +5465,8 @@ class Bot:
             sell_notional = actual_price * actual_qty
             fee = compute_fee_usdc(sell_notional, mt if mt else ("maker" if use_maker else "taker"))
             net_pnl = pnl - fee
+            # Loss-tail guard: track negative exits
+            self._record_negative_exit(m.slug, net_pnl, reason)
             self.logger.log_order_fill(
                 engine="EXIT", reason=reason,
                 decision_id=decision_id, client_order_id=client_oid,

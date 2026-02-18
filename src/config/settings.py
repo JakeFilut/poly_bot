@@ -33,6 +33,11 @@ STATE_FILE = os.getenv("STATE_FILE", os.path.join(_LOG_DIR, "state.json"))
 
 # Markets / coins
 CRYPTOS = ["BTC", "ETH", "SOL", "XRP"]
+ENABLE_XRP = bool(os.getenv("ENABLE_XRP", "False") not in ("", "0", "False", "false"))   # default OFF
+XRP_MAX_USD_PER_SLUG = float(os.getenv("XRP_MAX_USD_PER_SLUG", "15.0"))
+XRP_MAX_IMBALANCE_SHARES = float(os.getenv("XRP_MAX_IMBALANCE_SHARES", "10"))
+XRP_PARITY_QUOTE_ENABLED = bool(os.getenv("XRP_PARITY_QUOTE_ENABLED", "False") not in ("", "0", "False", "false"))
+XRP_PARITY_BUY_ENABLED = bool(os.getenv("XRP_PARITY_BUY_ENABLED", "False") not in ("", "0", "False", "false"))
 
 # Polling / evaluation
 EVAL_EVERY_SEC = float(os.getenv("EVAL_EVERY_SEC", "0.0"))
@@ -40,8 +45,9 @@ ORDER_REPRICE_SEC = float(os.getenv("ORDER_REPRICE_SEC", "10.0"))
 
 # Time window within each hour (minutes)
 TRADE_START_MIN = 2.0
-TRADE_STOP_ADD_MIN = 57.0
+TRADE_STOP_ADD_MIN = 55.0                                                                  # was 57 — stop entries 2 min earlier
 TRADE_HARD_STOP_MIN = 59.25
+NO_NEW_ENTRIES_SEC_TO_CLOSE = float(os.getenv("NO_NEW_ENTRIES_SEC_TO_CLOSE", "180"))       # 3 min to close → block new entries
 
 # -----------------------------------------------------------------------------
 # Entry thresholds (bps) -- coin-specific, time-varying
@@ -234,9 +240,10 @@ MIN_TOP_LIQ_USD = 1.0                   # block parity if best bid/ask size < $1
 PARITY_MAX_CACHE_AGE_MS = 600           # block parity if cache > 600ms stale
 
 # End-of-hour parity flattening
-PARITY_STOP_NEW_MIN = 57.0              # stop opening NEW parity trades after minute 57
-PARITY_FLATTEN_START_MIN = 59.0         # begin flattening locked + unpaired parity inventory
-PARITY_HARD_FLATTEN_MIN = 59.25         # force taker flatten (if time_to_close<20s or emergency)
+PARITY_STOP_NEW_MIN = 55.0              # stop opening NEW parity trades (aligned with TRADE_STOP_ADD_MIN)
+PARITY_QUOTE_STOP_MIN = float(os.getenv("PARITY_QUOTE_STOP_MIN", "50.0"))   # stop quoting at minute 50, exits/recycle continue
+PARITY_FLATTEN_START_MIN = 58.5         # begin flattening locked + unpaired parity inventory (was 59.0)
+PARITY_HARD_FLATTEN_MIN = 59.1          # force taker flatten (was 59.25)
 
 # ---------------------------------------------------------------------------
 # Parity QUOTING mode -- continuously post maker bids on BOTH legs
@@ -463,3 +470,16 @@ OM_SANITY_REPORT_INTERVAL_SEC = float(os.getenv("OM_SANITY_REPORT_INTERVAL_SEC",
 # ---------------------------------------------------------------------------
 LIVE_SAFE_ENTRY_WINDOW_SEC = float(os.getenv("LIVE_SAFE_ENTRY_WINDOW_SEC", "300"))        # buys allowed for 300s after start
 LIVE_SAFE_MAX_ORDER_USD = float(os.getenv("LIVE_SAFE_MAX_ORDER_USD", "2.00"))             # max buy order size in LIVE_SAFE
+
+# ---------------------------------------------------------------------------
+# LOSS-TAIL REDUCTION GUARD — auto-pause slugs with repeated negative exits
+# ---------------------------------------------------------------------------
+LOSS_TAIL_NEGATIVE_EXIT_REASONS = {"DERISK_MAKER", "PARITY_FLATTEN", "PARITY_RECYCLE"}
+LOSS_TAIL_LOOKBACK_SEC = float(os.getenv("LOSS_TAIL_LOOKBACK_SEC", "600"))                # 10 min rolling window
+LOSS_TAIL_NEG_EXIT_THRESHOLD = int(os.getenv("LOSS_TAIL_NEG_EXIT_THRESHOLD", "3"))        # X negative exits in window → pause
+LOSS_TAIL_PAUSE_SEC = float(os.getenv("LOSS_TAIL_PAUSE_SEC", "600"))                      # pause entries for 10 min
+
+# ---------------------------------------------------------------------------
+# PER-SLUG PnL REPORT — emitted every 60s alongside TEMPO_REPORT
+# ---------------------------------------------------------------------------
+SLUG_PNL_REPORT_INTERVAL_SEC = float(os.getenv("SLUG_PNL_REPORT_INTERVAL_SEC", "60"))
