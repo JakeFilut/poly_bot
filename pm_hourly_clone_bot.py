@@ -328,6 +328,11 @@ if FAST_CLONE:
     HEDGE_TICK2_MS = 350
     HEDGE_EARLY_CROSS_MS = 1500
     HEDGE_CROSS_MS = 2000
+    # Fast-start: trade immediately, minimal persistence delay, lower early threshold
+    TRADE_START_MIN = 0.1
+    PERSISTENCE_SEC = 1.5
+    for _coin in list(_THR_TABLE.keys()):
+        _THR_TABLE[_coin]["early"] = 3
 # ---------------------------------------------------------------------------
 # RATE LIMITING / CHURN CONTROL — hard caps per slug (F247 cadence)
 # ---------------------------------------------------------------------------
@@ -365,6 +370,8 @@ DSCALP_STEP_USD = float(os.getenv("DSCALP_STEP_USD", "8.0"))                   #
 DSCALP_STEP_USD_MIN = float(os.getenv("DSCALP_STEP_USD_MIN", "6.0"))           # minimum entry size (no $1 clips)
 DSCALP_MAX_USD_PER_SLUG = float(os.getenv("DSCALP_MAX_USD_PER_SLUG", "30.0"))  # max directional per slug
 DSCALP_COOLDOWN_MS = float(os.getenv("DSCALP_COOLDOWN_MS", "4000"))            # 4s between entries (target ~15 trades/min)
+if FAST_CLONE:
+    DSCALP_COOLDOWN_MS = float(os.getenv("DSCALP_COOLDOWN_MS", "1000"))       # FAST_CLONE: 1s cooldown
 # Exit ladder
 DSCALP_TP1_CENTS = float(os.getenv("DSCALP_TP1_CENTS", "4.0"))                 # +4c: sell 30% (raised from +3c)
 DSCALP_TP1_FRAC = float(os.getenv("DSCALP_TP1_FRAC", "0.30"))
@@ -1418,6 +1425,9 @@ class Bot:
         # Warm-up: timestamp of bootstrap completion + last hour roll
         self._bootstrap_done_ts: float = 0.0
         self._last_hour_roll_ts: float = 0.0
+        # GATE_BREAKDOWN: per-slug per-minute counters, reset every 60s
+        self._gate_counters: Dict[str, Dict[str, int]] = {}  # slug -> {reason: count}
+        self._gate_report_last_ts: float = 0.0
         # Rescue invested tracking: slug -> USD spent on rescue buys
         self._rescue_invested_usd: Dict[str, float] = {}
         # Similarity/tempo stats: timestamps of all parity trades this minute
@@ -3250,6 +3260,7 @@ class Bot:
                     self._emit_diag_report()    # F247-style behavioral diagnostics
                     self._emit_pnl_attribution()  # per-hour PnL attribution + expectancy
                     self._emit_tempo_report()
+                    self._maybe_emit_gate_report()  # GATE_BREAKDOWN
                     self._tempo_last_report_ts = now
             except Exception as e:
                 self.logger.log_event({"event_type": "LOOP_ERROR", "err": str(e)})
@@ -4795,6 +4806,42 @@ class Bot:
         return now < paused_until or now < degraded_until
 
     # =================================================================
+    # GATE_BREAKDOWN — per-slug gate counters + GATE_REPORT
+    # =================================================================
+    def _gate_inc(self, slug: str, reason: str):
+        """Increment gate-blocked counter for a slug."""
+        bucket = self._gate_counters.setdefault(slug, {})
+        bucket[reason] = bucket.get(reason, 0) + 1
+
+    def _maybe_emit_gate_report(self):
+        """Emit GATE_REPORT every 60s with per-slug gate breakdown."""
+        now = time.time()
+        if now - self._gate_report_last_ts < 60.0:
+            return
+        self._gate_report_last_ts = now
+        if not self._gate_counters:
+            return
+        per_slug = {}
+        for slug, reasons in self._gate_counters.items():
+            total = sum(reasons.values())
+            top3 = sorted(reasons.items(), key=lambda x: -x[1])[:3]
+            per_slug[slug] = {"total_blocked": total,
+                              "top3": {k: v for k, v in top3}}
+        write_jsonl({"event_type": "GATE_REPORT",
+                      "ts_ms": int(now * 1000),
+                      "per_slug": per_slug})
+        # Console summary
+        top_slugs = sorted(per_slug.items(), key=lambda x: -x[1]["total_blocked"])[:3]
+        parts = []
+        for s, d in top_slugs:
+            reasons_s = ",".join(f"{k}={v}" for k, v in d["top3"].items())
+            parts.append(f"{s}({d['total_blocked']}): {reasons_s}")
+        if parts:
+            print(f"  GATE: {' | '.join(parts)}")
+        # Reset for next window
+        self._gate_counters = {}
+
+    # =================================================================
     # DIRECTIONAL SCALP MODE — F247-style momentum entries
     # =================================================================
     def _dscalp_entries(self, ctx: dict):
@@ -4813,15 +4860,18 @@ class Bot:
         # Cooldown (4s default = ~15 trades/min max across all slugs)
         last_entry = self._dscalp_last_entry_ts.get(m.slug, 0.0)
         if (now_t - last_entry) * 1000 < DSCALP_COOLDOWN_MS:
+            self._gate_inc(m.slug, "cooldown")
             return
 
         # Already at max position for this slug
         invested = self._dscalp_invested_usd.get(m.slug, 0.0)
         if invested >= DSCALP_MAX_USD_PER_SLUG:
+            self._gate_inc(m.slug, "max_position")
             return
 
         # Rate limit
         if not self._rate_limit_ok(m.slug):
+            self._gate_inc(m.slug, "rate_limit")
             return
 
         # Regime awareness: reduce activity in low-vol
@@ -4829,6 +4879,7 @@ class Bot:
         if activity_mult < 1.0:
             # In low-vol, randomly skip entries proportional to reduction
             if random.random() > activity_mult:
+                self._gate_inc(m.slug, "low_vol")
                 return
 
         # Direction: follow the drift
@@ -4840,11 +4891,13 @@ class Bot:
         # Cache freshness
         cache_age = self._cache_age_ms(m.slug)
         if cache_age > DSCALP_MAX_CACHE_AGE_MS:
+            self._gate_inc(m.slug, "stale_cache")
             return
 
         # Spread gate
         spread_cents = book.spread * 100
         if spread_cents > DSCALP_MAX_SPREAD_CENTS:
+            self._gate_inc(m.slug, "spread")
             return
 
         # Edge filter: require minimum directional edge (cents) for this coin
@@ -4867,34 +4920,41 @@ class Bot:
         signal_edge_cents = abs_delta_bps * book.mid / 100.0  # convert bps to cents
         effective_edge_cents = signal_edge_cents - half_spread_cents  # net of half-spread cost
         if effective_edge_cents < min_edge:
+            self._gate_inc(m.slug, "edge")
             return
 
         # No-trade zone: block if data feeds disagree or are stale
         _feed_delta = self._feed_disagreement_bps(m.slug) if hasattr(self, '_feed_disagreement_bps') else 0.0
         if _feed_delta > DSCALP_FEED_DISAGREE_BPS:
+            self._gate_inc(m.slug, "feed_disagree")
             return
         _feed_age = self._max_feed_age_sec(m.slug) if hasattr(self, '_max_feed_age_sec') else 0.0
         if _feed_age > DSCALP_FEED_STALE_SEC:
+            self._gate_inc(m.slug, "feed_stale")
             return
 
         # ── ENTRY SIGNAL: delta >= 15bps OR spot moved >= 8bps in 10s ──
         delta_ok = abs_delta_bps >= DSCALP_DELTA_MIN_BPS
         spot_move_ok = self._spot_move_10s_bps(m.slug) >= DSCALP_SPOT_MOVE_10S_BPS
         if not delta_ok and not spot_move_ok:
+            self._gate_inc(m.slug, "delta")
             return
 
         # Velocity must be supportive (agree with direction)
         # If vel is None (unknown/warming up), skip this gate — allow entry
         if vel is not None:
             if outcome == "Up" and vel < DSCALP_VEL_MIN_BPS_PER_MIN:
+                self._gate_inc(m.slug, "velocity")
                 return
             if outcome == "Down" and vel > -DSCALP_VEL_MIN_BPS_PER_MIN:
+                self._gate_inc(m.slug, "velocity")
                 return
 
         # Size: $5-10 per entry, no micro-splits
         remaining = DSCALP_MAX_USD_PER_SLUG - invested
         step_usd = min(DSCALP_STEP_USD, remaining)
         if step_usd < DSCALP_STEP_USD_MIN:
+            self._gate_inc(m.slug, "size")
             return  # don't enter with less than minimum size
 
         # Place maker buy
@@ -5288,6 +5348,14 @@ class Bot:
         skip_reason = ""
         if not will_trade:
             reasons = []
+            # Track gate breakdown for _core_entries too
+            if not valid_time: self._gate_inc(m.slug, "time_gate")
+            if not valid_delta: self._gate_inc(m.slug, "delta")
+            if sig and not persist_ok: self._gate_inc(m.slug, "persistence")
+            if sig and cooldown_active: self._gate_inc(m.slug, "cooldown")
+            if sig and risk_blocked: self._gate_inc(m.slug, "risk")
+            if whipsaw_blocked: self._gate_inc(m.slug, "whipsaw")
+            if noflip_blocked: self._gate_inc(m.slug, "noflip")
             if not valid_time: reasons.append("time")
             if not valid_delta: reasons.append(f"delta({abs_delta_bps:.1f}<{thr})")
             if not valid_z: reasons.append("zscore")
@@ -5303,6 +5371,35 @@ class Bot:
             if sig and persist_ok and not cooldown_active and not risk_blocked and clip < MIN_ORDER_USDC:
                 reasons.append(f"clip_too_small({clip:.2f})")
             skip_reason = "|".join(reasons)
+
+        # ENTRY_INTENT: signal present but trade blocked — show exact gate
+        if sig and not will_trade:
+            _cd_remaining = 0.0
+            if st.last_entry_ts:
+                try:
+                    _last = datetime.strptime(st.last_entry_ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                    _cd_remaining = max(0, entry_cooldown_sec(m.crypto, t_min) - (utc_now() - _last).total_seconds()) * 1000
+                except Exception:
+                    pass
+            write_jsonl({
+                "event_type": "ENTRY_INTENT",
+                "slug": m.slug, "crypto": m.crypto, "outcome": outcome,
+                "delta_bps": round(delta_bps, 2),
+                "abs_delta_bps": round(abs_delta_bps, 2),
+                "thr_used": round(thr, 1),
+                "persist_ok": persist_ok,
+                "persist_sec": PERSISTENCE_SEC,
+                "cooldown_active": cooldown_active,
+                "cooldown_remaining_ms": round(_cd_remaining, 0),
+                "risk_blocked": risk_blocked,
+                "whipsaw_blocked": whipsaw_blocked,
+                "noflip_blocked": noflip_blocked,
+                "cache_age_ms": round(self._cache_age_ms(m.slug), 0),
+                "spread_cents": round(book.spread * 100, 2),
+                "vel": round(vel, 2) if vel is not None else None,
+                "clip": round(clip, 2),
+                "skip_reason": skip_reason,
+            })
 
         sig_dict = {
             "outcome": outcome, "will_trade": will_trade,
@@ -5331,7 +5428,7 @@ class Bot:
                 "will_trade": will_trade, "skip_reason": skip_reason,
                 "spot": spot, "hour_open": ctx["hour_open"],
                 "delta_bps": round(delta_bps, 3), "abs_delta_bps": round(abs_delta_bps, 3),
-                "vel": round(vel, 3), "z": round(z, 3),
+                "vel": round(vel, 3) if vel is not None else None, "z": round(z, 3),
                 "sm_state": sm["state"],
             })
         # ── BOUNDARY events ──
