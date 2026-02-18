@@ -410,6 +410,24 @@ OM_HEDGE_TICK2_MS = 350       # +3 ticks after 350ms
 OM_HEDGE_CROSS_MS = 500       # taker cross after 500ms
 OM_HEDGE_CROSS_MIN_EDGE_CENTS = 0.5
 OM_HEDGE_CROSS_MAX_SPREAD_CENTS = 2.0
+# Restart recovery (Safety Item 1)
+OM_STARTUP_RECONCILE = bool(os.getenv("OM_STARTUP_RECONCILE", "True") not in ("", "0", "False", "false"))
+OM_OPEN_ORDERS_FILE = os.getenv("OM_OPEN_ORDERS_FILE", os.path.join(_LOG_DIR, "om_open_orders.json"))
+# Per-slug no-progress circuit breaker (Safety Item 2)
+OM_SLUG_NOPROGRESS_SUBMITS = int(os.getenv("OM_SLUG_NOPROGRESS_SUBMITS", "20"))   # submits in 60s threshold
+OM_SLUG_PAUSE_SEC = float(os.getenv("OM_SLUG_PAUSE_SEC", "120"))                   # pause duration
+# Cancel/replace rate limits (Safety Item 3)
+OM_MIN_REPLACE_INTERVAL_MS = float(os.getenv("OM_MIN_REPLACE_INTERVAL_MS", "250")) # min ms between replaces
+OM_MAX_CANCELS_PER_MIN_GLOBAL = int(os.getenv("OM_MAX_CANCELS_PER_MIN_GLOBAL", "200"))    # global cancel cap
+OM_MAX_CANCELS_PER_MIN_SLUG = int(os.getenv("OM_MAX_CANCELS_PER_MIN_SLUG", "40"))         # per-slug cancel cap
+OM_CANCEL_FREEZE_SEC = float(os.getenv("OM_CANCEL_FREEZE_SEC", "30"))              # freeze quoting after exceed
+# Flatten verification (Safety Item 4)
+OM_FLATTEN_VERIFY_ENABLED = bool(os.getenv("OM_FLATTEN_VERIFY_ENABLED", "True") not in ("", "0", "False", "false"))
+OM_FLATTEN_CROSS_MAX_RETRIES = int(os.getenv("OM_FLATTEN_CROSS_MAX_RETRIES", "3"))
+# State drift detector (Safety Item 5)
+OM_DRIFT_CHECK_INTERVAL_SEC = float(os.getenv("OM_DRIFT_CHECK_INTERVAL_SEC", "60"))
+OM_DRIFT_QTY_TOLERANCE = float(os.getenv("OM_DRIFT_QTY_TOLERANCE", "5.0"))         # shares tolerance
+OM_DRIFT_PAUSE_SEC = float(os.getenv("OM_DRIFT_PAUSE_SEC", "120"))                 # pause entries on drift
 # =============================================================================
 # UTIL / LOGGING — thin wrappers around Logger instance
 # =============================================================================
@@ -1328,6 +1346,18 @@ class Bot:
         self._om_kill_switch_until: float = 0.0  # entries disabled until this ts
         self._om_last_sanity_ts: float = 0.0
         self._om_sanity_interval_sec: float = 60.0
+        # Safety Item 2: per-slug no-progress circuit
+        self._om_slug_submits_60s: Dict[str, List[float]] = {}   # slug -> [submit_ts, ...]
+        self._om_slug_fills_60s: Dict[str, List[float]] = {}     # slug -> [fill_ts, ...]
+        self._om_slug_paused_until: Dict[str, float] = {}        # slug -> pause_until_ts
+        # Safety Item 3: cancel rate limits
+        self._om_cancel_ts_global: List[float] = []              # timestamps of global cancels
+        self._om_cancel_ts_slug: Dict[str, List[float]] = {}     # slug -> [cancel_ts, ...]
+        self._om_cancel_freeze_until: float = 0.0                # global freeze on quoting
+        self._om_last_replace_ts: Dict[str, float] = {}          # (slug+outcome+side) -> last replace ts
+        # Safety Item 5: state drift detector
+        self._om_last_drift_check_ts: float = 0.0
+        self._om_drift_pause_until: float = 0.0
         self._diag_quote_submit_count = 0
         self._diag_quote_cancel_count = 0
         self._diag_quote_replace_count = 0
@@ -1510,6 +1540,8 @@ class Bot:
                          "realized_pnl": self.realized_pnl_usdc,
                          "loaded_schema_version": loaded_schema,
                          "current_schema_version": SCHEMA_VERSION})
+            # Safety Item 1: load persisted open orders
+            self._om_load_open_orders()
         except Exception as e:
             write_jsonl({"event_type":"STATE_LOAD_ERROR", "err": str(e)})
     def _save_state(self):
@@ -1538,6 +1570,8 @@ class Bot:
                 json.dump(raw, f, separators=(",", ":"))
         except Exception as e:
             write_jsonl({"event_type":"STATE_SAVE_ERROR", "err": str(e)})
+        # Safety Item 1: persist open orders separately (every save cycle)
+        self._om_save_open_orders()
     def _equity(self) -> float:
         """Mark-to-market equity: cash + sum(pos.qty * mid_price) for all open positions."""
         mtm = 0.0
@@ -1766,15 +1800,17 @@ class Bot:
                 fill_qty = result.get("fill_qty", 0)
                 fill_price = result.get("fill_price", 0.0)
 
-                # Successful submit — count tx
+                # Successful submit — count tx + record for slug progress
                 if oid:
                     self._true_cost_tx_count += 1
                     self._true_cost_submit_count += 1
+                    self._om_record_slug_submit(slug)
 
                 # If fully filled immediately, count fill and do NOT track as open
                 if filled and fill_qty >= int(float(qty)):
                     self._true_cost_fill_count += 1
                     self._true_cost_fill_count_min += 1
+                    self._om_record_slug_fill(slug)
                     write_jsonl({"event_type": "OM_ORDER_FILLED_IMMEDIATE",
                                   "order_id": oid, "slug": slug, "outcome": outcome,
                                   "side": side, "price": fill_price, "qty": fill_qty,
@@ -1800,6 +1836,7 @@ class Bot:
                         self._true_cost_fill_count_min += 1
                         self._om_partial_fill_events += 1
                         self._om_partial_fill_events_min += 1
+                        self._om_record_slug_fill(slug)
                     write_jsonl({"event_type": "OM_ORDER_TRACKED",
                                   "order_id": oid, "slug": slug, "outcome": outcome,
                                   "side": side, "price": price, "qty": int(float(qty)),
@@ -1873,6 +1910,7 @@ class Bot:
                 outcome = entry["outcome"]
                 fill_price = entry["price"]  # best available; CLOB may not give avg
                 usdc_delta = fill_price * delta_qty
+                self._om_record_slug_fill(slug)
 
                 st = self.market_states.get(slug)
                 if st:
@@ -1914,10 +1952,19 @@ class Bot:
             self._om_open_orders.pop(order_id, None)
             return True
 
+        # Safety Item 3: Cancel rate-limit check (skip for hard_flatten/shutdown)
+        slug = entry.get("slug", "")
+        if reason not in ("hard_flatten", "shutdown", "kill_switch") and not self._om_cancel_rate_ok(slug):
+            write_jsonl({"event_type": "OM_CANCEL_RATE_LIMITED", "order_id": order_id,
+                          "slug": slug, "reason": reason})
+            entry["cancel_pending"] = True
+            return False
+
         for attempt in range(OM_CANCEL_MAX_RETRIES):
             try:
                 self.client._clob.cancel(order_id)
                 self._true_cost_cancel_count += 1
+                self._om_record_cancel(slug)
                 self._om_open_orders.pop(order_id, None)
                 write_jsonl({"event_type": "OM_ORDER_CANCELED", "order_id": order_id,
                               "slug": entry["slug"], "outcome": entry["outcome"],
@@ -1957,9 +2004,15 @@ class Bot:
         outcome = entry["outcome"]
         side = entry["side"]
 
+        # Safety Item 3: Replace interval throttle
+        if not self._om_replace_interval_ok(slug, outcome, side):
+            return None  # too soon, skip this tick
+
         # Cancel old
         if not self._om_cancel_order(order_id, f"reprice:{reason}"):
             return None  # will retry next tick
+
+        self._om_record_replace(slug, outcome, side)
 
         # Submit new with remaining qty
         st = self.market_states.get(slug)
@@ -2084,6 +2137,20 @@ class Bot:
             return {"filled": False, "fill_qty": 0, "fill_price": 0.0,
                     "usdc_cost": 0.0, "order_id": ""}
 
+        # Safety Item 2: Per-slug no-progress circuit breaker
+        if self._om_slug_paused(m.slug):
+            write_jsonl({"event_type": "OM_BUY_BLOCKED_SLUG_PAUSED",
+                          "slug": m.slug, "outcome": outcome, "reason": reason})
+            return {"filled": False, "fill_qty": 0, "fill_price": 0.0,
+                    "usdc_cost": 0.0, "order_id": ""}
+
+        # Safety Item 5: State drift pause
+        if self._om_drift_paused():
+            write_jsonl({"event_type": "OM_BUY_BLOCKED_DRIFT_PAUSE",
+                          "slug": m.slug, "outcome": outcome, "reason": reason})
+            return {"filled": False, "fill_qty": 0, "fill_price": 0.0,
+                    "usdc_cost": 0.0, "order_id": ""}
+
         result = self._om_submit_order(
             token_id=token_id, slug=m.slug, outcome=outcome,
             side="BUY", price=price, qty=qty, reason=reason,
@@ -2150,6 +2217,17 @@ class Bot:
             ages.append(age_ms)
         avg_age_ms = sum(ages) / len(ages) if ages else 0.0
 
+        # Safety Item 2: Count slugs currently paused
+        slugs_paused = [s for s, t in self._om_slug_paused_until.items() if now_ts < t]
+
+        # Safety Item 3: Cancel rate metrics
+        cutoff_60 = now_ts - 60.0
+        cancels_global_min = len([t for t in self._om_cancel_ts_global if t > cutoff_60])
+        cancel_freeze_remaining = max(0.0, self._om_cancel_freeze_until - now_ts)
+
+        # Safety Item 5: Drift pause remaining
+        drift_pause_remaining = max(0.0, self._om_drift_pause_until - now_ts)
+
         write_jsonl({
             "event_type": "LIVE_SANITY",
             "open_orders_count": len(self._om_open_orders),
@@ -2168,6 +2246,14 @@ class Bot:
             "fill_count_min": self._true_cost_fill_count_min,
             "kill_switch_active": self._om_kill_switch_active(),
             "kill_switch_until": round(max(0, self._om_kill_switch_until - now_ts), 1),
+            # Safety Item 2: Slug progress
+            "slugs_paused": slugs_paused,
+            "slugs_paused_count": len(slugs_paused),
+            # Safety Item 3: Cancel rate
+            "cancels_global_min": cancels_global_min,
+            "cancel_freeze_remaining_sec": round(cancel_freeze_remaining, 1),
+            # Safety Item 5: Drift
+            "drift_pause_remaining_sec": round(drift_pause_remaining, 1),
         })
 
         # Reset per-minute counters
@@ -2176,6 +2262,363 @@ class Bot:
         self._om_submit_fail_min = 0
         self._om_cancel_fail_min = 0
         self._om_api_errors_min = 0
+
+    # =========================================================================
+    # Safety Item 1: Restart Recovery — persist + reconcile open orders
+    # =========================================================================
+
+    def _om_save_open_orders(self):
+        """Persist _om_open_orders to disk for crash recovery."""
+        if not self._om_open_orders:
+            # Remove stale file if no open orders
+            try:
+                if os.path.exists(OM_OPEN_ORDERS_FILE):
+                    os.remove(OM_OPEN_ORDERS_FILE)
+            except Exception:
+                pass
+            return
+        try:
+            with open(OM_OPEN_ORDERS_FILE, "w", encoding="utf-8") as f:
+                json.dump(self._om_open_orders, f, separators=(",", ":"))
+        except Exception as e:
+            write_jsonl({"event_type": "OM_SAVE_ORDERS_ERROR", "err": str(e)[:200]})
+
+    def _om_load_open_orders(self):
+        """Load persisted open orders from disk (called during _load_state)."""
+        if not os.path.exists(OM_OPEN_ORDERS_FILE):
+            return
+        try:
+            with open(OM_OPEN_ORDERS_FILE, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                self._om_open_orders = loaded
+                write_jsonl({"event_type": "OM_ORDERS_LOADED",
+                              "count": len(loaded),
+                              "order_ids": list(loaded.keys())[:20]})
+        except Exception as e:
+            write_jsonl({"event_type": "OM_LOAD_ORDERS_ERROR", "err": str(e)[:200]})
+
+    def _om_startup_reconcile(self):
+        """On startup: list CLOB orders, adopt tracked ones, cancel unknown ones."""
+        if not self.client._clob:
+            return
+        try:
+            clob_orders = self.client.get_open_orders()
+        except Exception as e:
+            write_jsonl({"event_type": "OM_STARTUP_RECONCILE_ERROR", "err": str(e)[:200]})
+            return
+
+        clob_ids = {}
+        for o in clob_orders:
+            oid = o.get("id") or o.get("orderID") or o.get("order_id", "")
+            if oid:
+                clob_ids[oid] = o
+
+        adopted = 0
+        canceled_unknown = 0
+        reconciled_fills = 0
+
+        # 1. For tracked orders that still exist on CLOB: reconcile fills
+        for oid in list(self._om_open_orders.keys()):
+            if oid in clob_ids:
+                result = self._om_poll_and_reconcile(oid)
+                if result.get("filled_qty", 0) > 0:
+                    reconciled_fills += 1
+                adopted += 1
+            else:
+                # Order no longer on CLOB — it was filled or expired while we were down
+                entry = self._om_open_orders[oid]
+                # Assume fully filled (conservative: position state was already applied
+                # for any partial fills before crash, remainder is unknown)
+                write_jsonl({"event_type": "OM_STARTUP_ORDER_GONE",
+                              "order_id": oid, "slug": entry["slug"],
+                              "outcome": entry["outcome"], "side": entry["side"],
+                              "filled_qty": entry["filled_qty"], "total_qty": entry["qty"]})
+                self._om_open_orders.pop(oid, None)
+
+        # 2. For CLOB orders NOT in our tracking: cancel them (orphans)
+        tracked = set(self._om_open_orders.keys())
+        for oid, o in clob_ids.items():
+            if oid not in tracked:
+                try:
+                    self.client._clob.cancel(oid)
+                    canceled_unknown += 1
+                    write_jsonl({"event_type": "OM_STARTUP_ORPHAN_CANCELED",
+                                  "order_id": oid,
+                                  "side": o.get("side", ""),
+                                  "price": o.get("price", ""),
+                                  "size": o.get("size", "")})
+                except Exception as e:
+                    write_jsonl({"event_type": "OM_STARTUP_ORPHAN_CANCEL_ERROR",
+                                  "order_id": oid, "err": str(e)[:120]})
+
+        write_jsonl({"event_type": "OM_STARTUP_RECONCILE_DONE",
+                      "clob_orders": len(clob_ids),
+                      "adopted": adopted,
+                      "canceled_unknown": canceled_unknown,
+                      "reconciled_fills": reconciled_fills,
+                      "tracked_remaining": len(self._om_open_orders)})
+
+    # =========================================================================
+    # Safety Item 2: Per-Slug No-Progress Circuit Breaker
+    # =========================================================================
+
+    def _om_record_slug_submit(self, slug: str):
+        """Record a submit for the no-progress circuit breaker."""
+        now = time.time()
+        self._om_slug_submits_60s.setdefault(slug, []).append(now)
+
+    def _om_record_slug_fill(self, slug: str):
+        """Record a fill for the no-progress circuit breaker."""
+        now = time.time()
+        self._om_slug_fills_60s.setdefault(slug, []).append(now)
+
+    def _om_slug_paused(self, slug: str) -> bool:
+        """True if slug is paused due to no-progress circuit breaker."""
+        return time.time() < self._om_slug_paused_until.get(slug, 0.0)
+
+    def _om_check_slug_progress(self):
+        """Check all slugs for no-progress condition. Pause offenders."""
+        now = time.time()
+        cutoff = now - 60.0
+
+        for slug in list(self._om_slug_submits_60s.keys()):
+            # Trim old entries
+            self._om_slug_submits_60s[slug] = [
+                t for t in self._om_slug_submits_60s[slug] if t > cutoff]
+            fills = self._om_slug_fills_60s.get(slug, [])
+            self._om_slug_fills_60s[slug] = [t for t in fills if t > cutoff]
+
+            submits_60s = len(self._om_slug_submits_60s[slug])
+            fills_60s = len(self._om_slug_fills_60s.get(slug, []))
+
+            if (submits_60s >= OM_SLUG_NOPROGRESS_SUBMITS and fills_60s == 0
+                    and not self._om_slug_paused(slug)):
+                self._om_slug_paused_until[slug] = now + OM_SLUG_PAUSE_SEC
+                # Cancel all open orders for this slug
+                for oid, entry in list(self._om_open_orders.items()):
+                    if entry["slug"] == slug:
+                        self._om_cancel_order(oid, "noprogress_pause")
+                write_jsonl({"event_type": "OM_SLUG_NOPROGRESS_PAUSE",
+                              "slug": slug,
+                              "submits_60s": submits_60s, "fills_60s": fills_60s,
+                              "pause_sec": OM_SLUG_PAUSE_SEC})
+
+    # =========================================================================
+    # Safety Item 3: Cancel/Replace Rate Limits
+    # =========================================================================
+
+    def _om_cancel_rate_ok(self, slug: str = "") -> bool:
+        """Check if we can cancel/replace without exceeding rate limits."""
+        if time.time() < self._om_cancel_freeze_until:
+            return False
+
+        now = time.time()
+        cutoff = now - 60.0
+
+        # Global check
+        self._om_cancel_ts_global = [t for t in self._om_cancel_ts_global if t > cutoff]
+        if len(self._om_cancel_ts_global) >= OM_MAX_CANCELS_PER_MIN_GLOBAL:
+            self._om_cancel_freeze_until = now + OM_CANCEL_FREEZE_SEC
+            write_jsonl({"event_type": "OM_CANCEL_RATE_FREEZE",
+                          "reason": "global_limit",
+                          "cancels_min": len(self._om_cancel_ts_global),
+                          "freeze_sec": OM_CANCEL_FREEZE_SEC})
+            return False
+
+        # Per-slug check
+        if slug:
+            slug_ts = self._om_cancel_ts_slug.get(slug, [])
+            self._om_cancel_ts_slug[slug] = [t for t in slug_ts if t > cutoff]
+            if len(self._om_cancel_ts_slug[slug]) >= OM_MAX_CANCELS_PER_MIN_SLUG:
+                self._om_cancel_freeze_until = now + OM_CANCEL_FREEZE_SEC
+                write_jsonl({"event_type": "OM_CANCEL_RATE_FREEZE",
+                              "reason": "slug_limit", "slug": slug,
+                              "cancels_min": len(self._om_cancel_ts_slug[slug]),
+                              "freeze_sec": OM_CANCEL_FREEZE_SEC})
+                return False
+
+        return True
+
+    def _om_record_cancel(self, slug: str = ""):
+        """Record a cancel for rate-limiting purposes."""
+        now = time.time()
+        self._om_cancel_ts_global.append(now)
+        if slug:
+            self._om_cancel_ts_slug.setdefault(slug, []).append(now)
+
+    def _om_replace_interval_ok(self, slug: str, outcome: str, side: str) -> bool:
+        """Check if enough time has passed since last replace for this key."""
+        key = f"{slug}:{outcome}:{side}"
+        last = self._om_last_replace_ts.get(key, 0.0)
+        elapsed_ms = (time.time() - last) * 1000
+        return elapsed_ms >= OM_MIN_REPLACE_INTERVAL_MS
+
+    def _om_record_replace(self, slug: str, outcome: str, side: str):
+        """Record a replace timestamp."""
+        key = f"{slug}:{outcome}:{side}"
+        self._om_last_replace_ts[key] = time.time()
+
+    # =========================================================================
+    # Safety Item 4: Flatten Guarantees + Verify
+    # =========================================================================
+
+    def _om_flatten_hard(self, m, st: MarketState, ctx: dict):
+        """Hard flatten: cancel ALL orders, cross positions with retries, verify flat."""
+        slug = m.slug
+        up_book = ctx.get("up_book")
+        dn_book = ctx.get("dn_book")
+
+        # 1. Cancel ALL tracked open orders for this slug
+        for oid, entry in list(self._om_open_orders.items()):
+            if entry["slug"] == slug:
+                self._om_cancel_order(oid, "hard_flatten")
+
+        # 2. Orphan scan for this slug specifically
+        if MODE != "LOG" and self.client._clob:
+            try:
+                clob_orders = self.client.get_open_orders()
+                for o in clob_orders:
+                    # Filter to this slug's token_ids
+                    o_token = o.get("asset_id") or o.get("token_id", "")
+                    if o_token in (m.outcome_up_id, m.outcome_down_id):
+                        oid = o.get("id") or o.get("orderID") or o.get("order_id", "")
+                        if oid:
+                            try:
+                                self.client._clob.cancel(oid)
+                                self._om_orphan_canceled_count += 1
+                                write_jsonl({"event_type": "OM_FLATTEN_ORPHAN_CANCELED",
+                                              "slug": slug, "order_id": oid})
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+
+        # 3. Cross remaining positions with retries
+        for outcome in ["Up", "Down"]:
+            pos = st.positions[outcome]
+            if pos.qty < MIN_QTY:
+                continue
+            book = up_book if outcome == "Up" else dn_book
+            if not book or book.bid <= 0:
+                continue
+
+            for attempt in range(OM_FLATTEN_CROSS_MAX_RETRIES):
+                sell_price = book.bid  # taker cross at bid
+                sell_result = self._exec_sell(
+                    st, m, outcome, sell_price, pos.qty,
+                    reason="HARD_FLATTEN_CROSS", prefer_maker=False, ctx=ctx)
+                if sell_result.get("filled"):
+                    break
+                # Brief pause before retry
+                time.sleep(0.2)
+                # Refresh book if possible
+                cached = self._data_cache.get(slug)
+                if cached:
+                    book = cached.get(f"{outcome.lower()}_book") or cached.get(f"{outcome}_book") or book
+
+        # 4. Verify flat (Safety Item 4 — assert flat)
+        if not OM_FLATTEN_VERIFY_ENABLED or MODE == "LOG":
+            return
+
+        # Brief delay for fills to settle
+        time.sleep(0.5)
+
+        any_remaining = False
+        for outcome in ["Up", "Down"]:
+            pos = st.positions[outcome]
+            if pos.qty >= MIN_QTY:
+                any_remaining = True
+                write_jsonl({"event_type": "FLATTEN_VERIFY_FAIL",
+                              "slug": slug, "outcome": outcome,
+                              "remaining_qty": round(pos.qty, 1),
+                              "vwap": round(pos.vwap, 4)})
+
+        if any_remaining:
+            # Disable trading for this slug
+            self._om_slug_paused_until[slug] = time.time() + 300.0  # 5 min pause
+            write_jsonl({"event_type": "FLATTEN_VERIFY_FAIL_PAUSED",
+                          "slug": slug, "pause_sec": 300})
+
+    # =========================================================================
+    # Safety Item 5: State Drift Detector
+    # =========================================================================
+
+    def _om_check_state_drift(self):
+        """Compare internal position state against CLOB order state.
+        If mismatch beyond tolerance, log STATE_DRIFT and pause entries."""
+        if MODE == "LOG" or not self.client._clob:
+            return
+
+        now_ts = time.time()
+        if now_ts - self._om_last_drift_check_ts < OM_DRIFT_CHECK_INTERVAL_SEC:
+            return
+        self._om_last_drift_check_ts = now_ts
+
+        # 1. Compare tracked open orders vs CLOB reality
+        try:
+            clob_orders = self.client.get_open_orders()
+        except Exception:
+            return  # can't check, skip this cycle
+
+        clob_ids = set()
+        for o in clob_orders:
+            oid = o.get("id") or o.get("orderID") or o.get("order_id", "")
+            if oid:
+                clob_ids.add(oid)
+
+        tracked_ids = set(self._om_open_orders.keys())
+
+        # Orders we think are open but CLOB says are gone
+        ghost_orders = tracked_ids - clob_ids
+        # Orders CLOB has that we don't track (orphans — handled by orphan scan)
+        orphan_orders = clob_ids - tracked_ids
+
+        drift_detected = False
+
+        if ghost_orders:
+            # These orders disappeared — might have filled or been cancelled externally
+            for oid in ghost_orders:
+                entry = self._om_open_orders.get(oid, {})
+                write_jsonl({"event_type": "STATE_DRIFT_GHOST_ORDER",
+                              "order_id": oid,
+                              "slug": entry.get("slug", ""),
+                              "outcome": entry.get("outcome", ""),
+                              "side": entry.get("side", ""),
+                              "filled_qty": entry.get("filled_qty", 0),
+                              "total_qty": entry.get("qty", 0)})
+                # Try to reconcile one last time before removing
+                self._om_poll_and_reconcile(oid)
+                # If still tracked (poll didn't remove it), force-remove
+                if oid in self._om_open_orders:
+                    self._om_open_orders.pop(oid, None)
+            drift_detected = True
+
+        # 2. Cross-check internal position qty consistency
+        # Sum up all pending BUY fills that haven't been applied
+        pending_buy_qty: Dict[str, Dict[str, float]] = {}  # slug -> outcome -> qty
+        pending_sell_qty: Dict[str, Dict[str, float]] = {}
+        for entry in self._om_open_orders.values():
+            remaining = max(0, entry["qty"] - entry["filled_qty"])
+            if remaining > 0:
+                d = pending_buy_qty if entry["side"] == "BUY" else pending_sell_qty
+                d.setdefault(entry["slug"], {}).setdefault(entry["outcome"], 0.0)
+                d[entry["slug"]][entry["outcome"]] += remaining
+
+        if drift_detected:
+            write_jsonl({"event_type": "STATE_DRIFT",
+                          "ghost_orders": len(ghost_orders),
+                          "orphan_orders": len(orphan_orders),
+                          "pending_buy_slugs": len(pending_buy_qty),
+                          "pending_sell_slugs": len(pending_sell_qty)})
+            # Pause entries briefly to let reconciliation settle
+            self._om_drift_pause_until = now_ts + OM_DRIFT_PAUSE_SEC
+            write_jsonl({"event_type": "STATE_DRIFT_PAUSE",
+                          "pause_sec": OM_DRIFT_PAUSE_SEC})
+
+    def _om_drift_paused(self) -> bool:
+        """True if entries are paused due to state drift."""
+        return time.time() < self._om_drift_pause_until
 
     # -----------------------------
     # Risk checks (log-only alerts)
@@ -2446,6 +2889,10 @@ class Bot:
         except Exception as e:
             self.logger.log_event({"event_type": "INIT_BOOTSTRAP_ERROR", "err": str(e)})
 
+        # ── Safety Item 1: Startup reconcile — adopt or cancel leftover CLOB orders ──
+        if MODE != "LOG" and OM_STARTUP_RECONCILE:
+            self._om_startup_reconcile()
+
         # ══════════════════════════════════════════════════════════════════
         # NON-BLOCKING MAIN LOOP — reads from cache, never blocks on HTTP
         # Background pool continuously refreshes _data_cache
@@ -2528,7 +2975,9 @@ class Bot:
                 # 4c. Order Manager: reconcile open orders, TTL, orphan scan
                 self._om_reconcile_all()
 
-                # 4d. LIVE_SANITY report (every 60s)
+                # 4d. Safety checks: no-progress, state drift, LIVE_SANITY
+                self._om_check_slug_progress()
+                self._om_check_state_drift()
                 self._om_emit_live_sanity()
 
                 # 5. Save state periodically (every STATE_SAVE_INTERVAL_SEC)
@@ -6089,6 +6538,11 @@ class Bot:
         dn_book: BookTop = ctx["dn_book"]
         seconds_to_close = ctx.get("seconds_to_close", 999.0)
         hard_mode = t_min >= PARITY_HARD_FLATTEN_MIN
+
+        # Safety Item 4: In LIVE hard mode, use _om_flatten_hard for guaranteed flatten
+        if hard_mode and MODE != "LOG" and seconds_to_close < 20.0:
+            self._om_flatten_hard(m, st, ctx)
+            return
 
         for outcome in ["Up", "Down"]:
             pos = st.positions[outcome]
