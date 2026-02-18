@@ -41,9 +41,7 @@ from logger import (
     infer_maker_taker, spread_capture_fields,
 )
 
-# =============================================================================
 # MODULAR IMPORTS — config, data structures, utils, strategy, feeds, gating
-# =============================================================================
 from src.config.settings import *                       # noqa: F403 — all config constants
 from src.config.settings import (                       # private names not exported by *
     _PROJECT_DIR, _KEYS_DIR, _LOG_DIR, _THR_TABLE,
@@ -72,9 +70,7 @@ from src.trading.risk import market_cost_usdc, crypto_cost_usdc
 from src.feeds.polymarket import PolymarketClient, set_jsonl_writer
 from src.bot.app import BotApp
 
-# =============================================================================
 # UTIL / LOGGING — thin wrappers around Logger instance
-# =============================================================================
 _LOGGER: Optional["Logger"] = None
 
 def write_jsonl(event: dict) -> None:
@@ -86,9 +82,20 @@ def write_jsonl(event: dict) -> None:
         event["run_id"] = RUN_ID
         print(f"[{event.get('event_type','')}] (pre-logger)")
 
-# =============================================================================
+def _parse_iso_z(s: str) -> datetime:
+    """Parse ISO-8601 UTC string like '2025-01-01T00:00:00Z' → aware datetime."""
+    return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+
+
+def _p50_p90(vals) -> Tuple[float, float]:
+    """Return (median, 90th-percentile) of a numeric list, or (0, 0) if empty."""
+    if not vals:
+        return 0.0, 0.0
+    s = sorted(vals)
+    return s[len(s) // 2], s[min(int(len(s) * 0.9), len(s) - 1)]
+
+
 # BOT CORE
-# =============================================================================
 class Bot:
     def __init__(self):
         global _LOGGER
@@ -359,7 +366,7 @@ class Bot:
                 self.day_start = datetime.strptime(saved_day, "%Y-%m-%d").date()
             saved_hour = raw.get("hour_window")
             if saved_hour:
-                self._hour_window = datetime.strptime(saved_hour, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                self._hour_window = _parse_iso_z(saved_hour)
             ms = raw.get("market_states", {})
             pos_fields = {f.name for f in Position.__dataclass_fields__.values()}
             ms_fields = {f.name for f in MarketState.__dataclass_fields__.values()}
@@ -1018,14 +1025,7 @@ class Bot:
         maker_fill_rate = (self._diag_maker_fills / max(1, self._diag_maker_orders_placed)
                            if self._diag_maker_orders_placed > 0 else 0.0)
         # Maker fill latency percentiles
-        maker_lat_p50 = 0.0
-        maker_lat_p90 = 0.0
-        if self._diag_maker_fill_latencies:
-            sorted_lat = sorted(self._diag_maker_fill_latencies)
-            p50_idx = len(sorted_lat) // 2
-            p90_idx = int(len(sorted_lat) * 0.9)
-            maker_lat_p50 = sorted_lat[min(p50_idx, len(sorted_lat) - 1)]
-            maker_lat_p90 = sorted_lat[min(p90_idx, len(sorted_lat) - 1)]
+        maker_lat_p50, maker_lat_p90 = _p50_p90(self._diag_maker_fill_latencies)
         # Similarity/tempo stats
         trade_ts = sorted(self._diag_parity_trade_timestamps)
         paired_trades_per_min = len(trade_ts)
@@ -1301,22 +1301,10 @@ class Bot:
         med_signal_to_fill_ms = (statistics.median(self._clone_signal_to_fill)
                                  if self._clone_signal_to_fill else 0.0)
         # maker queue time percentiles (submit_ts -> fill_ts)
-        queue_p50 = 0.0
-        queue_p90 = 0.0
-        if self._diag_maker_queue_times:
-            sorted_qt = sorted(self._diag_maker_queue_times)
-            p50_idx = len(sorted_qt) // 2
-            p90_idx = int(len(sorted_qt) * 0.9)
-            queue_p50 = sorted_qt[min(p50_idx, len(sorted_qt) - 1)]
-            queue_p90 = sorted_qt[min(p90_idx, len(sorted_qt) - 1)]
+        queue_p50, queue_p90 = _p50_p90(self._diag_maker_queue_times)
 
         # ── 2. Hold time distribution for paired inventory ──
-        hold_p50 = 0.0
-        hold_p90 = 0.0
-        if self._clone_hold_times:
-            sorted_ht = sorted(self._clone_hold_times)
-            hold_p50 = sorted_ht[len(sorted_ht) // 2]
-            hold_p90 = sorted_ht[int(len(sorted_ht) * 0.9)]
+        hold_p50, hold_p90 = _p50_p90(self._clone_hold_times)
         # Also compute current hold times from active locked positions
         active_hold_secs = []
         now_t = time.time()
@@ -1359,20 +1347,10 @@ class Bot:
                         + [s for s in self.market_states]):
             # Cache age p50/p90
             ages = self._tempo_cache_ages.get(slug, [])
-            ca_p50 = 0.0
-            ca_p90 = 0.0
-            if ages:
-                sa = sorted(ages)
-                ca_p50 = sa[len(sa) // 2]
-                ca_p90 = sa[min(int(len(sa) * 0.9), len(sa) - 1)]
+            ca_p50, ca_p90 = _p50_p90(ages)
             # BG fetch duration p50/p90
             fetch_durs = self._bg_fetch_durations.get(slug, [])
-            bf_p50 = 0.0
-            bf_p90 = 0.0
-            if fetch_durs:
-                sf = sorted(fetch_durs)
-                bf_p50 = sf[len(sf) // 2]
-                bf_p90 = sf[min(int(len(sf) * 0.9), len(sf) - 1)]
+            bf_p50, bf_p90 = _p50_p90(fetch_durs)
             # Per-slug pair completion KPI
             slug_unpaired = self._diag_slug_unpaired_events.get(slug, 0)
             slug_p500 = self._diag_slug_paired_500ms.get(slug, 0)
@@ -1569,14 +1547,8 @@ class Bot:
             if "xrp" in slug.lower():
                 xrp_ages = ages_list
 
-        def _percentiles(vals):
-            if not vals:
-                return 0.0, 0.0
-            s = sorted(vals)
-            return s[len(s) // 2], s[min(int(len(s) * 0.9), len(s) - 1)]
-
-        sol_p50, sol_p90 = _percentiles(sol_ages)
-        xrp_p50, xrp_p90 = _percentiles(xrp_ages)
+        sol_p50, sol_p90 = _p50_p90(sol_ages)
+        xrp_p50, xrp_p90 = _p50_p90(xrp_ages)
 
         # ── True cost ──
         hour_elapsed = max(0.01, (now_t - self._true_cost_hour_start_ts) / 3600.0)
@@ -1697,6 +1669,44 @@ class Bot:
         rpnl_str = f"+${self.realized_pnl_usdc:.2f}" if self.realized_pnl_usdc >= 0 else f"-${abs(self.realized_pnl_usdc):.2f}"
         print(f"\n  --- Cash: ${self.cash_usdc:.2f}  |  Equity: ${equity:.2f}  |  Invested: ${total_cost:.2f}"
               f"  |  Day P&L: {pnl_str}  |  Total P&L: {rpnl_str}  |  Positions: {pos_str} ---\n")
+    def _log_hour_label(self, slug, st, final_price, effective_close,
+                        hour_direction, delta_bps,
+                        position_direction="NONE", would_win=None,
+                        positions_held=None):
+        """Emit HOUR_LABEL truth-label event (shared by settled and no-position paths)."""
+        data = {
+            "event_type": "HOUR_LABEL", "slug": slug, "crypto": st.crypto,
+            "hour_start_utc": st.hour_start_utc,
+            "hour_label_et": _hour_label_et(st.hour_start_utc),
+            "hour_index": st.hour_index,
+            "hour_open": round(st.hour_open, 2),
+            "hour_final_price": round(final_price, 2),
+            "effective_hour_close": round(effective_close, 2),
+            "hour_close_source": "NEXT_HOUR_OPEN",
+            "hour_direction": hour_direction,
+            "settlement_delta_bps": round(delta_bps, 3),
+            "won_up": hour_direction == "Up",
+            "won_down": hour_direction == "Down",
+            "position_direction_at_entry": position_direction,
+            "would_win_if_held_to_settle": would_win,
+        }
+        if positions_held is not None:
+            data["positions_held"] = positions_held
+        write_jsonl(data)
+    def _cleanup_market_slug(self, slug: str):
+        """Remove all per-slug state when a market hour ends."""
+        self.market_states.pop(slug, None)
+        self.signal_hist.pop(slug, None)
+        self.last_book.pop(slug, None)
+        self.recent_extreme_price.pop(slug, None)
+        self.entry_sm.pop(slug, None)
+        self._data_cache.pop(slug, None)
+        self._pending_fetches.pop(slug, None)
+        self._parity_last_order_ts.pop(slug, None)
+        self._parity_invested_usd.pop(slug, None)
+        self._parity_locked_since.pop(slug, None)
+        self._parity_maker_orders.pop(slug, None)
+        self._parity_pending_pairs[:] = [p for p in self._parity_pending_pairs if p["slug"] != slug]
     def _resolve_ended_hours(self, current_markets: List[MarketRef]):
         """
         Resolve positions for hours that have ended.
@@ -1713,35 +1723,10 @@ class Bot:
                     sp, nho = self.client.get_binance_spot_and_hour_open(st.crypto)
                     sd = (sp - st.hour_open) / max(st.hour_open, 1e-9) * 10000.0
                     w = "Up" if sp >= st.hour_open else "Down"
-                    write_jsonl({
-                        "event_type": "HOUR_LABEL", "slug": slug, "crypto": st.crypto,
-                        "hour_start_utc": st.hour_start_utc,
-                        "hour_label_et": _hour_label_et(st.hour_start_utc),
-                        "hour_index": st.hour_index,
-                        "hour_open": round(st.hour_open, 2),
-                        "hour_final_price": round(sp, 2),
-                        "effective_hour_close": round(nho, 2),
-                        "hour_close_source": "NEXT_HOUR_OPEN",
-                        "hour_direction": w,
-                        "settlement_delta_bps": round(sd, 3),
-                        "won_up": w == "Up", "won_down": w == "Down",
-                        "position_direction_at_entry": "NONE",
-                        "would_win_if_held_to_settle": None,
-                    })
+                    self._log_hour_label(slug, st, sp, nho, w, sd)
                 except Exception:
                     pass
-                self.market_states.pop(slug, None)
-                self.signal_hist.pop(slug, None)
-                self.last_book.pop(slug, None)
-                self.recent_extreme_price.pop(slug, None)
-                self.entry_sm.pop(slug, None)
-                self._data_cache.pop(slug, None)
-                self._pending_fetches.pop(slug, None)
-                self._parity_last_order_ts.pop(slug, None)
-                self._parity_invested_usd.pop(slug, None)
-                self._parity_locked_since.pop(slug, None)
-                self._parity_maker_orders.pop(slug, None)
-                self._parity_pending_pairs[:] = [p for p in self._parity_pending_pairs if p["slug"] != slug]
+                self._cleanup_market_slug(slug)
                 continue
             # Determine winner by checking final Binance price vs hour open
             # spot here = next hour's opening price (close proxy for the prior hour)
@@ -1796,42 +1781,16 @@ class Bot:
                 "equity": round(self._equity(), 2),
             })
             # HOUR_LABEL — truth labels for settlement analysis
-            # What position direction did we actually hold?
             held_up = any(d["outcome"] == "Up" for d in pos_details)
             held_down = any(d["outcome"] == "Down" for d in pos_details)
             position_direction = "Up" if (held_up and not held_down) else ("Down" if (held_down and not held_up) else ("BOTH" if (held_up and held_down) else "NONE"))
             hour_direction = "Up" if close_proxy >= st.hour_open else "Down"
             would_win = position_direction == hour_direction if position_direction in ("Up", "Down") else None
-            write_jsonl({
-                "event_type": "HOUR_LABEL", "slug": slug, "crypto": st.crypto,
-                "hour_start_utc": st.hour_start_utc,
-                "hour_label_et": _hour_label_et(st.hour_start_utc),
-                "hour_index": st.hour_index,
-                "hour_open": round(st.hour_open, 2),
-                "hour_final_price": round(close_proxy, 2),
-                "effective_hour_close": round(next_hour_open, 2),
-                "hour_close_source": "NEXT_HOUR_OPEN",
-                "hour_direction": hour_direction,
-                "settlement_delta_bps": round(settlement_delta_bps, 3),
-                "won_up": hour_direction == "Up",
-                "won_down": hour_direction == "Down",
-                "position_direction_at_entry": position_direction,
-                "would_win_if_held_to_settle": would_win,
-                "positions_held": pos_details,
-            })
+            self._log_hour_label(slug, st, close_proxy, next_hour_open,
+                                 hour_direction, settlement_delta_bps,
+                                 position_direction, would_win, pos_details)
             # Clean up ended market
-            self.market_states.pop(slug, None)
-            self.signal_hist.pop(slug, None)
-            self.last_book.pop(slug, None)
-            self.recent_extreme_price.pop(slug, None)
-            self.entry_sm.pop(slug, None)
-            self._data_cache.pop(slug, None)
-            self._pending_fetches.pop(slug, None)
-            self._parity_last_order_ts.pop(slug, None)
-            self._parity_invested_usd.pop(slug, None)
-            self._parity_locked_since.pop(slug, None)
-            self._parity_maker_orders.pop(slug, None)
-            self._parity_pending_pairs[:] = [p for p in self._parity_pending_pairs if p["slug"] != slug]
+            self._cleanup_market_slug(slug)
     def _get_markets(self) -> List[MarketRef]:
         # In practice: discover the current hour markets
         return self.client.get_current_hour_markets()
@@ -1890,7 +1849,7 @@ class Bot:
         up_book, dn_book = data["up_book"], data["dn_book"]
         st = self.market_states[m.slug]
         now = utc_now()
-        hour_start = datetime.strptime(st.hour_start_utc, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        hour_start = _parse_iso_z(st.hour_start_utc)
         t_min = minutes_into_hour(hour_start, now)
         if t_min >= TRADE_HARD_STOP_MIN:
             self.last_book[m.slug]["Up"] = up_book
@@ -2586,12 +2545,12 @@ class Bot:
         if sm["state"] == "COOLDOWN":
             cooldown_active = True
         elif st.last_entry_ts:
-            last = datetime.strptime(st.last_entry_ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            last = _parse_iso_z(st.last_entry_ts)
             cd = entry_cooldown_sec(m.crypto, t_min)
             cooldown_active = (utc_now() - last).total_seconds() < cd
         # Exit COOLDOWN state when cooldown expires
         if sm["state"] == "COOLDOWN" and st.last_entry_ts:
-            last = datetime.strptime(st.last_entry_ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            last = _parse_iso_z(st.last_entry_ts)
             cd = entry_cooldown_sec(m.crypto, t_min)
             if (utc_now() - last).total_seconds() >= cd:
                 self._sm_transition(m.slug, "IDLE", "cooldown_expired", ctx)
@@ -4590,7 +4549,7 @@ class Bot:
             return
         now_iso = iso_z(utc_now())
         if st.last_reentry_ts:
-            last = datetime.strptime(st.last_reentry_ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            last = _parse_iso_z(st.last_reentry_ts)
             if (utc_now() - last).total_seconds() < REENTRY_COOLDOWN_SEC:
                 return
         clip = self._calc_clip(m.crypto, t_min, abs_delta_bps) * 0.50
@@ -4678,7 +4637,7 @@ class Bot:
             if not book:
                 continue
             if pos.scalp_mode and pos.scalp_open_ts:
-                opened = datetime.strptime(pos.scalp_open_ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                opened = _parse_iso_z(pos.scalp_open_ts)
                 if (utc_now() - opened).total_seconds() / 60.0 > LATE_SCALP_MAX_HOLD_MIN:
                     self._do_sell(m, st, outcome, pos.qty, book.bid,
                                   reason="SCALP_TIMEOUT", leg="SCALP_TIMEOUT", ctx=ctx)
@@ -4702,7 +4661,7 @@ class Bot:
                         should_inv_sell = True
                     else:
                         try:
-                            last_dt = datetime.strptime(pos.last_derisk_ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                            last_dt = _parse_iso_z(pos.last_derisk_ts)
                             elapsed = (now_t - last_dt).total_seconds()
                         except Exception:
                             elapsed = 999.0
@@ -4747,7 +4706,7 @@ class Bot:
                         should_derisk = True  # first derisk for this position
                     else:
                         try:
-                            last_dt = datetime.strptime(pos.last_derisk_ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                            last_dt = _parse_iso_z(pos.last_derisk_ts)
                             elapsed = (now_t - last_dt).total_seconds()
                         except Exception:
                             elapsed = 999.0
@@ -4981,7 +4940,7 @@ class Bot:
             # --- FAST_TP: early partial take-profit (once per position) ---
             if not pos.fast_tp_done and pos.opened_at:
                 try:
-                    opened_dt = datetime.strptime(pos.opened_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                    opened_dt = _parse_iso_z(pos.opened_at)
                     pos_age_sec = (utc_now() - opened_dt).total_seconds()
                 except Exception:
                     pos_age_sec = 0.0
@@ -5048,7 +5007,7 @@ class Bot:
         # Build a minimal ctx if caller didn't pass one
         if ctx is None:
             t_min = minutes_into_hour(
-                datetime.strptime(st.hour_start_utc, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc),
+                _parse_iso_z(st.hour_start_utc),
                 utc_now())
             ctx = {"hour_start_utc": st.hour_start_utc, "hour_open": st.hour_open,
                    "t_min": t_min, "phase": _phase(t_min),
@@ -5102,7 +5061,7 @@ class Bot:
                 time_held = 0.0
                 if pos.opened_at:
                     try:
-                        opened_dt = datetime.strptime(pos.opened_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                        opened_dt = _parse_iso_z(pos.opened_at)
                         time_held = (utc_now() - opened_dt).total_seconds()
                     except Exception:
                         pass
@@ -5145,7 +5104,7 @@ class Bot:
                 time_held = 0.0
                 if pos.opened_at:
                     try:
-                        opened_dt = datetime.strptime(pos.opened_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                        opened_dt = _parse_iso_z(pos.opened_at)
                         time_held = (utc_now() - opened_dt).total_seconds()
                     except Exception:
                         pass
@@ -5200,9 +5159,7 @@ class Bot:
                 self._do_sell(m, st, outcome, pos.qty,
                               max(book.bid, book.ask - MAX_CROSS_SLIPPAGE),
                               reason="CLEANUP", leg="CLEANUP")
-# =============================================================================
 # MAIN
-# =============================================================================
 def main():
     if MODE not in ("LOG", "LIVE"):
         print("MODE must be LOG or LIVE")
