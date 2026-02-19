@@ -483,3 +483,30 @@ LOSS_TAIL_PAUSE_SEC = float(os.getenv("LOSS_TAIL_PAUSE_SEC", "600"))            
 # PER-SLUG PnL REPORT — emitted every 60s alongside TEMPO_REPORT
 # ---------------------------------------------------------------------------
 SLUG_PNL_REPORT_INTERVAL_SEC = float(os.getenv("SLUG_PNL_REPORT_INTERVAL_SEC", "60"))
+
+# ---------------------------------------------------------------------------
+# PRE-8HR SAFETY CAPS — inventory, cooldown, exit reliability, time stops
+# ---------------------------------------------------------------------------
+
+# 1) Inventory caps — block new BUYS when exceeded, sells always allowed
+MAX_POSITION_USD_PER_SLUG = float(os.getenv("MAX_POSITION_USD_PER_SLUG", "60"))
+MAX_POSITION_SHARES_PER_OUTCOME = float(os.getenv("MAX_POSITION_SHARES_PER_OUTCOME", "50"))
+MAX_NET_IMBALANCE_SHARES = float(os.getenv("MAX_NET_IMBALANCE_SHARES", "12"))
+
+# 2) Post-fill cooldown — skip new BUY attempts after any fill on slug
+POST_FILL_COOLDOWN_MS = float(os.getenv("POST_FILL_COOLDOWN_MS", "800"))
+
+# 3) Exit reliability — maker-first TP with taker fallback
+TP_MAKER_GRACE_MS = float(os.getenv("TP_MAKER_GRACE_MS", "2000"))
+
+# 4) Time stop exits — force exit if position held too long
+MAX_HOLD_SEC_SCALP = float(os.getenv("MAX_HOLD_SEC_SCALP", "600"))
+MAX_HOLD_SEC_PARITY = float(os.getenv("MAX_HOLD_SEC_PARITY", "900"))
+
+# 5) Coin-specific spread limits (cents)
+MAX_SPREAD_ENTRY_CENTS_BTCETH = float(os.getenv("MAX_SPREAD_ENTRY_CENTS_BTCETH", "2"))
+MAX_SPREAD_ENTRY_CENTS_SOLXRP = float(os.getenv("MAX_SPREAD_ENTRY_CENTS_SOLXRP", "4"))
+MAX_SPREAD_EXIT_CENTS_SOLXRP = float(os.getenv("MAX_SPREAD_EXIT_CENTS_SOLXRP", "6"))
+
+# 6) Module priority — directional suppresses parity BUYs
+DIRECTIONAL_PARITY_SUPPRESS_SEC = float(os.getenv("DIRECTIONAL_PARITY_SUPPRESS_SEC", "120"))
