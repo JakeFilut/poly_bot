@@ -270,14 +270,17 @@ class Bot:
         self._dscalp_invested_usd: Dict[str, float] = {}    # slug -> total invested USD
         # Directional scalp diagnostics (per-minute, reset in DIAG report)
         self._diag_dscalp_entries = 0
-        self._diag_dscalp_exits = 0                          # all exits (TP + timeout + stop)
+        self._diag_dscalp_exits = 0                          # all exits (TP + timeout + stop + early)
         self._diag_dscalp_tp1 = 0
         self._diag_dscalp_tp2 = 0
         self._diag_dscalp_tp3 = 0
         self._diag_dscalp_timeout_exits = 0
         self._diag_dscalp_stop_exits = 0
+        self._diag_dscalp_early_exits = 0                    # early exit (all 3 conditions met)
         self._diag_dscalp_hold_times: List[float] = []    # seconds
         self._diag_dscalp_exit_cents: List[float] = []     # profit/loss in cents
+        # Entry reject tracking by gate (per-minute, reset in DIAG report)
+        self._diag_entry_reject_by_gate: Dict[str, int] = {}
         # Parity fill tracking (for parity_fill_pct)
         self._diag_parity_fills_min = 0                      # parity fills this minute
         self._diag_directional_fills_min = 0                 # directional fills this minute
@@ -1587,7 +1590,7 @@ class Bot:
 
     def _emit_diag_report(self):
         """Emit behavioral diagnostics every 60s — measures success vs F247 targets.
-        Targets: trades/min ~10-20, avg_trade_size ~$7+, median_hold >=120s, exit >= +3c."""
+        Targets: trades/min ~10-20, avg_trade_size ~$7+, median_hold >=60s, exit >= +4c."""
         import statistics as _stats
         now_t = time.time()
         elapsed_min = max(0.1, (now_t - self._diag_report_last_ts) / 60.0)
@@ -1608,6 +1611,23 @@ class Bot:
                     if self._diag_dscalp_exit_cents else 0.0)
         unpaired_rate = self._diag_unpaired_count_min / max(1, total_fills)
         derisk_rate = self._diag_derisk_count_min / max(1, total_fills)
+
+        # ── Asymmetry metrics (win/loss breakdown) ──
+        wins = [c for c in self._diag_dscalp_exit_cents if c > 0]
+        losses = [c for c in self._diag_dscalp_exit_cents if c <= 0]
+        avg_win_cents = _stats.mean(wins) if wins else 0.0
+        avg_loss_cents = _stats.mean(losses) if losses else 0.0
+        win_rate = len(wins) / max(1, len(wins) + len(losses))
+
+        # ── Exit reason counts ──
+        exit_reason_counts = {
+            "TP1": self._diag_dscalp_tp1,
+            "TP2": self._diag_dscalp_tp2,
+            "TP3": self._diag_dscalp_tp3,
+            "STOP": self._diag_dscalp_stop_exits,
+            "EARLY": self._diag_dscalp_early_exits,
+            "TIMEOUT": self._diag_dscalp_timeout_exits,
+        }
 
         # ── SOL/XRP cache age ──
         sol_ages = []
@@ -1640,6 +1660,11 @@ class Bot:
             "avg_trade_size_usd": round(avg_trade_size, 2),
             "median_directional_hold_sec": round(med_hold, 1),
             "median_directional_exit_cents": round(med_exit, 2),
+            # Asymmetry metrics (real-time monitoring)
+            "avg_win_cents": round(avg_win_cents, 2),
+            "avg_loss_cents": round(avg_loss_cents, 2),
+            "win_rate": round(win_rate, 3),
+            "median_hold_sec": round(med_hold, 1),
             # Fill composition
             "directional_entry_count": dir_entry_count,
             "directional_exit_count": dir_exit_count,
@@ -1670,7 +1695,12 @@ class Bot:
             "dscalp_tp3": self._diag_dscalp_tp3,
             "dscalp_timeouts": self._diag_dscalp_timeout_exits,
             "dscalp_stops": self._diag_dscalp_stop_exits,
+            "dscalp_early_exits": self._diag_dscalp_early_exits,
             "dscalp_active_positions": len(self._dscalp_positions),
+            # Exit reason breakdown
+            "exit_reason_counts": exit_reason_counts,
+            # Entry reject breakdown by gate
+            "entry_reject_count_by_gate": dict(self._diag_entry_reject_by_gate),
             # Pre-8hr safety metrics
             "cap_blocks": self._diag_cap_blocks,
             "post_fill_cooldown_blocks": self._diag_post_fill_cooldown_blocks,
@@ -1704,14 +1734,16 @@ class Bot:
         # Status indicators: check vs target
         tpm_ok = "OK" if 10 <= trades_per_min <= 20 else "!!"
         size_ok = "OK" if avg_trade_size >= 7.0 else "!!"
-        hold_ok = "OK" if med_hold >= 120 else ("--" if med_hold == 0 else "!!")
-        exit_ok = "OK" if med_exit >= 3.0 else ("--" if med_exit == 0 else "!!")
+        hold_ok = "OK" if med_hold >= 60 else ("--" if med_hold == 0 else "!!")
+        exit_ok = "OK" if med_exit >= 4.0 else ("--" if med_exit == 0 else "!!")
         par_ok = "OK" if parity_fill_pct <= 0.30 else "!!"
 
         print(f"  DIAG [{tpm_ok}] trades/min={trades_per_min:.1f}  "
               f"[{size_ok}] avg_size=${avg_trade_size:.1f}  "
               f"[{hold_ok}] hold={med_hold:.0f}s  "
               f"[{exit_ok}] exit={med_exit:+.1f}c")
+        print(f"  ASYM: win_rate={win_rate:.0%}  avg_win={avg_win_cents:+.1f}c  "
+              f"avg_loss={avg_loss_cents:+.1f}c  med_hold={med_hold:.0f}s")
         print(f"  FILL: dir_entry={dir_entry_count}  dir_exit={dir_exit_count}  "
               f"parity={par_fills}  [{par_ok}] par_pct={parity_fill_pct:.0%}  "
               f"unpaired={unpaired_rate:.0%}  derisk={derisk_rate:.0%}")
@@ -1720,11 +1752,17 @@ class Bot:
         print(f"  COST: fills/hr={fills_per_hour:.0f}  tx/hr={tx_per_hour:.0f}  "
               f"est=${est_cost_per_hour:.4f}/hr  "
               f"rate_block={self._rate_blocked_interval}+{self._rate_blocked_cap}")
-        if self._dscalp_positions:
+        if self._dscalp_positions or dir_exit_count > 0:
             print(f"  DSCALP: tp1={self._diag_dscalp_tp1} tp2={self._diag_dscalp_tp2} "
                   f"tp3={self._diag_dscalp_tp3} "
-                  f"timeout={self._diag_dscalp_timeout_exits} stop={self._diag_dscalp_stop_exits} "
+                  f"stop={self._diag_dscalp_stop_exits} early={self._diag_dscalp_early_exits} "
+                  f"timeout={self._diag_dscalp_timeout_exits} "
                   f"active={len(self._dscalp_positions)}")
+        # Entry reject summary
+        if self._diag_entry_reject_by_gate:
+            reject_parts = [f"{k}={v}" for k, v in sorted(self._diag_entry_reject_by_gate.items()) if v > 0]
+            if reject_parts:
+                print(f"  GATE_REJECTS: {' '.join(reject_parts)}")
         # Safety caps summary
         if (self._diag_cap_blocks or self._diag_post_fill_cooldown_blocks
                 or self._diag_time_stop_exits or self._diag_spread_limit_blocks
@@ -1762,8 +1800,10 @@ class Bot:
         self._diag_dscalp_tp3 = 0
         self._diag_dscalp_timeout_exits = 0
         self._diag_dscalp_stop_exits = 0
+        self._diag_dscalp_early_exits = 0
         self._diag_dscalp_hold_times.clear()
         self._diag_dscalp_exit_cents.clear()
+        self._diag_entry_reject_by_gate.clear()
         # Pre-8hr safety counter resets
         self._diag_cap_blocks = 0
         self._diag_post_fill_cooldown_blocks = 0
@@ -2501,10 +2541,18 @@ class Bot:
 
         # Inventory cap check
         if not self._inventory_cap_ok(m.slug, outcome):
+            self._diag_entry_reject_by_gate["inventory_cap"] = self._diag_entry_reject_by_gate.get("inventory_cap", 0) + 1
             return
 
         # Post-fill cooldown
         if not self._post_fill_cooldown_ok(m.slug):
+            self._diag_entry_reject_by_gate["post_fill_cooldown"] = self._diag_entry_reject_by_gate.get("post_fill_cooldown", 0) + 1
+            return
+
+        # Anti-stacking: min time between new entries after a fill
+        last_fill = self._last_fill_ts.get(m.slug, 0.0)
+        if (now_t - last_fill) * 1000 < MIN_TIME_BETWEEN_NEW_ENTRIES_MS:
+            self._diag_entry_reject_by_gate["entry_stacking"] = self._diag_entry_reject_by_gate.get("entry_stacking", 0) + 1
             return
 
         # Cache freshness
@@ -2512,30 +2560,39 @@ class Bot:
         if cache_age > DSCALP_MAX_CACHE_AGE_MS:
             return
 
-        # Coin-specific spread gate
+        # Coin-specific spread gate (BTC/ETH: <=2c, SOL/XRP: <=4c)
         spread_cents = book.spread * 100
         if not self._coin_spread_entry_ok(m.crypto, spread_cents):
+            self._diag_entry_reject_by_gate["spread_filter"] = self._diag_entry_reject_by_gate.get("spread_filter", 0) + 1
+            write_jsonl({"event_type": "GATE_SPREAD_BLOCK", "ts_ms": int(now_t * 1000),
+                          "slug": m.slug, "crypto": m.crypto, "spread_cents": round(spread_cents, 2),
+                          "limit_cents": MAX_SPREAD_ENTRY_CENTS_BTCETH if m.crypto in ("BTC", "ETH") else MAX_SPREAD_ENTRY_CENTS_SOLXRP})
             return
 
         # Spread gate (existing)
         if book.spread * 100 > DSCALP_MAX_SPREAD_CENTS:
+            self._diag_entry_reject_by_gate["spread_general"] = self._diag_entry_reject_by_gate.get("spread_general", 0) + 1
             return
 
-        # Entry edge gate: outcome mid must be >= 2c above 50c neutral
+        # Entry edge gate: outcome mid must be >= 2.5c above 50c neutral
         entry_edge_cents = (book.mid - 0.50) * 100
         if entry_edge_cents < DSCALP_MIN_ENTRY_EDGE_CENTS:
+            self._diag_entry_reject_by_gate["entry_edge"] = self._diag_entry_reject_by_gate.get("entry_edge", 0) + 1
             return
 
         # ── ENTRY SIGNAL: delta >= 15bps OR spot moved >= 8bps in 10s ──
         delta_ok = abs_delta_bps >= DSCALP_DELTA_MIN_BPS
         spot_move_ok = self._spot_move_10s_bps(m.slug) >= DSCALP_SPOT_MOVE_10S_BPS
         if not delta_ok and not spot_move_ok:
+            self._diag_entry_reject_by_gate["signal"] = self._diag_entry_reject_by_gate.get("signal", 0) + 1
             return
 
-        # Velocity must be supportive (agree with direction)
+        # Velocity must be supportive (agree with direction, min 2.0 bps/min)
         if outcome == "Up" and vel < DSCALP_VEL_MIN_BPS_PER_MIN:
+            self._diag_entry_reject_by_gate["velocity"] = self._diag_entry_reject_by_gate.get("velocity", 0) + 1
             return
         if outcome == "Down" and vel > -DSCALP_VEL_MIN_BPS_PER_MIN:
+            self._diag_entry_reject_by_gate["velocity"] = self._diag_entry_reject_by_gate.get("velocity", 0) + 1
             return
 
         # Size: $5-10 per entry, no micro-splits
@@ -2632,10 +2689,10 @@ class Bot:
         )
 
     def _dscalp_manage_exits(self, m: MarketRef, st: MarketState, ctx: dict):
-        """Manage directional scalp exits: TP ladder + timeout + stop loss.
-        ENFORCES 90s minimum hold unless emergency (stop loss / spread collapse / reversal).
-        Early +2c exit only when spread collapses or velocity reverses.
-        TP ladder: +3c/+5c/+7c at 25% each, remainder for timeout/trailing."""
+        """Manage directional scalp exits: TP ladder + timeout + hard stop loss.
+        ENFORCES 60s minimum hold unless hard stop (-4c) or TP hit.
+        Early exit requires ALL: profit >= 4c AND vel reversal >= 6 bps AND spread >= 5c.
+        TP ladder: +4c/+6c/+8c at 25% each, remainder for timeout/trailing."""
         dpos = self._dscalp_positions.get(m.slug)
         if dpos is None:
             return
@@ -2657,8 +2714,8 @@ class Bot:
         current_mid = book.mid
         pnl_cents = (current_mid - entry_price) * 100
 
-        # ── Stop loss (EMERGENCY ONLY — bypasses min hold) ──
-        if pnl_cents <= -DSCALP_STOP_LOSS_CENTS and hold_sec > 10:
+        # ── HARD STOP LOSS — triggers immediately at -4c, overrides min hold timer ──
+        if pnl_cents <= -DSCALP_STOP_LOSS_CENTS:
             sell_qty = pos.qty
             sell_price = max(book.bid, 0.01)
             self._do_sell(m, st, outcome, sell_qty, sell_price,
@@ -2677,21 +2734,26 @@ class Bot:
                           "pnl_cents": round(pnl_cents, 2), "hold_sec": round(hold_sec, 1)})
             return
 
-        # ── MINIMUM HOLD FLOOR: 90s unless emergency bypass ──
-        # Detect spread blowout (> 6c = liquidity evaporating)
+        # ── MINIMUM HOLD FLOOR: 60s unless TP/STOP hit or early exit conditions met ──
         spread_cents = book.spread * 100
-        spread_collapsed = spread_cents > DSCALP_EARLY_TP_SPREAD_THRESH
-        # Detect velocity reversal (> 4 bps/min against position)
         vel = ctx.get("vel", 0.0)
-        vel_reversed = (outcome == "Up" and vel < -DSCALP_VEL_REVERSAL_BPS) or (outcome == "Down" and vel > DSCALP_VEL_REVERSAL_BPS)
-        # Early +2c taker exit: only when real danger (spread blowout OR strong reversal)
-        if hold_sec < DSCALP_MIN_HOLD_SEC:
-            if pnl_cents >= DSCALP_EARLY_TP_CENTS and (spread_collapsed or vel_reversed):
+
+        # Early exit requires ALL THREE conditions simultaneously:
+        #   1) profit >= EARLY_EXIT_MIN_PROFIT_CENTS (4c)
+        #   2) velocity reversal >= EARLY_EXIT_VEL_REVERSAL_BPS (6 bps/min against position)
+        #   3) spread >= EARLY_EXIT_SPREAD_THRESHOLD_CENTS (5c)
+        if hold_sec < DSCALP_MIN_HOLD_SEC and EARLY_EXIT_ENABLED:
+            profit_ok = pnl_cents >= EARLY_EXIT_MIN_PROFIT_CENTS
+            vel_reversed = ((outcome == "Up" and vel < -EARLY_EXIT_VEL_REVERSAL_BPS)
+                            or (outcome == "Down" and vel > EARLY_EXIT_VEL_REVERSAL_BPS))
+            spread_wide = spread_cents >= EARLY_EXIT_SPREAD_THRESHOLD_CENTS
+
+            if profit_ok and vel_reversed and spread_wide:
                 sell_qty = pos.qty
                 sell_price = max(book.bid, 0.01)
-                reason_tag = "DSCALP_EARLY_TP_SPREAD" if spread_collapsed else "DSCALP_EARLY_TP_REVERSAL"
                 self._do_sell(m, st, outcome, sell_qty, sell_price,
-                              reason=reason_tag, leg="DSCALP", ctx=ctx, use_maker=False)
+                              reason="DSCALP_EARLY_EXIT", leg="DSCALP", ctx=ctx, use_maker=False)
+                self._diag_dscalp_early_exits += 1
                 self._diag_dscalp_exits += 1
                 self._diag_dscalp_hold_times.append(hold_sec)
                 self._diag_dscalp_exit_cents.append(pnl_cents)
@@ -2700,7 +2762,7 @@ class Bot:
                 self._throttle_record_trade()
                 self._dscalp_positions.pop(m.slug, None)
                 self._dscalp_invested_usd.pop(m.slug, None)
-                write_jsonl({"event_type": reason_tag, "ts_ms": int(now_t * 1000),
+                write_jsonl({"event_type": "DSCALP_EARLY_EXIT", "ts_ms": int(now_t * 1000),
                               "slug": m.slug, "outcome": outcome,
                               "pnl_cents": round(pnl_cents, 2), "hold_sec": round(hold_sec, 1),
                               "spread_cents": round(spread_cents, 2), "vel": round(vel, 2)})
@@ -2726,7 +2788,7 @@ class Bot:
                           "pnl_cents": round(pnl_cents, 2), "hold_sec": round(hold_sec, 1)})
             return
 
-        # ── TP1: +3c, sell 25% (maker-grace then taker) ──
+        # ── TP1: +4c, sell 25% (maker-grace then taker) ──
         if pnl_cents >= DSCALP_TP1_CENTS and not dpos["tp1_done"]:
             sell_qty = min(pos.qty * DSCALP_TP1_FRAC, pos.qty)
             if sell_qty >= MIN_QTY:
@@ -2745,7 +2807,7 @@ class Bot:
                               "hold_sec": round(hold_sec, 1)})
             dpos["tp1_done"] = True
 
-        # ── TP2: +5c, sell 25% (maker-grace then taker) ──
+        # ── TP2: +6c, sell 25% (maker-grace then taker) ──
         if pnl_cents >= DSCALP_TP2_CENTS and not dpos["tp2_done"]:
             sell_qty = min(pos.qty * DSCALP_TP2_FRAC, pos.qty)
             if sell_qty >= MIN_QTY:
@@ -2764,7 +2826,7 @@ class Bot:
                               "hold_sec": round(hold_sec, 1)})
             dpos["tp2_done"] = True
 
-        # ── TP3: +7c, sell 25% — remainder rides to timeout or trailing stop (maker-grace then taker) ──
+        # ── TP3: +8c, sell 25% — remainder rides to timeout or trailing stop (maker-grace then taker) ──
         if pnl_cents >= DSCALP_TP3_CENTS and not dpos.get("tp3_done"):
             sell_qty = min(pos.qty * DSCALP_TP3_FRAC, pos.qty)
             if sell_qty >= MIN_QTY:

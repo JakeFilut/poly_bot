@@ -111,9 +111,9 @@ SIZING_MULTIPLIERS = [
 ]
 
 # Exit ladder (scale out)
-TP1 = 0.03; TP1_SELL_FRAC = 0.25
-TP2 = 0.05; TP2_SELL_FRAC = 0.25
-TP3 = 0.07; TP3_SELL_FRAC = 0.25
+TP1 = 0.04; TP1_SELL_FRAC = 0.25
+TP2 = 0.06; TP2_SELL_FRAC = 0.25
+TP3 = 0.08; TP3_SELL_FRAC = 0.25
 CORE_KEEP_FRAC = 0.25
 
 # De-risk on drift reversal (bps)
@@ -359,7 +359,7 @@ if FAST_CLONE:
 # RATE LIMITING / CHURN CONTROL -- hard caps per slug (F247 cadence)
 # ---------------------------------------------------------------------------
 RATE_LIMIT_ENABLED = bool(os.getenv("RATE_LIMIT_ENABLED", "True") not in ("", "0", "False", "false"))
-MIN_ORDER_INTERVAL_MS = float(os.getenv("MIN_ORDER_INTERVAL_MS", "500"))       # min ms between ANY orders on same slug
+MIN_ORDER_INTERVAL_MS = float(os.getenv("MIN_ORDER_INTERVAL_MS", "600"))       # min ms between ANY orders on same slug
 MAX_ORDER_SUBMITS_PER_MIN = int(os.getenv("MAX_ORDER_SUBMITS_PER_MIN", "60"))  # hard cap submits/min per slug -- no bursting
 QUOTE_REFRESH_SKIP_IF_SAME = True                                               # skip refresh if price unchanged
 QUOTE_REFRESH_MIN_TICK_MOVE = 0.001                                              # require >= 1 tick move to refresh
@@ -374,9 +374,13 @@ DIRECTIONAL_SCALP_ENABLED = bool(os.getenv("DIRECTIONAL_SCALP_ENABLED", "True") 
 # Entry gates (explicit -- must meet delta OR spot_move condition)
 DSCALP_DELTA_MIN_BPS = float(os.getenv("DSCALP_DELTA_MIN_BPS", "15.0"))        # min abs_delta_bps for entry (raised for conviction)
 DSCALP_SPOT_MOVE_10S_BPS = float(os.getenv("DSCALP_SPOT_MOVE_10S_BPS", "8.0"))  # OR: spot moved >= 8bps in last 10s
-DSCALP_VEL_MIN_BPS_PER_MIN = float(os.getenv("DSCALP_VEL_MIN_BPS_PER_MIN", "1.0"))  # min velocity (supportive, not hard gate)
+DSCALP_VEL_MIN_BPS_PER_MIN = float(os.getenv("DSCALP_VEL_MIN_BPS_PER_MIN", "2.0"))  # min velocity (mild directional confirmation)
 DSCALP_MAX_SPREAD_CENTS = float(os.getenv("DSCALP_MAX_SPREAD_CENTS", "2.0"))   # max spread for entry
-DSCALP_MIN_ENTRY_EDGE_CENTS = float(os.getenv("DSCALP_MIN_ENTRY_EDGE_CENTS", "2.0"))  # min edge: outcome mid must be >=2c above 50c neutral
+DSCALP_MIN_ENTRY_EDGE_CENTS = float(os.getenv("DSCALP_MIN_ENTRY_EDGE_CENTS", "2.5"))  # min edge: outcome mid must be >=2.5c above 50c neutral
+
+# Stronger entry quality gates
+MIN_DIRECTIONAL_EDGE_CENTS = float(os.getenv("MIN_DIRECTIONAL_EDGE_CENTS", "2.5"))  # min directional edge for entry
+MIN_VEL_BPS_PER_MIN = float(os.getenv("MIN_VEL_BPS_PER_MIN", "2.0"))               # min velocity confirmation (not hard block)
 DSCALP_MAX_CACHE_AGE_MS = float(os.getenv("DSCALP_MAX_CACHE_AGE_MS", "250"))   # max cache age for entry
 
 # Sizing -- one entry = one meaningful position, no micro-splits
@@ -386,18 +390,23 @@ DSCALP_MAX_USD_PER_SLUG = float(os.getenv("DSCALP_MAX_USD_PER_SLUG", "30.0"))  #
 DSCALP_COOLDOWN_MS = float(os.getenv("DSCALP_COOLDOWN_MS", "4000"))            # 4s between entries (target ~15 trades/min)
 
 # Exit ladder
-DSCALP_TP1_CENTS = float(os.getenv("DSCALP_TP1_CENTS", "3.0"))                 # +3c: sell 25%
+DSCALP_TP1_CENTS = float(os.getenv("DSCALP_TP1_CENTS", "4.0"))                 # +4c: sell 25%
 DSCALP_TP1_FRAC = float(os.getenv("DSCALP_TP1_FRAC", "0.25"))
 DSCALP_TP2_CENTS = float(os.getenv("DSCALP_TP2_CENTS", "6.0"))                 # +6c: sell 25%
 DSCALP_TP2_FRAC = float(os.getenv("DSCALP_TP2_FRAC", "0.25"))
 DSCALP_TP3_CENTS = float(os.getenv("DSCALP_TP3_CENTS", "8.0"))                 # +8c: sell 25%, remainder for timeout/trailing
 DSCALP_TP3_FRAC = float(os.getenv("DSCALP_TP3_FRAC", "0.25"))
-DSCALP_EARLY_TP_CENTS = float(os.getenv("DSCALP_EARLY_TP_CENTS", "2.0"))       # +2c early exit (taker) — fires only on real danger
-DSCALP_EARLY_TP_SPREAD_THRESH = float(os.getenv("DSCALP_EARLY_TP_SPREAD_THRESH", "6.0"))  # spread blowout threshold for early exit (cents)
-DSCALP_VEL_REVERSAL_BPS = float(os.getenv("DSCALP_VEL_REVERSAL_BPS", "4.0"))   # velocity reversal threshold (bps/min against position)
-DSCALP_MIN_HOLD_SEC = float(os.getenv("DSCALP_MIN_HOLD_SEC", "90"))            # 90s min hold -- bypass for emergency/spread-collapse/reversal
+
+# Early exit — requires ALL three conditions: profit >= 4c AND vel reversal >= 6 bps AND spread >= 5c
+EARLY_EXIT_ENABLED = bool(os.getenv("EARLY_EXIT_ENABLED", "True") not in ("", "0", "False", "false"))
+EARLY_EXIT_MIN_PROFIT_CENTS = float(os.getenv("EARLY_EXIT_MIN_PROFIT_CENTS", "4.0"))       # min profit to allow early exit
+EARLY_EXIT_VEL_REVERSAL_BPS = float(os.getenv("EARLY_EXIT_VEL_REVERSAL_BPS", "6.0"))       # min velocity reversal (bps/min against position)
+EARLY_EXIT_SPREAD_THRESHOLD_CENTS = float(os.getenv("EARLY_EXIT_SPREAD_THRESHOLD_CENTS", "5.0"))  # min spread (cents) for early exit
+DSCALP_VEL_REVERSAL_BPS = float(os.getenv("DSCALP_VEL_REVERSAL_BPS", "6.0"))   # velocity reversal threshold (bps/min against position)
+
+DSCALP_MIN_HOLD_SEC = float(os.getenv("DSCALP_MIN_HOLD_SEC", "60"))            # 60s min hold -- TP/STOP can override
 DSCALP_MAX_HOLD_SEC = float(os.getenv("DSCALP_MAX_HOLD_SEC", "600"))           # 10 min max hold
-DSCALP_STOP_LOSS_CENTS = float(os.getenv("DSCALP_STOP_LOSS_CENTS", "5.0"))     # -5c stop loss (emergency only)
+DSCALP_STOP_LOSS_CENTS = float(os.getenv("DSCALP_STOP_LOSS_CENTS", "4.0"))     # -4c hard stop loss — overrides min hold timer
 
 # ---------------------------------------------------------------------------
 # PARITY SUPPRESSION -- parity is #3 priority, hard-capped
@@ -416,7 +425,9 @@ TARGET_TRADES_PER_MIN = float(os.getenv("TARGET_TRADES_PER_MIN", "15"))         
 THROTTLE_LOOKBACK_SEC = float(os.getenv("THROTTLE_LOOKBACK_SEC", "60"))          # rolling window for trades/min calc
 # Per-slug entry throttle (prevents over-trading any single market)
 MIN_ENTRY_INTERVAL_MS = float(os.getenv("MIN_ENTRY_INTERVAL_MS", "350"))         # min ms between entries on same slug
-MAX_ENTRIES_PER_MIN_PER_SLUG = int(os.getenv("MAX_ENTRIES_PER_MIN_PER_SLUG", "40"))  # hard cap per slug per minute
+MAX_ENTRIES_PER_MIN_PER_SLUG = int(os.getenv("MAX_ENTRIES_PER_MIN_PER_SLUG", "20"))  # hard cap per slug per minute (was 40)
+# Anti-stacking: prevent rapid entries after a fill
+MIN_TIME_BETWEEN_NEW_ENTRIES_MS = float(os.getenv("MIN_TIME_BETWEEN_NEW_ENTRIES_MS", "1500"))  # 1.5s cooldown after fill before new entry
 
 # ---------------------------------------------------------------------------
 # REGIME AWARENESS -- volatility-adaptive activity
@@ -503,9 +514,9 @@ TP_MAKER_GRACE_MS = float(os.getenv("TP_MAKER_GRACE_MS", "2000"))
 MAX_HOLD_SEC_SCALP = float(os.getenv("MAX_HOLD_SEC_SCALP", "600"))
 MAX_HOLD_SEC_PARITY = float(os.getenv("MAX_HOLD_SEC_PARITY", "900"))
 
-# 5) Coin-specific spread limits (cents)
-MAX_SPREAD_ENTRY_CENTS_BTCETH = float(os.getenv("MAX_SPREAD_ENTRY_CENTS_BTCETH", "2"))
-MAX_SPREAD_ENTRY_CENTS_SOLXRP = float(os.getenv("MAX_SPREAD_ENTRY_CENTS_SOLXRP", "4"))
+# 5) Coin-specific spread limits (cents) — directional entries only
+MAX_SPREAD_ENTRY_CENTS_BTCETH = float(os.getenv("MAX_SPREAD_ENTRY_CENTS_BTCETH", "2"))   # BTC/ETH: max 2c spread for entry
+MAX_SPREAD_ENTRY_CENTS_SOLXRP = float(os.getenv("MAX_SPREAD_ENTRY_CENTS_SOLXRP", "4"))   # SOL/XRP: max 4c spread for entry
 MAX_SPREAD_EXIT_CENTS_SOLXRP = float(os.getenv("MAX_SPREAD_EXIT_CENTS_SOLXRP", "6"))
 
 # 6) Module priority — directional suppresses parity BUYs
