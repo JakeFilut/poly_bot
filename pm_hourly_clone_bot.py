@@ -3912,12 +3912,15 @@ class Bot:
             write_jsonl({"event_type": "PARITY_SUPPRESSED_DUE_TO_DIRECTIONAL",
                           "slug": m.slug, "crypto": m.crypto,
                           "ts_ms": int(time.time() * 1000)})
+        # ── LIVE/TEST symbol filter: block new parity quotes for non-allowed symbols ──
+        _symbol_ok = not (MODE in ("LIVE", "LIVE_SAFE", "TEST") and m.crypto not in LIVE_ALLOWED_SYMBOLS)
         if (PARITY_QUOTE_ENABLED and t_min < PARITY_QUOTE_STOP_MIN
                 and not new_quotes_blocked and self._buys_allowed()
                 and xrp_quote_ok and self._slug_entry_allowed(m.slug)
                 and not _dir_suppress
                 and self._inventory_cap_ok(m.slug)
-                and self._post_fill_cooldown_ok(m.slug)):
+                and self._post_fill_cooldown_ok(m.slug)
+                and _symbol_ok):
             self._parity_quote(m, st, ctx)
 
         # ── End-of-hour flattening (runs even after PARITY_STOP_NEW_MIN) ──
@@ -3943,6 +3946,10 @@ class Bot:
 
         # ── Stop new parity trades after PARITY_STOP_NEW_MIN or when blocked ──
         if t_min >= PARITY_STOP_NEW_MIN or new_quotes_blocked:
+            return
+
+        # ── LIVE/TEST symbol filter: block new parity buys for non-allowed symbols ──
+        if MODE in ("LIVE", "LIVE_SAFE", "TEST") and m.crypto not in LIVE_ALLOWED_SYMBOLS:
             return
 
         # ── LIVE_SAFE entry window gate (buys only) ──
@@ -5848,6 +5855,8 @@ class Bot:
                             rescue_block_reason = "inventory_cap"
                         elif not self._post_fill_cooldown_ok(m.slug):
                             rescue_block_reason = "post_fill_cooldown"
+                        elif MODE in ("LIVE", "LIVE_SAFE", "TEST") and m.crypto not in LIVE_ALLOWED_SYMBOLS:
+                            rescue_block_reason = "symbol_not_allowed"
 
                         if rescue_block_reason is None:
                             # ── Execute rescue buy ──
