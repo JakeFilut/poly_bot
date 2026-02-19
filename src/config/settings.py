@@ -112,8 +112,8 @@ SIZING_MULTIPLIERS = [
 
 # Exit ladder (scale out)
 TP1 = 0.04; TP1_SELL_FRAC = 0.25
-TP2 = 0.06; TP2_SELL_FRAC = 0.25
-TP3 = 0.08; TP3_SELL_FRAC = 0.25
+TP2 = 0.07; TP2_SELL_FRAC = 0.25
+TP3 = 0.10; TP3_SELL_FRAC = 0.25
 CORE_KEEP_FRAC = 0.25
 
 # De-risk on drift reversal (bps)
@@ -392,9 +392,9 @@ DSCALP_COOLDOWN_MS = float(os.getenv("DSCALP_COOLDOWN_MS", "4000"))            #
 # Exit ladder
 DSCALP_TP1_CENTS = float(os.getenv("DSCALP_TP1_CENTS", "4.0"))                 # +4c: sell 25%
 DSCALP_TP1_FRAC = float(os.getenv("DSCALP_TP1_FRAC", "0.25"))
-DSCALP_TP2_CENTS = float(os.getenv("DSCALP_TP2_CENTS", "6.0"))                 # +6c: sell 25%
+DSCALP_TP2_CENTS = float(os.getenv("DSCALP_TP2_CENTS", "7.0"))                 # +7c: sell 25% (widened from 6c for right-tail capture)
 DSCALP_TP2_FRAC = float(os.getenv("DSCALP_TP2_FRAC", "0.25"))
-DSCALP_TP3_CENTS = float(os.getenv("DSCALP_TP3_CENTS", "8.0"))                 # +8c: sell 25%, remainder for timeout/trailing
+DSCALP_TP3_CENTS = float(os.getenv("DSCALP_TP3_CENTS", "10.0"))                # +10c: sell 25%, remainder for timeout/trailing (widened from 8c)
 DSCALP_TP3_FRAC = float(os.getenv("DSCALP_TP3_FRAC", "0.25"))
 
 # Early exit — requires ALL three conditions: profit >= 4c AND vel reversal >= 6 bps AND spread >= 5c

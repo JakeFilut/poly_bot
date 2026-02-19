@@ -2743,7 +2743,7 @@ class Bot:
         """Manage directional scalp exits: TP ladder + timeout + hard stop loss.
         ENFORCES 60s minimum hold unless hard stop (-4c) or TP hit.
         Early exit requires ALL: profit >= 4c AND vel reversal >= 6 bps AND spread >= 5c.
-        TP ladder: +4c/+6c/+8c at 25% each, remainder for timeout/trailing."""
+        TP ladder: +4c/+7c/+10c at 25% each, remainder for timeout/trailing."""
         dpos = self._dscalp_positions.get(m.slug)
         if dpos is None:
             return
@@ -2876,7 +2876,7 @@ class Bot:
                               "hold_sec": round(hold_sec, 1)})
             dpos["tp1_done"] = True
 
-        # ── TP2: +6c, sell 25% (maker-grace then taker) ──
+        # ── TP2: +7c, sell 25% (maker-grace then taker) ──
         if pnl_cents >= DSCALP_TP2_CENTS and not dpos["tp2_done"]:
             sell_qty = min(pos.qty * DSCALP_TP2_FRAC, pos.qty)
             if sell_qty >= MIN_QTY:
@@ -2896,7 +2896,7 @@ class Bot:
                               "hold_sec": round(hold_sec, 1)})
             dpos["tp2_done"] = True
 
-        # ── TP3: +8c, sell 25% — remainder rides to timeout or trailing stop (maker-grace then taker) ──
+        # ── TP3: +10c, sell 25% — remainder rides to timeout or trailing stop (maker-grace then taker) ──
         if pnl_cents >= DSCALP_TP3_CENTS and not dpos.get("tp3_done"):
             sell_qty = min(pos.qty * DSCALP_TP3_FRAC, pos.qty)
             if sell_qty >= MIN_QTY:
@@ -5868,14 +5868,19 @@ class Bot:
         taker_price = max(book.bid, 0.01) if book else maker_price
         spread_cents = book.spread * 100 if book else 0
 
-        # Only cross taker if still profitable by >= 2c (prevent missed-exit losses)
+        # Only cross taker if still profitable by >= 2c AND bid within 1 tick of original target
+        # (prevent missed-exit losses; for TP exits ensure market hasn't moved away)
         dpos = self._dscalp_positions.get(m.slug)
-        if dpos and book:
+        if dpos and book and "STOP" not in reason and "TIMEOUT" not in reason:
             entry_price = dpos.get("entry_price", 0)
             taker_pnl_cents = (taker_price - entry_price) * 100
-            if taker_pnl_cents < 2.0 and "STOP" not in reason and "TIMEOUT" not in reason:
-                write_jsonl({"event_type": "EXIT_TAKER_SKIP_LOW_PNL", "slug": m.slug,
+            bid_within_1tick = taker_price >= maker_price - 0.01
+            if taker_pnl_cents < 2.0 or not bid_within_1tick:
+                write_jsonl({"event_type": "EXIT_TAKER_SKIP", "slug": m.slug,
                               "outcome": outcome, "taker_pnl_cents": round(taker_pnl_cents, 2),
+                              "bid_within_1tick": bid_within_1tick,
+                              "maker_price": round(maker_price, 4),
+                              "taker_price": round(taker_price, 4),
                               "reason": reason, "ts_ms": int(time.time() * 1000)})
                 # Re-queue: position stays open, next tick will re-evaluate
                 return
