@@ -265,7 +265,7 @@ class Bot:
         self._entry_count: Dict[str, int] = {}              # slug -> entries this minute
         self._entry_window_start: Dict[str, float] = {}     # slug -> minute window start ts
         # ── Directional scalp state ──
-        self._dscalp_positions: Dict[str, dict] = {}  # slug -> {outcome, entry_price, entry_ts, qty, tp1_done, tp2_done}
+        self._dscalp_positions: Dict[str, dict] = {}  # slug -> {outcome, entry_price, entry_ts, qty, tp1_done, tp2_done, tp3_done, tp4_done}
         self._dscalp_last_entry_ts: Dict[str, float] = {}   # slug -> last entry timestamp
         self._dscalp_invested_usd: Dict[str, float] = {}    # slug -> total invested USD
         self._dscalp_last_stop_ts: Dict[str, float] = {}    # slug -> last stop loss timestamp (for cooldown)
@@ -275,6 +275,8 @@ class Bot:
         self._diag_dscalp_tp1 = 0
         self._diag_dscalp_tp2 = 0
         self._diag_dscalp_tp3 = 0
+        self._diag_dscalp_tp4 = 0
+        self._diag_dscalp_runner_fallbacks = 0
         self._diag_dscalp_timeout_exits = 0
         self._diag_dscalp_stop_exits = 0
         self._diag_dscalp_early_exits = 0                    # early exit (all 3 conditions met)
@@ -1638,6 +1640,8 @@ class Bot:
             "TP1": self._diag_dscalp_tp1,
             "TP2": self._diag_dscalp_tp2,
             "TP3": self._diag_dscalp_tp3,
+            "TP4": self._diag_dscalp_tp4,
+            "RUNNER_FALLBACK": self._diag_dscalp_runner_fallbacks,
             "STOP": self._diag_dscalp_stop_exits,
             "EARLY": self._diag_dscalp_early_exits,
             "TIMEOUT": self._diag_dscalp_timeout_exits,
@@ -1710,6 +1714,8 @@ class Bot:
             "dscalp_tp1": self._diag_dscalp_tp1,
             "dscalp_tp2": self._diag_dscalp_tp2,
             "dscalp_tp3": self._diag_dscalp_tp3,
+            "dscalp_tp4": self._diag_dscalp_tp4,
+            "dscalp_runner_fallbacks": self._diag_dscalp_runner_fallbacks,
             "dscalp_timeouts": self._diag_dscalp_timeout_exits,
             "dscalp_stops": self._diag_dscalp_stop_exits,
             "dscalp_early_exits": self._diag_dscalp_early_exits,
@@ -1778,7 +1784,8 @@ class Bot:
               f"rate_block={self._rate_blocked_interval}+{self._rate_blocked_cap}")
         if self._dscalp_positions or dir_exit_count > 0:
             print(f"  DSCALP: tp1={self._diag_dscalp_tp1} tp2={self._diag_dscalp_tp2} "
-                  f"tp3={self._diag_dscalp_tp3} "
+                  f"tp3={self._diag_dscalp_tp3} tp4={self._diag_dscalp_tp4} "
+                  f"runner_fb={self._diag_dscalp_runner_fallbacks} "
                   f"stop={self._diag_dscalp_stop_exits} early={self._diag_dscalp_early_exits} "
                   f"timeout={self._diag_dscalp_timeout_exits} "
                   f"active={len(self._dscalp_positions)}")
@@ -1831,6 +1838,8 @@ class Bot:
         self._diag_dscalp_tp1 = 0
         self._diag_dscalp_tp2 = 0
         self._diag_dscalp_tp3 = 0
+        self._diag_dscalp_tp4 = 0
+        self._diag_dscalp_runner_fallbacks = 0
         self._diag_dscalp_timeout_exits = 0
         self._diag_dscalp_stop_exits = 0
         self._diag_dscalp_early_exits = 0
@@ -2719,6 +2728,7 @@ class Bot:
             "tp1_done": self._dscalp_positions.get(m.slug, {}).get("tp1_done", False),
             "tp2_done": self._dscalp_positions.get(m.slug, {}).get("tp2_done", False),
             "tp3_done": self._dscalp_positions.get(m.slug, {}).get("tp3_done", False),
+            "tp4_done": self._dscalp_positions.get(m.slug, {}).get("tp4_done", False),
         }
         self._dscalp_invested_usd[m.slug] = invested + actual_cost
         self._dscalp_last_entry_ts[m.slug] = now_t
@@ -2743,7 +2753,8 @@ class Bot:
         """Manage directional scalp exits: TP ladder + timeout + hard stop loss.
         ENFORCES 60s minimum hold unless hard stop (-4c) or TP hit.
         Early exit requires ALL: profit >= 4c AND vel reversal >= 6 bps AND spread >= 5c.
-        TP ladder: +4c/+6c/+8c at 25% each, remainder for timeout/trailing."""
+        TP ladder: +4c(35%) / +7c(25%) / +10c(25%) / +12c(15% runner).
+        Runner protection: exit at TP3 price if held > 600s or vel reversal >= 8 bps."""
         dpos = self._dscalp_positions.get(m.slug)
         if dpos is None:
             return
@@ -2839,6 +2850,7 @@ class Bot:
         # ── Timeout exit (maker-grace then taker) ──
         if hold_sec >= DSCALP_MAX_HOLD_SEC:
             sell_qty = pos.qty
+            sell_price = book.bid
             self._do_sell_maker_then_taker(m, st, outcome, sell_qty,
                                             reason="DSCALP_TIMEOUT", ctx=ctx)
             self._diag_dscalp_timeout_exits += 1
@@ -2876,7 +2888,7 @@ class Bot:
                               "hold_sec": round(hold_sec, 1)})
             dpos["tp1_done"] = True
 
-        # ── TP2: +6c, sell 25% (maker-grace then taker) ──
+        # ── TP2: +7c, sell 25% (maker-grace then taker) ──
         if pnl_cents >= DSCALP_TP2_CENTS and not dpos["tp2_done"]:
             sell_qty = min(pos.qty * DSCALP_TP2_FRAC, pos.qty)
             if sell_qty >= MIN_QTY:
@@ -2896,7 +2908,7 @@ class Bot:
                               "hold_sec": round(hold_sec, 1)})
             dpos["tp2_done"] = True
 
-        # ── TP3: +8c, sell 25% — remainder rides to timeout or trailing stop (maker-grace then taker) ──
+        # ── TP3: +10c, sell 25% (maker-grace then taker) ──
         if pnl_cents >= DSCALP_TP3_CENTS and not dpos.get("tp3_done"):
             sell_qty = min(pos.qty * DSCALP_TP3_FRAC, pos.qty)
             if sell_qty >= MIN_QTY:
@@ -2915,6 +2927,60 @@ class Bot:
                               "pnl_cents": round(pnl_cents, 2), "sell_qty": round(sell_qty, 1),
                               "hold_sec": round(hold_sec, 1)})
             dpos["tp3_done"] = True
+
+        # ── TP4 "runner": +12c, sell remaining 15% (maker-grace then taker) ──
+        if pnl_cents >= DSCALP_TP4_CENTS and not dpos.get("tp4_done"):
+            sell_qty = min(pos.qty * DSCALP_TP4_FRAC, pos.qty)
+            if sell_qty >= MIN_QTY:
+                sell_price = book.bid
+                self._do_sell_maker_then_taker(m, st, outcome, sell_qty,
+                                                reason="DSCALP_TP4", ctx=ctx)
+                self._diag_dscalp_tp4 += 1
+                self._diag_dscalp_exits += 1
+                self._diag_directional_fills_min += 1
+                self._diag_total_fills_min += 1
+                self._throttle_record_trade()
+                self._diag_trade_sizes.append(sell_qty * sell_price)
+                self._track_exit_pnl("TP4", pnl_cents, sell_qty, sell_price)
+                write_jsonl({"event_type": "DSCALP_TP4", "ts_ms": int(now_t * 1000),
+                              "slug": m.slug, "outcome": outcome,
+                              "pnl_cents": round(pnl_cents, 2), "sell_qty": round(sell_qty, 1),
+                              "hold_sec": round(hold_sec, 1)})
+            dpos["tp4_done"] = True
+
+        # ── Runner protection: if TP3 done but TP4 not yet hit, check for runner fallback ──
+        # Exit runner at TP3 price (10c) via maker→taker if:
+        #   (a) held > RUNNER_MAX_HOLD_SEC (600s), OR
+        #   (b) velocity reversal >= RUNNER_VEL_REVERSAL_BPS (8 bps/min against position)
+        if dpos.get("tp3_done") and not dpos.get("tp4_done") and pos.qty >= MIN_QTY:
+            runner_hold_sec = now_t - entry_ts
+            vel_against = ((outcome == "Up" and vel < -RUNNER_VEL_REVERSAL_BPS)
+                           or (outcome == "Down" and vel > RUNNER_VEL_REVERSAL_BPS))
+            runner_timeout = runner_hold_sec >= RUNNER_MAX_HOLD_SEC
+
+            if runner_timeout or vel_against:
+                fallback_reason = "runner_timeout" if runner_timeout else "runner_vel_reversal"
+                sell_qty = pos.qty  # sell entire remaining runner portion
+                # Fall back to TP3 target price (10c above entry) via maker→taker
+                tp3_target_price = entry_price + DSCALP_TP3_CENTS / 100.0
+                sell_price = max(min(book.bid, tp3_target_price), 0.01)
+                self._do_sell_maker_then_taker(m, st, outcome, sell_qty,
+                                                reason="DSCALP_RUNNER_FALLBACK", ctx=ctx)
+                self._diag_dscalp_runner_fallbacks += 1
+                self._diag_dscalp_exits += 1
+                self._diag_directional_fills_min += 1
+                self._diag_total_fills_min += 1
+                self._throttle_record_trade()
+                self._diag_trade_sizes.append(sell_qty * sell_price)
+                self._track_exit_pnl("RUNNER_FALLBACK", pnl_cents, sell_qty, sell_price)
+                self._dscalp_positions.pop(m.slug, None)
+                self._dscalp_invested_usd.pop(m.slug, None)
+                write_jsonl({"event_type": "DSCALP_RUNNER_FALLBACK", "ts_ms": int(now_t * 1000),
+                              "slug": m.slug, "outcome": outcome,
+                              "pnl_cents": round(pnl_cents, 2), "sell_qty": round(sell_qty, 1),
+                              "hold_sec": round(hold_sec, 1),
+                              "runner_fallback_reason": fallback_reason,
+                              "vel": round(vel, 2)})
 
     def _core_entries(self, ctx: dict):
         m, st = ctx["m"], ctx["st"]
@@ -5868,14 +5934,19 @@ class Bot:
         taker_price = max(book.bid, 0.01) if book else maker_price
         spread_cents = book.spread * 100 if book else 0
 
-        # Only cross taker if still profitable by >= 2c (prevent missed-exit losses)
+        # Only cross taker if still profitable by >= 2c AND bid within 1 tick of original target
+        # (prevent missed-exit losses; for TP exits ensure market hasn't moved away)
         dpos = self._dscalp_positions.get(m.slug)
-        if dpos and book:
+        if dpos and book and "STOP" not in reason and "TIMEOUT" not in reason:
             entry_price = dpos.get("entry_price", 0)
             taker_pnl_cents = (taker_price - entry_price) * 100
-            if taker_pnl_cents < 2.0 and "STOP" not in reason and "TIMEOUT" not in reason:
-                write_jsonl({"event_type": "EXIT_TAKER_SKIP_LOW_PNL", "slug": m.slug,
+            bid_within_1tick = taker_price >= maker_price - 0.01
+            if taker_pnl_cents < 2.0 or not bid_within_1tick:
+                write_jsonl({"event_type": "EXIT_TAKER_SKIP", "slug": m.slug,
                               "outcome": outcome, "taker_pnl_cents": round(taker_pnl_cents, 2),
+                              "bid_within_1tick": bid_within_1tick,
+                              "maker_price": round(maker_price, 4),
+                              "taker_price": round(taker_price, 4),
                               "reason": reason, "ts_ms": int(time.time() * 1000)})
                 # Re-queue: position stays open, next tick will re-evaluate
                 return

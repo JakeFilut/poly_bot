@@ -110,11 +110,12 @@ SIZING_MULTIPLIERS = [
     (75,  10_000, 3.50),
 ]
 
-# Exit ladder (scale out)
-TP1 = 0.04; TP1_SELL_FRAC = 0.25
-TP2 = 0.06; TP2_SELL_FRAC = 0.25
-TP3 = 0.08; TP3_SELL_FRAC = 0.25
-CORE_KEEP_FRAC = 0.25
+# Exit ladder (scale out) -- TP1=35%, TP2=25%, TP3=25%, TP4=15% runner
+TP1 = 0.04; TP1_SELL_FRAC = 0.35
+TP2 = 0.07; TP2_SELL_FRAC = 0.25
+TP3 = 0.10; TP3_SELL_FRAC = 0.25
+TP4 = 0.12; TP4_SELL_FRAC = 0.15
+CORE_KEEP_FRAC = 0.0
 
 # De-risk on drift reversal (bps)
 DERISK_CROSS_BPS = 5.0
@@ -389,13 +390,19 @@ DSCALP_STEP_USD_MIN = float(os.getenv("DSCALP_STEP_USD_MIN", "6.0"))           #
 DSCALP_MAX_USD_PER_SLUG = float(os.getenv("DSCALP_MAX_USD_PER_SLUG", "30.0"))  # max directional per slug
 DSCALP_COOLDOWN_MS = float(os.getenv("DSCALP_COOLDOWN_MS", "4000"))            # 4s between entries (target ~15 trades/min)
 
-# Exit ladder
-DSCALP_TP1_CENTS = float(os.getenv("DSCALP_TP1_CENTS", "4.0"))                 # +4c: sell 25%
-DSCALP_TP1_FRAC = float(os.getenv("DSCALP_TP1_FRAC", "0.25"))
-DSCALP_TP2_CENTS = float(os.getenv("DSCALP_TP2_CENTS", "6.0"))                 # +6c: sell 25%
+# Exit ladder (TP1=35%, TP2=25%, TP3=25%, TP4=15% runner)
+DSCALP_TP1_CENTS = float(os.getenv("DSCALP_TP1_CENTS", "4.0"))                 # +4c: sell 35%
+DSCALP_TP1_FRAC = float(os.getenv("DSCALP_TP1_FRAC", "0.35"))
+DSCALP_TP2_CENTS = float(os.getenv("DSCALP_TP2_CENTS", "7.0"))                 # +7c: sell 25%
 DSCALP_TP2_FRAC = float(os.getenv("DSCALP_TP2_FRAC", "0.25"))
-DSCALP_TP3_CENTS = float(os.getenv("DSCALP_TP3_CENTS", "8.0"))                 # +8c: sell 25%, remainder for timeout/trailing
+DSCALP_TP3_CENTS = float(os.getenv("DSCALP_TP3_CENTS", "10.0"))                # +10c: sell 25%
 DSCALP_TP3_FRAC = float(os.getenv("DSCALP_TP3_FRAC", "0.25"))
+DSCALP_TP4_CENTS = float(os.getenv("DSCALP_TP4_CENTS", "12.0"))                # +12c: sell remaining 15% (runner tier)
+DSCALP_TP4_FRAC = float(os.getenv("DSCALP_TP4_FRAC", "0.15"))
+
+# Runner protection -- exit runner if held too long or velocity reverses hard
+RUNNER_MAX_HOLD_SEC = float(os.getenv("RUNNER_MAX_HOLD_SEC", "600"))            # max 600s for runner portion
+RUNNER_VEL_REVERSAL_BPS = float(os.getenv("RUNNER_VEL_REVERSAL_BPS", "8.0"))   # vel reversal >= 8 bps/min triggers runner fallback
 
 # Early exit — requires ALL three conditions: profit >= 4c AND vel reversal >= 6 bps AND spread >= 5c
 EARLY_EXIT_ENABLED = bool(os.getenv("EARLY_EXIT_ENABLED", "True") not in ("", "0", "False", "false"))
