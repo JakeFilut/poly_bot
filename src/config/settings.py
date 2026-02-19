@@ -388,9 +388,23 @@ DSCALP_VEL_MIN_BPS_PER_MIN = float(os.getenv("DSCALP_VEL_MIN_BPS_PER_MIN", "2.5"
 DSCALP_MAX_SPREAD_CENTS = float(os.getenv("DSCALP_MAX_SPREAD_CENTS", "2.0"))   # max spread for entry
 DSCALP_MIN_ENTRY_EDGE_CENTS = float(os.getenv("DSCALP_MIN_ENTRY_EDGE_CENTS", "3.0"))  # min edge: outcome mid must be >=3c above 50c neutral (tightened from 2.5)
 
-# Stronger entry quality gates
-MIN_DIRECTIONAL_EDGE_CENTS = float(os.getenv("MIN_DIRECTIONAL_EDGE_CENTS", "3.0"))  # min directional edge for entry (tightened from 2.5)
-MIN_VEL_BPS_PER_MIN = float(os.getenv("MIN_VEL_BPS_PER_MIN", "2.5"))               # min velocity confirmation (tightened from 2.0)
+# Stronger entry quality gates — PER-COIN GROUP (BTC/ETH vs SOL/XRP)
+# SOL/XRP require stronger momentum + better edge + fresher data due to higher latency/noise
+MIN_DIRECTIONAL_EDGE_CENTS_BTCETH = float(os.getenv("MIN_DIRECTIONAL_EDGE_CENTS_BTCETH", "3.0"))
+MIN_DIRECTIONAL_EDGE_CENTS_SOLXRP = float(os.getenv("MIN_DIRECTIONAL_EDGE_CENTS_SOLXRP", "4.0"))
+MIN_VEL_BPS_PER_MIN_BTCETH = float(os.getenv("MIN_VEL_BPS_PER_MIN_BTCETH", "2.5"))
+MIN_VEL_BPS_PER_MIN_SOLXRP = float(os.getenv("MIN_VEL_BPS_PER_MIN_SOLXRP", "3.5"))
+CACHE_AGE_MAX_MS_BTCETH = float(os.getenv("CACHE_AGE_MAX_MS_BTCETH", "300"))
+CACHE_AGE_MAX_MS_SOLXRP = float(os.getenv("CACHE_AGE_MAX_MS_SOLXRP", "200"))        # SOL/XRP must be fresher
+# Per-coin group cooldown between new directional entries
+BTCETH_COOLDOWN_MS = float(os.getenv("BTCETH_COOLDOWN_MS", "1500"))
+SOLXRP_COOLDOWN_MS = float(os.getenv("SOLXRP_COOLDOWN_MS", "2500"))                  # slower markets get longer cooldown
+# Late-move filter (SOL/XRP only): block entry if spot moved too fast on stale data
+SOLXRP_LATE_MOVE_BPS = float(os.getenv("SOLXRP_LATE_MOVE_BPS", "8.0"))               # max abs spot move in last 2s
+SOLXRP_LATE_MOVE_CACHE_MS = float(os.getenv("SOLXRP_LATE_MOVE_CACHE_MS", "120"))     # only block if cache_age > 120ms
+# Legacy globals (kept for backward compat, overridden by per-coin values above)
+MIN_DIRECTIONAL_EDGE_CENTS = float(os.getenv("MIN_DIRECTIONAL_EDGE_CENTS", "3.0"))
+MIN_VEL_BPS_PER_MIN = float(os.getenv("MIN_VEL_BPS_PER_MIN", "2.5"))
 DSCALP_MAX_CACHE_AGE_MS = float(os.getenv("DSCALP_MAX_CACHE_AGE_MS", "250"))   # max cache age for entry
 
 # Sizing -- one entry = one meaningful position, no micro-splits
@@ -551,7 +565,7 @@ MAX_HOLD_SEC_PARITY = float(os.getenv("MAX_HOLD_SEC_PARITY", "900"))
 
 # 5) Coin-specific spread limits (cents) — directional entries only
 MAX_SPREAD_ENTRY_CENTS_BTCETH = float(os.getenv("MAX_SPREAD_ENTRY_CENTS_BTCETH", "2"))   # BTC/ETH: max 2c spread for entry
-MAX_SPREAD_ENTRY_CENTS_SOLXRP = float(os.getenv("MAX_SPREAD_ENTRY_CENTS_SOLXRP", "4"))   # SOL/XRP: max 4c spread for entry
+MAX_SPREAD_ENTRY_CENTS_SOLXRP = float(os.getenv("MAX_SPREAD_ENTRY_CENTS_SOLXRP", "3"))   # SOL/XRP: max 3c spread for entry (tightened from 4c)
 MAX_SPREAD_EXIT_CENTS_SOLXRP = float(os.getenv("MAX_SPREAD_EXIT_CENTS_SOLXRP", "6"))
 
 # 6) Module priority — directional suppresses parity BUYs

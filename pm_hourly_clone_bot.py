@@ -1787,9 +1787,23 @@ class Bot:
             "time_stop_exits": self._diag_time_stop_exits,
             "spread_limit_blocks": self._diag_spread_limit_blocks,
             "parity_directional_suppress": self._diag_parity_directional_suppress,
-            # Coin-specific spread config
-            "max_spread_entry_btceth": MAX_SPREAD_ENTRY_CENTS_BTCETH,
-            "max_spread_entry_solxrp": MAX_SPREAD_ENTRY_CENTS_SOLXRP,
+            # Per-coin group entry thresholds (for monitoring)
+            "thresholds_btceth": {
+                "edge_cents": MIN_DIRECTIONAL_EDGE_CENTS_BTCETH,
+                "vel_bps_min": MIN_VEL_BPS_PER_MIN_BTCETH,
+                "spread_cents": MAX_SPREAD_ENTRY_CENTS_BTCETH,
+                "cache_age_ms": CACHE_AGE_MAX_MS_BTCETH,
+                "cooldown_ms": BTCETH_COOLDOWN_MS,
+            },
+            "thresholds_solxrp": {
+                "edge_cents": MIN_DIRECTIONAL_EDGE_CENTS_SOLXRP,
+                "vel_bps_min": MIN_VEL_BPS_PER_MIN_SOLXRP,
+                "spread_cents": MAX_SPREAD_ENTRY_CENTS_SOLXRP,
+                "cache_age_ms": CACHE_AGE_MAX_MS_SOLXRP,
+                "cooldown_ms": SOLXRP_COOLDOWN_MS,
+                "late_move_bps": SOLXRP_LATE_MOVE_BPS,
+                "late_move_cache_ms": SOLXRP_LATE_MOVE_CACHE_MS,
+            },
             "max_spread_exit_solxrp": MAX_SPREAD_EXIT_CENTS_SOLXRP,
         }
         # Per-slug exposure + imbalance
@@ -1808,6 +1822,13 @@ class Bot:
                     "imbalance_shares": round(up_q - dn_q, 1),
                 }
         diag_data["per_slug_exposure"] = slug_exposure
+        # Per-slug cache age p50/p90
+        per_slug_cache_age = {}
+        for slug, ages_list in self._tempo_cache_ages.items():
+            if ages_list:
+                p50, p90 = _p50_p90(ages_list)
+                per_slug_cache_age[slug] = {"p50_ms": round(p50, 0), "p90_ms": round(p90, 0)}
+        diag_data["per_slug_cache_age"] = per_slug_cache_age
         write_jsonl(diag_data)
 
         # ── Console output (F247 target comparison) ──
@@ -2646,10 +2667,32 @@ class Bot:
     # =================================================================
     # DIRECTIONAL SCALP MODE — F247-style momentum entries
     # =================================================================
+    @staticmethod
+    def _is_solxrp(crypto: str) -> bool:
+        """Return True if coin is in the SOL/XRP (higher latency) group."""
+        return crypto in ("SOL", "XRP")
+
+    def _spot_move_2s_bps(self, slug: str) -> float:
+        """Absolute spot move over the last 2 seconds, in bps."""
+        spot_hist = self._spot_history.get(slug, [])
+        if len(spot_hist) < 2:
+            return 0.0
+        now = time.time()
+        cutoff = now - 2.0
+        recent = [(ts, s) for ts, s in spot_hist if ts > cutoff]
+        if len(recent) < 2:
+            return 0.0
+        first_spot = recent[0][1]
+        last_spot = recent[-1][1]
+        if first_spot <= 0:
+            return 0.0
+        return abs((last_spot - first_spot) / first_spot) * 10000.0
+
     def _dscalp_entries(self, ctx: dict):
         """Directional scalp entry (PRIMARY engine, F247-style).
+        Per-coin thresholds: SOL/XRP require stronger edge, velocity, fresher cache.
         Entry requires: (delta >= 15bps OR spot_move_10s >= 8bps)
-        AND spread <= 2c AND cache_age <= 250ms. Min $6 per entry."""
+        AND spread within coin-specific limit AND cache_age within coin-specific limit."""
         m, st = ctx["m"], ctx["st"]
         t_min = ctx["t_min"]
         delta_bps = ctx["delta_bps"]
@@ -2707,15 +2750,22 @@ class Bot:
             self._diag_entry_reject_by_gate["post_fill_cooldown"] = self._diag_entry_reject_by_gate.get("post_fill_cooldown", 0) + 1
             return
 
-        # Anti-stacking: min time between new entries after a fill
+        # Determine coin group for per-coin thresholds
+        _solxrp = self._is_solxrp(m.crypto)
+        _coin_cooldown_ms = SOLXRP_COOLDOWN_MS if _solxrp else BTCETH_COOLDOWN_MS
+        _coin_edge_cents = MIN_DIRECTIONAL_EDGE_CENTS_SOLXRP if _solxrp else MIN_DIRECTIONAL_EDGE_CENTS_BTCETH
+        _coin_vel_min = MIN_VEL_BPS_PER_MIN_SOLXRP if _solxrp else MIN_VEL_BPS_PER_MIN_BTCETH
+        _coin_cache_max_ms = CACHE_AGE_MAX_MS_SOLXRP if _solxrp else CACHE_AGE_MAX_MS_BTCETH
+
+        # Anti-stacking: per-coin cooldown between new entries after a fill
         last_fill = self._last_fill_ts.get(m.slug, 0.0)
-        if (now_t - last_fill) * 1000 < MIN_TIME_BETWEEN_NEW_ENTRIES_MS:
+        if (now_t - last_fill) * 1000 < _coin_cooldown_ms:
             self._diag_entry_reject_by_gate["entry_stacking"] = self._diag_entry_reject_by_gate.get("entry_stacking", 0) + 1
             return
 
-        # Cache freshness
+        # Cache freshness (per-coin: SOL/XRP need fresher data)
         cache_age = self._cache_age_ms(m.slug)
-        if cache_age > DSCALP_MAX_CACHE_AGE_MS:
+        if cache_age > _coin_cache_max_ms:
             return
 
         # Coin-specific spread gate (BTC/ETH: <=2c, SOL/XRP: <=4c)
@@ -2739,9 +2789,9 @@ class Bot:
             self._diag_entry_reject_by_gate["noisy_spread"] = self._diag_entry_reject_by_gate.get("noisy_spread", 0) + 1
             return
 
-        # Entry edge gate: outcome mid must be >= 3c above 50c neutral
+        # Entry edge gate: per-coin (BTC/ETH: 3c, SOL/XRP: 4c above 50c neutral)
         entry_edge_cents = (book.mid - 0.50) * 100
-        if entry_edge_cents < DSCALP_MIN_ENTRY_EDGE_CENTS:
+        if entry_edge_cents < _coin_edge_cents:
             self._diag_entry_reject_by_gate["entry_edge"] = self._diag_entry_reject_by_gate.get("entry_edge", 0) + 1
             return
 
@@ -2752,13 +2802,20 @@ class Bot:
             self._diag_entry_reject_by_gate["signal"] = self._diag_entry_reject_by_gate.get("signal", 0) + 1
             return
 
-        # Velocity must be supportive (agree with direction, min 2.0 bps/min)
-        if outcome == "Up" and vel < DSCALP_VEL_MIN_BPS_PER_MIN:
+        # Velocity must be supportive (per-coin: BTC/ETH 2.5, SOL/XRP 3.5 bps/min)
+        if outcome == "Up" and vel < _coin_vel_min:
             self._diag_entry_reject_by_gate["velocity"] = self._diag_entry_reject_by_gate.get("velocity", 0) + 1
             return
-        if outcome == "Down" and vel > -DSCALP_VEL_MIN_BPS_PER_MIN:
+        if outcome == "Down" and vel > -_coin_vel_min:
             self._diag_entry_reject_by_gate["velocity"] = self._diag_entry_reject_by_gate.get("velocity", 0) + 1
             return
+
+        # Late-move filter (SOL/XRP only): block if spot moved too fast on stale data
+        if _solxrp and cache_age > SOLXRP_LATE_MOVE_CACHE_MS:
+            spot_move_2s = self._spot_move_2s_bps(m.slug)
+            if spot_move_2s > SOLXRP_LATE_MOVE_BPS:
+                self._diag_entry_reject_by_gate["late_move"] = self._diag_entry_reject_by_gate.get("late_move", 0) + 1
+                return
 
         # Size: $5-10 per entry, no micro-splits
         remaining = DSCALP_MAX_USD_PER_SLUG - invested
