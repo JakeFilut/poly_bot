@@ -975,6 +975,9 @@ class Bot:
                   f"Max order: ${LIVE_SAFE_MAX_ORDER_USD:.2f}  |  "
                   f"Buys disabled after window; sells always allowed\n")
 
+        if MODE in ("LIVE", "LIVE_SAFE", "TEST"):
+            print(f"  LIVE symbol filter active: {', '.join(LIVE_ALLOWED_SYMBOLS)}")
+
         # ══════════════════════════════════════════════════════════════════
         # NON-BLOCKING MAIN LOOP — reads from cache, never blocks on HTTP
         # Background pool continuously refreshes _data_cache
@@ -2402,6 +2405,10 @@ class Bot:
 
         # ── Global trades/min throttle ──
         if self._throttle_exceeded():
+            return
+
+        # ── LIVE/TEST symbol filter: block new entries for non-allowed symbols ──
+        if MODE in ("LIVE", "LIVE_SAFE", "TEST") and m.crypto not in LIVE_ALLOWED_SYMBOLS:
             return
 
         # ── PRIMARY: Directional scalp entries (priority #1) ──

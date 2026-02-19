@@ -18,6 +18,10 @@ MODE = os.getenv("MODE", "LOG").upper()         # LOG, LIVE_SAFE, or LIVE
 BANKROLL_START_USDC = float(os.getenv("BANKROLL_START_USDC", "1000.0"))  # only used in LOG
 RUN_ID = uuid.uuid4().hex[:12]  # unique per run -- included in all logs + file names
 
+# LIVE/TEST symbol filter — only these symbols allowed for new entries in LIVE/TEST modes
+# Sells/flattening always allowed regardless. LOG mode is unaffected.
+LIVE_ALLOWED_SYMBOLS = [s.strip() for s in os.getenv("LIVE_ALLOWED_SYMBOLS", "BTC,ETH").split(",")]
+
 # ---------------------------------------------------------------------------
 # Paths -- resolved relative to this file's location
 #   poly_bot/          <- _PROJECT_DIR
