@@ -79,8 +79,53 @@ from src.bot.app import BotApp
 # UTIL / LOGGING — thin wrappers around Logger instance
 _LOGGER: Optional["Logger"] = None
 
+# Events that ALWAYS get logged (even in COMPACT mode)
+_ALWAYS_LOG_EVENTS = frozenset({
+    # Order lifecycle
+    "ORDER_SUBMIT", "ORDER_FILL", "ORDER_CANCEL", "ORDER_ERROR", "ORDER_REPLACE",
+    "ORDER_PLACED", "CANCEL_ERROR",
+    # Periodic reports
+    "DIAG_REPORT", "CLONE_REPORT", "TEMPO_REPORT", "SLUG_PNL_REPORT",
+    "HOUR_SUMMARY", "HOUR_LABEL",
+    # System lifecycle
+    "INIT_BOOTSTRAP_DONE", "STOP_SIGNAL", "STOPPED", "NEW_DAY_RESET",
+    "STATE_LOADED", "STATE_LOAD_ERROR", "STATE_SAVE_ERROR", "NEW_MARKET_STATE",
+    # Risk / safety
+    "RISK_STOP_TRIGGERED", "SLUG_PAUSED_NEGATIVE_EXITS", "ADVERSE_GUARD_HARD_PAUSE",
+    # Directional scalp trades
+    "DSCALP_ENTRY", "DSCALP_TP1", "DSCALP_TP2", "DSCALP_TP3", "DSCALP_TP4",
+    "DSCALP_STOP", "DSCALP_LOSS_CAP", "DSCALP_EARLY_EXIT", "DSCALP_TIMEOUT",
+    "DSCALP_RUNNER_FALLBACK",
+    # Parity trades
+    "PARITY_BUY_STRADDLE", "PARITY_SELL_STRADDLE", "PARITY_PAIR_COMPLETED",
+    "PARITY_PAIR_COMPLETED_LATE", "PAIR_COMPLETED", "PARITY_QUOTE_STRADDLE",
+    # Exits / hedge fills
+    "TIME_STOP_EXIT", "TIME_STOP_SOFT_EXIT", "INVENTORY_PRESSURE_SELL",
+    "FAST_TP_FIRE", "EXIT_TAKER_FALLBACK", "RESCUE_TRIGGERED", "LEAN_EXIT",
+    "HEDGE_CROSS_EARLY", "HEDGE_CROSS_LATE", "PARITY_RECYCLE",
+    # Compact summaries (always log their own output)
+    "GATE_REPORT", "SNAPSHOT_COMPACT", "GATE_SPREAD_BLOCK",
+    # Market discovery
+    "MARKET_DISCOVERY_ERROR",
+})
+# Prefixes that always log (for variable event_type like flatten_reason)
+_ALWAYS_LOG_PREFIXES = ("FLATTEN", "KILL", "PAUSE", "END_OF_HOUR")
+
+def _compact_gate(event_type: str) -> bool:
+    """Return True if this event should be logged in COMPACT mode."""
+    if LOG_LEVEL != "COMPACT":
+        return True  # DEBUG mode — log everything
+    if event_type in _ALWAYS_LOG_EVENTS:
+        return True
+    if any(event_type.startswith(p) for p in _ALWAYS_LOG_PREFIXES):
+        return True
+    return False
+
 def write_jsonl(event: dict) -> None:
-    """Legacy shim — delegates to _LOGGER._write_jsonl if available."""
+    """Legacy shim — delegates to _LOGGER._write_jsonl if available.
+    In COMPACT mode, suppresses verbose per-tick events."""
+    if not _compact_gate(event.get("event_type", "")):
+        return
     if _LOGGER is not None:
         _LOGGER._write_jsonl(event)
     else:
@@ -291,6 +336,9 @@ class Bot:
         self._diag_derisk_maker_defers = 0
         # PnL by exit reason (accumulated per minute)
         self._diag_pnl_by_exit_reason: Dict[str, float] = {}
+        # COMPACT log timing: GATE_REPORT every N sec, SNAPSHOT_COMPACT every N sec
+        self._gate_report_last_ts: float = 0.0
+        self._snapshot_last_ts: Dict[str, float] = {}       # slug -> last snapshot ts
         # Parity fill tracking (for parity_fill_pct)
         self._diag_parity_fills_min = 0                      # parity fills this minute
         self._diag_directional_fills_min = 0                 # directional fills this minute
@@ -1237,70 +1285,71 @@ class Bot:
         # Print summary to console
         total_fills = sum(v.get("fills_per_min", 0) for v in per_market.values())
         total_intents = sum(v.get("intents_per_min", 0) for v in per_market.values())
-        print(f"\n  TEMPO: fills/min={total_fills}  intents/min={total_intents}  "
-              f"loop_p95={loop_p95:.1f}ms  stale_skips={self._stale_skip_total}")
-        print(f"  DIAG:  taker={diag['taker_count']}  maker={diag['maker_count']}  "
-              f"derisk={diag['derisk_count']}(taker={diag['derisk_taker_count']})  "
-              f"blocked: whipsaw={diag['blocked_whipsaw']} "
-              f"taker_gate={diag['blocked_taker_gate']} "
-              f"noflip={diag['blocked_noflip']}")
-        print(f"  PARITY: buy_sig={diag['parity_buy_signals']}  "
-              f"sell_sig={diag['parity_sell_signals']}  "
-              f"trades={diag['parity_trades']}  "
-              f"avg_net_edge={diag['parity_avg_edge_net_cents']:.2f}c  "
-              f"maker={diag['parity_maker_count']}  "
-              f"taker={diag['parity_taker_count']}")
-        print(f"  PAIRS: partial={diag['pair_partial_count']}  "
-              f"avg_delay={diag['avg_pair_fill_delay_ms']:.0f}ms  "
-              f"unwind=${diag['unpaired_unwind_usd']:.2f}  "
-              f"recycle={diag['recycle_count']}")
-        print(f"  MAKER: placed={diag['maker_orders_placed']}  "
-              f"fills={diag['maker_fills']}  "
-              f"rate={diag['maker_fill_rate']:.1%}  "
-              f"lat_p50={diag['maker_fill_latency_ms_p50']:.0f}ms  "
-              f"lat_p90={diag['maker_fill_latency_ms_p90']:.0f}ms  "
-              f"timeout={diag['maker_timeout_cancel_count']}  "
-              f"lost_best={diag['maker_top_of_book_lost_count']}  "
-              f"cancel_rep={diag['cancel_replace_per_min']}")
-        if diag['flatten_actions_count'] > 0:
-            print(f"  FLATTEN: actions={diag['flatten_actions_count']}  "
-                  f"taker={diag['flatten_taker_count']}")
-        if diag['rescue_attempts'] > 0 or diag['rescue_success'] > 0:
-            print(f"  RESCUE: attempts={diag['rescue_attempts']}  "
-                  f"success={diag['rescue_success']}  "
-                  f"fallback_sells={diag['rescue_fallback_sells']}")
-        if diag['quote_orders_placed'] > 0 or diag['quote_unpaired_events'] > 0:
-            print(f"  QUOTE: placed={diag['quote_orders_placed']}  "
-                  f"fills={diag['quote_fills']}  "
-                  f"rate={diag['quote_fill_rate']:.1%}  "
-                  f"unpaired={diag['quote_unpaired_events']}  "
-                  f"escalations={diag['quote_unpaired_escalations']}  "
-                  f"pauses={diag['quote_pause_count']}")
-        if total_straddle_locked_usd > 0:
-            print(f"  STRADDLE: locked_usd=${total_straddle_locked_usd:.2f}  "
-                  f"avg_hold={avg_locked_hold_sec:.0f}s")
-        print(f"  TEMPO: paired_ratio={tempo_stats['paired_trade_ratio']:.1%}  "
-              f"paired/min={tempo_stats['paired_trades_per_min']}  "
-              f"max_burst={tempo_stats['max_trades_in_one_sec']}/s  "
-              f"med_gap={tempo_stats['median_inter_trade_ms']:.0f}ms  "
-              f"mkr_ratio={tempo_stats['maker_ratio']:.1%}")
-        print(f"  GUARD: spread_blk={diag['blocked_spread']}  "
-              f"liq_blk={diag['blocked_liq']}  "
-              f"stale_blk={diag['blocked_stale']}  "
-              f"adverse={diag['adverse_guard_events']}  "
-              f"degrades={diag['adverse_guard_degrades']}  "
-              f"hard_pauses={diag['adverse_guard_pauses']}")
-        if inv_imbalance:
-            for slug, inv in inv_imbalance.items():
-                print(f"    INV {slug[:30]:30s}  Up={inv['up_qty']:5.0f}  "
-                      f"Dn={inv['dn_qty']:5.0f}  "
-                      f"imbal={inv['imbalance']:+5.0f}  "
-                      f"locked={inv['straddle_locked']:.0f}({inv['locked_age_sec']:.0f}s)")
-        for slug, info in per_market.items():
-            if info["fills_per_min"] > 0 or info["intents_per_min"] > 0:
-                print(f"    {slug[:30]:30s}  fills={info['fills_per_min']:3d}  "
-                      f"intents={info['intents_per_min']:3d}  "
-                      f"cache_age_med={info['median_cache_age_ms']:.0f}ms")
+        if CONSOLE_LEVEL != "QUIET":
+            print(f"\n  TEMPO: fills/min={total_fills}  intents/min={total_intents}  "
+                  f"loop_p95={loop_p95:.1f}ms  stale_skips={self._stale_skip_total}")
+            print(f"  DIAG:  taker={diag['taker_count']}  maker={diag['maker_count']}  "
+                  f"derisk={diag['derisk_count']}(taker={diag['derisk_taker_count']})  "
+                  f"blocked: whipsaw={diag['blocked_whipsaw']} "
+                  f"taker_gate={diag['blocked_taker_gate']} "
+                  f"noflip={diag['blocked_noflip']}")
+            print(f"  PARITY: buy_sig={diag['parity_buy_signals']}  "
+                  f"sell_sig={diag['parity_sell_signals']}  "
+                  f"trades={diag['parity_trades']}  "
+                  f"avg_net_edge={diag['parity_avg_edge_net_cents']:.2f}c  "
+                  f"maker={diag['parity_maker_count']}  "
+                  f"taker={diag['parity_taker_count']}")
+            print(f"  PAIRS: partial={diag['pair_partial_count']}  "
+                  f"avg_delay={diag['avg_pair_fill_delay_ms']:.0f}ms  "
+                  f"unwind=${diag['unpaired_unwind_usd']:.2f}  "
+                  f"recycle={diag['recycle_count']}")
+            print(f"  MAKER: placed={diag['maker_orders_placed']}  "
+                  f"fills={diag['maker_fills']}  "
+                  f"rate={diag['maker_fill_rate']:.1%}  "
+                  f"lat_p50={diag['maker_fill_latency_ms_p50']:.0f}ms  "
+                  f"lat_p90={diag['maker_fill_latency_ms_p90']:.0f}ms  "
+                  f"timeout={diag['maker_timeout_cancel_count']}  "
+                  f"lost_best={diag['maker_top_of_book_lost_count']}  "
+                  f"cancel_rep={diag['cancel_replace_per_min']}")
+            if diag['flatten_actions_count'] > 0:
+                print(f"  FLATTEN: actions={diag['flatten_actions_count']}  "
+                      f"taker={diag['flatten_taker_count']}")
+            if diag['rescue_attempts'] > 0 or diag['rescue_success'] > 0:
+                print(f"  RESCUE: attempts={diag['rescue_attempts']}  "
+                      f"success={diag['rescue_success']}  "
+                      f"fallback_sells={diag['rescue_fallback_sells']}")
+            if diag['quote_orders_placed'] > 0 or diag['quote_unpaired_events'] > 0:
+                print(f"  QUOTE: placed={diag['quote_orders_placed']}  "
+                      f"fills={diag['quote_fills']}  "
+                      f"rate={diag['quote_fill_rate']:.1%}  "
+                      f"unpaired={diag['quote_unpaired_events']}  "
+                      f"escalations={diag['quote_unpaired_escalations']}  "
+                      f"pauses={diag['quote_pause_count']}")
+            if total_straddle_locked_usd > 0:
+                print(f"  STRADDLE: locked_usd=${total_straddle_locked_usd:.2f}  "
+                      f"avg_hold={avg_locked_hold_sec:.0f}s")
+            print(f"  TEMPO: paired_ratio={tempo_stats['paired_trade_ratio']:.1%}  "
+                  f"paired/min={tempo_stats['paired_trades_per_min']}  "
+                  f"max_burst={tempo_stats['max_trades_in_one_sec']}/s  "
+                  f"med_gap={tempo_stats['median_inter_trade_ms']:.0f}ms  "
+                  f"mkr_ratio={tempo_stats['maker_ratio']:.1%}")
+            print(f"  GUARD: spread_blk={diag['blocked_spread']}  "
+                  f"liq_blk={diag['blocked_liq']}  "
+                  f"stale_blk={diag['blocked_stale']}  "
+                  f"adverse={diag['adverse_guard_events']}  "
+                  f"degrades={diag['adverse_guard_degrades']}  "
+                  f"hard_pauses={diag['adverse_guard_pauses']}")
+            if inv_imbalance:
+                for slug, inv in inv_imbalance.items():
+                    print(f"    INV {slug[:30]:30s}  Up={inv['up_qty']:5.0f}  "
+                          f"Dn={inv['dn_qty']:5.0f}  "
+                          f"imbal={inv['imbalance']:+5.0f}  "
+                          f"locked={inv['straddle_locked']:.0f}({inv['locked_age_sec']:.0f}s)")
+            for slug, info in per_market.items():
+                if info["fills_per_min"] > 0 or info["intents_per_min"] > 0:
+                    print(f"    {slug[:30]:30s}  fills={info['fills_per_min']:3d}  "
+                          f"intents={info['intents_per_min']:3d}  "
+                          f"cache_age_med={info['median_cache_age_ms']:.0f}ms")
         # Reset counters for next minute
         self._tempo_fills.clear()
         self._tempo_intents.clear()
@@ -1523,7 +1572,7 @@ class Bot:
         }
         write_jsonl(clone_data)
 
-        # Console print
+        # Console print (QUIET mode: only first summary line)
         print(f"  CLONE: pairs={total_pairs}  "
               f"r500={paired_500ms_ratio:.0%}  "
               f"r1.5s={paired_straddle_ratio:.0%}  "
@@ -1531,40 +1580,41 @@ class Bot:
               f"delay={med_pair_delay_ms:.0f}ms  "
               f"gap={med_inter_pair_ms:.0f}ms  "
               f"sig2fill={med_signal_to_fill_ms:.0f}ms")
-        print(f"  LIFECYCLE: submit={clone_submits}  "
-              f"cancel={clone_cancels}  "
-              f"replace={clone_replaces}  "
-              f"fills={clone_fills}  "
-              f"fill_rate={fill_rate:.0%}  "
-              f"queue_p50={queue_p50:.0f}ms  "
-              f"queue_p90={queue_p90:.0f}ms")
-        print(f"  HEDGE: tick1={self._diag_hedge_tick1}  "
-              f"tick2={self._diag_hedge_tick2}  "
-              f"cross_early={self._diag_hedge_cross_early}  "
-              f"cross_late={self._diag_hedge_cross_late}  "
-              f"stale_skip={self._diag_hedge_skipped_stale}  "
-              f"unwind={self._diag_hedge_unwind}  "
-              f"fetch_streak={self._diag_pending_fetch_streak_max}")
-        print(f"  HOLD: p50={hold_p50:.0f}s  p90={hold_p90:.0f}s  "
-              f"active_p50={active_hold_p50:.0f}s  locked={len(active_hold_secs)}")
-        print(f"  IMBAL: max={global_max_imbalance:.0f}  "
-              f"corr(imbal,delta)={imbal_delta_corr:.2f}")
-        if per_slug_imbalance:
-            for slug, info in per_slug_imbalance.items():
-                print(f"    {slug[:30]:30s}  imbal={info['current_imbalance']:+5.0f}  "
-                      f"max={info['max_abs_imbalance']:.0f}")
-        # Per-slug KPI line
-        if per_slug_kpi:
-            for slug, kpi in per_slug_kpi.items():
-                if kpi["cache_age_p90_ms"] > 0 or kpi.get("paired_within_500ms", 0) > 0 or kpi.get("paired_within_1500ms", 0) > 0:
-                    print(f"    KPI {slug[:25]:25s}  "
-                          f"ca_p90={kpi['cache_age_p90_ms']:.0f}ms  "
-                          f"bg_p90={kpi['bg_fetch_p90_ms']:.0f}ms  "
-                          f"p500={kpi.get('paired_within_500ms', 0)}  "
-                          f"p1500={kpi.get('paired_within_1500ms', 0)}  "
-                          f"tout={kpi.get('timeouts', 0)}  "
-                          f"miss={kpi['refresh_miss_count']}  "
-                          f"hcross={kpi['hedge_cross_rate']:.0%}")
+        if CONSOLE_LEVEL != "QUIET":
+            print(f"  LIFECYCLE: submit={clone_submits}  "
+                  f"cancel={clone_cancels}  "
+                  f"replace={clone_replaces}  "
+                  f"fills={clone_fills}  "
+                  f"fill_rate={fill_rate:.0%}  "
+                  f"queue_p50={queue_p50:.0f}ms  "
+                  f"queue_p90={queue_p90:.0f}ms")
+            print(f"  HEDGE: tick1={self._diag_hedge_tick1}  "
+                  f"tick2={self._diag_hedge_tick2}  "
+                  f"cross_early={self._diag_hedge_cross_early}  "
+                  f"cross_late={self._diag_hedge_cross_late}  "
+                  f"stale_skip={self._diag_hedge_skipped_stale}  "
+                  f"unwind={self._diag_hedge_unwind}  "
+                  f"fetch_streak={self._diag_pending_fetch_streak_max}")
+            print(f"  HOLD: p50={hold_p50:.0f}s  p90={hold_p90:.0f}s  "
+                  f"active_p50={active_hold_p50:.0f}s  locked={len(active_hold_secs)}")
+            print(f"  IMBAL: max={global_max_imbalance:.0f}  "
+                  f"corr(imbal,delta)={imbal_delta_corr:.2f}")
+            if per_slug_imbalance:
+                for slug, info in per_slug_imbalance.items():
+                    print(f"    {slug[:30]:30s}  imbal={info['current_imbalance']:+5.0f}  "
+                          f"max={info['max_abs_imbalance']:.0f}")
+            # Per-slug KPI line
+            if per_slug_kpi:
+                for slug, kpi in per_slug_kpi.items():
+                    if kpi["cache_age_p90_ms"] > 0 or kpi.get("paired_within_500ms", 0) > 0 or kpi.get("paired_within_1500ms", 0) > 0:
+                        print(f"    KPI {slug[:25]:25s}  "
+                              f"ca_p90={kpi['cache_age_p90_ms']:.0f}ms  "
+                              f"bg_p90={kpi['bg_fetch_p90_ms']:.0f}ms  "
+                              f"p500={kpi.get('paired_within_500ms', 0)}  "
+                              f"p1500={kpi.get('paired_within_1500ms', 0)}  "
+                              f"tout={kpi.get('timeouts', 0)}  "
+                              f"miss={kpi['refresh_miss_count']}  "
+                              f"hcross={kpi['hedge_cross_rate']:.0%}")
         # Reset clone-specific counters (per-minute)
         self._clone_pair_delays.clear()
         self._clone_inter_pair_gaps.clear()
@@ -1768,20 +1818,13 @@ class Bot:
         exit_ok = "OK" if med_exit >= 4.0 else ("--" if med_exit == 0 else "!!")
         par_ok = "OK" if parity_fill_pct <= 0.30 else "!!"
 
+        # Always print: DIAG summary + ASYM + DSCALP
         print(f"  DIAG [{tpm_ok}] trades/min={trades_per_min:.1f}  "
               f"[{size_ok}] avg_size=${avg_trade_size:.1f}  "
               f"[{hold_ok}] hold={med_hold:.0f}s  "
               f"[{exit_ok}] exit={med_exit:+.1f}c")
         print(f"  ASYM: win_rate={win_rate:.0%}  avg_win={avg_win_cents:+.1f}c/${avg_win_usdc:+.4f}  "
               f"avg_loss={avg_loss_cents:+.1f}c/${avg_loss_usdc:+.4f}  med_hold={med_hold:.0f}s")
-        print(f"  FILL: dir_entry={dir_entry_count}  dir_exit={dir_exit_count}  "
-              f"parity={par_fills}  [{par_ok}] par_pct={parity_fill_pct:.0%}  "
-              f"unpaired={unpaired_rate:.0%}  derisk={derisk_rate:.0%}")
-        print(f"  CACHE: SOL={sol_p50:.0f}/{sol_p90:.0f}ms  XRP={xrp_p50:.0f}/{xrp_p90:.0f}ms  "
-              f"regime: {low_vol_slugs}/{total_slugs} low-vol")
-        print(f"  COST: fills/hr={fills_per_hour:.0f}  tx/hr={tx_per_hour:.0f}  "
-              f"est=${est_cost_per_hour:.4f}/hr  "
-              f"rate_block={self._rate_blocked_interval}+{self._rate_blocked_cap}")
         if self._dscalp_positions or dir_exit_count > 0:
             print(f"  DSCALP: tp1={self._diag_dscalp_tp1} tp2={self._diag_dscalp_tp2} "
                   f"tp3={self._diag_dscalp_tp3} tp4={self._diag_dscalp_tp4} "
@@ -1789,36 +1832,46 @@ class Bot:
                   f"stop={self._diag_dscalp_stop_exits} early={self._diag_dscalp_early_exits} "
                   f"timeout={self._diag_dscalp_timeout_exits} "
                   f"active={len(self._dscalp_positions)}")
-        # PnL by exit reason summary
-        if self._diag_pnl_by_exit_reason:
-            pnl_parts = [f"{k}=${v:+.4f}" for k, v in sorted(self._diag_pnl_by_exit_reason.items())]
-            print(f"  PNL_BY_EXIT: {' '.join(pnl_parts)}")
-        # TIME_STOP / DERISK defers
-        if self._diag_time_stop_defers or self._diag_time_stop_soft_exits or self._diag_derisk_maker_defers:
-            print(f"  LOSS_PREVENTION: ts_defer={self._diag_time_stop_defers}  "
-                  f"ts_soft={self._diag_time_stop_soft_exits}  "
-                  f"derisk_defer={self._diag_derisk_maker_defers}")
-        # Entry reject summary
-        if self._diag_entry_reject_by_gate:
-            reject_parts = [f"{k}={v}" for k, v in sorted(self._diag_entry_reject_by_gate.items()) if v > 0]
-            if reject_parts:
-                print(f"  GATE_REJECTS: {' '.join(reject_parts)}")
-        # Safety caps summary
-        if (self._diag_cap_blocks or self._diag_post_fill_cooldown_blocks
-                or self._diag_time_stop_exits or self._diag_spread_limit_blocks
-                or self._diag_parity_directional_suppress):
-            print(f"  SAFETY: cap_blocks={self._diag_cap_blocks}  "
-                  f"cooldown_blocks={self._diag_post_fill_cooldown_blocks}  "
-                  f"time_stops={self._diag_time_stop_exits}  "
-                  f"spread_blocks={self._diag_spread_limit_blocks}  "
-                  f"dir_suppress={self._diag_parity_directional_suppress}")
-        # Per-slug exposure summary (top 3 by exposure)
-        if slug_exposure:
-            top_slugs = sorted(slug_exposure.items(),
-                               key=lambda x: abs(x[1]["exposure_usd"]), reverse=True)[:3]
-            parts = [f"{s[:20]}=${d['exposure_usd']:.0f}/imb={d['imbalance_shares']:+.0f}"
-                     for s, d in top_slugs]
-            print(f"  EXPOSURE: {' | '.join(parts)}")
+        # Sub-detail lines (suppressed in QUIET mode)
+        if CONSOLE_LEVEL != "QUIET":
+            print(f"  FILL: dir_entry={dir_entry_count}  dir_exit={dir_exit_count}  "
+                  f"parity={par_fills}  [{par_ok}] par_pct={parity_fill_pct:.0%}  "
+                  f"unpaired={unpaired_rate:.0%}  derisk={derisk_rate:.0%}")
+            print(f"  CACHE: SOL={sol_p50:.0f}/{sol_p90:.0f}ms  XRP={xrp_p50:.0f}/{xrp_p90:.0f}ms  "
+                  f"regime: {low_vol_slugs}/{total_slugs} low-vol")
+            print(f"  COST: fills/hr={fills_per_hour:.0f}  tx/hr={tx_per_hour:.0f}  "
+                  f"est=${est_cost_per_hour:.4f}/hr  "
+                  f"rate_block={self._rate_blocked_interval}+{self._rate_blocked_cap}")
+            # PnL by exit reason summary
+            if self._diag_pnl_by_exit_reason:
+                pnl_parts = [f"{k}=${v:+.4f}" for k, v in sorted(self._diag_pnl_by_exit_reason.items())]
+                print(f"  PNL_BY_EXIT: {' '.join(pnl_parts)}")
+            # TIME_STOP / DERISK defers
+            if self._diag_time_stop_defers or self._diag_time_stop_soft_exits or self._diag_derisk_maker_defers:
+                print(f"  LOSS_PREVENTION: ts_defer={self._diag_time_stop_defers}  "
+                      f"ts_soft={self._diag_time_stop_soft_exits}  "
+                      f"derisk_defer={self._diag_derisk_maker_defers}")
+            # Entry reject summary
+            if self._diag_entry_reject_by_gate:
+                reject_parts = [f"{k}={v}" for k, v in sorted(self._diag_entry_reject_by_gate.items()) if v > 0]
+                if reject_parts:
+                    print(f"  GATE_REJECTS: {' '.join(reject_parts)}")
+            # Safety caps summary
+            if (self._diag_cap_blocks or self._diag_post_fill_cooldown_blocks
+                    or self._diag_time_stop_exits or self._diag_spread_limit_blocks
+                    or self._diag_parity_directional_suppress):
+                print(f"  SAFETY: cap_blocks={self._diag_cap_blocks}  "
+                      f"cooldown_blocks={self._diag_post_fill_cooldown_blocks}  "
+                      f"time_stops={self._diag_time_stop_exits}  "
+                      f"spread_blocks={self._diag_spread_limit_blocks}  "
+                      f"dir_suppress={self._diag_parity_directional_suppress}")
+            # Per-slug exposure summary (top 3 by exposure)
+            if slug_exposure:
+                top_slugs = sorted(slug_exposure.items(),
+                                   key=lambda x: abs(x[1]["exposure_usd"]), reverse=True)[:3]
+                parts = [f"{s[:20]}=${d['exposure_usd']:.0f}/imb={d['imbalance_shares']:+.0f}"
+                         for s, d in top_slugs]
+                print(f"  EXPOSURE: {' | '.join(parts)}")
 
         # Reset per-minute counters
         self._diag_report_last_ts = now_t
@@ -1863,6 +1916,46 @@ class Bot:
             self._exec_safety.reset_minute_counters()
             self._exec_unpaired.reset_minute_counters()
             self._exec_drift.reset_minute_counters()
+
+    def _emit_gate_report(self):
+        """Emit GATE_REPORT summary every LOG_GATES_EVERY_N_SEC with reject counts."""
+        now_t = time.time()
+        if now_t - self._gate_report_last_ts < LOG_GATES_EVERY_N_SEC:
+            return
+        self._gate_report_last_ts = now_t
+        if not self._diag_entry_reject_by_gate:
+            return
+        write_jsonl({
+            "event_type": "GATE_REPORT",
+            "ts_ms": int(now_t * 1000),
+            "reject_counts": dict(self._diag_entry_reject_by_gate),
+            "total_rejects": sum(self._diag_entry_reject_by_gate.values()),
+        })
+
+    def _emit_snapshot_compact(self, m, ctx: dict):
+        """Emit one SNAPSHOT_COMPACT per slug every LOG_SNAPSHOT_EVERY_N_SEC."""
+        now_t = time.time()
+        last = self._snapshot_last_ts.get(m.slug, 0.0)
+        if now_t - last < LOG_SNAPSHOT_EVERY_N_SEC:
+            return
+        self._snapshot_last_ts[m.slug] = now_t
+        up_book = ctx.get("up_book")
+        dn_book = ctx.get("dn_book")
+        book = up_book  # use Up book for spread/bid/ask
+        write_jsonl({
+            "event_type": "SNAPSHOT_COMPACT",
+            "ts_ms": int(now_t * 1000),
+            "slug": m.slug,
+            "t_min": round(ctx.get("t_min", 0), 1),
+            "spot": round(ctx.get("spot", 0), 2),
+            "hour_open": round(ctx.get("hour_open", 0), 2),
+            "vel_bps_min": round(ctx.get("vel", 0), 2),
+            "delta_bps": round(ctx.get("delta_bps", 0), 1),
+            "spread_c": round(book.spread * 100, 1) if book else 0,
+            "best_bid": round(book.bid, 3) if book else 0,
+            "best_ask": round(book.ask, 3) if book else 0,
+            "cache_age_ms": round(self._cache_age_ms(m.slug), 0),
+        })
 
     def _emit_live_sanity_report(self):
         """Emit LIVE_SANITY_REPORT with execution health diagnostics."""
@@ -2259,6 +2352,11 @@ class Bot:
         # ── Update regime awareness ──
         self._update_regime(m.slug)
 
+        # ── Compact logging: periodic snapshot + gate report ──
+        if LOG_LEVEL == "COMPACT":
+            self._emit_snapshot_compact(m, ctx)
+            self._emit_gate_report()
+
         # ── EXITS FIRST (all engines) ──
         self._manage_exits(m, st, t_min, delta_bps, ctx)
         if DIRECTIONAL_SCALP_ENABLED:
@@ -2624,9 +2722,11 @@ class Bot:
         spread_cents = book.spread * 100
         if not self._coin_spread_entry_ok(m.crypto, spread_cents):
             self._diag_entry_reject_by_gate["spread_filter"] = self._diag_entry_reject_by_gate.get("spread_filter", 0) + 1
-            write_jsonl({"event_type": "GATE_SPREAD_BLOCK", "ts_ms": int(now_t * 1000),
-                          "slug": m.slug, "crypto": m.crypto, "spread_cents": round(spread_cents, 2),
-                          "limit_cents": MAX_SPREAD_ENTRY_CENTS_BTCETH if m.crypto in ("BTC", "ETH") else MAX_SPREAD_ENTRY_CENTS_SOLXRP})
+            # Sampled log: only emit GATE_SPREAD_BLOCK at LOG_SPREAD_BLOCK_SAMPLER probability
+            if LOG_LEVEL != "COMPACT" or random.random() < LOG_SPREAD_BLOCK_SAMPLER:
+                write_jsonl({"event_type": "GATE_SPREAD_BLOCK", "ts_ms": int(now_t * 1000),
+                              "slug": m.slug, "crypto": m.crypto, "spread_cents": round(spread_cents, 2),
+                              "limit_cents": MAX_SPREAD_ENTRY_CENTS_BTCETH if m.crypto in ("BTC", "ETH") else MAX_SPREAD_ENTRY_CENTS_SOLXRP})
             return
 
         # Spread gate (existing)
@@ -2634,7 +2734,12 @@ class Bot:
             self._diag_entry_reject_by_gate["spread_general"] = self._diag_entry_reject_by_gate.get("spread_general", 0) + 1
             return
 
-        # Entry edge gate: outcome mid must be >= 2.5c above 50c neutral
+        # Noisy-spread chop guard: block if spread wide AND velocity low (choppy conditions)
+        if spread_cents > NOISY_SPREAD_BLOCK_CENTS and abs(vel) < NOISY_SPREAD_BLOCK_VEL:
+            self._diag_entry_reject_by_gate["noisy_spread"] = self._diag_entry_reject_by_gate.get("noisy_spread", 0) + 1
+            return
+
+        # Entry edge gate: outcome mid must be >= 3c above 50c neutral
         entry_edge_cents = (book.mid - 0.50) * 100
         if entry_edge_cents < DSCALP_MIN_ENTRY_EDGE_CENTS:
             self._diag_entry_reject_by_gate["entry_edge"] = self._diag_entry_reject_by_gate.get("entry_edge", 0) + 1
@@ -3142,15 +3247,18 @@ class Bot:
         # --- State machine: IDLE → PROBING → SCALING → COOLDOWN ---
         if sm["state"] == "IDLE":
             if not sig:
-                print(f"  [GATE_FAIL] {m.crypto:5s} {skip_reason}")
+                if CONSOLE_LEVEL != "QUIET":
+                    print(f"  [GATE_FAIL] {m.crypto:5s} {skip_reason}")
                 return
             if not persist_ok:
-                print(f"  [PERSIST_FAIL] {m.crypto:5s} sig=True but persistence not met (hist={len(sh)})")
+                if CONSOLE_LEVEL != "QUIET":
+                    print(f"  [PERSIST_FAIL] {m.crypto:5s} sig=True but persistence not met (hist={len(sh)})")
                 return
             if cooldown_active or risk_blocked:
                 return
             if clip < MIN_ORDER_USDC:
-                print(f"  [CLIP_FAIL] {m.crypto:5s} clip=${clip:.2f} < min=${MIN_ORDER_USDC}")
+                if CONSOLE_LEVEL != "QUIET":
+                    print(f"  [CLIP_FAIL] {m.crypto:5s} clip=${clip:.2f} < min=${MIN_ORDER_USDC}")
                 return
             # ---- Place PROBE order (taker-gated) ----
             if not self._exec_safety_can_enter(m.slug):
@@ -3195,7 +3303,8 @@ class Bot:
             bk_fields = self._book_fields(up_book, dn_book, outcome)
             order_place_ts = time.time()
             signal_to_order_ms = (order_place_ts - signal_detect_ts) * 1000
-            print(f"  [PROBE] {m.crypto:5s} {outcome} probe=${probe_usd:.2f} ask={book.ask:.3f} latency={signal_to_order_ms:.0f}ms")
+            if CONSOLE_LEVEL != "QUIET":
+                print(f"  [PROBE] {m.crypto:5s} {outcome} probe=${probe_usd:.2f} ask={book.ask:.3f} latency={signal_to_order_ms:.0f}ms")
             write_jsonl({"event_type": "SIGNAL_LATENCY", "slug": m.slug,
                           "crypto": m.crypto, "outcome": outcome,
                           "signal_detect_ts": signal_detect_ts,
