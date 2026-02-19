@@ -31,6 +31,15 @@ os.makedirs(_LOG_DIR, exist_ok=True)
 
 STATE_FILE = os.getenv("STATE_FILE", os.path.join(_LOG_DIR, "state.json"))
 
+# ---------------------------------------------------------------------------
+# LOG SIZE / READABILITY — COMPACT mode suppresses verbose per-tick events
+# ---------------------------------------------------------------------------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "COMPACT").upper()                           # COMPACT | DEBUG
+LOG_GATES_EVERY_N_SEC = float(os.getenv("LOG_GATES_EVERY_N_SEC", "30"))         # GATE_REPORT summary interval
+LOG_SNAPSHOT_EVERY_N_SEC = float(os.getenv("LOG_SNAPSHOT_EVERY_N_SEC", "60"))   # SNAPSHOT_COMPACT per slug interval
+LOG_SPREAD_BLOCK_SAMPLER = float(os.getenv("LOG_SPREAD_BLOCK_SAMPLER", "0.02")) # 2% sampling for GATE_SPREAD_BLOCK
+CONSOLE_LEVEL = os.getenv("CONSOLE_LEVEL", "NORMAL").upper()                    # NORMAL | QUIET
+
 # Markets / coins
 CRYPTOS = ["BTC", "ETH", "SOL", "XRP"]
 ENABLE_XRP = bool(os.getenv("ENABLE_XRP", "False") not in ("", "0", "False", "false"))   # default OFF
@@ -449,7 +458,11 @@ THROTTLE_LOOKBACK_SEC = float(os.getenv("THROTTLE_LOOKBACK_SEC", "60"))         
 MIN_ENTRY_INTERVAL_MS = float(os.getenv("MIN_ENTRY_INTERVAL_MS", "350"))         # min ms between entries on same slug
 MAX_ENTRIES_PER_MIN_PER_SLUG = int(os.getenv("MAX_ENTRIES_PER_MIN_PER_SLUG", "20"))  # hard cap per slug per minute (was 40)
 # Anti-stacking: prevent rapid entries after a fill
-MIN_TIME_BETWEEN_NEW_ENTRIES_MS = float(os.getenv("MIN_TIME_BETWEEN_NEW_ENTRIES_MS", "1500"))  # 1.5s cooldown after fill before new entry
+MIN_TIME_BETWEEN_NEW_ENTRIES_MS = float(os.getenv("MIN_TIME_BETWEEN_NEW_ENTRIES_MS", "2000"))  # 2s cooldown after fill before new entry (tightened from 1.5s)
+
+# Noisy-spread chop guard (entry-only): block if spread wide AND velocity low
+NOISY_SPREAD_BLOCK_CENTS = float(os.getenv("NOISY_SPREAD_BLOCK_CENTS", "4"))    # spread > 4c
+NOISY_SPREAD_BLOCK_VEL = float(os.getenv("NOISY_SPREAD_BLOCK_VEL", "4"))        # AND vel < 4 bps/min → chop, block entry
 
 # ---------------------------------------------------------------------------
 # REGIME AWARENESS -- volatility-adaptive activity
