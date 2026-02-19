@@ -268,6 +268,7 @@ class Bot:
         self._dscalp_positions: Dict[str, dict] = {}  # slug -> {outcome, entry_price, entry_ts, qty, tp1_done, tp2_done}
         self._dscalp_last_entry_ts: Dict[str, float] = {}   # slug -> last entry timestamp
         self._dscalp_invested_usd: Dict[str, float] = {}    # slug -> total invested USD
+        self._dscalp_last_stop_ts: Dict[str, float] = {}    # slug -> last stop loss timestamp (for cooldown)
         # Directional scalp diagnostics (per-minute, reset in DIAG report)
         self._diag_dscalp_entries = 0
         self._diag_dscalp_exits = 0                          # all exits (TP + timeout + stop + early)
@@ -281,6 +282,13 @@ class Bot:
         self._diag_dscalp_exit_cents: List[float] = []     # profit/loss in cents
         # Entry reject tracking by gate (per-minute, reset in DIAG report)
         self._diag_entry_reject_by_gate: Dict[str, int] = {}
+        # TIME_STOP deferred/soft-exit tracking
+        self._diag_time_stop_defers = 0
+        self._diag_time_stop_soft_exits = 0
+        # DERISK_MAKER deferred tracking
+        self._diag_derisk_maker_defers = 0
+        # PnL by exit reason (accumulated per minute)
+        self._diag_pnl_by_exit_reason: Dict[str, float] = {}
         # Parity fill tracking (for parity_fill_pct)
         self._diag_parity_fills_min = 0                      # parity fills this minute
         self._diag_directional_fills_min = 0                 # directional fills this minute
@@ -1619,6 +1627,12 @@ class Bot:
         avg_loss_cents = _stats.mean(losses) if losses else 0.0
         win_rate = len(wins) / max(1, len(wins) + len(losses))
 
+        # ── Win/loss in USD ──
+        win_exits_usd = [c / 100.0 for c in self._diag_dscalp_exit_cents if c > 0]
+        loss_exits_usd = [c / 100.0 for c in self._diag_dscalp_exit_cents if c <= 0]
+        avg_win_usdc = _stats.mean(win_exits_usd) if win_exits_usd else 0.0
+        avg_loss_usdc = _stats.mean(loss_exits_usd) if loss_exits_usd else 0.0
+
         # ── Exit reason counts ──
         exit_reason_counts = {
             "TP1": self._diag_dscalp_tp1,
@@ -1663,8 +1677,11 @@ class Bot:
             # Asymmetry metrics (real-time monitoring)
             "avg_win_cents": round(avg_win_cents, 2),
             "avg_loss_cents": round(avg_loss_cents, 2),
+            "avg_win_usdc": round(avg_win_usdc, 4),
+            "avg_loss_usdc": round(avg_loss_usdc, 4),
             "win_rate": round(win_rate, 3),
             "median_hold_sec": round(med_hold, 1),
+            "stop_count": self._diag_dscalp_stop_exits,
             # Fill composition
             "directional_entry_count": dir_entry_count,
             "directional_exit_count": dir_exit_count,
@@ -1701,6 +1718,13 @@ class Bot:
             "exit_reason_counts": exit_reason_counts,
             # Entry reject breakdown by gate
             "entry_reject_count_by_gate": dict(self._diag_entry_reject_by_gate),
+            # PnL by exit reason (sum USD)
+            "pnl_by_exit_reason": {k: round(v, 4) for k, v in self._diag_pnl_by_exit_reason.items()},
+            # TIME_STOP loss prevention
+            "time_stop_defer_count": self._diag_time_stop_defers,
+            "time_stop_soft_exit_count": self._diag_time_stop_soft_exits,
+            # DERISK_MAKER deferred
+            "derisk_maker_defer_count": self._diag_derisk_maker_defers,
             # Pre-8hr safety metrics
             "cap_blocks": self._diag_cap_blocks,
             "post_fill_cooldown_blocks": self._diag_post_fill_cooldown_blocks,
@@ -1742,8 +1766,8 @@ class Bot:
               f"[{size_ok}] avg_size=${avg_trade_size:.1f}  "
               f"[{hold_ok}] hold={med_hold:.0f}s  "
               f"[{exit_ok}] exit={med_exit:+.1f}c")
-        print(f"  ASYM: win_rate={win_rate:.0%}  avg_win={avg_win_cents:+.1f}c  "
-              f"avg_loss={avg_loss_cents:+.1f}c  med_hold={med_hold:.0f}s")
+        print(f"  ASYM: win_rate={win_rate:.0%}  avg_win={avg_win_cents:+.1f}c/${avg_win_usdc:+.4f}  "
+              f"avg_loss={avg_loss_cents:+.1f}c/${avg_loss_usdc:+.4f}  med_hold={med_hold:.0f}s")
         print(f"  FILL: dir_entry={dir_entry_count}  dir_exit={dir_exit_count}  "
               f"parity={par_fills}  [{par_ok}] par_pct={parity_fill_pct:.0%}  "
               f"unpaired={unpaired_rate:.0%}  derisk={derisk_rate:.0%}")
@@ -1758,6 +1782,15 @@ class Bot:
                   f"stop={self._diag_dscalp_stop_exits} early={self._diag_dscalp_early_exits} "
                   f"timeout={self._diag_dscalp_timeout_exits} "
                   f"active={len(self._dscalp_positions)}")
+        # PnL by exit reason summary
+        if self._diag_pnl_by_exit_reason:
+            pnl_parts = [f"{k}=${v:+.4f}" for k, v in sorted(self._diag_pnl_by_exit_reason.items())]
+            print(f"  PNL_BY_EXIT: {' '.join(pnl_parts)}")
+        # TIME_STOP / DERISK defers
+        if self._diag_time_stop_defers or self._diag_time_stop_soft_exits or self._diag_derisk_maker_defers:
+            print(f"  LOSS_PREVENTION: ts_defer={self._diag_time_stop_defers}  "
+                  f"ts_soft={self._diag_time_stop_soft_exits}  "
+                  f"derisk_defer={self._diag_derisk_maker_defers}")
         # Entry reject summary
         if self._diag_entry_reject_by_gate:
             reject_parts = [f"{k}={v}" for k, v in sorted(self._diag_entry_reject_by_gate.items()) if v > 0]
@@ -1804,6 +1837,10 @@ class Bot:
         self._diag_dscalp_hold_times.clear()
         self._diag_dscalp_exit_cents.clear()
         self._diag_entry_reject_by_gate.clear()
+        self._diag_pnl_by_exit_reason.clear()
+        self._diag_time_stop_defers = 0
+        self._diag_time_stop_soft_exits = 0
+        self._diag_derisk_maker_defers = 0
         # Pre-8hr safety counter resets
         self._diag_cap_blocks = 0
         self._diag_post_fill_cooldown_blocks = 0
@@ -2321,6 +2358,14 @@ class Bot:
         return False
 
     # =================================================================
+    # PNL BY EXIT REASON TRACKER
+    # =================================================================
+    def _track_exit_pnl(self, reason: str, pnl_cents: float, qty: float, price: float):
+        """Track PnL (in USD) by exit reason for DIAG_REPORT."""
+        pnl_usd = pnl_cents / 100.0 * qty
+        self._diag_pnl_by_exit_reason[reason] = self._diag_pnl_by_exit_reason.get(reason, 0.0) + pnl_usd
+
+    # =================================================================
     # GLOBAL THROTTLE — target trades/min
     # =================================================================
     def _throttle_exceeded(self) -> bool:
@@ -2516,6 +2561,12 @@ class Bot:
         invested = self._dscalp_invested_usd.get(m.slug, 0.0)
         max_usd = XRP_MAX_USD_PER_SLUG if m.crypto == "XRP" else DSCALP_MAX_USD_PER_SLUG
         if invested >= max_usd:
+            return
+
+        # Post-STOP cooldown: 90s no entries on slug after a stop loss
+        last_stop = self._dscalp_last_stop_ts.get(m.slug, 0.0)
+        if (now_t - last_stop) < STOP_COOLDOWN_SEC:
+            self._diag_entry_reject_by_gate["stop_cooldown"] = self._diag_entry_reject_by_gate.get("stop_cooldown", 0) + 1
             return
 
         # Rate limit
@@ -2715,23 +2766,38 @@ class Bot:
         pnl_cents = (current_mid - entry_price) * 100
 
         # ── HARD STOP LOSS — triggers immediately at -4c, overrides min hold timer ──
-        if pnl_cents <= -DSCALP_STOP_LOSS_CENTS:
+        # Also: per-position loss cap — if unrealized USD loss >= POS_LOSS_CAP_MULT * clip_usdc
+        invested_usd = self._dscalp_invested_usd.get(m.slug, 0.0)
+        unrealized_pnl_usd = (current_mid - entry_price) * dpos.get("qty", pos.qty)
+        pos_loss_cap_usd = -POS_LOSS_CAP_MULT * max(invested_usd, DSCALP_STEP_USD) if POS_LOSS_CAP_ENABLED else -9999
+
+        stop_triggered = pnl_cents <= -DSCALP_STOP_LOSS_CENTS
+        loss_cap_triggered = POS_LOSS_CAP_ENABLED and unrealized_pnl_usd <= pos_loss_cap_usd
+
+        if stop_triggered or loss_cap_triggered:
+            stop_reason = "DSCALP_STOP" if stop_triggered else "DSCALP_LOSS_CAP"
             sell_qty = pos.qty
             sell_price = max(book.bid, 0.01)
             self._do_sell(m, st, outcome, sell_qty, sell_price,
-                          reason="DSCALP_STOP", leg="DSCALP", ctx=ctx, use_maker=False)
+                          reason=stop_reason, leg="DSCALP", ctx=ctx, use_maker=False)
             self._diag_dscalp_stop_exits += 1
             self._diag_dscalp_hold_times.append(hold_sec)
             self._diag_dscalp_exit_cents.append(pnl_cents)
+            self._track_exit_pnl("STOP", pnl_cents, sell_qty, sell_price)
             self._diag_dscalp_exits += 1
             self._diag_directional_fills_min += 1
             self._diag_total_fills_min += 1
             self._throttle_record_trade()
+            # Record stop timestamp for per-slug stop cooldown
+            self._dscalp_last_stop_ts[m.slug] = now_t
             self._dscalp_positions.pop(m.slug, None)
             self._dscalp_invested_usd.pop(m.slug, None)
-            write_jsonl({"event_type": "DSCALP_STOP", "ts_ms": int(now_t * 1000),
+            write_jsonl({"event_type": stop_reason, "ts_ms": int(now_t * 1000),
                           "slug": m.slug, "outcome": outcome,
-                          "pnl_cents": round(pnl_cents, 2), "hold_sec": round(hold_sec, 1)})
+                          "pnl_cents": round(pnl_cents, 2),
+                          "unrealized_pnl_usd": round(unrealized_pnl_usd, 4),
+                          "pos_loss_cap_usd": round(pos_loss_cap_usd, 4),
+                          "hold_sec": round(hold_sec, 1)})
             return
 
         # ── MINIMUM HOLD FLOOR: 60s unless TP/STOP hit or early exit conditions met ──
@@ -2757,6 +2823,7 @@ class Bot:
                 self._diag_dscalp_exits += 1
                 self._diag_dscalp_hold_times.append(hold_sec)
                 self._diag_dscalp_exit_cents.append(pnl_cents)
+                self._track_exit_pnl("EARLY", pnl_cents, sell_qty, sell_price)
                 self._diag_directional_fills_min += 1
                 self._diag_total_fills_min += 1
                 self._throttle_record_trade()
@@ -2778,6 +2845,7 @@ class Bot:
             self._diag_dscalp_exits += 1
             self._diag_dscalp_hold_times.append(hold_sec)
             self._diag_dscalp_exit_cents.append(pnl_cents)
+            self._track_exit_pnl("TIMEOUT", pnl_cents, sell_qty, sell_price)
             self._diag_directional_fills_min += 1
             self._diag_total_fills_min += 1
             self._throttle_record_trade()
@@ -2801,6 +2869,7 @@ class Bot:
                 self._diag_total_fills_min += 1
                 self._throttle_record_trade()
                 self._diag_trade_sizes.append(sell_qty * sell_price)
+                self._track_exit_pnl("TP1", pnl_cents, sell_qty, sell_price)
                 write_jsonl({"event_type": "DSCALP_TP1", "ts_ms": int(now_t * 1000),
                               "slug": m.slug, "outcome": outcome,
                               "pnl_cents": round(pnl_cents, 2), "sell_qty": round(sell_qty, 1),
@@ -2820,6 +2889,7 @@ class Bot:
                 self._diag_total_fills_min += 1
                 self._throttle_record_trade()
                 self._diag_trade_sizes.append(sell_qty * sell_price)
+                self._track_exit_pnl("TP2", pnl_cents, sell_qty, sell_price)
                 write_jsonl({"event_type": "DSCALP_TP2", "ts_ms": int(now_t * 1000),
                               "slug": m.slug, "outcome": outcome,
                               "pnl_cents": round(pnl_cents, 2), "sell_qty": round(sell_qty, 1),
@@ -2839,6 +2909,7 @@ class Bot:
                 self._diag_total_fills_min += 1
                 self._throttle_record_trade()
                 self._diag_trade_sizes.append(sell_qty * sell_price)
+                self._track_exit_pnl("TP3", pnl_cents, sell_qty, sell_price)
                 write_jsonl({"event_type": "DSCALP_TP3", "ts_ms": int(now_t * 1000),
                               "slug": m.slug, "outcome": outcome,
                               "pnl_cents": round(pnl_cents, 2), "sell_qty": round(sell_qty, 1),
@@ -5297,16 +5368,82 @@ class Bot:
                     opened_dt = _parse_iso_z(pos.opened_at)
                     hold_sec = (utc_now() - opened_dt).total_seconds()
                     if hold_sec >= MAX_HOLD_SEC_PARITY:
-                        self._diag_time_stop_exits += 1
-                        write_jsonl({"event_type": "TIME_STOP_EXIT",
-                                      "slug": m.slug, "crypto": m.crypto,
-                                      "outcome": outcome, "hold_sec": round(hold_sec, 1),
-                                      "max_hold": MAX_HOLD_SEC_PARITY,
-                                      "qty": round(pos.qty, 1),
-                                      "ts_ms": int(time.time() * 1000)})
-                        self._do_sell_maker_then_taker(m, st, outcome, pos.qty,
-                                                        reason="TIME_STOP_EXIT", ctx=ctx)
-                        continue
+                        # Calculate mark-to-market PnL
+                        mark_pnl_cents = (book.bid - pos.vwap) * 100 if pos.vwap > 0 else 0.0
+                        spread_cents_ts = book.spread * 100
+                        vel_ts = ctx.get("vel", 0.0)
+
+                        if mark_pnl_cents >= TIME_STOP_MIN_PNL_CENTS:
+                            # Profitable — allow TIME_STOP_EXIT
+                            self._diag_time_stop_exits += 1
+                            write_jsonl({"event_type": "TIME_STOP_EXIT",
+                                          "slug": m.slug, "crypto": m.crypto,
+                                          "outcome": outcome, "hold_sec": round(hold_sec, 1),
+                                          "max_hold": MAX_HOLD_SEC_PARITY,
+                                          "mark_pnl_cents": round(mark_pnl_cents, 2),
+                                          "qty": round(pos.qty, 1),
+                                          "ts_ms": int(time.time() * 1000)})
+                            self._do_sell_maker_then_taker(m, st, outcome, pos.qty,
+                                                            reason="TIME_STOP_EXIT", ctx=ctx)
+                            continue
+                        else:
+                            # Negative PnL — DO NOT time-stop into a loss
+                            # (a) Attempt rescue/hedge-to-straddle if opposite leg liquidity ok
+                            opposite_ts = "Down" if outcome == "Up" else "Up"
+                            opp_book_ts = self.last_book.get(m.slug, {}).get(opposite_ts)
+                            rescue_possible = (DERISK_RESCUE_TO_STRADDLE
+                                               and opp_book_ts and opp_book_ts.bid > 0
+                                               and st.positions[opposite_ts].qty < MIN_PAIR_QTY)
+                            if rescue_possible:
+                                # Let the DERISK block below handle rescue-to-straddle
+                                self._diag_time_stop_defers += 1
+                                write_jsonl({"event_type": "TIME_STOP_DEFER",
+                                              "slug": m.slug, "crypto": m.crypto,
+                                              "outcome": outcome,
+                                              "mark_pnl_cents": round(mark_pnl_cents, 2),
+                                              "spread_cents": round(spread_cents_ts, 2),
+                                              "delta_bps": round(delta_bps, 1),
+                                              "vel": round(vel_ts, 2),
+                                              "hold_sec": round(hold_sec, 1),
+                                              "reason": "defer_to_rescue",
+                                              "ts_ms": int(time.time() * 1000)})
+                                # Fall through to DERISK logic below
+                            else:
+                                # (b) Soft-exit partial: sell 25% only if spread <= 2c and
+                                #     delta/vel continues against us
+                                vel_against = ((outcome == "Up" and vel_ts < -1.0)
+                                               or (outcome == "Down" and vel_ts > 1.0))
+                                if (spread_cents_ts <= TIME_STOP_SOFT_EXIT_MAX_SPREAD_CENTS
+                                        and vel_against):
+                                    soft_qty = pos.qty * TIME_STOP_SOFT_EXIT_FRAC
+                                    if soft_qty >= MIN_QTY:
+                                        soft_price = max(book.bid, 0.01)
+                                        self._do_sell(m, st, outcome, soft_qty, soft_price,
+                                                      reason="TIME_STOP_SOFT_EXIT", leg="TIME_STOP",
+                                                      ctx=ctx, use_maker=True)
+                                        self._diag_time_stop_soft_exits += 1
+                                        write_jsonl({"event_type": "TIME_STOP_SOFT_EXIT",
+                                                      "slug": m.slug, "crypto": m.crypto,
+                                                      "outcome": outcome,
+                                                      "qty": round(soft_qty, 1),
+                                                      "price": round(soft_price, 4),
+                                                      "mark_pnl_cents": round(mark_pnl_cents, 2),
+                                                      "spread_cents": round(spread_cents_ts, 2),
+                                                      "vel": round(vel_ts, 2),
+                                                      "ts_ms": int(time.time() * 1000)})
+                                else:
+                                    # Conditions not met for soft-exit — keep holding for TP ladder
+                                    self._diag_time_stop_defers += 1
+                                    write_jsonl({"event_type": "TIME_STOP_DEFER",
+                                                  "slug": m.slug, "crypto": m.crypto,
+                                                  "outcome": outcome,
+                                                  "mark_pnl_cents": round(mark_pnl_cents, 2),
+                                                  "spread_cents": round(spread_cents_ts, 2),
+                                                  "delta_bps": round(delta_bps, 1),
+                                                  "vel": round(vel_ts, 2),
+                                                  "hold_sec": round(hold_sec, 1),
+                                                  "reason": "no_soft_exit_conditions",
+                                                  "ts_ms": int(time.time() * 1000)})
                 except Exception:
                     pass
 
@@ -5566,7 +5703,12 @@ class Bot:
                             "dn_qty": round(st.positions["Down"].qty, 1),
                         })
 
-                        if not rescue_done and derisk_decision != "defer_to_hedge":
+                        # DERISK_MAKER gating: only fire for emergency-class reasons
+                        # Emergency class: emergency, near_close, stale_data
+                        # Non-emergency (rescue_failed): defer to hedge instead of maker-selling into loss
+                        derisk_is_emergency = derisk_decision in ("emergency", "near_close", "stale_data")
+
+                        if not rescue_done and derisk_is_emergency:
                             # Check for emergency taker conditions
                             emergency_taker = emergency
                             if not emergency_taker and abs_edge >= thr + DERISK_TAKER_EDGE_EXTRA_BPS:
@@ -5585,14 +5727,22 @@ class Bot:
                                 self._diag_rescue_fallback_sells += 1
                                 self._do_sell(m, st, outcome, sell_qty, book.bid,
                                               reason="DERISK_EMERGENCY", leg="DERISK", ctx=ctx)
-                            else:
+                            elif not DERISK_MAKER_EMERGENCY_ONLY or derisk_is_emergency:
                                 self._diag_maker_count += 1
                                 self._diag_rescue_fallback_sells += 1
                                 maker_price = min(book.ask, book.bid + 0.001) if book.bid > 0 else book.bid
                                 self._do_sell(m, st, outcome, sell_qty, maker_price,
                                               reason="DERISK_MAKER", leg="DERISK", ctx=ctx,
                                               use_maker=True)
-                        elif not rescue_done and derisk_decision == "defer_to_hedge":
+                            else:
+                                # DERISK_MAKER blocked by emergency-only gate — defer to hedge
+                                self._diag_derisk_maker_defers += 1
+                                write_jsonl({"event_type": "DERISK_MAKER_DEFERRED",
+                                              "slug": m.slug, "outcome": outcome,
+                                              "derisk_decision": derisk_decision,
+                                              "ts_ms": int(time.time() * 1000)})
+                        elif not rescue_done and (derisk_decision == "defer_to_hedge"
+                                                  or derisk_decision == "rescue_failed"):
                             # Trigger hedge state machine for opposite leg instead of selling
                             if m.slug not in self._quote_unpaired:
                                 self._quote_unpaired[m.slug] = {

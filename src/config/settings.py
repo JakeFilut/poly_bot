@@ -374,13 +374,13 @@ DIRECTIONAL_SCALP_ENABLED = bool(os.getenv("DIRECTIONAL_SCALP_ENABLED", "True") 
 # Entry gates (explicit -- must meet delta OR spot_move condition)
 DSCALP_DELTA_MIN_BPS = float(os.getenv("DSCALP_DELTA_MIN_BPS", "15.0"))        # min abs_delta_bps for entry (raised for conviction)
 DSCALP_SPOT_MOVE_10S_BPS = float(os.getenv("DSCALP_SPOT_MOVE_10S_BPS", "8.0"))  # OR: spot moved >= 8bps in last 10s
-DSCALP_VEL_MIN_BPS_PER_MIN = float(os.getenv("DSCALP_VEL_MIN_BPS_PER_MIN", "2.0"))  # min velocity (mild directional confirmation)
+DSCALP_VEL_MIN_BPS_PER_MIN = float(os.getenv("DSCALP_VEL_MIN_BPS_PER_MIN", "2.5"))  # min velocity (tightened from 2.0)
 DSCALP_MAX_SPREAD_CENTS = float(os.getenv("DSCALP_MAX_SPREAD_CENTS", "2.0"))   # max spread for entry
-DSCALP_MIN_ENTRY_EDGE_CENTS = float(os.getenv("DSCALP_MIN_ENTRY_EDGE_CENTS", "2.5"))  # min edge: outcome mid must be >=2.5c above 50c neutral
+DSCALP_MIN_ENTRY_EDGE_CENTS = float(os.getenv("DSCALP_MIN_ENTRY_EDGE_CENTS", "3.0"))  # min edge: outcome mid must be >=3c above 50c neutral (tightened from 2.5)
 
 # Stronger entry quality gates
-MIN_DIRECTIONAL_EDGE_CENTS = float(os.getenv("MIN_DIRECTIONAL_EDGE_CENTS", "2.5"))  # min directional edge for entry
-MIN_VEL_BPS_PER_MIN = float(os.getenv("MIN_VEL_BPS_PER_MIN", "2.0"))               # min velocity confirmation (not hard block)
+MIN_DIRECTIONAL_EDGE_CENTS = float(os.getenv("MIN_DIRECTIONAL_EDGE_CENTS", "3.0"))  # min directional edge for entry (tightened from 2.5)
+MIN_VEL_BPS_PER_MIN = float(os.getenv("MIN_VEL_BPS_PER_MIN", "2.5"))               # min velocity confirmation (tightened from 2.0)
 DSCALP_MAX_CACHE_AGE_MS = float(os.getenv("DSCALP_MAX_CACHE_AGE_MS", "250"))   # max cache age for entry
 
 # Sizing -- one entry = one meaningful position, no micro-splits
@@ -407,6 +407,21 @@ DSCALP_VEL_REVERSAL_BPS = float(os.getenv("DSCALP_VEL_REVERSAL_BPS", "6.0"))   #
 DSCALP_MIN_HOLD_SEC = float(os.getenv("DSCALP_MIN_HOLD_SEC", "60"))            # 60s min hold -- TP/STOP can override
 DSCALP_MAX_HOLD_SEC = float(os.getenv("DSCALP_MAX_HOLD_SEC", "600"))           # 10 min max hold
 DSCALP_STOP_LOSS_CENTS = float(os.getenv("DSCALP_STOP_LOSS_CENTS", "4.0"))     # -4c hard stop loss — overrides min hold timer
+
+# Per-position loss cap (tail-loss killer) -- prevents rare huge losses from wiping many wins
+POS_LOSS_CAP_MULT = float(os.getenv("POS_LOSS_CAP_MULT", "1.25"))              # trigger stop if unrealized <= -1.25 * clip_usdc
+POS_LOSS_CAP_ENABLED = bool(os.getenv("POS_LOSS_CAP_ENABLED", "True") not in ("", "0", "False", "false"))
+
+# Post-STOP entry cooldown per slug
+STOP_COOLDOWN_SEC = float(os.getenv("STOP_COOLDOWN_SEC", "90"))                 # 90s cooldown after STOP on same slug
+
+# TIME_STOP_EXIT loss prevention -- don't realize losses on time stop
+TIME_STOP_MIN_PNL_CENTS = float(os.getenv("TIME_STOP_MIN_PNL_CENTS", "1.0"))   # min +1c to allow TIME_STOP_EXIT
+TIME_STOP_SOFT_EXIT_FRAC = float(os.getenv("TIME_STOP_SOFT_EXIT_FRAC", "0.25"))  # soft-exit 25% when conditions met
+TIME_STOP_SOFT_EXIT_MAX_SPREAD_CENTS = float(os.getenv("TIME_STOP_SOFT_EXIT_MAX_SPREAD_CENTS", "2.0"))  # max spread for soft-exit
+
+# DERISK_MAKER emergency-only gating
+DERISK_MAKER_EMERGENCY_ONLY = bool(os.getenv("DERISK_MAKER_EMERGENCY_ONLY", "True") not in ("", "0", "False", "false"))
 
 # ---------------------------------------------------------------------------
 # PARITY SUPPRESSION -- parity is #3 priority, hard-capped
