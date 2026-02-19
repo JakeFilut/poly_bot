@@ -5717,6 +5717,19 @@ class Bot:
         book = self.last_book.get(m.slug, {}).get(outcome)
         taker_price = max(book.bid, 0.01) if book else maker_price
         spread_cents = book.spread * 100 if book else 0
+
+        # Only cross taker if still profitable by >= 2c (prevent missed-exit losses)
+        dpos = self._dscalp_positions.get(m.slug)
+        if dpos and book:
+            entry_price = dpos.get("entry_price", 0)
+            taker_pnl_cents = (taker_price - entry_price) * 100
+            if taker_pnl_cents < 2.0 and "STOP" not in reason and "TIMEOUT" not in reason:
+                write_jsonl({"event_type": "EXIT_TAKER_SKIP_LOW_PNL", "slug": m.slug,
+                              "outcome": outcome, "taker_pnl_cents": round(taker_pnl_cents, 2),
+                              "reason": reason, "ts_ms": int(time.time() * 1000)})
+                # Re-queue: position stays open, next tick will re-evaluate
+                return
+
         write_jsonl({"event_type": "EXIT_TAKER_FALLBACK", "slug": m.slug,
                       "crypto": m.crypto, "outcome": outcome,
                       "price": round(taker_price, 4), "qty": round(qty, 1),
