@@ -73,6 +73,7 @@ from src.execution.safety_caps import SafetyCaps
 from src.execution.unpaired_resolver import UnpairedResolver
 from src.execution.live_sanity_report import LiveSanityReporter
 from src.execution.state_drift_checker import StateDriftChecker
+from src.execution.live_safety import LiveSafety
 from src.feeds.polymarket import PolymarketClient, set_jsonl_writer
 from src.bot.app import BotApp
 
@@ -389,6 +390,7 @@ class Bot:
         self._exec_reporter = LiveSanityReporter(write_jsonl)
         self._exec_drift = StateDriftChecker(
             self.client.get_open_orders, self.client.get_balances, write_jsonl)
+        self._live_safety = LiveSafety(write_jsonl)
         # ── LIVE_SAFE mode: monotonic process start for entry window ──
         self._process_start_mono = time.monotonic()
         # ── Per-slug PnL tracking ──
@@ -938,6 +940,15 @@ class Bot:
               f"step=${PARITY_QUOTE_STEP_USD} max=${PARITY_QUOTE_MAX_USD_PER_SLUG} "
               f"unpaired_esc={QUOTE_UNPAIRED_ESCALATE_AFTER_MS}ms "
               f"max_unpaired={QUOTE_UNPAIRED_MAX_SEC}s pause={QUOTE_PAUSE_AFTER_UNPAIRED_SEC}s")
+        if MODE in ("LIVE", "LIVE_SAFE"):
+            print(f"  LIVE SAFETY: hedge_kill={HEDGE_KILL_TIMEOUT_SEC}s/{HEDGE_KILL_TIMEOUT_FINAL_SEC}s "
+                  f"slip={HEDGE_MAX_SLIPPAGE_CENTS}c "
+                  f"spread={SPREAD_EXPLOSION_CENTS_NORMAL}/{SPREAD_EXPLOSION_CENTS_FINAL}c "
+                  f"depth={DEPTH_CHECK_MULTIPLIER}x "
+                  f"breaker={HEDGE_FAIL_MAX_COUNT}/{HEDGE_FAIL_WINDOW_SEC:.0f}s/{HEDGE_FAIL_PAUSE_SEC:.0f}s "
+                  f"loss=${MAX_LOSS_PER_HOUR_USD} "
+                  f"ioc={LAST_SECONDS_IOC_ONLY:.0f}s "
+                  f"cancel_all={CANCEL_ALL_BEFORE_CLOSE_SEC:.0f}s")
         self._last_balance_print = 0.0
         self._last_save_ts = time.time()
 
@@ -1071,6 +1082,33 @@ class Bot:
                         self._get_token_to_slug_outcome())
                     self._exec_safety.set_drift_paused(
                         self._exec_drift.is_drifted())
+
+                    # Rule 9: Cancel all open orders 30s before resolution
+                    for m_r9 in markets:
+                        st_r9 = self.market_states.get(m_r9.slug)
+                        if st_r9 and st_r9.hour_start_utc:
+                            try:
+                                hr_start = _parse_iso_z(st_r9.hour_start_utc)
+                                t_min_r9 = minutes_into_hour(hr_start, utc_now())
+                                sec_to_close = max(0.0, (60.0 - t_min_r9) * 60.0)
+                                hour_key = st_r9.hour_start_utc
+                                if self._live_safety.should_cancel_all(sec_to_close, hour_key):
+                                    open_orders = self.client.get_open_orders()
+                                    for o in open_orders:
+                                        oid = o.get("id") or o.get("orderID") or o.get("order_id", "")
+                                        if oid:
+                                            self.client.cancel_order(oid)
+                                    self._exec_tracker._orders.clear()
+                                    write_jsonl({"event_type": "CANCEL_ALL_BEFORE_RESOLUTION",
+                                                  "slug": m_r9.slug,
+                                                  "seconds_to_close": round(sec_to_close, 1),
+                                                  "orders_cancelled": len(open_orders),
+                                                  "ts_ms": int(time.time() * 1000)})
+                                    print(f"  [RULE 9] Cancelled {len(open_orders)} orders "
+                                          f"({sec_to_close:.0f}s to close)")
+                            except Exception:
+                                pass
+                            break  # all markets share the same hour — only need one check
 
                 # 5. Save state periodically (every STATE_SAVE_INTERVAL_SEC)
                 now = time.time()
@@ -1940,6 +1978,7 @@ class Bot:
             self._exec_safety.reset_minute_counters()
             self._exec_unpaired.reset_minute_counters()
             self._exec_drift.reset_minute_counters()
+            self._live_safety.reset_minute_counters()
 
     def _emit_gate_report(self):
         """Emit GATE_REPORT summary every LOG_GATES_EVERY_N_SEC with reject counts."""
@@ -2011,6 +2050,7 @@ class Bot:
             "entry_window_remaining_sec": round(self._entry_window_remaining_sec(), 1),
             "live_safe_max_order_usd": LIVE_SAFE_MAX_ORDER_USD if MODE == "LIVE_SAFE" else None,
             "exposure_per_slug": exposure,
+            "live_safety": self._live_safety.get_diag(),
         })
 
     def _emit_slug_pnl_report(self):
@@ -2410,6 +2450,29 @@ class Bot:
         # ── LIVE/TEST symbol filter: block new entries for non-allowed symbols ──
         if MODE in ("LIVE", "LIVE_SAFE", "TEST") and m.crypto not in LIVE_ALLOWED_SYMBOLS:
             return
+
+        # ── LIVE SAFETY RULES (Rules 4,5,6,7,8 — composite pre-entry gate) ──
+        if MODE in ("LIVE", "LIVE_SAFE"):
+            up_book_e = ctx["up_book"]
+            dn_book_e = ctx["dn_book"]
+            ref_book_e = up_book_e if ctx.get("drift_dir") == "Up" else dn_book_e
+            ls_ok, ls_reason = self._live_safety.check_pre_entry(
+                slug=m.slug,
+                spread_cents=ref_book_e.spread * 100,
+                order_qty=max(1, self._calc_clip(m.crypto, t_min, ctx["abs_delta_bps"]) / max(0.01, ref_book_e.ask)),
+                book_depth=ref_book_e.depth_1c_ask,
+                t_min=t_min,
+                seconds_to_close=seconds_to_close,
+                equity=self._equity(),
+                hour_start_equity=self.hour_start_equity,
+                hour_key=st.hour_start_utc,
+            )
+            if not ls_ok:
+                write_jsonl({"event_type": "LIVE_SAFETY_BLOCK",
+                              "slug": m.slug, "reason": ls_reason,
+                              "t_min": round(t_min, 3),
+                              "ts_ms": int(time.time() * 1000)})
+                return
 
         # ── PRIMARY: Directional scalp entries (priority #1) ──
         if DIRECTIONAL_SCALP_ENABLED:
@@ -3975,6 +4038,11 @@ class Bot:
         if not self._buys_allowed():
             return
 
+        # ── Rule 8: Last 90 seconds — no new resting orders ──
+        seconds_to_close = ctx.get("seconds_to_close", 999.0)
+        if MODE in ("LIVE", "LIVE_SAFE") and self._live_safety.should_block_new_entry(seconds_to_close):
+            return
+
         # ── Loss-tail slug pause ──
         if not self._slug_entry_allowed(m.slug):
             return
@@ -4048,8 +4116,32 @@ class Bot:
             # Execute leg 1: BUY Up
             up_filled = self._parity_buy_leg(m, st, "Up", up_book, leg_usd, ctx, pair_id)
 
+            # ── LIVE Rules 2+3: slippage check + partial fill clamping before leg 2 ──
+            leg2_usd = leg_usd
+            if MODE in ("LIVE", "LIVE_SAFE") and up_filled > 0:
+                # Rule 3: clamp leg 2 to what leg 1 actually filled
+                leg2_usd = LiveSafety.clamp_hedge_qty(up_filled, leg_usd)
+                # Rule 2: check slippage — re-read book for leg 2
+                fresh_dn = self.last_book.get(m.slug, {}).get("Down", dn_book)
+                if not self._live_safety.check_slippage_ok(dn_book.ask, fresh_dn.ask):
+                    # Slippage too large — unwind leg 1 immediately
+                    up_pos = st.positions["Up"]
+                    up_unwind_qty = min(up_filled / max(0.01, up_book.ask), up_pos.qty)
+                    if up_unwind_qty >= MIN_QTY and up_book.bid > 0:
+                        self._do_sell(m, st, "Up", up_unwind_qty, up_book.bid,
+                                      reason="HEDGE_SLIPPAGE_EXIT", leg="PARITY", ctx=ctx)
+                        self._live_safety.on_hedge_fail(m.slug, "slippage")
+                    write_jsonl({"event_type": "HEDGE_SLIPPAGE_ABORT",
+                                  "slug": m.slug, "pair_id": pair_id,
+                                  "intended_ask": round(dn_book.ask, 4),
+                                  "current_ask": round(fresh_dn.ask, 4),
+                                  "slippage_cents": round(abs(fresh_dn.ask - dn_book.ask) * 100, 2),
+                                  "ts_ms": int(time.time() * 1000)})
+                    return
+                dn_book = fresh_dn  # use fresh book for leg 2
+
             # Execute leg 2: BUY Down
-            dn_filled = self._parity_buy_leg(m, st, "Down", dn_book, leg_usd, ctx, pair_id)
+            dn_filled = self._parity_buy_leg(m, st, "Down", dn_book, leg2_usd, ctx, pair_id)
 
             total_cost = up_filled + dn_filled
             both_filled = up_filled > 0 and dn_filled > 0
@@ -4186,16 +4278,48 @@ class Bot:
     def _parity_handle_pending_pairs(self, m: MarketRef, st: MarketState, ctx: dict):
         """Resolve partial fills from prior ticks. If timeout exceeded:
         - edge still good → cross remaining leg (taker if spread<=1c)
-        - edge gone → unwind filled leg to flatten."""
+        - edge gone → unwind filled leg to flatten.
+        LIVE Rule 1: atomic hedge kill switch — force exit after 2s (1s in final 2 min)."""
         now_t = time.time()
         up_book: BookTop = ctx["up_book"]
         dn_book: BookTop = ctx["dn_book"]
+        t_min = ctx["t_min"]
         resolved = []
 
         for i, pair in enumerate(self._parity_pending_pairs):
             if pair["slug"] != m.slug:
                 continue
-            elapsed_ms = (now_t - pair["ts"]) * 1000
+            elapsed_sec = now_t - pair["ts"]
+
+            # ── Rule 1: Atomic Hedge Kill Switch (LIVE modes) ──
+            if MODE in ("LIVE", "LIVE_SAFE"):
+                hedge_timeout = self._live_safety.hedge_timeout_sec(t_min)
+                if elapsed_sec >= hedge_timeout:
+                    # Timeout — force market exit the filled leg immediately
+                    filled_book = up_book if pair["filled_outcome"] == "Up" else dn_book
+                    pos = st.positions[pair["filled_outcome"]]
+                    unwind_qty = min(pair["filled_qty"], pos.qty)
+                    if unwind_qty >= MIN_QTY and filled_book.bid > 0:
+                        self._do_sell(m, st, pair["filled_outcome"], unwind_qty,
+                                      filled_book.bid, reason="HEDGE_FAIL_EXIT",
+                                      leg="PARITY", ctx=ctx)
+                        self._diag_unpaired_unwind_usd += unwind_qty * filled_book.bid
+                    self._live_safety.on_hedge_fail(m.slug, "timeout")
+                    self._parity_invested_usd[m.slug] = max(
+                        0.0, self._parity_invested_usd.get(m.slug, 0.0)
+                        - unwind_qty * filled_book.bid)
+                    write_jsonl({"event_type": "HEDGE_FAIL_EXIT",
+                                  "slug": m.slug, "pair_id": pair["pair_id"],
+                                  "filled_outcome": pair["filled_outcome"],
+                                  "elapsed_sec": round(elapsed_sec, 2),
+                                  "timeout_sec": hedge_timeout,
+                                  "unwind_qty": round(unwind_qty, 1),
+                                  "t_min": round(t_min, 3),
+                                  "ts_ms": int(now_t * 1000)})
+                    resolved.append(i)
+                    continue
+
+            elapsed_ms = elapsed_sec * 1000
 
             if elapsed_ms < PAIR_FILL_TIMEOUT_MS:
                 # Still within timeout — try to fill the pending leg
@@ -4268,6 +4392,9 @@ class Bot:
                 self._diag_unpaired_unwind_usd += unwind_qty * unwind_price
                 self._parity_invested_usd[m.slug] = max(
                     0.0, self._parity_invested_usd.get(m.slug, 0.0) - unwind_qty * unwind_price)
+                # Rule 6: Record hedge failure for circuit breaker
+                if MODE in ("LIVE", "LIVE_SAFE"):
+                    self._live_safety.on_hedge_fail(m.slug, "pair_unwind_partial")
                 write_jsonl({"event_type": "PARITY_UNWIND_PARTIAL",
                               "slug": m.slug, "pair_id": pair["pair_id"],
                               "unwound_outcome": pair["filled_outcome"],
@@ -4766,6 +4893,7 @@ class Bot:
         fill_ts = unpaired["fill_ts"]
         age_ms = (now_t - fill_ts) * 1000
         age_sec = age_ms / 1000.0
+        t_min = ctx["t_min"]
 
         up_book: BookTop = ctx["up_book"]
         dn_book: BookTop = ctx["dn_book"]
@@ -4932,7 +5060,12 @@ class Bot:
             hedge["cross_done"] = True
 
         # ── Timeout: after QUOTE_UNPAIRED_MAX_SEC, unwind and pause ──
-        if age_sec >= QUOTE_UNPAIRED_MAX_SEC:
+        # Rule 1: In LIVE modes, use tighter atomic hedge timeout (2s / 1s in final 2 min)
+        effective_timeout = QUOTE_UNPAIRED_MAX_SEC
+        if MODE in ("LIVE", "LIVE_SAFE"):
+            effective_timeout = min(effective_timeout,
+                                    self._live_safety.hedge_timeout_sec(t_min))
+        if age_sec >= effective_timeout:
             pos = st.positions[filled_outcome]
             if pos.qty >= MIN_QTY:
                 filled_book = up_book if filled_outcome == "Up" else dn_book
@@ -4944,6 +5077,9 @@ class Bot:
                     self._diag_unpaired_unwind_usd += unwind_price * pos.qty
                     self._diag_hedge_unwind += 1
                     self._diag_unpaired_count_min += 1
+            # Rule 6: Record hedge failure for circuit breaker
+            if MODE in ("LIVE", "LIVE_SAFE"):
+                self._live_safety.on_hedge_fail(m.slug, "quote_unpaired_timeout")
             self._quote_paused_until[m.slug] = now_t + QUOTE_PAUSE_AFTER_UNPAIRED_SEC
             self._diag_quote_pause_count += 1
             self._diag_slug_timeouts[m.slug] = self._diag_slug_timeouts.get(m.slug, 0) + 1

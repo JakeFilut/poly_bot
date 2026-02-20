@@ -574,3 +574,40 @@ MAX_SPREAD_EXIT_CENTS_SOLXRP = float(os.getenv("MAX_SPREAD_EXIT_CENTS_SOLXRP", "
 
 # 6) Module priority — directional suppresses parity BUYs
 DIRECTIONAL_PARITY_SUPPRESS_SEC = float(os.getenv("DIRECTIONAL_PARITY_SUPPRESS_SEC", "120"))
+
+# ---------------------------------------------------------------------------
+# LIVE TRADING SAFETY RULES (9 rules — active in LIVE and LIVE_SAFE modes)
+# ---------------------------------------------------------------------------
+
+# Rule 1: Atomic Hedge Rule — time-based kill switch for unpaired legs
+HEDGE_KILL_TIMEOUT_SEC = float(os.getenv("HEDGE_KILL_TIMEOUT_SEC", "2.0"))           # max wait for hedge fill (normal)
+HEDGE_KILL_TIMEOUT_FINAL_SEC = float(os.getenv("HEDGE_KILL_TIMEOUT_FINAL_SEC", "1.0"))  # max wait in last 2 min
+HEDGE_KILL_FINAL_WINDOW_MIN = float(os.getenv("HEDGE_KILL_FINAL_WINDOW_MIN", "58.0"))   # t_min threshold for "final" mode
+
+# Rule 2: Max Slippage Protection — abort hedge if price moved too far
+HEDGE_MAX_SLIPPAGE_CENTS = float(os.getenv("HEDGE_MAX_SLIPPAGE_CENTS", "1.5"))       # max price move before aborting 2nd leg
+
+# Rule 3: Partial Fill Handling — hedge only what actually filled
+# (no config needed — logic enforced in code: hedge filled_qty, cancel remainder)
+
+# Rule 4: Spread Explosion Filter — disable trading when spread too wide
+SPREAD_EXPLOSION_CENTS_NORMAL = float(os.getenv("SPREAD_EXPLOSION_CENTS_NORMAL", "3.0"))   # max spread (normal)
+SPREAD_EXPLOSION_CENTS_FINAL = float(os.getenv("SPREAD_EXPLOSION_CENTS_FINAL", "5.0"))     # max spread (last 2 min)
+SPREAD_EXPLOSION_PAUSE_SEC = float(os.getenv("SPREAD_EXPLOSION_PAUSE_SEC", "10.0"))        # pause trading this slug
+
+# Rule 5: Order Book Depth Check — require 2x order size at price level
+DEPTH_CHECK_MULTIPLIER = float(os.getenv("DEPTH_CHECK_MULTIPLIER", "2.0"))           # min depth = multiplier * order_size
+
+# Rule 6: Consecutive Hedge Failure Circuit Breaker
+HEDGE_FAIL_MAX_COUNT = int(os.getenv("HEDGE_FAIL_MAX_COUNT", "3"))                   # X failures in window → pause
+HEDGE_FAIL_WINDOW_SEC = float(os.getenv("HEDGE_FAIL_WINDOW_SEC", "600"))             # 10 min window
+HEDGE_FAIL_PAUSE_SEC = float(os.getenv("HEDGE_FAIL_PAUSE_SEC", "900"))               # 15 min pause
+
+# Rule 7: Max Loss Per Window — stop trading if PnL drops below threshold
+MAX_LOSS_PER_HOUR_USD = float(os.getenv("MAX_LOSS_PER_HOUR_USD", "25.0"))            # max loss per hour
+
+# Rule 8: Last 90 Seconds Rule — no resting orders, IOC-only
+LAST_SECONDS_IOC_ONLY = float(os.getenv("LAST_SECONDS_IOC_ONLY", "90.0"))           # seconds before close
+
+# Rule 9: Cancel All Before Resolution — cancel everything N seconds before close
+CANCEL_ALL_BEFORE_CLOSE_SEC = float(os.getenv("CANCEL_ALL_BEFORE_CLOSE_SEC", "30.0"))  # cancel all open orders
