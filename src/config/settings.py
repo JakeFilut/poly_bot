@@ -223,7 +223,7 @@ CAP_BOOST_EDGE_FULL = 30.0       # edge_bps at which full boost is applied
 # ---------------------------------------------------------------------------
 PARITY_BUY_ENABLED = True                # buy cheap straddle (up_ask + dn_ask < 1)
 PARITY_SELL_ENABLED = True               # sell rich straddle (up_bid + dn_bid > 1)
-PARITY_MAX_USD_PER_SLUG = 40.0          # max total straddle investment per slug
+PARITY_MAX_USD_PER_SLUG = 15.0          # max total straddle investment per slug
 PARITY_STEP_USD = 2.50                   # per-leg size per parity order
 PARITY_COOLDOWN_MS = 250                 # min time between parity orders per slug
 PARITY_MAKER_REFRESH_MS = 200            # cancel/replace maker every 200ms
@@ -266,7 +266,7 @@ PARITY_QUOTE_ENABLED = True
 PARITY_QUOTE_TARGET_EDGE_NET_CENTS_BASE = 1.0  # min edge target (aggressive -- pay up)
 PARITY_QUOTE_TARGET_EDGE_NET_CENTS_MAX  = 2.0  # max edge target (selective)
 PARITY_QUOTE_STEP_USD = 2.5              # per-leg bid size (equal USD both legs)
-PARITY_QUOTE_MAX_USD_PER_SLUG = 40.0    # max total quoting investment per slug
+PARITY_QUOTE_MAX_USD_PER_SLUG = 15.0    # max total quoting investment per slug
 PARITY_QUOTE_REFRESH_MS = 250           # refresh interval for quote repricing
 PARITY_QUOTE_ONLY_IF_LIQ_OK = True      # require liquidity guards for quoting
 
@@ -309,7 +309,7 @@ IMBALANCE_SOFT_CAP_SHARES = 20         # soft cap: start reducing new orders abo
 # ---------------------------------------------------------------------------
 DERISK_RESCUE_TO_STRADDLE = True
 RESCUE_MIN_EDGE_NET_CENTS = 0.5         # min net edge for straddle completion to be worth it
-RESCUE_MAX_USD_PER_SLUG = 20.0          # max USD to spend completing straddle per slug
+RESCUE_MAX_USD_PER_SLUG = 10.0          # max USD to spend completing straddle per slug
 RESCUE_STEP_USD = 2.5                    # per-order size for rescue buys
 MIN_PAIR_QTY = 5.0                       # both legs must exceed this to count as "already paired"
 
@@ -414,7 +414,7 @@ DSCALP_MAX_CACHE_AGE_MS = float(os.getenv("DSCALP_MAX_CACHE_AGE_MS", "250"))   #
 # Sizing -- one entry = one meaningful position, no micro-splits
 DSCALP_STEP_USD = float(os.getenv("DSCALP_STEP_USD", "7.0"))                   # per-order size (~F247's $7.4 avg)
 DSCALP_STEP_USD_MIN = float(os.getenv("DSCALP_STEP_USD_MIN", "6.0"))           # minimum entry size (no $1 clips)
-DSCALP_MAX_USD_PER_SLUG = float(os.getenv("DSCALP_MAX_USD_PER_SLUG", "30.0"))  # max directional per slug
+DSCALP_MAX_USD_PER_SLUG = float(os.getenv("DSCALP_MAX_USD_PER_SLUG", "15.0"))  # max directional per slug
 DSCALP_COOLDOWN_MS = float(os.getenv("DSCALP_COOLDOWN_MS", "4000"))            # 4s between entries (target ~15 trades/min)
 
 # Exit ladder (TP1=35%, TP2=25%, TP3=25%, TP4=15% runner)
@@ -523,8 +523,8 @@ OM_KILL_PAUSE_SEC = float(os.getenv("OM_KILL_PAUSE_SEC", "60"))                 
 
 # Global safety caps
 OM_MAX_OPEN_ORDERS = int(os.getenv("OM_MAX_OPEN_ORDERS", "50"))                    # hard cap on tracked open orders
-OM_MAX_TOTAL_USD = float(os.getenv("OM_MAX_TOTAL_USD", "500"))                     # max total exposure across all slugs
-OM_MAX_PER_SLUG_USD = float(os.getenv("OM_MAX_PER_SLUG_USD", "60"))                # max exposure per slug
+OM_MAX_TOTAL_USD = float(os.getenv("OM_MAX_TOTAL_USD", "30"))                      # max total exposure across all slugs
+OM_MAX_PER_SLUG_USD = float(os.getenv("OM_MAX_PER_SLUG_USD", "15"))                # max exposure per slug
 
 # Sanity report
 OM_SANITY_REPORT_INTERVAL_SEC = float(os.getenv("OM_SANITY_REPORT_INTERVAL_SEC", "60"))  # report every 60s
@@ -555,8 +555,8 @@ SLUG_PNL_REPORT_INTERVAL_SEC = float(os.getenv("SLUG_PNL_REPORT_INTERVAL_SEC", "
 # ---------------------------------------------------------------------------
 
 # 1) Inventory caps — block new BUYS when exceeded, sells always allowed
-MAX_POSITION_USD_PER_SLUG = float(os.getenv("MAX_POSITION_USD_PER_SLUG", "60"))
-MAX_POSITION_SHARES_PER_OUTCOME = float(os.getenv("MAX_POSITION_SHARES_PER_OUTCOME", "50"))
+MAX_POSITION_USD_PER_SLUG = float(os.getenv("MAX_POSITION_USD_PER_SLUG", "15"))
+MAX_POSITION_SHARES_PER_OUTCOME = float(os.getenv("MAX_POSITION_SHARES_PER_OUTCOME", "25"))
 MAX_NET_IMBALANCE_SHARES = float(os.getenv("MAX_NET_IMBALANCE_SHARES", "12"))
 
 # 2) Post-fill cooldown — skip new BUY attempts after any fill on slug
