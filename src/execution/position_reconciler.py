@@ -3,15 +3,17 @@
 Fetches actual token balances from the CLOB API, compares against the bot's
 internal position tracking, and corrects any mismatches.  Runs:
   - At startup
-  - After every trade fill
   - Every POSITION_RECONCILE_INTERVAL_SEC (default 60s)
 
 Key design decisions:
   - Quantities are ALWAYS stored as float with full precision (no int/floor/ceil).
-  - Internal state is NEVER trusted over wallet data.
+  - Internal state is NEVER trusted over wallet data — EXCEPT during the fill
+    cooldown window (CLOB balances lag after a fill).
   - Realized PnL is preserved separately and never overwritten by reconciliation.
   - A CRITICAL desync (bot thinks flat but wallet has shares) blocks new entries
     until the next successful reconciliation resolves it.
+  - The reconciler NEVER reduces a position that was traded within the last
+    FILL_COOLDOWN_SEC seconds (to avoid wiping fills before balances settle).
 """
 from __future__ import annotations
 
@@ -20,12 +22,16 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from src.config.settings import MIN_QTY
 
+# How long after a fill before we trust wallet balances for that position.
+# CLOB get_balances() can lag 15-30s after a fill settles on-chain.
+FILL_COOLDOWN_SEC = 30.0
+
 
 class PositionReconciler:
     """Full position reconciliation against CLOB wallet balances.
 
     Wire into bot:
-      - reconcile_positions(market_states, token_map) → runs the full cycle
+      - reconcile_positions(market_states, token_map, ...) → runs the full cycle
       - is_desynced() → True if a critical desync was detected (flat vs shares)
       - clear_desync() → called after state is corrected
       - last_reconcile_ts → epoch timestamp of last successful reconciliation
@@ -50,6 +56,7 @@ class PositionReconciler:
         self.reconcile_count: int = 0
         self.corrections_total: int = 0
         self.desync_events_total: int = 0
+        self.cooldown_skips_total: int = 0
 
     # ── Public API ─────────────────────────────────────────────────────
 
@@ -78,17 +85,9 @@ class PositionReconciler:
         token_to_slug_outcome: Dict[str, Tuple[str, str]],
         dscalp_positions: Optional[dict] = None,
         mid_price_lookup: Optional[Dict[Tuple[str, str], float]] = None,
+        last_fill_ts: Optional[Dict[str, float]] = None,
     ) -> Dict[str, List[dict]]:
         """Run full position reconciliation cycle.
-
-        Steps:
-          1. fetch_wallet_positions() — get actual CLOB balances
-          2. Normalize market identifiers (token_id → slug/outcome)
-          3. Match by token_id → (slug, outcome)
-          4. Compare internal qty vs wallet qty
-          5. If mismatch: log WARNING, overwrite internal state
-          6. If bot flat but wallet has shares: log CRITICAL desync
-          7. Preserve realized PnL separately (never touched)
 
         Args:
             market_states: {slug: MarketState} — the bot's internal state
@@ -96,6 +95,9 @@ class PositionReconciler:
             dscalp_positions: optional {slug: {...}} directional scalp tracker
             mid_price_lookup: optional {(slug, outcome): mid_price} for vwap
                 estimation on fresh-start positions with no prior vwap
+            last_fill_ts: optional {slug: epoch_ts} — last fill time per slug.
+                Positions traded within FILL_COOLDOWN_SEC are protected from
+                downward corrections (CLOB balances lag after fills).
 
         Returns:
             dict with keys:
@@ -143,9 +145,19 @@ class PositionReconciler:
             })
             result["open_orders"] = []
 
+        # ── Build fill-cooldown set ──
+        # Slugs with recent fills — don't trust wallet for downward corrections
+        if last_fill_ts is None:
+            last_fill_ts = {}
+        recently_traded: Set[str] = set()
+        for slug, ts in last_fill_ts.items():
+            if now - ts < FILL_COOLDOWN_SEC:
+                recently_traded.add(slug)
+
         # ── 3. Compare wallet vs internal state ──
         corrections = []
         critical_desyncs = []
+        cooldown_skips = []
 
         # Collect all (slug, outcome) pairs from both wallet and internal state
         all_keys: Set[Tuple[str, str]] = set(wallet_positions.keys())
@@ -174,6 +186,21 @@ class PositionReconciler:
             if abs(diff) < MIN_QTY:
                 continue
 
+            # ── FILL COOLDOWN GUARD ──
+            # If we recently traded this slug AND the wallet wants to REDUCE
+            # our position, skip it. CLOB balances lag after fills — trusting
+            # a stale wallet=0 would wipe out a real fill.
+            if slug in recently_traded and diff < 0:
+                cooldown_skips.append({
+                    "slug": slug,
+                    "outcome": outcome,
+                    "internal_qty": internal_qty,
+                    "wallet_qty": wallet_qty,
+                    "diff": diff,
+                    "cooldown_remaining": FILL_COOLDOWN_SEC - (now - last_fill_ts.get(slug, 0)),
+                })
+                continue
+
             # ── Mismatch detected ──
             correction = {
                 "slug": slug,
@@ -200,14 +227,11 @@ class PositionReconciler:
             if st and pos:
                 self._apply_correction(pos, wallet_qty, est_price)
             elif st and wallet_qty >= MIN_QTY:
-                # Position exists in wallet but not in internal state at all
-                # Create position entry
                 new_pos = st.positions.get(outcome)
                 if new_pos:
                     self._apply_correction(new_pos, wallet_qty, est_price)
 
         # ── 5. Handle positions that exist in wallet but not in market_states ──
-        # (these are truly unknown — we can only log them as warnings)
         for (slug, outcome), qty in wallet_positions.items():
             if slug not in market_states and qty >= MIN_QTY:
                 self._write_jsonl({
@@ -218,7 +242,32 @@ class PositionReconciler:
                     "ts_ms": now_ms,
                 })
 
-        # ── 6. Log results ──
+        # ── 6. Log cooldown skips ──
+        if cooldown_skips:
+            self.cooldown_skips_total += len(cooldown_skips)
+            self._write_jsonl({
+                "event_type": "RECONCILE_COOLDOWN_SKIPS",
+                "count": len(cooldown_skips),
+                "skips": [
+                    {
+                        "slug": s["slug"],
+                        "outcome": s["outcome"],
+                        "internal_qty": s["internal_qty"],
+                        "wallet_qty": s["wallet_qty"],
+                        "cooldown_remaining_sec": round(s["cooldown_remaining"], 1),
+                    }
+                    for s in cooldown_skips
+                ],
+                "ts_ms": now_ms,
+            })
+            for s in cooldown_skips:
+                print(
+                    f"  [RECONCILE] COOLDOWN SKIP: {s['slug']} {s['outcome']}: "
+                    f"internal={s['internal_qty']:.2f} wallet={s['wallet_qty']:.2f} "
+                    f"(recently traded, {s['cooldown_remaining']:.0f}s remaining)"
+                )
+
+        # ── 7. Log corrections ──
         if corrections:
             self.corrections_total += len(corrections)
             self._write_jsonl({
@@ -243,7 +292,7 @@ class PositionReconciler:
                     f"(diff={c['diff']:+.6f})"
                 )
 
-        # Log wallet summary even when no corrections (useful at startup)
+        # Log wallet summary on first reconciliation (useful at startup)
         active_wallet = {
             f"{s}/{o}": q for (s, o), q in wallet_positions.items() if q >= MIN_QTY
         }
@@ -258,7 +307,7 @@ class PositionReconciler:
             for key, qty in sorted(active_wallet.items()):
                 print(f"    {key}: {qty:.6f} shares")
 
-        # ── 7. Handle critical desyncs ──
+        # ── 8. Handle critical desyncs ──
         if critical_desyncs:
             self._desynced = True
             self._desync_details = critical_desyncs
@@ -286,15 +335,11 @@ class PositionReconciler:
                     f"{d['slug']} {d['outcome']}: "
                     f"bot_qty={d['old_qty']:.6f} wallet_qty={d['new_qty']:.6f}"
                 )
-
-            # Corrections already applied above — state is now updated.
-            # But we keep _desynced=True to block new trades until next
-            # reconciliation confirms no further desyncs.
         elif self._desynced:
             # Previous desync resolved — clear it
             self.clear_desync()
 
-        # ── 8. Sync dscalp tracker if provided ──
+        # ── 9. Sync dscalp tracker if provided ──
         if dscalp_positions is not None and corrections:
             self._sync_dscalp_tracker(
                 dscalp_positions, market_states, corrections
@@ -302,7 +347,7 @@ class PositionReconciler:
 
         result["corrections"] = corrections
 
-        # ── 9. Done ──
+        # ── 10. Done ──
         self.reconcile_count += 1
         self.last_reconcile_ts = now
 
@@ -310,10 +355,12 @@ class PositionReconciler:
             "event_type": "RECONCILE_DONE",
             "reconcile_count": self.reconcile_count,
             "corrections_count": len(corrections),
+            "cooldown_skips": len(cooldown_skips),
             "critical_desyncs": len(critical_desyncs),
             "wallet_positions_count": len(
                 [(s, o) for (s, o), q in wallet_positions.items() if q >= MIN_QTY]
             ),
+            "recently_traded_slugs": sorted(recently_traded),
             "ts_ms": now_ms,
         })
 
@@ -341,13 +388,11 @@ class PositionReconciler:
             return None
 
         if not balances:
-            # Empty balance list is valid (wallet is truly empty)
             return {}
 
         result: Dict[Tuple[str, str], float] = {}
         for bal in balances:
             token_id = bal.get("token_id") or bal.get("asset_id", "")
-            # Store as exact float — NEVER cast to int, NEVER round
             raw_balance = bal.get("balance", 0)
             if raw_balance is None:
                 raw_balance = 0
@@ -358,9 +403,7 @@ class PositionReconciler:
 
             if token_id in token_to_slug_outcome:
                 slug, outcome = token_to_slug_outcome[token_id]
-                # Accumulate in case multiple entries for same token
                 result[(slug, outcome)] = result.get((slug, outcome), 0.0) + qty
-            # else: token not in our current market set — ignore silently
 
         return result
 
@@ -374,10 +417,8 @@ class PositionReconciler:
         from the current orderbook as a reasonable cost-basis estimate.
         """
         if wallet_qty < MIN_QTY:
-            # Wallet says no shares — zero out
             pos.qty = 0.0
             pos.cost_usdc = 0.0
-            # Clear metadata
             pos.opened_at = None
             pos.last_trade_ts = None
             pos.position_id = None
@@ -391,12 +432,10 @@ class PositionReconciler:
             pos.scalp_mode = False
             pos.scalp_open_ts = None
         else:
-            # Update qty to wallet value; estimate cost_usdc from vwap
             pos.qty = wallet_qty
             if pos.vwap > 0:
                 pos.cost_usdc = pos.vwap * wallet_qty
             elif est_mid_price and est_mid_price > 0:
-                # Fresh start: no prior vwap — use current mid as estimate
                 pos.vwap = est_mid_price
                 pos.cost_usdc = est_mid_price * wallet_qty
                 self._write_jsonl({
@@ -406,7 +445,6 @@ class PositionReconciler:
                     "qty": wallet_qty,
                     "ts_ms": int(time.time() * 1000),
                 })
-            # Leave all other metadata intact
 
     def _sync_dscalp_tracker(
         self,
@@ -414,12 +452,7 @@ class PositionReconciler:
         market_states: dict,
         corrections: List[dict],
     ) -> None:
-        """Sync the directional scalp tracker with corrected positions.
-
-        If a correction zeros out a position that has an active dscalp entry,
-        remove it from the tracker.  If a correction adds shares where dscalp
-        didn't know about them, update the qty.
-        """
+        """Sync the directional scalp tracker with corrected positions."""
         for c in corrections:
             slug = c["slug"]
             new_qty = c["new_qty"]
@@ -432,7 +465,6 @@ class PositionReconciler:
                 continue
 
             if new_qty < MIN_QTY:
-                # Position gone — remove dscalp tracking
                 dscalp_positions.pop(slug, None)
                 self._write_jsonl({
                     "event_type": "RECONCILE_DSCALP_REMOVED",
@@ -442,9 +474,8 @@ class PositionReconciler:
                     "ts_ms": int(time.time() * 1000),
                 })
             else:
-                # Update qty in dscalp tracker
                 dpos["qty"] = new_qty
 
     def reset_minute_counters(self) -> None:
         """Reset per-minute diagnostic counters (called by DIAG report)."""
-        pass  # No per-minute counters currently; placeholder for future use
+        pass
