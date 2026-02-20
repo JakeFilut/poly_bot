@@ -804,15 +804,31 @@ class FillsLedger:
         Returns number of NEW fills appended (after dedup).
         """
         new_count = 0
-        for raw_fill in fills:
+        skipped_action = 0
+        skipped_dedup = 0
+        skipped_no_meta = 0
+
+        for i, raw_fill in enumerate(fills):
             trade_id = str(raw_fill.get("trade_id", raw_fill.get("id", "")))
             token_id = str(raw_fill.get("token_id", raw_fill.get("asset_id", "")))
             action = raw_fill.get("side", raw_fill.get("action", "")).upper()
-            if action not in ("BUY", "SELL"):
-                continue
-
             qty = raw_fill.get("size", raw_fill.get("amount", 0))
             price = raw_fill.get("price", 0)
+            order_id = str(raw_fill.get("order_id", ""))
+            timestamp = raw_fill.get("timestamp", raw_fill.get("created_at", ""))
+
+            # DEBUG: print every raw fill row BEFORE filtering/deduping
+            print(f"  [LEDGER] EXTERNAL_FILL_RAW[{i}]: "
+                  f"order_id={order_id[:16] if order_id else '?'}  "
+                  f"token_id={token_id[-12:] if token_id else '?'}  "
+                  f"side={action}  qty={qty}  price={price}  "
+                  f"trade_id={trade_id[:16] if trade_id else '?'}  "
+                  f"ts={timestamp}")
+
+            if action not in ("BUY", "SELL"):
+                skipped_action += 1
+                print(f"  [LEDGER]   -> SKIPPED: invalid action '{action}'")
+                continue
 
             # Look up metadata
             meta = (token_to_slug or {}).get(token_id)
@@ -822,6 +838,12 @@ class FillsLedger:
             crypto = meta[1] if meta else raw_fill.get("crypto", "")
             outcome = meta[2] if meta else raw_fill.get("outcome", "")
 
+            if not slug and not outcome:
+                skipped_no_meta += 1
+                print(f"  [LEDGER]   -> WARNING: no slug/outcome metadata "
+                      f"for token_id={token_id[-16:]}  "
+                      f"(not in token_to_slug or _token_meta)")
+
             pos = self.record_fill(
                 slug=slug, crypto=crypto,
                 token_id=token_id,
@@ -829,22 +851,32 @@ class FillsLedger:
                 side=outcome, action=action,
                 fill_qty=qty, fill_price=price,
                 fees=raw_fill.get("fee", raw_fill.get("fees", 0)),
-                order_id=str(raw_fill.get("order_id", "")),
+                order_id=order_id,
                 trade_id=trade_id,
                 source="polymarket",
             )
             if pos is not None:
                 new_count += 1
+                print(f"  [LEDGER]   -> NEW fill recorded: "
+                      f"{slug} {outcome} {action} qty={qty} @ {price}")
+            else:
+                skipped_dedup += 1
+                print(f"  [LEDGER]   -> DEDUP: already seen "
+                      f"(trade_id={trade_id[:16] if trade_id else '?'})")
 
-        if new_count > 0:
-            self._write_jsonl({
-                "event_type": "LEDGER_EXTERNAL_FILLS_INGESTED",
-                "new_fills": new_count,
-                "total_submitted": len(fills),
-                "ts_ms": int(time.time() * 1000),
-            })
-            print(f"  [LEDGER] Ingested {new_count} new external fills "
-                  f"(of {len(fills)} total)")
+        self._write_jsonl({
+            "event_type": "LEDGER_EXTERNAL_FILLS_INGESTED",
+            "new_fills": new_count,
+            "total_submitted": len(fills),
+            "skipped_action": skipped_action,
+            "skipped_dedup": skipped_dedup,
+            "skipped_no_meta": skipped_no_meta,
+            "ts_ms": int(time.time() * 1000),
+        })
+        if new_count > 0 or skipped_no_meta > 0:
+            print(f"  [LEDGER] External fill ingestion: {new_count} new, "
+                  f"{skipped_dedup} dedup, {skipped_action} bad_action, "
+                  f"{skipped_no_meta} no_meta (of {len(fills)} total)")
 
         return new_count
 

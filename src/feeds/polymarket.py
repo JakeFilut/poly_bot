@@ -550,6 +550,18 @@ class PolymarketClient:
             time.sleep(1)
         return 0.0
 
+    def get_order_status(self, order_id: str) -> Optional[dict]:
+        """Get order status from CLOB by order_id. Returns dict or None."""
+        if not self._clob or not order_id:
+            return None
+        try:
+            result = self._clob.get_order(order_id)
+            if isinstance(result, dict):
+                return result
+            return None
+        except Exception:
+            return None
+
     def cancel_order(self, order_id: str) -> None:
         """Cancel a single order by id."""
         if _settings.MODE == "LOG":
