@@ -5,11 +5,23 @@ Run this BEFORE launching the bot to confirm sells will work.
 Usage:  python check_sell_ready.py
 """
 import os, sys
+from pathlib import Path
+from dotenv import load_dotenv
 from web3 import Web3
+
+# Load .env the same way the bot does (../keys/.env or ./.env)
+_PROJECT_DIR = Path(__file__).resolve().parent
+_KEYS_DIR = os.getenv("KEYS_DIR", str(_PROJECT_DIR.parent / "keys"))
+for env_path in [os.path.join(_KEYS_DIR, ".env"), str(_PROJECT_DIR / ".env")]:
+    if os.path.exists(env_path):
+        load_dotenv(env_path)
+        print(f"Loaded: {env_path}")
+        break
 
 PRIVATE_KEY = os.getenv("POLYMARKET_PRIVATE_KEY", "")
 if not PRIVATE_KEY:
-    print("ERROR: Set POLYMARKET_PRIVATE_KEY env var")
+    print("ERROR: POLYMARKET_PRIVATE_KEY not found")
+    print(f"  Searched: {_KEYS_DIR}/.env and {_PROJECT_DIR}/.env")
     sys.exit(1)
 
 # Polygon RPC
