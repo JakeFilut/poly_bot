@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Quick buy+sell test: buys 5 shares of the cheaper BTC side, then sells them.
-Proves the full order lifecycle works (buy fill -> sell fill).
-Calls the CLOB directly so all errors are visible (not swallowed).
+"""Quick buy+sell test using FOK (Fill-Or-Kill) market orders.
+Buys shares of the cheaper BTC side, then immediately sells them.
+FOK orders fill instantly or cancel entirely — no resting orders left behind.
 
 Usage:  python test_buy_sell.py
 """
-import os, sys, time
+import math, os, sys, time
 from pathlib import Path
 from dotenv import load_dotenv
 from web3 import Web3
@@ -22,15 +22,18 @@ for env_path in [os.path.join(_KEYS_DIR, ".env"), str(_PROJECT_DIR / ".env")]:
 os.environ["MODE"] = "LIVE"
 
 from src.feeds.polymarket import PolymarketClient
-from py_clob_client.clob_types import OrderArgs, OrderType
+from py_clob_client.clob_types import OrderType
 
 PRIVATE_KEY = os.getenv("POLYMARKET_PRIVATE_KEY", "")
 if not PRIVATE_KEY:
     print("ERROR: POLYMARKET_PRIVATE_KEY not found")
     sys.exit(1)
 
+# Slippage buffer added to ask / subtracted from bid for FOK worst-price limit
+SLIPPAGE_CENTS = 0.02
+
 print("=" * 55)
-print("  BUY + SELL TEST (5 shares, BTC cheaper side)")
+print("  BUY + SELL TEST  (FOK market orders, BTC)")
 print("=" * 55)
 
 # Initialize the feed client
@@ -112,85 +115,58 @@ print(f"    Down ask={dn_book.ask:.3f}  bid={dn_book.bid:.3f}")
 
 # Pick cheaper side
 if dn_book.ask <= up_book.ask:
-    side_name, token_id, buy_price = "Down", btc.outcome_down_id, dn_book.ask
+    side_name, token_id, ask_price = "Down", btc.outcome_down_id, dn_book.ask
+    bid_price = dn_book.bid
 else:
-    side_name, token_id, buy_price = "Up", btc.outcome_up_id, up_book.ask
+    side_name, token_id, ask_price = "Up", btc.outcome_up_id, up_book.ask
+    bid_price = up_book.bid
 
-import math
-buy_price = round(max(0.01, min(0.99, buy_price)), 3)
-# CLOB requires: min 5 shares AND min $1 total order value
-qty = max(5, math.ceil(1.01 / buy_price))
-cost = buy_price * qty
-print(f"\n    Picking: {side_name} (cheaper @ ${buy_price:.3f})")
-print(f"    Qty: {qty} shares (${cost:.2f} total, meets $1 min)")
+ask_price = round(max(0.01, min(0.99, ask_price)), 3)
+# FOK BUY amount is in dollars; need >= $1 minimum
+buy_dollars = max(1.01, round(ask_price * 5, 2))  # ~5 shares worth, at least $1.01
+# Worst-price limit = ask + slippage buffer
+buy_limit = round(min(0.99, ask_price + SLIPPAGE_CENTS), 3)
+expected_shares = math.floor(buy_dollars / ask_price)
+
+print(f"\n    Picking: {side_name} (cheaper @ ${ask_price:.3f})")
+print(f"    FOK BUY: ${buy_dollars:.2f} @ limit ${buy_limit:.3f} (~{expected_shares} shares)")
 
 # Check on-chain balance BEFORE buy
 bal_before = ct.functions.balanceOf(wallet, int(token_id)).call()
 print(f"\n[3] On-chain balance before buy: {bal_before}")
 
-# BUY — call CLOB directly
-print(f"\n[4] Placing BUY order (direct CLOB call)...")
+# ── BUY (FOK market order) ────────────────────────────────────────────
+print(f"\n[4] Placing FOK BUY...")
 try:
-    args = OrderArgs(
-        price=buy_price,
-        size=qty,
-        side="BUY",
+    signed = clob.create_market_order(
         token_id=token_id,
+        side="BUY",
+        amount=buy_dollars,
+        price=buy_limit,
     )
-    signed = clob.create_order(args)
-    response = clob.post_order(signed, OrderType.GTC)
+    response = clob.post_order(signed, OrderType.FOK)
     print(f"    Raw CLOB response: {response}")
 except Exception as e:
     print(f"\n    BUY ERROR: {e}")
-    print(f"    Error type: {type(e).__name__}")
-    import traceback
-    traceback.print_exc()
+    import traceback; traceback.print_exc()
     sys.exit(1)
 
-# Parse buy response
 if not response or not isinstance(response, dict):
     print(f"    Unexpected response: {response}")
     sys.exit(1)
 
 status = response.get("status", "").lower()
 tx_hashes = response.get("transactionsHashes", []) or response.get("transactionHashes", [])
-size_matched = response.get("size_matched") or 0
 
 if status == "matched" or tx_hashes:
-    fill_qty = int(size_matched) if size_matched else qty
+    taking = response.get("takingAmount", "")
+    fill_qty = int(taking) if taking else expected_shares
     print(f"    FILLED: {fill_qty} shares")
-elif status == "live":
-    print(f"    Order is LIVE (resting). Waiting up to 5s for fill...")
-    oid = response.get("orderID", "")
-    fill_qty = 0
-    for _ in range(50):
-        time.sleep(0.1)
-        try:
-            order = clob.get_order(oid)
-            if order and isinstance(order, dict):
-                s = order.get("status", "").lower()
-                if s in ("matched", "filled"):
-                    fill_qty = int(order.get("size_matched", qty) or qty)
-                    break
-        except Exception:
-            pass
-    if fill_qty > 0:
-        print(f"    FILLED: {fill_qty} shares")
-    else:
-        print(f"    BUY did not fill within 5s — cancelling resting order...")
-        try:
-            clob.cancel(oid)
-            print(f"    Cancelled order {oid[:16]}...")
-        except Exception as ce:
-            print(f"    Cancel failed: {ce}")
-        sys.exit(1)
 else:
-    print(f"    Unexpected status: {status}")
+    print(f"    FOK not filled (status={status}). No resting order left.")
     sys.exit(1)
 
-fill_price = buy_price
-
-# Wait and poll for on-chain settlement
+# Wait for on-chain settlement
 print(f"\n[5] Waiting for on-chain settlement...")
 for i in range(12):
     time.sleep(2.5)
@@ -209,43 +185,42 @@ time.sleep(5)
 
 # Re-read book for sell price
 book = feed.get_top_of_book(token_id)
-sell_price = book.bid
-print(f"\n    Current bid: ${sell_price:.3f}")
+current_bid = book.bid
+print(f"\n    Current bid: ${current_bid:.3f}")
 
-# SELL — call CLOB directly
-print(f"\n[6] Placing SELL order: {fill_qty} @ ${sell_price:.3f}")
-sell_price = round(max(0.01, min(0.99, sell_price)), 3)
+# Worst-price limit = bid - slippage buffer
+sell_limit = round(max(0.01, current_bid - SLIPPAGE_CENTS), 3)
+
+# ── SELL (FOK market order) ───────────────────────────────────────────
+print(f"\n[6] Placing FOK SELL: {fill_qty} shares @ limit ${sell_limit:.3f}")
 try:
-    args = OrderArgs(
-        price=sell_price,
-        size=int(fill_qty),
-        side="SELL",
+    signed = clob.create_market_order(
         token_id=token_id,
+        side="SELL",
+        amount=fill_qty,
+        price=sell_limit,
     )
-    signed = clob.create_order(args)
-    response = clob.post_order(signed, OrderType.GTC)
+    response = clob.post_order(signed, OrderType.FOK)
     print(f"    Raw CLOB response: {response}")
 
-    if response and isinstance(response, dict):
-        status = response.get("status", "").lower()
-        if status == "matched" or response.get("transactionsHashes") or response.get("transactionHashes"):
-            print(f"\n    SELL FILLED!")
-            print("\n" + "=" * 55)
-            print("  SUCCESS: Buy and sell both worked!")
-            print("=" * 55)
-        elif status == "live":
-            print(f"\n    SELL order is live (resting on book)")
-            print(f"    Order ID: {response.get('orderID', 'N/A')}")
-        else:
-            print(f"\n    Unexpected status: {status}")
+    status = (response or {}).get("status", "").lower()
+    tx_hashes = (response or {}).get("transactionsHashes", []) or (response or {}).get("transactionHashes", [])
+
+    if status == "matched" or tx_hashes:
+        print(f"\n    SELL FILLED!")
+        print("\n" + "=" * 55)
+        print("  SUCCESS: Buy and sell both worked!")
+        print("=" * 55)
     else:
-        print(f"    Unexpected response type: {type(response)}: {response}")
+        print(f"\n    FOK SELL not filled (status={status}). Shares remain in wallet.")
+        print("=" * 55)
+        print("  PARTIAL: Buy worked, sell did not fill (no liquidity on bid)")
+        print("=" * 55)
+        sys.exit(1)
 
 except Exception as e:
     print(f"\n    SELL ERROR: {e}")
-    print(f"    Error type: {type(e).__name__}")
-    import traceback
-    traceback.print_exc()
+    import traceback; traceback.print_exc()
     err_str = str(e).lower()
     if "allowance" in err_str or "balance" in err_str:
         print(f"\n    On-chain balance: {ct.functions.balanceOf(wallet, int(token_id)).call()}")
