@@ -492,10 +492,28 @@ class PolymarketClient:
                 fill_qty = 0
                 if status == "matched" or tx_hashes:
                     filled = True
-                    fill_qty = int(size_matched) if size_matched else qty
+                    fill_qty = int(size_matched) if size_matched else 0
+                    # If CLOB said "matched" but gave no size_matched, poll to confirm
+                    if fill_qty == 0 and oid:
+                        fill_qty = self._poll_order_fill(oid, qty, timeout=5)
+                    if fill_qty == 0:
+                        # CLOB said matched but we can't confirm qty — treat as unfilled
+                        filled = False
+                        _write_jsonl({"event_type":"FILL_QTY_UNKNOWN",
+                                     "order_id": oid, "status": status,
+                                     "requested_qty": qty})
                 elif status == "live" and oid:
                     fill_qty = self._poll_order_fill(oid, qty, timeout=5)
                     filled = fill_qty > 0
+                    if not filled:
+                        # Order is still resting — cancel it so it doesn't fill later
+                        try:
+                            self._clob.cancel(order_id=oid)
+                            _write_jsonl({"event_type":"CANCELLED_UNFILLED_ORDER",
+                                         "order_id": oid, "side": side,
+                                         "token_id": token_id[-12:]})
+                        except Exception:
+                            pass
 
                 _write_jsonl({"event_type":"ORDER_PLACED", "order_id": oid,
                              "token_id": token_id[-12:], "side": side,
@@ -513,7 +531,7 @@ class PolymarketClient:
 
     def _poll_order_fill(self, order_id: str, expected_qty: int,
                          timeout: int = 5) -> int:
-        """Poll CLOB briefly for GTC order fill. Returns filled qty (0 if not filled)."""
+        """Poll CLOB briefly for GTC order fill. Returns filled qty (0 if not confirmed)."""
         start = time.time()
         while time.time() - start < timeout:
             try:
@@ -521,8 +539,10 @@ class PolymarketClient:
                 if order and isinstance(order, dict):
                     status = order.get("status", "").lower()
                     if status in ("matched", "filled"):
-                        return int(order.get("size_matched", expected_qty)
-                                   or expected_qty)
+                        sm = order.get("size_matched")
+                        if sm:
+                            return int(sm)
+                        # status says matched but no size — keep polling
                     if status in ("cancelled", "canceled", "expired"):
                         return 0
             except Exception:

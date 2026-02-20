@@ -426,6 +426,7 @@ class Bot:
         self._cached_markets: List[MarketRef] = []
         self._last_market_discovery_ts = 0.0
         self._last_save_ts = 0.0
+        self._last_balance_sync_ts = 0.0             # CLOB balance reconciliation
         self._pending_fetches: Dict[str, bool] = {}  # slug -> True if fetch in-flight
         self._high_priority_slugs: set = set()       # markets needing fast refresh
         self._stale_skip_total = 0                   # counter: stale cache skips
@@ -1150,6 +1151,11 @@ class Bot:
                 if now - self._last_balance_print >= 30.0:
                     self._print_balance_summary()
                     self._last_balance_print = now
+
+                # 7b. CLOB balance reconciliation (every 60s in LIVE modes)
+                if MODE in ("LIVE", "LIVE_SAFE") and now - self._last_balance_sync_ts >= 60.0:
+                    self._sync_clob_balances()
+                    self._last_balance_sync_ts = now
 
                 # 8. Tempo parity diagnostics (every 60s)
                 if now - self._tempo_last_report_ts >= 60.0:
@@ -3607,6 +3613,67 @@ class Bot:
             if m.outcome_down_id:
                 result[m.outcome_down_id] = (m.slug, "Down")
         return result
+
+    def _sync_clob_balances(self):
+        """Reconcile internal position state with actual CLOB balances.
+        Runs every 60s in LIVE/LIVE_SAFE. Corrects drift without trading."""
+        if MODE not in ("LIVE", "LIVE_SAFE"):
+            return
+        try:
+            balances = self.client.get_balances()
+            if not balances:
+                return
+            token_map = self._get_token_to_slug_outcome()
+            # Build actual balance lookup: {(slug, outcome): qty}
+            actual = {}
+            for b in balances:
+                tid = b.get("token_id") or b.get("asset_type", "")
+                bal = float(b.get("balance", 0))
+                if tid in token_map and bal > 0:
+                    slug, outcome = token_map[tid]
+                    actual[(slug, outcome)] = bal
+
+            # Compare with internal state
+            drifts = []
+            for slug, st in self.market_states.items():
+                for outcome in ("Up", "Down"):
+                    pos = st.positions.get(outcome)
+                    if not pos:
+                        continue
+                    internal_qty = pos.qty
+                    actual_qty = actual.get((slug, outcome), 0.0)
+                    diff = actual_qty - internal_qty
+                    if abs(diff) >= 1.0:  # 1+ share drift
+                        drifts.append({
+                            "slug": slug, "outcome": outcome,
+                            "internal_qty": round(internal_qty, 1),
+                            "clob_qty": round(actual_qty, 1),
+                            "diff": round(diff, 1),
+                        })
+                        # Correct internal state to match reality
+                        if actual_qty > internal_qty:
+                            # We have MORE shares than we think (sell didn't go through)
+                            pos.qty = actual_qty
+                            pos.cost_usdc = pos.vwap * actual_qty if pos.vwap > 0 else 0.0
+                        elif actual_qty < internal_qty and actual_qty < MIN_QTY:
+                            # We have FEWER shares (sell went through but wasn't tracked)
+                            pos.qty = 0.0
+                            pos.cost_usdc = 0.0
+                        else:
+                            pos.qty = actual_qty
+                            pos.cost_usdc = pos.vwap * actual_qty if pos.vwap > 0 else 0.0
+
+            if drifts:
+                write_jsonl({"event_type": "BALANCE_DRIFT_CORRECTED",
+                             "drifts": drifts,
+                             "ts_ms": int(time.time() * 1000)})
+                for d in drifts:
+                    print(f"  [DRIFT] {d['slug']} {d['outcome']}: "
+                          f"internal={d['internal_qty']} → CLOB={d['clob_qty']} "
+                          f"(diff={d['diff']:+.1f})")
+        except Exception as e:
+            write_jsonl({"event_type": "BALANCE_SYNC_ERROR",
+                         "err": str(e)[:200]})
 
     def _buys_allowed(self) -> bool:
         """Check if BUY orders are currently allowed.
@@ -6515,6 +6582,15 @@ class Bot:
                     "max_favorable_bps": round(mfe, 3), "max_adverse_bps": round(mae, 3),
                     "exit_reason": reason,
                 }, also_csv=True)
+        elif fill_result.get("status") in ("live", "delayed"):
+            # Order was placed but didn't fill within polling window.
+            # The feed adapter already cancelled it. Don't update position state.
+            write_jsonl({"event_type": "SELL_NOT_FILLED",
+                         "slug": m.slug, "outcome": outcome,
+                         "order_id": oid, "status": fill_result.get("status"),
+                         "requested_qty": qty, "price": price, "reason": reason,
+                         "ts_ms": int(time.time() * 1000)})
+            self._exec_tracker.on_cancel(oid)
         elif fill_result.get("status") == "error":
             self._exec_safety.record_api_error()
             sell_key = f"{m.slug}|{outcome}"
