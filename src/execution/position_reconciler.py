@@ -57,6 +57,8 @@ class PositionReconciler:
         self.corrections_total: int = 0
         self.desync_events_total: int = 0
         self.cooldown_skips_total: int = 0
+        self.balance_fetch_errors: int = 0
+        self.balance_empty_errors: int = 0
 
     # ── Public API ─────────────────────────────────────────────────────
 
@@ -124,13 +126,19 @@ class PositionReconciler:
 
         # ── 1. Fetch actual wallet positions ──
         wallet_positions = self._fetch_wallet_positions(token_to_slug_outcome)
-        if wallet_positions is None:
-            # Fetch failed — skip reconciliation, don't clear desync
+        balance_fetch_ok = wallet_positions is not None
+        if not balance_fetch_ok:
+            # Fetch failed after retries — still continue with open orders/fills
+            wallet_positions = {}
             self._write_jsonl({
-                "event_type": "RECONCILE_SKIP_FETCH_FAILED",
+                "event_type": "RECONCILE_BALANCE_FETCH_FAILED_CONTINUING",
+                "total_fetch_errors": self.balance_fetch_errors,
+                "total_empty_errors": self.balance_empty_errors,
                 "ts_ms": now_ms,
             })
-            return result
+            print(f"  [RECONCILE] WARN: balance fetch failed — still reconciling "
+                  f"open orders/fills (fetch_errors={self.balance_fetch_errors}, "
+                  f"empty_errors={self.balance_empty_errors})")
         result["wallet_positions"] = wallet_positions
 
         # ── 2. Fetch open orders ──
@@ -154,41 +162,55 @@ class PositionReconciler:
             if now - ts < FILL_COOLDOWN_SEC:
                 recently_traded.add(slug)
 
-        # ── TOTAL WIPEOUT GUARD ──
-        # If we have significant internal positions but the wallet shows NOTHING
-        # for any of them, this is almost certainly an API glitch — skip reconciliation.
-        internal_positions_with_qty = []
-        for slug, st in market_states.items():
-            for outcome in ("Up", "Down"):
-                pos = st.positions.get(outcome)
-                if pos and pos.qty >= MIN_QTY:
-                    internal_positions_with_qty.append((slug, outcome, pos.qty))
+        # ── TOTAL WIPEOUT GUARD (only if balance fetch succeeded) ──
+        if balance_fetch_ok:
+            internal_positions_with_qty = []
+            for slug, st in market_states.items():
+                for outcome in ("Up", "Down"):
+                    pos = st.positions.get(outcome)
+                    if pos and pos.qty >= MIN_QTY:
+                        internal_positions_with_qty.append((slug, outcome, pos.qty))
 
-        if internal_positions_with_qty:
-            # Check if wallet has ZERO for ALL our internal positions
-            all_wallet_zero = all(
-                wallet_positions.get((slug, outcome), 0.0) < MIN_QTY
-                for slug, outcome, _ in internal_positions_with_qty
-            )
-            if all_wallet_zero:
-                total_internal_qty = sum(q for _, _, q in internal_positions_with_qty)
-                self._write_jsonl({
-                    "event_type": "RECONCILE_TOTAL_WIPEOUT_BLOCKED",
-                    "internal_positions": len(internal_positions_with_qty),
-                    "total_internal_qty": total_internal_qty,
-                    "wallet_has_zero": True,
-                    "ts_ms": now_ms,
-                })
-                print(f"  [RECONCILE] *** TOTAL WIPEOUT BLOCKED: wallet shows 0 for all "
-                      f"{len(internal_positions_with_qty)} positions "
-                      f"(total {total_internal_qty:.2f} shares) — skipping reconciliation ***")
-                print(f"  [RECONCILE]     This is likely an API glitch. Will retry next cycle.")
-                return result
+            if internal_positions_with_qty:
+                # Check if wallet has ZERO for ALL our internal positions
+                all_wallet_zero = all(
+                    wallet_positions.get((slug, outcome), 0.0) < MIN_QTY
+                    for slug, outcome, _ in internal_positions_with_qty
+                )
+                if all_wallet_zero:
+                    total_internal_qty = sum(q for _, _, q in internal_positions_with_qty)
+                    self._write_jsonl({
+                        "event_type": "RECONCILE_TOTAL_WIPEOUT_BLOCKED",
+                        "internal_positions": len(internal_positions_with_qty),
+                        "total_internal_qty": total_internal_qty,
+                        "wallet_has_zero": True,
+                        "ts_ms": now_ms,
+                    })
+                    print(f"  [RECONCILE] *** TOTAL WIPEOUT BLOCKED: wallet shows 0 for all "
+                          f"{len(internal_positions_with_qty)} positions "
+                          f"(total {total_internal_qty:.2f} shares) — skipping reconciliation ***")
+                    print(f"  [RECONCILE]     This is likely an API glitch. Will retry next cycle.")
+                    # Still continue to log open orders / update reconcile_count
+                    # but skip corrections
+                    balance_fetch_ok = False
 
-        # ── 3. Compare wallet vs internal state ──
+        # ── 3. Compare wallet vs internal state (skip if balance fetch failed) ──
         corrections = []
         critical_desyncs = []
         cooldown_skips = []
+
+        if not balance_fetch_ok:
+            # Skip wallet comparison but still log open orders and update counters
+            self.reconcile_count += 1
+            self.last_reconcile_ts = now
+            self._write_jsonl({
+                "event_type": "RECONCILE_DONE_PARTIAL",
+                "reconcile_count": self.reconcile_count,
+                "balance_fetch_ok": False,
+                "open_orders_count": len(result["open_orders"]),
+                "ts_ms": now_ms,
+            })
+            return result
 
         # Collect all (slug, outcome) pairs from both wallet and internal state
         all_keys: Set[Tuple[str, str]] = set(wallet_positions.keys())
@@ -406,27 +428,67 @@ class PositionReconciler:
         """Fetch token balances from CLOB and normalize to {(slug, outcome): qty}.
 
         Returns None if the fetch fails entirely OR returns suspicious empty data.
+        Retries up to 3 times with exponential backoff on failure or empty result.
         Quantities are stored as exact floats — no rounding, no int cast.
         """
-        try:
-            balances = self._get_balances()
-        except Exception as e:
-            self._write_jsonl({
-                "event_type": "RECONCILE_BALANCE_FETCH_ERROR",
-                "err": str(e)[:200],
-                "ts_ms": int(time.time() * 1000),
-            })
-            return None
+        max_retries = 3
+        backoff_base = 2.0  # seconds: 2, 4, 8
 
-        if not balances:
-            # API returned empty/None — treat as fetch failure, NOT "wallet is empty".
-            # Returning {} would tell the reconciler every position is 0, which is
-            # catastrophically wrong if we actually hold positions.
+        balances = None
+        last_err = ""
+
+        for attempt in range(max_retries):
+            try:
+                balances = self._get_balances()
+            except Exception as e:
+                last_err = str(e)[:200]
+                self.balance_fetch_errors += 1
+                self._write_jsonl({
+                    "event_type": "RECONCILE_BALANCE_FETCH_ERROR",
+                    "err": last_err,
+                    "attempt": attempt + 1,
+                    "max_retries": max_retries,
+                    "total_fetch_errors": self.balance_fetch_errors,
+                    "ts_ms": int(time.time() * 1000),
+                })
+                if attempt < max_retries - 1:
+                    wait = backoff_base * (2 ** attempt)
+                    print(f"  [RECONCILE] WARN: get_balances() error "
+                          f"(attempt {attempt + 1}/{max_retries}): {last_err[:80]} "
+                          f"— retrying in {wait:.0f}s")
+                    time.sleep(wait)
+                    continue
+                print(f"  [RECONCILE] ERROR: get_balances() failed after "
+                      f"{max_retries} attempts (total errors: "
+                      f"{self.balance_fetch_errors})")
+                return None
+
+            if balances:
+                break  # got data
+
+            # Empty result — retry
+            self.balance_empty_errors += 1
             self._write_jsonl({
                 "event_type": "RECONCILE_EMPTY_BALANCES",
+                "attempt": attempt + 1,
+                "max_retries": max_retries,
+                "total_empty_errors": self.balance_empty_errors,
                 "ts_ms": int(time.time() * 1000),
             })
-            print("  [RECONCILE] WARN: get_balances() returned empty — skipping reconciliation")
+            if attempt < max_retries - 1:
+                wait = backoff_base * (2 ** attempt)
+                print(f"  [RECONCILE] WARN: get_balances() returned empty "
+                      f"(attempt {attempt + 1}/{max_retries}, "
+                      f"total empty: {self.balance_empty_errors}) "
+                      f"— retrying in {wait:.0f}s")
+                time.sleep(wait)
+            else:
+                print(f"  [RECONCILE] ERROR: get_balances() empty after "
+                      f"{max_retries} attempts (total empty errors: "
+                      f"{self.balance_empty_errors})")
+                return None
+
+        if not balances:
             return None
 
         result: Dict[Tuple[str, str], float] = {}

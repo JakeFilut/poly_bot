@@ -397,7 +397,9 @@ class Bot:
         self.entry_sm: Dict[str, dict] = {}   # IDLE / PROBING / SCALING / COOLDOWN
         self.hour_index_counters: Dict[str, int] = {c: 0 for c in CRYPTOS}  # crypto -> monotonic index
         # ── LIVE execution safety modules (no-ops in LOG mode) ──
-        self._exec_tracker = LiveOrderTracker(self.client.cancel_order, write_jsonl)
+        self._exec_tracker = LiveOrderTracker(
+            self.client.cancel_order, write_jsonl,
+            get_order_status_fn=self.client.get_order_status)
         self._exec_orphan = OrphanScanner(
             self.client.get_open_orders, self.client.cancel_order, write_jsonl)
         self._exec_safety = SafetyCaps(write_jsonl)
@@ -1149,6 +1151,8 @@ class Bot:
                 # 4c. LIVE execution safety ticks (no-op in LOG)
                 if MODE in ("LIVE", "LIVE_SAFE"):
                     self._exec_tracker.tick()
+                    # Order Lifecycle Guard: poll pending orders for missed fills
+                    self._process_lifecycle_recovered_fills()
                     self._exec_orphan.tick(self._exec_tracker.get_tracked_order_ids())
                     self._exec_safety.update_orphan_count(
                         self._exec_orphan.orphan_cancels_this_min)
@@ -2206,15 +2210,48 @@ class Bot:
         print(f"  [SLUG_PNL] {crypto_str}  worst=[{worst_str}]{pause_str}")
 
     def _print_balance_summary(self):
-        """Print balance and open positions to console."""
+        """Print balance and open positions to console.
+
+        Positions line is derived from BOTH session market_states AND
+        the fills ledger (wallet-wide), so external fills (e.g. BTC bought
+        outside this session) are always visible.
+        """
         total_cost = 0.0
         pos_parts = []
+        seen_keys = set()  # (crypto, outcome) keys already printed from session
+
+        # 1. Session positions from market_states
         for slug, st in self.market_states.items():
             for outcome in ["Up", "Down"]:
                 pos = st.positions[outcome]
                 if pos.qty >= MIN_QTY:
                     total_cost += pos.cost_usdc
                     pos_parts.append(f"{st.crypto} {outcome}:{pos.qty:.0f}@{pos.vwap:.3f}")
+                    seen_keys.add((st.crypto, outcome))
+
+        # 2. Ledger positions not already in session (wallet-wide / external fills)
+        if self._fills_ledger is not None:
+            ledger_active = self._fills_ledger.get_all_active_positions()
+            for (token_id, side), lpos in ledger_active.items():
+                key = (lpos.crypto, side)
+                if key in seen_keys or not lpos.crypto:
+                    continue
+                # Check this isn't already covered by a session market_state
+                already_in_session = False
+                for slug, st in self.market_states.items():
+                    if st.crypto == lpos.crypto:
+                        sess_pos = st.positions.get(side)
+                        if sess_pos and sess_pos.qty >= MIN_QTY:
+                            already_in_session = True
+                            break
+                if not already_in_session and float(lpos.net_qty) >= MIN_QTY:
+                    cost = float(lpos.total_cost)
+                    total_cost += cost
+                    pos_parts.append(
+                        f"{lpos.crypto} {side}:{float(lpos.net_qty):.0f}"
+                        f"@{float(lpos.avg_entry_price):.3f}[ledger]")
+                    seen_keys.add(key)
+
         pos_str = "  ".join(pos_parts) if pos_parts else "none"
         equity = self._equity()
         daily_pnl = equity - self.day_start_equity
@@ -3701,6 +3738,74 @@ class Bot:
                 return token_id or "", m.market_id or ""
         return "", ""
 
+    # ── Order Lifecycle Guard: process recovered fills ──
+
+    def _process_lifecycle_recovered_fills(self):
+        """Poll tracked orders for missed fills and record them in ledger + positions."""
+        recovered = self._exec_tracker.poll_pending_orders()
+        if not recovered:
+            return
+        for fill in recovered:
+            oid = fill["order_id"]
+            slug = fill["slug"]
+            outcome = fill["outcome"]
+            side = fill["side"]
+            qty = fill["fill_qty"]
+            price = fill["fill_price"]
+            reason = fill.get("reason", "LIFECYCLE_RECOVERED")
+
+            print(f"  [ORDER_LIFECYCLE] Processing recovered fill: "
+                  f"{slug} {outcome} {side} qty={qty:.2f} @ {price:.4f} "
+                  f"reason={reason}")
+
+            # Emit ORDER_FILL event
+            write_jsonl({
+                "event_type": "ORDER_FILL",
+                "source": "lifecycle_guard",
+                "slug": slug, "outcome": outcome,
+                "side": side, "order_id": oid,
+                "price": round(price, 4), "qty": round(qty, 2),
+                "reason": reason,
+                "ts_ms": int(time.time() * 1000),
+            })
+
+            # Update internal position state
+            st = self.market_states.get(slug)
+            m = None
+            for mk in self._cached_markets:
+                if mk.slug == slug:
+                    m = mk
+                    break
+
+            if st and m:
+                if side == "BUY":
+                    if MODE in ("LIVE", "LIVE_SAFE"):
+                        actual_cost = price * qty
+                        self._live_buy(st, outcome, price, qty, actual_cost)
+                    self._ledger_record_buy_fill(m, st, outcome, price, qty,
+                                                 order_id=oid)
+                elif side == "SELL":
+                    if MODE in ("LIVE", "LIVE_SAFE"):
+                        self._live_sell(st, outcome, price, qty)
+                    self._ledger_record_sell_fill(m, st, outcome, price, qty,
+                                                  order_id=oid)
+                self._record_fill_ts(slug)
+            elif self._fills_ledger is not None:
+                # No market_state for this slug — still record in ledger
+                token_id, market_id = self._token_for_slug_outcome(slug, outcome)
+                crypto = ""
+                for mk in self._cached_markets:
+                    if mk.slug == slug:
+                        crypto = mk.crypto
+                        break
+                action = side.upper()
+                self._fills_ledger.record_fill(
+                    slug=slug, crypto=crypto, token_id=token_id,
+                    market_id=market_id, side=outcome, action=action,
+                    fill_qty=qty, fill_price=price,
+                    order_id=oid, source="bot",
+                )
+
     # ── Fills Ledger helpers: record_order_intent / record_fill at call sites ──
 
     def _ledger_record_buy_fill(self, m, st, outcome: str, price: float, qty: float,
@@ -3898,15 +4003,40 @@ class Bot:
             # 4. Fetch wallet balances + open orders and reconcile (LIVE modes only)
             if MODE in ("LIVE", "LIVE_SAFE"):
                 try:
-                    balances = self.client.get_balances()
+                    # Fetch balances with retry
+                    balances = None
+                    for _bal_attempt in range(3):
+                        try:
+                            balances = self.client.get_balances()
+                            if balances:
+                                break
+                        except Exception as _be:
+                            if _bal_attempt < 2:
+                                time.sleep(2 * (2 ** _bal_attempt))
+                            else:
+                                write_jsonl({
+                                    "event_type": "LEDGER_BALANCE_FETCH_FAILED",
+                                    "err": str(_be)[:200],
+                                    "attempts": 3,
+                                    "ts_ms": int(time.time() * 1000),
+                                })
+
                     open_orders = []
                     try:
                         open_orders = self.client.get_open_orders() or []
                     except Exception:
                         pass
 
+                    if not balances:
+                        write_jsonl({
+                            "event_type": "LEDGER_RECONCILE_EMPTY_BALANCES",
+                            "ts_ms": int(time.time() * 1000),
+                        })
+                        print("  [LEDGER] WARN: get_balances() empty after retries "
+                              "— still reconciling open orders")
+
+                    wallet_positions: Dict[Tuple[str, str], float] = {}
                     if balances:
-                        wallet_positions: Dict[Tuple[str, str], float] = {}
                         for bal in balances:
                             token_id = bal.get("token_id") or bal.get("asset_id", "")
                             raw_balance = bal.get("balance", 0)
@@ -3930,21 +4060,21 @@ class Bot:
                                 key = (token_id, side)
                                 wallet_positions[key] = wallet_positions.get(key, 0.0) + qty
 
-                        result = self._fills_ledger.reconcile_positions(
-                            wallet_balances=wallet_positions,
-                            open_orders=open_orders,
-                            tolerance_shares=LEDGER_RECONCILE_TOLERANCE,
-                        )
+                    result = self._fills_ledger.reconcile_positions(
+                        wallet_balances=wallet_positions,
+                        open_orders=open_orders,
+                        tolerance_shares=LEDGER_RECONCILE_TOLERANCE,
+                    )
 
-                        # Enter SAFE MODE on critical mismatch
-                        if result.get("critical") and SAFE_MODE_ON_MISMATCH:
-                            if not self._fills_ledger.safe_mode:
-                                self._fills_ledger.enter_safe_mode(
-                                    reason="Critical position mismatch detected",
-                                    details=result.get("mismatches", []),
-                                )
-                        elif self._fills_ledger.safe_mode and not result.get("critical"):
-                            self._fills_ledger.exit_safe_mode()
+                    # Enter SAFE MODE on critical mismatch
+                    if result.get("critical") and SAFE_MODE_ON_MISMATCH:
+                        if not self._fills_ledger.safe_mode:
+                            self._fills_ledger.enter_safe_mode(
+                                reason="Critical position mismatch detected",
+                                details=result.get("mismatches", []),
+                            )
+                    elif self._fills_ledger.safe_mode and not result.get("critical"):
+                        self._fills_ledger.exit_safe_mode()
                 except Exception as e:
                     write_jsonl({
                         "event_type": "LEDGER_RECONCILE_FETCH_ERROR",
@@ -4356,8 +4486,21 @@ class Bot:
                     )
                     total_filled_usd += fill["fill_price"] * fill["fill_qty"]
                     burst_count += 1
+                elif fill.get("status") in ("live", "delayed"):
+                    # Order placed but not filled within polling window.
+                    # Lifecycle guard will poll for it; log for visibility.
+                    write_jsonl({"event_type": "BUY_NOT_FILLED_YET",
+                                 "slug": m.slug, "outcome": outcome,
+                                 "order_id": oid, "status": fill.get("status"),
+                                 "requested_qty": this_qty, "price": order_price,
+                                 "reason": "ENTRY_BURST",
+                                 "ts_ms": int(time.time() * 1000)})
+                    print(f"  [ORDER_LIFECYCLE] BUY pending: {m.slug} {outcome} "
+                          f"qty={this_qty:.1f} @ {order_price:.4f} "
+                          f"(order_id={oid[:16]}...) — lifecycle guard will poll")
                 elif fill.get("status") == "error":
                     self._exec_safety.record_api_error()
+                    self._exec_tracker.on_cancel(oid)
 
             # Track diagnostics
             if use_taker:
