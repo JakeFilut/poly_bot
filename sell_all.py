@@ -378,7 +378,7 @@ for crypto, outcome, qty, price, status, vwap, pnl, slug, token_id in results:
     marker = "OK" if status == "FILLED" else "FAILED"
     cost_str = f"vwap=${vwap:.3f}" if vwap > 0 else "vwap=N/A"
     pnl_str = f"pnl=${pnl:+.2f}" if status == "FILLED" and vwap > 0 else ""
-    print(f"  {marker:6s}  {crypto:4s} {outcome:5s}  {qty:6d} shares @ ${price:.3f}  "
+    print(f"  {marker:6s}  {crypto:4s} {outcome:5s}  {qty:10.2f} shares @ ${price:.3f}  "
           f"= ${proceeds:.2f}  {cost_str}  {pnl_str}")
 
 print(f"\n  Total proceeds: ${total_proceeds:.2f}")

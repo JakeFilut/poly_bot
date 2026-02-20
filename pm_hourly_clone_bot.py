@@ -664,25 +664,11 @@ class Bot:
             self._shadow_trades_blocked += 1
         # Hourly stats
         self._hour_trade_count += 1
-        # Fills ledger: record BUY
-        if self._fills_ledger is not None:
-            token_id, market_id = self._token_for_slug_outcome(st.slug, outcome)
-            self._fills_ledger.record_fill(
-                slug=st.slug, crypto=st.crypto, token_id=token_id,
-                market_id=market_id, side=outcome, action="BUY",
-                fill_qty=qty, fill_price=price, source="bot",
-            )
-        # Post-fill: periodic reconciliation will verify after cooldown
     def _paper_sell(self, st: MarketState, outcome: str, price: float, qty: float):
         pos = st.positions[outcome]
         qty = min(qty, pos.qty)
         if qty <= 0:
             return 0.0
-        # Ledger sell validation: log attempt, cap if needed
-        if self._fills_ledger is not None:
-            token_id, _ = self._token_for_slug_outcome(st.slug, outcome)
-            print(f"  [LEDGER] Attempting to sell {qty:.6f} {st.slug} {outcome}, "
-                  f"currently owned {pos.qty:.6f}")
         proceeds = price * qty
         cost_basis = pos.vwap * qty
         pnl = proceeds - cost_basis
@@ -707,15 +693,6 @@ class Bot:
         # Hourly stats
         self._hour_trade_count += 1
         self._hour_net_pnl += pnl
-        # Fills ledger: record SELL
-        if self._fills_ledger is not None:
-            token_id, market_id = self._token_for_slug_outcome(st.slug, outcome)
-            self._fills_ledger.record_fill(
-                slug=st.slug, crypto=st.crypto, token_id=token_id,
-                market_id=market_id, side=outcome, action="SELL",
-                fill_qty=qty, fill_price=price, source="bot",
-            )
-        # Post-fill: periodic reconciliation will verify after cooldown
         return pnl
     def _live_buy(self, st: MarketState, outcome: str, price: float,
                   qty: float, usdc_cost: float):
@@ -731,15 +708,6 @@ class Bot:
             pos.opened_at = pos.last_trade_ts
         self.cash_usdc -= usdc_cost
         self._hour_trade_count += 1
-        # Fills ledger: record BUY
-        if self._fills_ledger is not None:
-            token_id, market_id = self._token_for_slug_outcome(st.slug, outcome)
-            self._fills_ledger.record_fill(
-                slug=st.slug, crypto=st.crypto, token_id=token_id,
-                market_id=market_id, side=outcome, action="BUY",
-                fill_qty=qty, fill_price=price, source="bot",
-            )
-        # Post-fill: periodic reconciliation will verify after cooldown
     def _live_sell(self, st: MarketState, outcome: str, price: float,
                    qty: float) -> float:
         """Update position state after a real sell fill (mirrors _paper_sell). Returns pnl."""
@@ -747,10 +715,6 @@ class Bot:
         qty = min(qty, pos.qty)
         if qty <= 0:
             return 0.0
-        # Ledger sell validation: log attempt
-        if self._fills_ledger is not None:
-            print(f"  [LEDGER] Attempting to sell {qty:.6f} {st.slug} {outcome}, "
-                  f"currently owned {pos.qty:.6f}")
         proceeds = price * qty
         cost_basis = pos.vwap * qty
         pnl = proceeds - cost_basis
@@ -765,15 +729,6 @@ class Bot:
         self._hour_net_pnl += pnl
         # Per-slug PnL
         self._slug_realized_pnl[st.slug] = self._slug_realized_pnl.get(st.slug, 0.0) + pnl
-        # Fills ledger: record SELL
-        if self._fills_ledger is not None:
-            token_id, market_id = self._token_for_slug_outcome(st.slug, outcome)
-            self._fills_ledger.record_fill(
-                slug=st.slug, crypto=st.crypto, token_id=token_id,
-                market_id=market_id, side=outcome, action="SELL",
-                fill_qty=qty, fill_price=price, source="bot",
-            )
-        # Post-fill: periodic reconciliation will verify after cooldown
         return pnl
     @staticmethod
     def _clean_dust(pos: Position):
@@ -3097,9 +3052,11 @@ class Bot:
                       "spread_cents": round(book.spread * 100, 2)})
 
         # Execute buy
+        self._ledger_order_intent(m, st, outcome, "BUY", order_qty, buy_price, "DSCALP_ENTRY")
         if MODE == "LOG":
             actual_cost = order_qty * buy_price
             self._paper_buy(st, outcome, buy_price, order_qty, actual_cost)
+            self._ledger_record_buy_fill(m, st, outcome, buy_price, order_qty)
             mt = "maker"
         else:
             fill = self._place_layered_buy(m, outcome, order_qty, buy_price)
@@ -3109,6 +3066,7 @@ class Bot:
             buy_price = fill["avg_price"]
             actual_cost = fill["total_cost"]
             self._live_buy(st, outcome, buy_price, order_qty, actual_cost)
+            self._ledger_record_buy_fill(m, st, outcome, buy_price, order_qty)
             mt = infer_maker_taker("BUY", buy_price, book)
         self._record_fill_ts(m.slug)  # post-fill cooldown
         self._rate_limit_record(m.slug)
@@ -3633,8 +3591,10 @@ class Bot:
                 side="BUY", qty=probe_qty, target_price=probe_price,
                 usdc_cost=probe_usd, ctx=ctx, book_fields=bk_fields,
             )
+            self._ledger_order_intent(m, st, outcome, "BUY", probe_qty, probe_price, "ENTRY_PROBE", order_id=client_oid)
             if MODE == "LOG":
                 self._paper_buy(st, outcome, probe_price, probe_qty, probe_usd)
+                self._ledger_record_buy_fill(m, st, outcome, probe_price, probe_qty)
                 self._record_fill_ts(m.slug)  # post-fill cooldown
                 mt = probe_mt
                 sc = spread_capture_fields("BUY", probe_price, book)
@@ -3653,6 +3613,7 @@ class Bot:
                 fill = self._place_layered_buy(m, outcome, probe_qty, probe_price)
                 if fill["total_filled"] > 0:
                     self._live_buy(st, outcome, fill["avg_price"], fill["total_filled"], fill["total_cost"])
+                    self._ledger_record_buy_fill(m, st, outcome, fill["avg_price"], fill["total_filled"])
                     mt = infer_maker_taker("BUY", fill["avg_price"], book)
                     sc = spread_capture_fields("BUY", fill["avg_price"], book)
                     _fee = compute_fee_usdc(fill["total_cost"], mt)
@@ -3739,6 +3700,47 @@ class Bot:
                 token_id = m.outcome_up_id if outcome == "Up" else m.outcome_down_id
                 return token_id or "", m.market_id or ""
         return "", ""
+
+    # ── Fills Ledger helpers: record_order_intent / record_fill at call sites ──
+
+    def _ledger_record_buy_fill(self, m, st, outcome: str, price: float, qty: float,
+                                order_id: str = "", trade_id: str = "") -> None:
+        """Record a CONFIRMED BUY fill in the fills ledger (call AFTER API confirms)."""
+        if self._fills_ledger is None:
+            return
+        token_id = m.outcome_up_id if outcome == "Up" else m.outcome_down_id
+        self._fills_ledger.record_fill(
+            slug=st.slug, crypto=st.crypto, token_id=token_id or "",
+            market_id=m.market_id or "", side=outcome, action="BUY",
+            fill_qty=qty, fill_price=price, order_id=order_id,
+            trade_id=trade_id, source="bot",
+        )
+
+    def _ledger_record_sell_fill(self, m, st, outcome: str, price: float, qty: float,
+                                 order_id: str = "", trade_id: str = "") -> None:
+        """Record a CONFIRMED SELL fill in the fills ledger (call AFTER API confirms)."""
+        if self._fills_ledger is None:
+            return
+        token_id = m.outcome_up_id if outcome == "Up" else m.outcome_down_id
+        self._fills_ledger.record_fill(
+            slug=st.slug, crypto=st.crypto, token_id=token_id or "",
+            market_id=m.market_id or "", side=outcome, action="SELL",
+            fill_qty=qty, fill_price=price, order_id=order_id,
+            trade_id=trade_id, source="bot",
+        )
+
+    def _ledger_order_intent(self, m, st, outcome: str, action: str,
+                             qty: float, price: float, reason: str,
+                             order_id: str = "") -> None:
+        """Record an ORDER INTENT in the fills ledger (call at SUBMIT time)."""
+        if self._fills_ledger is None:
+            return
+        token_id = m.outcome_up_id if outcome == "Up" else m.outcome_down_id
+        self._fills_ledger.record_order_intent(
+            slug=st.slug, token_id=token_id or "", side=outcome,
+            action=action, requested_qty=qty, requested_price=price,
+            reason=reason, order_id=order_id,
+        )
 
     def _sync_clob_balances(self):
         """Reconcile internal position state with actual CLOB balances.
@@ -3844,12 +3846,13 @@ class Bot:
             })
 
     def _run_ledger_reconciliation(self) -> None:
-        """Run fills ledger reconciliation against wallet balances.
+        """Run fills ledger reconciliation against wallet balances + open orders.
 
-        1. Update unrealized PnL from current book prices
-        2. Register any new token mappings
-        3. Reconcile ledger-derived positions vs on-chain balances
-        4. Enter SAFE MODE on critical mismatch (if configured)
+        1. Register any new token mappings
+        2. Fetch + ingest recent fills from Polymarket API (dedup)
+        3. Update unrealized PnL from current book prices
+        4. Fetch wallet balances + open orders and reconcile
+        5. Enter SAFE MODE on critical mismatch (if configured)
         """
         if self._fills_ledger is None:
             return
@@ -3863,22 +3866,45 @@ class Bot:
                     self._fills_ledger.register_token(
                         m.outcome_down_id, m.slug, m.crypto, "Down")
 
-            # 2. Update unrealized PnL from cached book prices
+            # 2. Fetch + ingest recent fills from API (LIVE modes only)
+            if MODE in ("LIVE", "LIVE_SAFE"):
+                try:
+                    token_slug_map = {}
+                    for mk in self._cached_markets:
+                        if mk.outcome_up_id:
+                            token_slug_map[mk.outcome_up_id] = (mk.slug, mk.crypto, "Up")
+                        if mk.outcome_down_id:
+                            token_slug_map[mk.outcome_down_id] = (mk.slug, mk.crypto, "Down")
+                    self._fills_ledger.fetch_and_ingest_fills(
+                        self.client._clob, token_to_slug=token_slug_map)
+                except Exception as e:
+                    write_jsonl({
+                        "event_type": "LEDGER_FETCH_FILLS_ERROR",
+                        "err": str(e)[:200],
+                        "ts_ms": int(time.time() * 1000),
+                    })
+
+            # 3. Update unrealized PnL from cached book prices
             price_lookup: Dict[Tuple[str, str], float] = {}
             for slug, books in self.last_book.items():
                 for outcome, book in books.items():
                     if not book or book.mid <= 0:
                         continue
-                    # Look up token_id for this slug+outcome
                     token_id, _ = self._token_for_slug_outcome(slug, outcome)
                     if token_id:
                         price_lookup[(token_id, outcome)] = book.mid
             self._fills_ledger.update_unrealized_pnl(price_lookup)
 
-            # 3. Fetch wallet balances and reconcile (LIVE modes only)
+            # 4. Fetch wallet balances + open orders and reconcile (LIVE modes only)
             if MODE in ("LIVE", "LIVE_SAFE"):
                 try:
                     balances = self.client.get_balances()
+                    open_orders = []
+                    try:
+                        open_orders = self.client.get_open_orders() or []
+                    except Exception:
+                        pass
+
                     if balances:
                         wallet_positions: Dict[Tuple[str, str], float] = {}
                         for bal in balances:
@@ -3893,12 +3919,11 @@ class Bot:
                             meta = self._fills_ledger._token_meta.get(token_id)
                             side = meta[2] if meta else ""
                             if not side:
-                                # Try from cached markets
-                                for m in self._cached_markets:
-                                    if m.outcome_up_id == token_id:
+                                for mk in self._cached_markets:
+                                    if mk.outcome_up_id == token_id:
                                         side = "Up"
                                         break
-                                    if m.outcome_down_id == token_id:
+                                    if mk.outcome_down_id == token_id:
                                         side = "Down"
                                         break
                             if side:
@@ -3907,7 +3932,8 @@ class Bot:
 
                         result = self._fills_ledger.reconcile_positions(
                             wallet_balances=wallet_positions,
-                            tolerance=LEDGER_RECONCILE_TOLERANCE,
+                            open_orders=open_orders,
+                            tolerance_shares=LEDGER_RECONCILE_TOLERANCE,
                         )
 
                         # Enter SAFE MODE on critical mismatch
@@ -3918,7 +3944,6 @@ class Bot:
                                     details=result.get("mismatches", []),
                                 )
                         elif self._fills_ledger.safe_mode and not result.get("critical"):
-                            # Mismatch resolved
                             self._fills_ledger.exit_safe_mode()
                 except Exception as e:
                     write_jsonl({
@@ -3927,7 +3952,7 @@ class Bot:
                         "ts_ms": int(time.time() * 1000),
                     })
 
-            # 4. Log ledger summary periodically
+            # 5. Log ledger summary periodically
             summary = self._fills_ledger.summary()
             write_jsonl({
                 "event_type": "LEDGER_STATUS",
@@ -4281,8 +4306,10 @@ class Bot:
                           "cache_age_ms": round(self._cache_age_ms(m.slug), 0),
                           "live_delta_bps": round(live_delta_bps, 2)})
 
+            self._ledger_order_intent(m, st, outcome, "BUY", this_qty, order_price, "ENTRY_BURST")
             if MODE == "LOG":
                 self._paper_buy(st, outcome, order_price, this_qty, this_usd)
+                self._ledger_record_buy_fill(m, st, outcome, order_price, this_qty)
                 self._record_fill_ts(m.slug)  # post-fill cooldown
                 mt = order_type
                 sc = spread_capture_fields("BUY", order_price, fresh_book)
@@ -4312,6 +4339,7 @@ class Bot:
                     self._record_fill_ts(m.slug)  # post-fill cooldown
                     self._live_buy(st, outcome, fill["fill_price"], fill["fill_qty"],
                                    fill["fill_price"] * fill["fill_qty"])
+                    self._ledger_record_buy_fill(m, st, outcome, fill["fill_price"], fill["fill_qty"], order_id=oid)
                     mt = infer_maker_taker("BUY", fill["fill_price"], fresh_book)
                     sc = spread_capture_fields("BUY", fill["fill_price"], fresh_book)
                     _burst_notional = fill["fill_price"] * fill["fill_qty"]
@@ -5574,6 +5602,7 @@ class Bot:
                               "new_px": round(bid_price, 4),
                               "reason": "refresh"})
 
+        self._ledger_order_intent(m, st, outcome, "BUY", order_qty, bid_price, "PARITY_QUOTE", order_id=client_oid)
         if MODE == "LOG":
             fill_ts = time.time()
             fill_ts_ms = int(fill_ts * 1000)
@@ -5584,6 +5613,7 @@ class Bot:
                 return 0.0
             actual_cost = bid_price * order_qty
             self._paper_buy(st, outcome, bid_price, order_qty, actual_cost)
+            self._ledger_record_buy_fill(m, st, outcome, bid_price, order_qty)
             self._record_fill_ts(m.slug)  # post-fill cooldown
             fill_latency_ms = (fill_ts - placed_ts) * 1000
             notional = bid_price * order_qty
@@ -5671,6 +5701,8 @@ class Bot:
                 fill_latency_ms = (fill_ts - placed_ts) * 1000
                 actual_cost = fill["fill_price"] * fill["fill_qty"]
                 self._live_buy(st, outcome, fill["fill_price"], fill["fill_qty"], actual_cost)
+                self._ledger_record_buy_fill(m, st, outcome, fill["fill_price"], fill["fill_qty"],
+                                             order_id=fill.get("order_id", ""))
                 notional = fill["fill_price"] * fill["fill_qty"]
                 fee = compute_fee_usdc(notional, "maker")
                 self.logger.log_order_fill(
@@ -5792,10 +5824,12 @@ class Bot:
             usdc_cost=leg_usd, ctx=ctx, book_fields=bk_fields,
             extra={"pair_id": pair_id, "placed_ts": placed_ts} if pair_id else {"placed_ts": placed_ts},
         )
+        self._ledger_order_intent(m, st, outcome, "BUY", order_qty, order_price, "PARITY_BUY", order_id=client_oid)
 
         if MODE == "LOG":
             fill_ts = time.time()
             self._paper_buy(st, outcome, order_price, order_qty, leg_usd)
+            self._ledger_record_buy_fill(m, st, outcome, order_price, order_qty)
             self._record_fill_ts(m.slug)  # post-fill cooldown
             sc = spread_capture_fields("BUY", order_price, book)
             fill_latency_ms = (fill_ts - placed_ts) * 1000
@@ -5830,6 +5864,8 @@ class Bot:
                 fill_latency_ms = (fill_ts - placed_ts) * 1000
                 actual_cost = fill["fill_price"] * fill["fill_qty"]
                 self._live_buy(st, outcome, fill["fill_price"], fill["fill_qty"], actual_cost)
+                self._ledger_record_buy_fill(m, st, outcome, fill["fill_price"], fill["fill_qty"],
+                                             order_id=fill.get("order_id", ""))
                 sc = spread_capture_fields("BUY", fill["fill_price"], book)
                 actual_mt = infer_maker_taker("BUY", fill["fill_price"], book)
                 _fee = compute_fee_usdc(actual_cost, actual_mt)
@@ -6104,9 +6140,11 @@ class Bot:
             side="BUY", qty=qty, target_price=book.ask,
             usdc_cost=clip, ctx=ctx, book_fields=bk_fields,
         )
+        self._ledger_order_intent(m, st, outcome, "BUY", qty, book.ask, "ENTRY_SCALP", order_id=client_oid)
         st.last_reentry_ts = now_iso
         if MODE == "LOG":
             self._paper_buy(st, outcome, book.ask, qty, clip)
+            self._ledger_record_buy_fill(m, st, outcome, book.ask, qty)
             self._record_fill_ts(m.slug)  # post-fill cooldown
             mt = infer_maker_taker("BUY", book.ask, book)
             sc = spread_capture_fields("BUY", book.ask, book)
@@ -6130,6 +6168,7 @@ class Bot:
             actual_price = fill["avg_price"]
             actual_cost = fill["total_cost"]
             self._live_buy(st, outcome, actual_price, actual_qty, actual_cost)
+            self._ledger_record_buy_fill(m, st, outcome, actual_price, actual_qty)
             mt = infer_maker_taker("BUY", actual_price, book)
             sc = spread_capture_fields("BUY", actual_price, book)
             _fee = compute_fee_usdc(actual_cost, mt)
@@ -6653,6 +6692,7 @@ class Bot:
             actual_price = fill_result["fill_price"]
             actual_qty = fill_result["fill_qty"]
             pnl = self._live_sell(st, outcome, actual_price, actual_qty)
+            self._ledger_record_sell_fill(m, st, outcome, actual_price, actual_qty, order_id=oid)
             self._record_negative_exit(m.slug, pnl, reason)
             return
 
@@ -6773,6 +6813,8 @@ class Bot:
             side="SELL", qty=qty, target_price=target_price or price,
             usdc_cost=usdc_cost, ctx=ctx, book_fields=bk_fields,
         )
+        # Ledger: record order intent at submit time
+        self._ledger_order_intent(m, st, outcome, "SELL", qty, price, reason, order_id=client_oid)
         # True cost: submit counted here (confirmed submit for both modes)
         self._true_cost_tx_count += 1
         if MODE == "LOG":
@@ -6781,6 +6823,7 @@ class Bot:
             self._true_cost_fill_count_min += 1
             self._record_fill_ts(m.slug)  # post-fill cooldown
             pnl = self._paper_sell(st, outcome, price, qty)
+            self._ledger_record_sell_fill(m, st, outcome, price, qty)
             mt = infer_maker_taker("SELL", price, ref_book) if ref_book else ""
             sc = spread_capture_fields("SELL", price, ref_book) if ref_book else {}
             sell_notional = price * qty
@@ -6837,6 +6880,7 @@ class Bot:
             self._true_cost_fill_count += 1
             self._true_cost_fill_count_min += 1
             pnl = self._live_sell(st, outcome, actual_price, actual_qty)
+            self._ledger_record_sell_fill(m, st, outcome, actual_price, actual_qty, order_id=oid)
             mt = infer_maker_taker("SELL", actual_price, ref_book) if ref_book else ""
             sc = spread_capture_fields("SELL", actual_price, ref_book) if ref_book else {}
             sell_notional = actual_price * actual_qty
@@ -6908,6 +6952,8 @@ class Bot:
                     self._true_cost_fill_count += 1
                     self._true_cost_fill_count_min += 1
                     pnl = self._live_sell(st, outcome, actual_price, actual_qty)
+                    self._ledger_record_sell_fill(m, st, outcome, actual_price, actual_qty,
+                                                  order_id=retry.get("order_id", ""))
                     mt = infer_maker_taker("SELL", actual_price, ref_book) if ref_book else ""
                     sell_notional = actual_price * actual_qty
                     fee = compute_fee_usdc(sell_notional, mt if mt else ("maker" if use_maker else "taker"))
