@@ -73,6 +73,7 @@ from src.execution.safety_caps import SafetyCaps
 from src.execution.unpaired_resolver import UnpairedResolver
 from src.execution.live_sanity_report import LiveSanityReporter
 from src.execution.state_drift_checker import StateDriftChecker
+from src.execution.position_reconciler import PositionReconciler
 from src.execution.live_safety import LiveSafety
 from src.feeds.polymarket import PolymarketClient, set_jsonl_writer
 from src.bot.app import BotApp
@@ -108,6 +109,10 @@ _ALWAYS_LOG_EVENTS = frozenset({
     "GATE_REPORT", "SNAPSHOT_COMPACT", "GATE_SPREAD_BLOCK",
     # Market discovery
     "MARKET_DISCOVERY_ERROR",
+    # Position reconciliation
+    "RECONCILE_START", "RECONCILE_DONE", "RECONCILE_CORRECTIONS",
+    "RECONCILE_TRIGGERED", "RECONCILE_ERROR",
+    "STATE_DESYNC_DETECTED", "STATE_DESYNC_RESOLVED",
 })
 # Prefixes that always log (for variable event_type like flatten_reason)
 _ALWAYS_LOG_PREFIXES = ("FLATTEN", "KILL", "PAUSE", "END_OF_HOUR")
@@ -390,6 +395,10 @@ class Bot:
         self._exec_reporter = LiveSanityReporter(write_jsonl)
         self._exec_drift = StateDriftChecker(
             self.client.get_open_orders, self.client.get_balances, write_jsonl)
+        self._exec_reconciler = PositionReconciler(
+            self.client.get_balances, self.client.get_open_orders, write_jsonl)
+        self._last_reconcile_ts: float = 0.0             # position reconciliation timer
+        self._reconcile_after_fill_pending: bool = False  # flag for post-fill reconciliation
         self._live_safety = LiveSafety(write_jsonl)
         # ── LIVE_SAFE mode: monotonic process start for entry window ──
         self._process_start_mono = time.monotonic()
@@ -633,6 +642,9 @@ class Bot:
             self._shadow_trades_blocked += 1
         # Hourly stats
         self._hour_trade_count += 1
+        # Flag post-fill reconciliation
+        if POSITION_RECONCILE_ENABLED and POSITION_RECONCILE_AFTER_FILL:
+            self._reconcile_after_fill_pending = True
     def _paper_sell(self, st: MarketState, outcome: str, price: float, qty: float):
         pos = st.positions[outcome]
         qty = min(qty, pos.qty)
@@ -662,6 +674,9 @@ class Bot:
         # Hourly stats
         self._hour_trade_count += 1
         self._hour_net_pnl += pnl
+        # Flag post-fill reconciliation
+        if POSITION_RECONCILE_ENABLED and POSITION_RECONCILE_AFTER_FILL:
+            self._reconcile_after_fill_pending = True
         return pnl
     def _live_buy(self, st: MarketState, outcome: str, price: float,
                   qty: float, usdc_cost: float):
@@ -677,6 +692,9 @@ class Bot:
             pos.opened_at = pos.last_trade_ts
         self.cash_usdc -= usdc_cost
         self._hour_trade_count += 1
+        # Flag post-fill reconciliation
+        if POSITION_RECONCILE_ENABLED and POSITION_RECONCILE_AFTER_FILL:
+            self._reconcile_after_fill_pending = True
     def _live_sell(self, st: MarketState, outcome: str, price: float,
                    qty: float) -> float:
         """Update position state after a real sell fill (mirrors _paper_sell). Returns pnl."""
@@ -698,6 +716,9 @@ class Bot:
         self._hour_net_pnl += pnl
         # Per-slug PnL
         self._slug_realized_pnl[st.slug] = self._slug_realized_pnl.get(st.slug, 0.0) + pnl
+        # Flag post-fill reconciliation
+        if POSITION_RECONCILE_ENABLED and POSITION_RECONCILE_AFTER_FILL:
+            self._reconcile_after_fill_pending = True
         return pnl
     @staticmethod
     def _clean_dust(pos: Position):
@@ -964,6 +985,11 @@ class Bot:
               f"step=${PARITY_QUOTE_STEP_USD} max=${PARITY_QUOTE_MAX_USD_PER_SLUG} "
               f"unpaired_esc={QUOTE_UNPAIRED_ESCALATE_AFTER_MS}ms "
               f"max_unpaired={QUOTE_UNPAIRED_MAX_SEC}s pause={QUOTE_PAUSE_AFTER_UNPAIRED_SEC}s")
+        print(f"  RECONCILE: enabled={POSITION_RECONCILE_ENABLED} "
+              f"interval={POSITION_RECONCILE_INTERVAL_SEC}s "
+              f"on_startup={POSITION_RECONCILE_ON_STARTUP} "
+              f"after_fill={POSITION_RECONCILE_AFTER_FILL} "
+              f"block_on_desync={POSITION_RECONCILE_BLOCK_ON_DESYNC}")
         if MODE in ("LIVE", "LIVE_SAFE"):
             print(f"  LIVE SAFETY: hedge_kill={HEDGE_KILL_TIMEOUT_SEC}s/{HEDGE_KILL_TIMEOUT_FINAL_SEC}s "
                   f"slip={HEDGE_MAX_SLIPPAGE_CENTS}c "
@@ -1004,6 +1030,10 @@ class Bot:
         # ── LIVE startup safety: cancel all stale CLOB orders ──
         if MODE in ("LIVE", "LIVE_SAFE"):
             self._exec_orphan.startup_cleanup()
+
+        # ── Position reconciliation at startup ──
+        if POSITION_RECONCILE_ENABLED and POSITION_RECONCILE_ON_STARTUP:
+            self._run_reconciliation("startup")
 
         if MODE == "LIVE_SAFE":
             print(f"\n  [LIVE_SAFE] Entry window: {LIVE_SAFE_ENTRY_WINDOW_SEC:.0f}s  |  "
@@ -1156,6 +1186,18 @@ class Bot:
                 if MODE in ("LIVE", "LIVE_SAFE") and now - self._last_balance_sync_ts >= 60.0:
                     self._sync_clob_balances()
                     self._last_balance_sync_ts = now
+
+                # 7c. Position reconciliation (configurable interval, all modes)
+                if POSITION_RECONCILE_ENABLED:
+                    reconcile_due = (now - self._last_reconcile_ts
+                                     >= POSITION_RECONCILE_INTERVAL_SEC)
+                    if reconcile_due or self._reconcile_after_fill_pending:
+                        self._run_reconciliation(
+                            "post_fill" if self._reconcile_after_fill_pending
+                            else "periodic"
+                        )
+                        self._reconcile_after_fill_pending = False
+                        self._last_reconcile_ts = now
 
                 # 8. Tempo parity diagnostics (every 60s)
                 if now - self._tempo_last_report_ts >= 60.0:
@@ -2077,6 +2119,10 @@ class Bot:
             "total_kill_activations": self._exec_safety.total_kill_activations,
             "cap_blocks_last_min": self._exec_safety.cap_blocks_this_min,
             "drift_detected": self._exec_drift.is_drifted(),
+            "reconcile_count": self._exec_reconciler.reconcile_count,
+            "reconcile_corrections": self._exec_reconciler.corrections_total,
+            "reconcile_desynced": self._exec_reconciler.is_desynced(),
+            "reconcile_desync_events": self._exec_reconciler.desync_events_total,
             "no_progress_pauses": self._exec_safety.no_progress_pauses_total,
             "mode": MODE,
             "buys_allowed": self._buys_allowed(),
@@ -3643,12 +3689,12 @@ class Bot:
                     internal_qty = pos.qty
                     actual_qty = actual.get((slug, outcome), 0.0)
                     diff = actual_qty - internal_qty
-                    if abs(diff) >= 1.0:  # 1+ share drift
+                    if abs(diff) >= MIN_QTY:  # any non-dust drift
                         drifts.append({
                             "slug": slug, "outcome": outcome,
-                            "internal_qty": round(internal_qty, 1),
-                            "clob_qty": round(actual_qty, 1),
-                            "diff": round(diff, 1),
+                            "internal_qty": internal_qty,
+                            "clob_qty": actual_qty,
+                            "diff": diff,
                         })
                         # Correct internal state to match reality
                         if actual_qty > internal_qty:
@@ -3675,9 +3721,49 @@ class Bot:
             write_jsonl({"event_type": "BALANCE_SYNC_ERROR",
                          "err": str(e)[:200]})
 
+    def _run_reconciliation(self, trigger: str = "periodic") -> None:
+        """Run full position reconciliation against wallet balances.
+
+        Args:
+            trigger: what triggered this reconciliation (startup/periodic/post_fill)
+        """
+        if not POSITION_RECONCILE_ENABLED:
+            return
+        try:
+            token_map = self._get_token_to_slug_outcome()
+            result = self._exec_reconciler.reconcile_positions(
+                market_states=self.market_states,
+                token_to_slug_outcome=token_map,
+                dscalp_positions=self._dscalp_positions,
+            )
+            corrections = result.get("corrections", [])
+            if corrections:
+                write_jsonl({
+                    "event_type": "RECONCILE_TRIGGERED",
+                    "trigger": trigger,
+                    "corrections_count": len(corrections),
+                    "desync": result.get("desync_detected", False),
+                    "ts_ms": int(time.time() * 1000),
+                })
+                # Save state immediately after corrections
+                self._save_state()
+        except Exception as e:
+            write_jsonl({
+                "event_type": "RECONCILE_ERROR",
+                "trigger": trigger,
+                "err": str(e)[:200],
+                "ts_ms": int(time.time() * 1000),
+            })
+
     def _buys_allowed(self) -> bool:
         """Check if BUY orders are currently allowed.
-        LOG: always True. LIVE: always True. LIVE_SAFE: only during entry window."""
+        LOG: always True. LIVE: always True. LIVE_SAFE: only during entry window.
+        Blocked if position desync detected and POSITION_RECONCILE_BLOCK_ON_DESYNC is True."""
+        # Block new trades during critical state desync
+        if (POSITION_RECONCILE_ENABLED
+                and POSITION_RECONCILE_BLOCK_ON_DESYNC
+                and self._exec_reconciler.is_desynced()):
+            return False
         if MODE != "LIVE_SAFE":
             return True
         return (time.monotonic() - self._process_start_mono) < LIVE_SAFE_ENTRY_WINDOW_SEC
@@ -3698,10 +3784,10 @@ class Bot:
         min_qty_for_usd = _math.ceil(1.01 / max(1e-9, price))
         clob_min = max(CLOB_MIN_ORDER_SIZE, min_qty_for_usd)
         if MODE != "LIVE_SAFE":
-            qty = max(clob_min, int(order_usd / max(1e-9, price)))
+            qty = max(float(clob_min), order_usd / max(1e-9, price))
             return qty * price, qty
         capped_usd = min(order_usd, LIVE_SAFE_MAX_ORDER_USD)
-        capped_qty = int(capped_usd / max(1e-9, price))
+        capped_qty = capped_usd / max(1e-9, price)
         # Enforce Polymarket minimum (shares + $1 value)
         if capped_qty < clob_min:
             min_usd = clob_min * price

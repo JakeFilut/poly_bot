@@ -451,7 +451,7 @@ class PolymarketClient:
         """
         if _settings.MODE == "LOG":
             pid = f"paper_{int(time.time()*1000)}_{random.randint(100,999)}"
-            return {"order_id": pid, "filled": True, "fill_qty": int(float(size)),
+            return {"order_id": pid, "filled": True, "fill_qty": float(size),
                     "fill_price": price, "status": "matched"}
 
         if not self._clob:
@@ -461,12 +461,12 @@ class PolymarketClient:
 
         import math as _math
         price = round(max(0.01, min(0.99, price)), 3)  # round to tick (0.001)
-        qty   = int(float(size))
+        qty   = float(size)  # preserve fractional shares — never cast to int
         # Polymarket CLOB requires: min 5 shares AND min $1 total order value
         min_qty_for_usd = _math.ceil(1.01 / price) if price > 0 else 5
         clob_min = max(5, min_qty_for_usd)
         if qty < clob_min:
-            return {"order_id": "", "filled": False, "fill_qty": 0,
+            return {"order_id": "", "filled": False, "fill_qty": 0.0,
                     "fill_price": 0.0, "status": "rejected"}
 
         order_type = OrderType.GTC  # limit / resting order
@@ -489,10 +489,10 @@ class PolymarketClient:
                              or response.get("transactionHashes", []))
 
                 filled = False
-                fill_qty = 0
+                fill_qty = 0.0
                 if status == "matched" or tx_hashes:
                     filled = True
-                    fill_qty = int(size_matched) if size_matched else 0
+                    fill_qty = float(size_matched) if size_matched else 0.0
                     # If CLOB said "matched" but gave no size_matched, poll to confirm
                     if fill_qty == 0 and oid:
                         fill_qty = self._poll_order_fill(oid, qty, timeout=5)
@@ -526,12 +526,12 @@ class PolymarketClient:
             _write_jsonl({"event_type":"ORDER_ERROR", "err": str(e)[:200],
                          "token_id": token_id[-12:], "side": side,
                          "price": price, "qty": qty})
-        return {"order_id": "", "filled": False, "fill_qty": 0,
+        return {"order_id": "", "filled": False, "fill_qty": 0.0,
                 "fill_price": 0.0, "status": "error"}
 
-    def _poll_order_fill(self, order_id: str, expected_qty: int,
-                         timeout: int = 5) -> int:
-        """Poll CLOB briefly for GTC order fill. Returns filled qty (0 if not confirmed)."""
+    def _poll_order_fill(self, order_id: str, expected_qty: float,
+                         timeout: int = 5) -> float:
+        """Poll CLOB briefly for GTC order fill. Returns filled qty (0.0 if not confirmed)."""
         start = time.time()
         while time.time() - start < timeout:
             try:
@@ -541,14 +541,14 @@ class PolymarketClient:
                     if status in ("matched", "filled"):
                         sm = order.get("size_matched")
                         if sm:
-                            return int(sm)
+                            return float(sm)
                         # status says matched but no size — keep polling
                     if status in ("cancelled", "canceled", "expired"):
-                        return 0
+                        return 0.0
             except Exception:
                 pass
             time.sleep(1)
-        return 0
+        return 0.0
 
     def cancel_order(self, order_id: str) -> None:
         """Cancel a single order by id."""
