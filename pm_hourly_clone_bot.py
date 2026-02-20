@@ -159,11 +159,20 @@ class Bot:
         self.client = PolymarketClient()
         set_jsonl_writer(write_jsonl)  # wire module-level callback for CLOB logging
         self.running = True
-        self.cash_usdc = BANKROLL_START_USDC
+        # Fetch real USDC balance from Polygon wallet; fall back to config
+        self._wallet_usdc_at_start = None
+        if MODE in ("LIVE", "LIVE_SAFE"):
+            self._wallet_usdc_at_start = self.client.get_usdc_balance()
+            if self._wallet_usdc_at_start is not None:
+                print(f"  [WALLET] On-chain USDC balance: ${self._wallet_usdc_at_start:.2f}")
+            else:
+                print(f"  [WALLET] Could not fetch USDC balance, using BANKROLL_START_USDC=${BANKROLL_START_USDC:.2f}")
+        starting_cash = self._wallet_usdc_at_start if self._wallet_usdc_at_start is not None else BANKROLL_START_USDC
+        self.cash_usdc = starting_cash
         self.realized_pnl_usdc = 0.0  # cumulative realized P&L (sells + settlements)
         self.day_start = utc_now().date()
-        self.day_start_equity = BANKROLL_START_USDC
-        self.hour_start_equity = BANKROLL_START_USDC
+        self.day_start_equity = starting_cash
+        self.hour_start_equity = starting_cash
         self.hourly_pnl_usdc = 0.0
         self._hour_window = utc_now().replace(minute=0, second=0, microsecond=0)
         # Risk-alert tracking (log-only, never enforced)
@@ -1023,7 +1032,9 @@ class Bot:
                                                    "slug": m_ref.slug, "err": str(e)})
             write_jsonl({"event_type": "INIT_BOOTSTRAP_DONE",
                           "markets": len(self._cached_markets),
-                          "cached": len(self._data_cache)})
+                          "cached": len(self._data_cache),
+                          "cash_usdc": round(self.cash_usdc, 2),
+                          "cash_source": "wallet" if self._wallet_usdc_at_start is not None else "config"})
         except Exception as e:
             self.logger.log_event({"event_type": "INIT_BOOTSTRAP_ERROR", "err": str(e)})
 
@@ -3731,10 +3742,17 @@ class Bot:
             return
         try:
             token_map = self._get_token_to_slug_outcome()
+            # Build mid-price lookup from cached books for vwap estimation
+            mid_prices: Dict[tuple, float] = {}
+            for slug, books in self.last_book.items():
+                for outcome, book in books.items():
+                    if book and book.mid > 0:
+                        mid_prices[(slug, outcome)] = book.mid
             result = self._exec_reconciler.reconcile_positions(
                 market_states=self.market_states,
                 token_to_slug_outcome=token_map,
                 dscalp_positions=self._dscalp_positions,
+                mid_price_lookup=mid_prices,
             )
             corrections = result.get("corrections", [])
             if corrections:

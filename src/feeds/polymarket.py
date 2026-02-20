@@ -589,3 +589,66 @@ class PolymarketClient:
             return []
         except Exception:
             return []
+
+    # ================================================================== #
+    #  6.  USDC WALLET BALANCE (on-chain)
+    # ================================================================== #
+    # USDC.e on Polygon (6 decimals)
+    _USDC_E_ADDR = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+
+    def get_usdc_balance(self) -> Optional[float]:
+        """Fetch on-chain USDC.e balance for the wallet (EOA + proxy).
+
+        Returns balance in USD (float) or None if fetch fails.
+        Uses the same Polygon RPC as sell-approval setup.
+        """
+        if not self._wallet_address:
+            return None
+        try:
+            from web3 import Web3
+            w3 = Web3(Web3.HTTPProvider("https://polygon-rpc.com"))
+            if not w3.is_connected():
+                w3 = Web3(Web3.HTTPProvider("https://rpc-mainnet.matic.quiknode.pro"))
+
+            usdc_abi = [
+                {"constant": True,
+                 "inputs": [{"name": "_owner", "type": "address"}],
+                 "name": "balanceOf",
+                 "outputs": [{"name": "balance", "type": "uint256"}],
+                 "type": "function"},
+            ]
+            contract = w3.eth.contract(
+                address=Web3.to_checksum_address(self._USDC_E_ADDR),
+                abi=usdc_abi,
+            )
+            wallet = Web3.to_checksum_address(self._wallet_address)
+            eoa_bal = float(contract.functions.balanceOf(wallet).call()) / 1e6
+
+            # Also check proxy wallet (Polymarket uses smart contract wallets)
+            proxy_bal = 0.0
+            if self._clob:
+                try:
+                    proxy = self._clob.get_proxy_wallet_address()
+                    if proxy and proxy.lower() != wallet.lower():
+                        proxy_bal = float(
+                            contract.functions.balanceOf(
+                                Web3.to_checksum_address(proxy)
+                            ).call()
+                        ) / 1e6
+                except Exception:
+                    pass
+
+            total = eoa_bal + proxy_bal
+            _write_jsonl({
+                "event_type": "USDC_BALANCE_FETCHED",
+                "eoa_bal": round(eoa_bal, 6),
+                "proxy_bal": round(proxy_bal, 6),
+                "total": round(total, 6),
+            })
+            return total
+        except Exception as e:
+            _write_jsonl({
+                "event_type": "USDC_BALANCE_ERROR",
+                "err": str(e)[:200],
+            })
+            return None
