@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Quick buy+sell test: buys 5 shares of the cheaper BTC side, then sells them.
 Proves the full order lifecycle works (buy fill -> sell fill).
+Calls the CLOB directly so all errors are visible (not swallowed).
 
 Usage:  python test_buy_sell.py
 """
@@ -34,6 +35,7 @@ print("=" * 55)
 
 # Initialize the feed client
 feed = PolymarketClient()
+clob = feed._clob
 
 # Web3 for balance checks
 w3 = Web3(Web3.HTTPProvider("https://polygon-rpc.com"))
@@ -75,6 +77,7 @@ else:
     side_name, token_id, buy_price = "Up", btc.outcome_up_id, up_book.ask
 
 qty = 5
+buy_price = round(max(0.01, min(0.99, buy_price)), 3)
 cost = buy_price * qty
 print(f"\n    Picking: {side_name} (cheaper @ ${buy_price:.3f})")
 print(f"    Cost: {qty} x ${buy_price:.3f} = ${cost:.2f}")
@@ -83,21 +86,65 @@ print(f"    Cost: {qty} x ${buy_price:.3f} = ${cost:.2f}")
 bal_before = ct.functions.balanceOf(wallet, int(token_id)).call()
 print(f"\n[3] On-chain balance before buy: {bal_before}")
 
-# BUY
-print(f"\n[4] Placing BUY order...")
-buy_result = feed.place_limit_order(token_id, "BUY", buy_price, qty, post_only=False)
-print(f"    Result: {buy_result}")
-
-if not buy_result.get("filled"):
-    print("    BUY did not fill.")
+# BUY — call CLOB directly
+print(f"\n[4] Placing BUY order (direct CLOB call)...")
+try:
+    args = OrderArgs(
+        price=buy_price,
+        size=qty,
+        side="BUY",
+        token_id=token_id,
+    )
+    signed = clob.create_order(args)
+    response = clob.post_order(signed, OrderType.GTC)
+    print(f"    Raw CLOB response: {response}")
+except Exception as e:
+    print(f"\n    BUY ERROR: {e}")
+    print(f"    Error type: {type(e).__name__}")
+    import traceback
+    traceback.print_exc()
     sys.exit(1)
 
-fill_qty = buy_result["fill_qty"]
-fill_price = buy_result["fill_price"]
-print(f"    FILLED: {fill_qty} @ ${fill_price:.3f}")
+# Parse buy response
+if not response or not isinstance(response, dict):
+    print(f"    Unexpected response: {response}")
+    sys.exit(1)
+
+status = response.get("status", "").lower()
+tx_hashes = response.get("transactionsHashes", []) or response.get("transactionHashes", [])
+size_matched = response.get("size_matched") or 0
+
+if status == "matched" or tx_hashes:
+    fill_qty = int(size_matched) if size_matched else qty
+    print(f"    FILLED: {fill_qty} shares")
+elif status == "live":
+    print(f"    Order is LIVE (resting). Waiting up to 5s for fill...")
+    oid = response.get("orderID", "")
+    fill_qty = 0
+    for _ in range(50):
+        time.sleep(0.1)
+        try:
+            order = clob.get_order(oid)
+            if order and isinstance(order, dict):
+                s = order.get("status", "").lower()
+                if s in ("matched", "filled"):
+                    fill_qty = int(order.get("size_matched", qty) or qty)
+                    break
+        except Exception:
+            pass
+    if fill_qty > 0:
+        print(f"    FILLED: {fill_qty} shares")
+    else:
+        print(f"    BUY did not fill within 5s. Status: {status}")
+        sys.exit(1)
+else:
+    print(f"    Unexpected status: {status}")
+    sys.exit(1)
+
+fill_price = buy_price
 
 # Wait and poll for on-chain settlement
-print("\n[5] Waiting for on-chain settlement...")
+print(f"\n[5] Waiting for on-chain settlement...")
 for i in range(12):
     time.sleep(2.5)
     bal_now = ct.functions.balanceOf(wallet, int(token_id)).call()
@@ -114,7 +161,7 @@ book = feed.get_top_of_book(token_id)
 sell_price = book.bid
 print(f"\n    Current bid: ${sell_price:.3f}")
 
-# SELL — call CLOB directly to see the raw error
+# SELL — call CLOB directly
 print(f"\n[6] Placing SELL order: {fill_qty} @ ${sell_price:.3f}")
 sell_price = round(max(0.01, min(0.99, sell_price)), 3)
 try:
@@ -124,8 +171,8 @@ try:
         side="SELL",
         token_id=token_id,
     )
-    signed = feed._clob.create_order(args)
-    response = feed._clob.post_order(signed, OrderType.GTC)
+    signed = clob.create_order(args)
+    response = clob.post_order(signed, OrderType.GTC)
     print(f"    Raw CLOB response: {response}")
 
     if response and isinstance(response, dict):
@@ -146,13 +193,11 @@ try:
 except Exception as e:
     print(f"\n    SELL ERROR: {e}")
     print(f"    Error type: {type(e).__name__}")
-    # Check if it's an allowance/balance issue
+    import traceback
+    traceback.print_exc()
     err_str = str(e).lower()
     if "allowance" in err_str or "balance" in err_str:
-        print("\n    This is a balance/allowance error.")
-        print(f"    On-chain balance: {ct.functions.balanceOf(wallet, int(token_id)).call()}")
-        print("    Approvals were confirmed OK by check_sell_ready.py")
-        print("    The CLOB may need more time to reflect your balance.")
+        print(f"\n    On-chain balance: {ct.functions.balanceOf(wallet, int(token_id)).call()}")
     print("\n" + "=" * 55)
     print("  FAIL: Sell error — see above for details")
     print("=" * 55)
