@@ -77,6 +77,7 @@ class PositionReconciler:
         market_states: dict,
         token_to_slug_outcome: Dict[str, Tuple[str, str]],
         dscalp_positions: Optional[dict] = None,
+        mid_price_lookup: Optional[Dict[Tuple[str, str], float]] = None,
     ) -> Dict[str, List[dict]]:
         """Run full position reconciliation cycle.
 
@@ -93,6 +94,8 @@ class PositionReconciler:
             market_states: {slug: MarketState} — the bot's internal state
             token_to_slug_outcome: {token_id: (slug, outcome)} mapping
             dscalp_positions: optional {slug: {...}} directional scalp tracker
+            mid_price_lookup: optional {(slug, outcome): mid_price} for vwap
+                estimation on fresh-start positions with no prior vwap
 
         Returns:
             dict with keys:
@@ -189,14 +192,19 @@ class PositionReconciler:
                 critical_desyncs.append(correction)
 
             # ── 4. Overwrite internal state with wallet data ──
+            # Look up mid price for vwap estimation if available
+            est_price = None
+            if mid_price_lookup:
+                est_price = mid_price_lookup.get((slug, outcome))
+
             if st and pos:
-                self._apply_correction(pos, wallet_qty)
+                self._apply_correction(pos, wallet_qty, est_price)
             elif st and wallet_qty >= MIN_QTY:
                 # Position exists in wallet but not in internal state at all
                 # Create position entry
                 new_pos = st.positions.get(outcome)
                 if new_pos:
-                    self._apply_correction(new_pos, wallet_qty)
+                    self._apply_correction(new_pos, wallet_qty, est_price)
 
         # ── 5. Handle positions that exist in wallet but not in market_states ──
         # (these are truly unknown — we can only log them as warnings)
@@ -234,6 +242,21 @@ class PositionReconciler:
                     f"internal={c['old_qty']:.6f} → wallet={c['new_qty']:.6f} "
                     f"(diff={c['diff']:+.6f})"
                 )
+
+        # Log wallet summary even when no corrections (useful at startup)
+        active_wallet = {
+            f"{s}/{o}": q for (s, o), q in wallet_positions.items() if q >= MIN_QTY
+        }
+        if active_wallet and self.reconcile_count == 0:
+            self._write_jsonl({
+                "event_type": "RECONCILE_WALLET_SUMMARY",
+                "positions": active_wallet,
+                "total_positions": len(active_wallet),
+                "ts_ms": now_ms,
+            })
+            print(f"  [RECONCILE] Wallet has {len(active_wallet)} active position(s):")
+            for key, qty in sorted(active_wallet.items()):
+                print(f"    {key}: {qty:.6f} shares")
 
         # ── 7. Handle critical desyncs ──
         if critical_desyncs:
@@ -341,9 +364,15 @@ class PositionReconciler:
 
         return result
 
-    def _apply_correction(self, pos, wallet_qty: float) -> None:
+    def _apply_correction(
+        self, pos, wallet_qty: float, est_mid_price: Optional[float] = None
+    ) -> None:
         """Overwrite position qty to match wallet.  Preserves vwap for cost basis
-        estimation.  Does NOT touch realized PnL."""
+        estimation.  Does NOT touch realized PnL.
+
+        If pos.vwap is 0 (fresh start, no prior trades), uses est_mid_price
+        from the current orderbook as a reasonable cost-basis estimate.
+        """
         if wallet_qty < MIN_QTY:
             # Wallet says no shares — zero out
             pos.qty = 0.0
@@ -366,6 +395,17 @@ class PositionReconciler:
             pos.qty = wallet_qty
             if pos.vwap > 0:
                 pos.cost_usdc = pos.vwap * wallet_qty
+            elif est_mid_price and est_mid_price > 0:
+                # Fresh start: no prior vwap — use current mid as estimate
+                pos.vwap = est_mid_price
+                pos.cost_usdc = est_mid_price * wallet_qty
+                self._write_jsonl({
+                    "event_type": "RECONCILE_VWAP_ESTIMATED",
+                    "vwap_source": "mid_price",
+                    "estimated_vwap": est_mid_price,
+                    "qty": wallet_qty,
+                    "ts_ms": int(time.time() * 1000),
+                })
             # Leave all other metadata intact
 
     def _sync_dscalp_tracker(

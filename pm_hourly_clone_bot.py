@@ -3731,10 +3731,17 @@ class Bot:
             return
         try:
             token_map = self._get_token_to_slug_outcome()
+            # Build mid-price lookup from cached books for vwap estimation
+            mid_prices: Dict[tuple, float] = {}
+            for slug, books in self.last_book.items():
+                for outcome, book in books.items():
+                    if book and book.mid > 0:
+                        mid_prices[(slug, outcome)] = book.mid
             result = self._exec_reconciler.reconcile_positions(
                 market_states=self.market_states,
                 token_to_slug_outcome=token_map,
                 dscalp_positions=self._dscalp_positions,
+                mid_price_lookup=mid_prices,
             )
             corrections = result.get("corrections", [])
             if corrections:
