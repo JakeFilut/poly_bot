@@ -117,13 +117,8 @@ for m in markets:
             continue
         try:
             raw = ct.functions.balanceOf(wallet, int(token_id)).call()
-            qty = float(raw) / 1e6 if raw > 1e12 else float(raw)
-            # Polymarket CT tokens have no decimals (ERC-1155 raw count)
-            # But some setups return in micro-units. Use raw if reasonable.
-            if raw > 0 and raw < 1e12:
-                qty = float(raw)
-            elif raw >= 1e12:
-                qty = float(raw) / 1e6
+            # Polymarket CT tokens use 6 decimal places (like USDC)
+            qty = float(raw) / 1e6
         except Exception as e:
             print(f"  ERROR reading {m.crypto} {outcome}: {e}")
             continue
