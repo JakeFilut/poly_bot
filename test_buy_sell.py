@@ -48,6 +48,45 @@ ct_abi = [{"inputs": [{"name": "account", "type": "address"}, {"name": "id", "ty
 ct = w3.eth.contract(address=Web3.to_checksum_address(CT_ADDR), abi=ct_abi)
 wallet = Web3.to_checksum_address(feed._wallet_address)
 
+# ── Ensure ERC-1155 approvals (required for SELL orders) ──────────────
+# The CLOB checks on-chain that the exchange operators are approved to
+# transfer conditional tokens on your behalf.  Without this, SELL orders
+# are rejected with "not enough balance / allowance".
+OPERATORS = [
+    ("0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8ED0a90", "CTF Exchange"),
+    ("0xC5d563A36AE78145C45a50134d48A1215220f80a", "Neg Risk CTF Exchange"),
+    ("0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296", "Neg Risk Adapter"),
+]
+approval_abi = [
+    {"inputs": [{"name": "operator", "type": "address"}, {"name": "approved", "type": "bool"}],
+     "name": "setApprovalForAll", "outputs": [], "stateMutability": "nonpayable", "type": "function"},
+    {"inputs": [{"name": "owner", "type": "address"}, {"name": "operator", "type": "address"}],
+     "name": "isApprovedForAll", "outputs": [{"name": "", "type": "bool"}],
+     "stateMutability": "view", "type": "function"},
+]
+ct_approval = w3.eth.contract(address=Web3.to_checksum_address(CT_ADDR), abi=approval_abi)
+print("\n[0] Checking conditional-token approvals...")
+for op_addr, op_name in OPERATORS:
+    op = Web3.to_checksum_address(op_addr)
+    approved = ct_approval.functions.isApprovedForAll(wallet, op).call()
+    if approved:
+        print(f"    {op_name}: already approved")
+    else:
+        print(f"    {op_name}: NOT approved — sending approval tx...")
+        nonce = w3.eth.get_transaction_count(wallet)
+        tx = ct_approval.functions.setApprovalForAll(op, True).build_transaction({
+            'from': wallet, 'nonce': nonce, 'gas': 100000,
+            'gasPrice': w3.eth.gas_price, 'chainId': 137,
+        })
+        signed_tx = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
+        tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+        if receipt['status'] == 1:
+            print(f"    {op_name}: approved (tx {tx_hash.hex()[:16]}...)")
+        else:
+            print(f"    {op_name}: approval tx FAILED")
+            sys.exit(1)
+
 # Find BTC market
 print("\n[1] Finding current BTC market...")
 markets = feed.get_current_hour_markets()
