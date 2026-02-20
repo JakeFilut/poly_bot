@@ -651,9 +651,7 @@ class Bot:
             self._shadow_trades_blocked += 1
         # Hourly stats
         self._hour_trade_count += 1
-        # Flag post-fill reconciliation
-        if POSITION_RECONCILE_ENABLED and POSITION_RECONCILE_AFTER_FILL:
-            self._reconcile_after_fill_pending = True
+        # Post-fill: periodic reconciliation will verify after cooldown
     def _paper_sell(self, st: MarketState, outcome: str, price: float, qty: float):
         pos = st.positions[outcome]
         qty = min(qty, pos.qty)
@@ -683,9 +681,7 @@ class Bot:
         # Hourly stats
         self._hour_trade_count += 1
         self._hour_net_pnl += pnl
-        # Flag post-fill reconciliation
-        if POSITION_RECONCILE_ENABLED and POSITION_RECONCILE_AFTER_FILL:
-            self._reconcile_after_fill_pending = True
+        # Post-fill: periodic reconciliation will verify after cooldown
         return pnl
     def _live_buy(self, st: MarketState, outcome: str, price: float,
                   qty: float, usdc_cost: float):
@@ -701,9 +697,7 @@ class Bot:
             pos.opened_at = pos.last_trade_ts
         self.cash_usdc -= usdc_cost
         self._hour_trade_count += 1
-        # Flag post-fill reconciliation
-        if POSITION_RECONCILE_ENABLED and POSITION_RECONCILE_AFTER_FILL:
-            self._reconcile_after_fill_pending = True
+        # Post-fill: periodic reconciliation will verify after cooldown
     def _live_sell(self, st: MarketState, outcome: str, price: float,
                    qty: float) -> float:
         """Update position state after a real sell fill (mirrors _paper_sell). Returns pnl."""
@@ -725,9 +719,7 @@ class Bot:
         self._hour_net_pnl += pnl
         # Per-slug PnL
         self._slug_realized_pnl[st.slug] = self._slug_realized_pnl.get(st.slug, 0.0) + pnl
-        # Flag post-fill reconciliation
-        if POSITION_RECONCILE_ENABLED and POSITION_RECONCILE_AFTER_FILL:
-            self._reconcile_after_fill_pending = True
+        # Post-fill: periodic reconciliation will verify after cooldown
         return pnl
     @staticmethod
     def _clean_dust(pos: Position):
@@ -1199,15 +1191,14 @@ class Bot:
                     self._last_balance_sync_ts = now
 
                 # 7c. Position reconciliation (configurable interval, all modes)
+                # NOTE: runs periodically only (not post-fill) because CLOB
+                # get_balances() lags 15-30s after fills.  The fill cooldown
+                # guard in the reconciler protects recently-traded positions.
                 if POSITION_RECONCILE_ENABLED:
                     reconcile_due = (now - self._last_reconcile_ts
                                      >= POSITION_RECONCILE_INTERVAL_SEC)
-                    if reconcile_due or self._reconcile_after_fill_pending:
-                        self._run_reconciliation(
-                            "post_fill" if self._reconcile_after_fill_pending
-                            else "periodic"
-                        )
-                        self._reconcile_after_fill_pending = False
+                    if reconcile_due:
+                        self._run_reconciliation("periodic")
                         self._last_reconcile_ts = now
 
                 # 8. Tempo parity diagnostics (every 60s)
@@ -3753,6 +3744,7 @@ class Bot:
                 token_to_slug_outcome=token_map,
                 dscalp_positions=self._dscalp_positions,
                 mid_price_lookup=mid_prices,
+                last_fill_ts=self._last_fill_ts,
             )
             corrections = result.get("corrections", [])
             if corrections:
