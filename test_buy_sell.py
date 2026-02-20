@@ -177,7 +177,12 @@ elif status == "live":
     if fill_qty > 0:
         print(f"    FILLED: {fill_qty} shares")
     else:
-        print(f"    BUY did not fill within 5s. Status: {status}")
+        print(f"    BUY did not fill within 5s — cancelling resting order...")
+        try:
+            clob.cancel(oid)
+            print(f"    Cancelled order {oid[:16]}...")
+        except Exception as ce:
+            print(f"    Cancel failed: {ce}")
         sys.exit(1)
 else:
     print(f"    Unexpected status: {status}")
