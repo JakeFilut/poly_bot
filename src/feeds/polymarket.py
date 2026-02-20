@@ -503,17 +503,17 @@ class PolymarketClient:
                                      "order_id": oid, "status": status,
                                      "requested_qty": qty})
                 elif status == "live" and oid:
-                    fill_qty = self._poll_order_fill(oid, qty, timeout=5)
+                    # Quick check: poll briefly to see if it filled immediately
+                    fill_qty = self._poll_order_fill(oid, qty, timeout=3)
                     filled = fill_qty > 0
+                    # Do NOT auto-cancel unfilled orders here — the bot's
+                    # TruthCapture order watcher will poll and handle them.
+                    # Auto-cancelling races with fills and causes lost trades.
                     if not filled:
-                        # Order is still resting — cancel it so it doesn't fill later
-                        try:
-                            self._clob.cancel(order_id=oid)
-                            _write_jsonl({"event_type":"CANCELLED_UNFILLED_ORDER",
-                                         "order_id": oid, "side": side,
-                                         "token_id": token_id[-12:]})
-                        except Exception:
-                            pass
+                        _write_jsonl({"event_type":"ORDER_RESTING",
+                                     "order_id": oid, "side": side,
+                                     "token_id": token_id[-12:],
+                                     "note": "watcher will track"})
 
                 _write_jsonl({"event_type":"ORDER_PLACED", "order_id": oid,
                              "token_id": token_id[-12:], "side": side,
