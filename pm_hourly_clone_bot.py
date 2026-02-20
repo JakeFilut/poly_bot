@@ -5636,6 +5636,12 @@ class Bot:
         sell_qty = min(excess, wrong_pos.qty * 0.25, float(LEAN_MAX_IMBALANCE_SHARES))
         if sell_qty < MIN_QTY:
             return
+        # Enforce CLOB minimum — if we can't sell enough, bump to min or skip
+        if MODE in ("LIVE", "LIVE_SAFE") and sell_qty < CLOB_MIN_ORDER_SIZE:
+            if excess >= CLOB_MIN_ORDER_SIZE and wrong_pos.qty >= CLOB_MIN_ORDER_SIZE:
+                sell_qty = float(CLOB_MIN_ORDER_SIZE)
+            else:
+                return  # not enough to meet CLOB minimum
 
         # Only sell if we're profitable on this side (don't force a loss)
         if book.bid < wrong_pos.vwap:
