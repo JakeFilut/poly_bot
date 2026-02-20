@@ -3599,15 +3599,22 @@ class Bot:
 
     def _live_safe_cap_usd(self, order_usd: float, price: float) -> Tuple[float, float]:
         """Apply LIVE_SAFE trade-size limiter to a BUY order.
-        Returns (capped_usd, capped_qty). If qty < MIN_QTY, returns (0, 0) to skip.
-        In non-LIVE_SAFE modes, returns original values unchanged."""
+        Returns (capped_usd, capped_qty). If qty < CLOB_MIN_ORDER_SIZE, returns (0, 0) to skip.
+        In non-LIVE_SAFE modes, enforces CLOB minimum but no USD cap."""
         if MODE != "LIVE_SAFE":
-            qty = order_usd / max(1e-9, price)
-            return order_usd, qty
+            qty = max(CLOB_MIN_ORDER_SIZE, int(order_usd / max(1e-9, price)))
+            return qty * price, qty
         capped_usd = min(order_usd, LIVE_SAFE_MAX_ORDER_USD)
-        capped_qty = math.floor(capped_usd / max(1e-9, price) * 100) / 100  # floor to tick
-        if capped_qty < MIN_QTY:
-            return 0.0, 0.0
+        capped_qty = int(capped_usd / max(1e-9, price))
+        # Enforce Polymarket minimum order size
+        if capped_qty < CLOB_MIN_ORDER_SIZE:
+            # Bump to minimum if within the LIVE_SAFE cap
+            min_usd = CLOB_MIN_ORDER_SIZE * price
+            if min_usd <= LIVE_SAFE_MAX_ORDER_USD:
+                capped_qty = CLOB_MIN_ORDER_SIZE
+                capped_usd = min_usd
+            else:
+                return 0.0, 0.0  # can't meet minimum within cap
         return capped_usd, capped_qty
 
     def _record_negative_exit(self, slug: str, net_pnl: float, reason: str):

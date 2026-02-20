@@ -403,9 +403,9 @@ class PolymarketClient:
 
         from py_clob_client.clob_types import OrderArgs, OrderType
 
-        price = max(0.01, min(0.99, price))
+        price = round(max(0.01, min(0.99, price)), 3)  # round to tick (0.001)
         qty   = int(float(size))
-        if qty < 1:
+        if qty < 5:  # Polymarket CLOB minimum order size
             return {"order_id": "", "filled": False, "fill_qty": 0,
                     "fill_price": 0.0, "status": "rejected"}
 
