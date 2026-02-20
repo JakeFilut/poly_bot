@@ -5,9 +5,12 @@ Usage:  python sell_all.py
         python sell_all.py --dry-run     (show positions without selling)
 
 Reads on-chain conditional token balances for all current-hour markets,
-then sells each position at the best bid (or bid - 1c for faster fill).
+loads cost basis from state.json (VWAP), sells each position at the best
+bid (or bid - 1c for faster fill), logs every trade, and updates state.json
+with proceeds and realised P&L.
 """
-import math, os, sys, time
+import json, math, os, sys, time
+from datetime import datetime, timezone
 from pathlib import Path
 from dotenv import load_dotenv
 from web3 import Web3
@@ -23,6 +26,7 @@ for env_path in [os.path.join(_KEYS_DIR, ".env"), str(_PROJECT_DIR / ".env")]:
 os.environ["MODE"] = "LIVE"
 
 from src.feeds.polymarket import PolymarketClient
+from src.utils.logging import log_trade
 from py_clob_client.clob_types import OrderArgs, OrderType
 
 DRY_RUN = "--dry-run" in sys.argv or "-n" in sys.argv
@@ -31,6 +35,10 @@ PRIVATE_KEY = os.getenv("POLYMARKET_PRIVATE_KEY", "")
 if not PRIVATE_KEY:
     print("ERROR: POLYMARKET_PRIVATE_KEY not found")
     sys.exit(1)
+
+# ── State file path (same as main bot uses) ──
+_LOG_DIR = os.path.join(os.path.dirname(str(_PROJECT_DIR)), "logs", "poly_bot")
+STATE_FILE = os.getenv("STATE_FILE", os.path.join(_LOG_DIR, "state.json"))
 
 print("=" * 55)
 print("  SELL ALL POSITIONS" + ("  [DRY RUN]" if DRY_RUN else ""))
@@ -41,6 +49,26 @@ feed = PolymarketClient()
 clob = feed._clob
 wallet = Web3.to_checksum_address(feed._wallet_address)
 print(f"  Wallet: {wallet}")
+
+# ── Load state.json for cost basis ──
+state_data = {}
+if os.path.exists(STATE_FILE):
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            state_data = json.load(f)
+        print(f"  State loaded: {STATE_FILE}")
+    except Exception as e:
+        print(f"  WARN: Could not load state.json: {e}")
+else:
+    print(f"  WARN: No state.json found at {STATE_FILE}")
+    print(f"         P&L will not be calculated (no cost basis).")
+
+def _get_state_position(slug: str, outcome: str) -> dict:
+    """Look up position data from state.json for a given slug+outcome."""
+    ms = state_data.get("market_states", {})
+    st = ms.get(slug, {})
+    positions = st.get("positions", {})
+    return positions.get(outcome, {})
 
 # Web3 for on-chain balance checks
 w3 = Web3(Web3.HTTPProvider("https://polygon-rpc.com"))
@@ -109,7 +137,7 @@ for m in markets:
 
 # ── Check balances for each token ──
 print("\n[3] Checking on-chain balances...")
-positions = []  # (market, outcome, token_id, qty, book)
+positions = []  # (market, outcome, token_id, qty, bid, vwap, cost_usdc)
 
 for m in markets:
     for outcome, token_id in [("Up", m.outcome_up_id), ("Down", m.outcome_down_id)]:
@@ -133,18 +161,28 @@ for m in markets:
         except Exception:
             bid = 0.0
 
-        positions.append((m, outcome, token_id, qty, bid))
+        # Get cost basis from state.json
+        state_pos = _get_state_position(m.slug, outcome)
+        vwap = state_pos.get("vwap", 0.0)
+        cost_usdc = state_pos.get("cost_usdc", 0.0)
+
+        positions.append((m, outcome, token_id, qty, bid, vwap, cost_usdc))
         value = qty * bid if bid > 0 else 0
+        cost_display = f"  vwap=${vwap:.3f}" if vwap > 0 else "  vwap=N/A"
         print(f"  {m.crypto:4s} {outcome:5s}: {qty:10.2f} shares  "
-              f"bid=${bid:.3f}  value=${value:.2f}")
+              f"bid=${bid:.3f}{cost_display}  value=${value:.2f}")
 
 if not positions:
     print("\n  No positions found — wallet is flat.")
     sys.exit(0)
 
-total_value = sum(qty * bid for _, _, _, qty, bid in positions)
+total_value = sum(qty * bid for _, _, _, qty, bid, _, _ in positions)
+total_cost = sum(cost for _, _, _, _, _, _, cost in positions)
 print(f"\n  Total positions: {len(positions)}  |  "
-      f"Estimated value: ${total_value:.2f}")
+      f"Estimated value: ${total_value:.2f}  |  "
+      f"Total cost: ${total_cost:.2f}")
+if total_cost > 0:
+    print(f"  Estimated P&L: ${total_value - total_cost:.2f}")
 
 if DRY_RUN:
     print("\n  [DRY RUN] — not selling. Run without --dry-run to sell.")
@@ -159,9 +197,9 @@ if confirm != "yes":
 
 # ── Sell each position ──
 print("\n[4] Selling positions...")
-results = []
+results = []  # (crypto, outcome, sell_qty, fill_price, status, vwap, pnl)
 
-for m, outcome, token_id, qty, bid in positions:
+for m, outcome, token_id, qty, bid, vwap, cost_usdc in positions:
     sell_qty = int(qty)  # CLOB requires integer shares for sell
     if sell_qty < 1:
         print(f"  SKIP {m.crypto} {outcome}: qty={qty:.2f} < 1 share")
@@ -173,6 +211,8 @@ for m, outcome, token_id, qty, bid in positions:
     print(f"\n  SELL {m.crypto} {outcome}: {sell_qty} shares @ ${sell_price:.3f}")
 
     filled = False
+    fill_price = 0.0
+    fill_order_id = ""
     for attempt in range(3):
         try:
             price = max(0.01, round(sell_price - (attempt * 0.02), 3))
@@ -194,7 +234,8 @@ for m, outcome, token_id, qty, bid in positions:
                 if status == "matched" and tx_hashes:
                     print(f"    SOLD @ ${price:.3f} (matched)")
                     filled = True
-                    results.append((m.crypto, outcome, sell_qty, price, "FILLED"))
+                    fill_price = price
+                    fill_order_id = oid
                     break
                 elif status == "live" and oid:
                     # Poll briefly for fill
@@ -206,7 +247,8 @@ for m, outcome, token_id, qty, bid in positions:
                             if order and order.get("status", "").lower() in ("matched", "filled"):
                                 print(f"    SOLD @ ${price:.3f} (filled after polling)")
                                 filled = True
-                                results.append((m.crypto, outcome, sell_qty, price, "FILLED"))
+                                fill_price = price
+                                fill_order_id = oid
                                 break
                         except Exception:
                             pass
@@ -226,23 +268,104 @@ for m, outcome, token_id, qty, bid in positions:
             if "allowance" in err_msg.lower() or "not enough" in err_msg.lower():
                 time.sleep(3)
 
-    if not filled:
+    # Calculate P&L
+    if filled:
+        proceeds = fill_price * sell_qty
+        cost_basis = vwap * sell_qty if vwap > 0 else 0.0
+        pnl = proceeds - cost_basis if vwap > 0 else 0.0
+        results.append((m.crypto, outcome, sell_qty, fill_price, "FILLED",
+                        vwap, pnl, m.slug, token_id))
+        # Log the trade
+        log_trade(
+            action="SELL",
+            token_id=token_id,
+            side="SELL",
+            quantity=sell_qty,
+            price=fill_price,
+            order_type="GTC",
+            status="FILLED",
+            order_id=fill_order_id,
+            notes=f"sell_all {m.crypto} {outcome} pnl={pnl:.2f}",
+        )
+        print(f"    Proceeds: ${proceeds:.2f}  "
+              f"Cost basis: ${cost_basis:.2f}  "
+              f"P&L: ${pnl:+.2f}")
+    else:
         print(f"    FAILED to sell {m.crypto} {outcome}")
-        results.append((m.crypto, outcome, sell_qty, 0, "FAILED"))
+        results.append((m.crypto, outcome, sell_qty, 0, "FAILED",
+                        vwap, 0.0, m.slug, token_id))
+        log_trade(
+            action="SELL",
+            token_id=token_id,
+            side="SELL",
+            quantity=sell_qty,
+            price=sell_price,
+            order_type="GTC",
+            status="FAILED",
+            notes=f"sell_all {m.crypto} {outcome} FAILED after 3 attempts",
+        )
+
+# ── Update state.json ──
+if state_data and any(r[4] == "FILLED" for r in results):
+    print("\n[5] Updating state.json...")
+    ms = state_data.get("market_states", {})
+    now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    for crypto, outcome, sell_qty, fill_price, status, vwap, pnl, slug, token_id in results:
+        if status != "FILLED":
+            continue
+        st = ms.get(slug, {})
+        pos = st.get("positions", {}).get(outcome, {})
+        if not pos:
+            continue
+
+        proceeds = fill_price * sell_qty
+        cost_basis = vwap * sell_qty if vwap > 0 else 0.0
+
+        # Update position: subtract sold qty
+        old_qty = pos.get("qty", 0.0)
+        new_qty = max(0.0, old_qty - sell_qty)
+        pos["qty"] = 0.0 if new_qty < 0.01 else new_qty
+        pos["cost_usdc"] = max(0.0, pos.get("cost_usdc", 0.0) - cost_basis)
+        pos["last_trade_ts"] = now_iso
+
+        # Zero out dust
+        if pos["qty"] < 0.01:
+            pos["qty"] = 0.0
+            pos["cost_usdc"] = 0.0
+
+        # Update cash and realized P&L at top level
+        state_data["cash_usdc"] = state_data.get("cash_usdc", 0.0) + proceeds
+        state_data["realized_pnl_usdc"] = state_data.get("realized_pnl_usdc", 0.0) + pnl
+        state_data["hourly_pnl_usdc"] = state_data.get("hourly_pnl_usdc", 0.0) + pnl
+
+    try:
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state_data, f, separators=(",", ":"))
+        print(f"  State saved: {STATE_FILE}")
+    except Exception as e:
+        print(f"  ERROR saving state: {e}")
 
 # ── Summary ──
 print("\n" + "=" * 55)
 print("  SELL SUMMARY")
 print("=" * 55)
 total_proceeds = 0.0
-for crypto, outcome, qty, price, status in results:
+total_pnl = 0.0
+for crypto, outcome, qty, price, status, vwap, pnl, slug, token_id in results:
     proceeds = qty * price if status == "FILLED" else 0
     total_proceeds += proceeds
+    total_pnl += pnl
     marker = "OK" if status == "FILLED" else "FAILED"
+    cost_str = f"vwap=${vwap:.3f}" if vwap > 0 else "vwap=N/A"
+    pnl_str = f"pnl=${pnl:+.2f}" if status == "FILLED" and vwap > 0 else ""
     print(f"  {marker:6s}  {crypto:4s} {outcome:5s}  {qty:6d} shares @ ${price:.3f}  "
-          f"= ${proceeds:.2f}")
+          f"= ${proceeds:.2f}  {cost_str}  {pnl_str}")
 
 print(f"\n  Total proceeds: ${total_proceeds:.2f}")
+if total_pnl != 0:
+    print(f"  Total P&L:      ${total_pnl:+.2f}")
 print(f"  Positions attempted: {len(results)}")
 print(f"  Filled: {sum(1 for r in results if r[4] == 'FILLED')}")
 print(f"  Failed: {sum(1 for r in results if r[4] == 'FAILED')}")
