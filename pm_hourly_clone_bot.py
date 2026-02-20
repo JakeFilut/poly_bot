@@ -403,6 +403,9 @@ class Bot:
         self._slug_entry_paused_until: Dict[str, float] = {}
         # ── Pre-8hr safety: post-fill cooldown ──
         self._last_fill_ts: Dict[str, float] = {}             # slug -> last fill epoch ts (buy or sell)
+        # ── Sell-error cooldown: prevent spam on repeated failures ──
+        self._sell_error_until: Dict[str, float] = {}          # (slug|outcome) -> monotonic ts cooldown expires
+        self._sell_allowance_retried = False                    # True after one re-approval attempt
         # ── Pre-8hr safety: diagnostic counters (reset per DIAG cycle) ──
         self._diag_cap_blocks = 0                              # inventory cap blocks this minute
         self._diag_post_fill_cooldown_blocks = 0               # post-fill cooldown blocks this minute
@@ -6325,6 +6328,15 @@ class Bot:
         qty = max(0.0, qty)
         if qty < MIN_QTY:
             return  # don't sell dust — don't log it either
+        # Enforce CLOB minimum order size for live sells
+        if MODE in ("LIVE", "LIVE_SAFE") and qty < CLOB_MIN_ORDER_SIZE:
+            return
+        # Sell-error cooldown: skip if a recent sell on this (slug,outcome) failed
+        if MODE in ("LIVE", "LIVE_SAFE"):
+            sell_key = f"{m.slug}|{outcome}"
+            cooldown_until = self._sell_error_until.get(sell_key, 0.0)
+            if time.monotonic() < cooldown_until:
+                return  # still in cooldown after a sell error
         # Sell churn guard: sell must be monotonic risk-reducing (no shorting)
         pos = st.positions[outcome]
         if MODE in ("LIVE", "LIVE_SAFE"):
@@ -6474,6 +6486,39 @@ class Bot:
                 }, also_csv=True)
         elif fill_result.get("status") == "error":
             self._exec_safety.record_api_error()
+            sell_key = f"{m.slug}|{outcome}"
+            # If it looks like an allowance issue, try re-approving once then retry immediately
+            if not self._sell_allowance_retried and hasattr(self.client, '_ensure_allowances'):
+                write_jsonl({"event_type": "SELL_REAPPROVAL", "slug": m.slug,
+                             "outcome": outcome, "reason": "allowance_error"})
+                self._sell_allowance_retried = True
+                try:
+                    self.client._ensure_allowances()
+                except Exception:
+                    pass
+                # Quick retry after re-approval — clear cooldown so next loop picks it up
+                self._sell_error_until.pop(sell_key, None)
+                retry = self.client.place_limit_order(token_id, "SELL", price, qty, post_only=use_maker)
+                if retry.get("filled"):
+                    actual_qty = retry["fill_qty"]
+                    actual_price = retry["fill_price"]
+                    self._exec_safety.record_slug_fill(m.slug)
+                    self._record_fill_ts(m.slug)
+                    self._true_cost_fill_count += 1
+                    self._true_cost_fill_count_min += 1
+                    pnl = self._live_sell(st, outcome, actual_price, actual_qty)
+                    mt = infer_maker_taker("SELL", actual_price, ref_book) if ref_book else ""
+                    sell_notional = actual_price * actual_qty
+                    fee = compute_fee_usdc(sell_notional, mt if mt else ("maker" if use_maker else "taker"))
+                    net_pnl = pnl - fee
+                    self._record_negative_exit(m.slug, net_pnl, reason)
+                    write_jsonl({"event_type": "SELL_RETRY_OK", "slug": m.slug,
+                                 "outcome": outcome, "qty": actual_qty, "price": actual_price})
+                    return
+                # Retry also failed — fall through to cooldown
+            # Sell-error cooldown: back off 30s to prevent spam
+            self._sell_error_until[sell_key] = time.monotonic() + 30.0
+
     def _place_layered_buy(self, m: MarketRef, outcome: str, qty: float, ask: float) -> dict:
         """Place layered buy orders. Returns {total_filled, total_cost, avg_price}."""
         token_id = m.outcome_up_id if outcome == "Up" else m.outcome_down_id
