@@ -72,17 +72,35 @@ class LiveSanityReporter:
             max_usd = stats.get("live_safe_max_order_usd", 0)
             buys_str = f"buys={buys_ok}({remaining:.0f}s)  max_order=${max_usd:.2f}  "
 
+        # Win/loss stats
+        wins = stats.get('wins_last_min', 0)
+        losses = stats.get('losses_last_min', 0)
+        wr = stats.get('win_rate', 0)
+        avg_w = stats.get('avg_win_cents', 0)
+        avg_l = stats.get('avg_loss_cents', 0)
+
+        # Guard flags
+        flags = []
+        if stats.get('velocity_stale'):
+            flags.append("VEL_STALE")
+        if stats.get('recon_lag_paused'):
+            flags.append("RECON_LAG")
+        if stats.get('balance_paused'):
+            flags.append("BAL_LOW")
+        flag_str = f"  flags=[{','.join(flags)}]" if flags else ""
+
         print(
             f"  [LIVE_SANITY] "
             f"{buys_str}"
             f"open_orders={stats.get('open_orders_count', 0)}  "
+            f"fills_1m={stats.get('fills_last_min', 0)}  "
+            f"W/L={wins}/{losses}({wr:.0f}%)  "
+            f"avg_w={avg_w:.1f}c  avg_l={avg_l:.1f}c  "
             f"orphan_cx={stats.get('orphan_cancels_last_min', 0)}  "
             f"api_err={stats.get('api_errors_last_min', 0)}  "
-            f"partial={stats.get('partial_fill_count', 0)}  "
-            f"unpaired={stats.get('unpaired_events_last_min', 0)}  "
-            f"ttl_cx={stats.get('ttl_cancels', 0)}  "
-            f"cap_blk={stats.get('cap_blocks_last_min', 0)}  "
+            f"dedup={stats.get('dedup_blocks_last_min', 0)}  "
             f"drift={'YES' if stats.get('drift_detected') else 'no'}  "
             f"kill={'ON' if stats.get('kill_switch_active') else 'off'}  "
             f"exposure=${total_usd:.0f}  top=[{top_str}]"
+            f"{flag_str}"
         )

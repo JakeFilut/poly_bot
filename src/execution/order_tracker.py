@@ -79,6 +79,8 @@ class LiveOrderTracker:
         self.ttl_cancels = 0
         self.cancel_retries = 0
         self.partial_fill_count = 0
+        # Per-minute fill tracking (item 15)
+        self.fills_this_min = 0
 
     # ── Public API ──────────────────────────────────────────────────────
 
@@ -102,11 +104,13 @@ class LiveOrderTracker:
         if tracked is None:
             # Unknown order — still count the fill for accuracy
             self.confirmed_fills += 1
+            self.fills_this_min += 1
             return fill_qty
 
         delta = min(fill_qty, tracked.remaining_qty)
         tracked.filled_qty += delta
         self.confirmed_fills += 1
+        self.fills_this_min += 1
 
         if delta < tracked.requested_qty and delta > 0:
             self.partial_fill_count += 1
@@ -196,3 +200,4 @@ class LiveOrderTracker:
         """Reset per-minute counters (call from minute reset)."""
         self.ttl_cancels = 0
         self.cancel_retries = 0
+        self.fills_this_min = 0

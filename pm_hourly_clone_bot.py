@@ -407,6 +407,11 @@ class Bot:
         self._diag_time_stop_exits = 0                         # time-stop exit count this minute
         self._diag_parity_directional_suppress = 0             # parity suppressed by directional priority
         self._diag_spread_limit_blocks = 0                     # coin spread limit blocks this minute
+        # ── Per-minute win/loss tracking for sanity report (item 15) ──
+        self._wins_this_min = 0
+        self._losses_this_min = 0
+        self._win_cents_this_min: List[float] = []
+        self._loss_cents_this_min: List[float] = []
         # ── Pre-8hr safety: maker-grace TP tracking ──
         # slug -> {outcome, price, qty, placed_ts, order_id, reason}
         self._tp_maker_pending: Dict[str, dict] = {}
@@ -1064,6 +1069,26 @@ class Bot:
                     self._exec_safety.update_orphan_count(
                         self._exec_orphan.orphan_cancels_this_min)
                     self._exec_safety.tick()
+                    # Velocity stale guard (item 8)
+                    self._exec_safety.check_velocity_stale()
+                    # Reconciliation lag guard (item 9)
+                    self._exec_safety.update_loop_latency(
+                        (time.time() - loop_start) * 1000)
+                    # Balance check (item 13): periodic USDC balance refresh
+                    if self._exec_safety.needs_balance_refresh():
+                        try:
+                            balances = self.client.get_balances()
+                            usdc_bal = 0.0
+                            for b in balances:
+                                if b.get("asset_type") == "USDC" or b.get("token_id", "") == "":
+                                    usdc_bal = float(b.get("balance", 0) or 0)
+                                    break
+                            # Fallback: sum all USDC-like balances
+                            if usdc_bal <= 0:
+                                usdc_bal = self.cash_usdc  # trust internal if API unclear
+                            self._exec_safety.update_balance(usdc_bal)
+                        except Exception:
+                            pass  # non-fatal — uses cached balance
                     # State drift check (every 60s)
                     self._exec_drift.tick(
                         self._exec_tracker.get_tracked_order_ids(),
@@ -2011,7 +2036,23 @@ class Bot:
             "entry_window_remaining_sec": round(self._entry_window_remaining_sec(), 1),
             "live_safe_max_order_usd": LIVE_SAFE_MAX_ORDER_USD if MODE == "LIVE_SAFE" else None,
             "exposure_per_slug": exposure,
+            # Item 15: per-minute trade stats
+            "fills_last_min": self._exec_tracker.fills_this_min,
+            "wins_last_min": self._wins_this_min,
+            "losses_last_min": self._losses_this_min,
+            "win_rate": round(self._wins_this_min / max(1, self._wins_this_min + self._losses_this_min) * 100, 1),
+            "avg_win_cents": round(sum(self._win_cents_this_min) / max(1, len(self._win_cents_this_min)), 2) if self._win_cents_this_min else 0.0,
+            "avg_loss_cents": round(sum(self._loss_cents_this_min) / max(1, len(self._loss_cents_this_min)), 2) if self._loss_cents_this_min else 0.0,
+            "dedup_blocks_last_min": self._exec_safety.dedup_blocks_this_min,
+            "velocity_stale": self._exec_safety._velocity_stale,
+            "recon_lag_paused": self._exec_safety._recon_lag_paused,
+            "balance_paused": self._exec_safety._balance_paused,
         })
+        # Reset per-minute win/loss counters
+        self._wins_this_min = 0
+        self._losses_this_min = 0
+        self._win_cents_this_min.clear()
+        self._loss_cents_this_min.clear()
 
     def _emit_slug_pnl_report(self):
         """Emit per-slug PnL report every 60s. Shows realized PnL, negative exit counts,
@@ -2499,6 +2540,13 @@ class Bot:
         """Track PnL (in USD) by exit reason for DIAG_REPORT."""
         pnl_usd = pnl_cents / 100.0 * qty
         self._diag_pnl_by_exit_reason[reason] = self._diag_pnl_by_exit_reason.get(reason, 0.0) + pnl_usd
+        # Per-minute win/loss tracking (item 15)
+        if pnl_cents >= 0:
+            self._wins_this_min += 1
+            self._win_cents_this_min.append(pnl_cents)
+        else:
+            self._losses_this_min += 1
+            self._loss_cents_this_min.append(pnl_cents)
 
     # =================================================================
     # GLOBAL THROTTLE — target trades/min
@@ -2708,6 +2756,10 @@ class Bot:
         up_book: BookTop = ctx["up_book"]
         dn_book: BookTop = ctx["dn_book"]
         now_t = time.time()
+
+        # Velocity stale guard (item 8): feed current velocity to safety caps
+        if MODE in ("LIVE", "LIVE_SAFE"):
+            self._exec_safety.update_velocity(vel)
 
         # Cooldown (4s default = ~15 trades/min max across all slugs)
         last_entry = self._dscalp_last_entry_ts.get(m.slug, 0.0)
@@ -3828,10 +3880,21 @@ class Bot:
                 total_filled_usd += this_usd
                 burst_count += 1
             else:
+                # Duplicate order guard (item 11)
+                if self._exec_safety.check_dedup(m.slug, outcome, "BUY"):
+                    stop_reason = "dedup_block"
+                    break
                 post_only = not use_taker
                 fill = self.client.place_limit_order(token_id, "BUY", order_price,
                                                      this_qty, post_only=post_only)
                 oid = fill.get("order_id", "")
+                # LIVE_WIRING_BUG check (item 5): order submitted but no order_id
+                if not oid and not fill.get("filled"):
+                    write_jsonl({"event_type": "LIVE_WIRING_BUG", "slug": m.slug,
+                                  "outcome": outcome, "side": "BUY",
+                                  "detail": "no_order_id_on_buy",
+                                  "ts_ms": int(time.time() * 1000)})
+                    self._exec_safety.record_api_error()
                 self._exec_tracker.on_submit(oid, m.slug, outcome, "BUY", order_price, this_qty, "ENTRY_BURST")
                 self._exec_safety.record_slug_submit(m.slug)
                 if fill.get("filled"):
@@ -6236,8 +6299,48 @@ class Bot:
                     "exit_reason": reason,
                 }, also_csv=True)
             return
-        fill_result = self.client.place_limit_order(token_id, "SELL", price, qty, post_only=use_maker)
+        # Sell with retry: up to SELL_MAX_RETRIES attempts, then emergency taker
+        sell_attempts = 0
+        fill_result = None
+        while sell_attempts < SELL_MAX_RETRIES:
+            try:
+                fill_result = self.client.place_limit_order(token_id, "SELL", price, qty, post_only=use_maker)
+                break  # API call succeeded (may or may not have filled)
+            except Exception as e:
+                sell_attempts += 1
+                self._exec_safety.record_api_error()
+                write_jsonl({"event_type": "SELL_SUBMIT_RETRY", "slug": m.slug,
+                              "outcome": outcome, "attempt": sell_attempts,
+                              "err": str(e)[:120], "ts_ms": int(time.time() * 1000)})
+                if sell_attempts < SELL_MAX_RETRIES:
+                    time.sleep(SELL_RETRY_DELAY_MS / 1000.0)
+                else:
+                    # Emergency: all retries exhausted — try taker at any price
+                    write_jsonl({"event_type": "SELL_EMERGENCY_TAKER", "slug": m.slug,
+                                  "outcome": outcome, "reason": reason,
+                                  "ts_ms": int(time.time() * 1000)})
+                    try:
+                        fill_result = self.client.place_limit_order(
+                            token_id, "SELL", max(0.01, price * 0.95), qty, post_only=False)
+                    except Exception as e2:
+                        write_jsonl({"event_type": "SELL_EMERGENCY_FAILED", "slug": m.slug,
+                                      "outcome": outcome, "err": str(e2)[:120],
+                                      "ts_ms": int(time.time() * 1000)})
+                        return
+
+        if fill_result is None:
+            return
+
         oid = fill_result.get("order_id", "")
+        # LIVE_WIRING_BUG check: order submitted but no order_id returned
+        if not oid and not fill_result.get("filled"):
+            write_jsonl({"event_type": "LIVE_WIRING_BUG", "slug": m.slug,
+                          "outcome": outcome, "side": "SELL", "reason": reason,
+                          "detail": "no_order_id_on_sell",
+                          "ts_ms": int(time.time() * 1000)})
+            self._exec_safety.record_api_error()
+            print(f"  [LIVE_WIRING_BUG] SELL {m.slug}/{outcome} — no order_id returned, pausing entries")
+
         self._exec_tracker.on_submit(oid, m.slug, outcome, "SELL", price, qty, reason)
         self._exec_safety.record_slug_submit(m.slug)
         if fill_result.get("filled"):

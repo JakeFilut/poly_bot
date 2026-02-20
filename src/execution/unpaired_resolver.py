@@ -19,6 +19,7 @@ from src.config.settings import (
     HEDGE_TICK2_MS,
     HEDGE_EARLY_CROSS_MS,
     HEDGE_CROSS_MS,
+    HEDGE_MAX_DURATION_MS,
 )
 
 
@@ -130,6 +131,25 @@ class UnpairedResolver:
         actions = []
         for slug, pos in list(self._active.items()):
             age = pos.age_ms
+
+            # Hard deadline: force unwind if unpaired > HEDGE_MAX_DURATION_MS
+            if age >= HEDGE_MAX_DURATION_MS and pos.state != UnpairedPosition.UNWINDING:
+                pos.state = UnpairedPosition.UNWINDING
+                self.total_unwinds += 1
+                actions.append({
+                    "slug": slug, "action": "UNWIND",
+                    "filled_outcome": pos.filled_outcome,
+                    "filled_qty": pos.filled_qty,
+                })
+                self._write_jsonl({
+                    "event_type": "UNPAIRED_UNWIND",
+                    "slug": slug,
+                    "age_ms": round(age, 1),
+                    "reason": "HEDGE_MAX_DURATION",
+                    "ts_ms": int(time.time() * 1000),
+                })
+                self._active.pop(slug, None)
+                continue
 
             if pos.state == UnpairedPosition.STARTED and age >= HEDGE_TICK1_MS:
                 pos.state = UnpairedPosition.TICK1

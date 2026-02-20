@@ -23,6 +23,12 @@ from src.config.settings import (
     OM_MAX_PER_SLUG_USD,
     OM_NO_PROGRESS_SUBMITS,
     OM_NO_PROGRESS_PAUSE_SEC,
+    VELOCITY_STALE_SEC,
+    RECON_LAG_THRESHOLD_MS,
+    RECON_LAG_CONSECUTIVE,
+    DEDUP_WINDOW_MS,
+    BALANCE_CHECK_INTERVAL_SEC,
+    BALANCE_MIN_USDC,
 )
 
 
@@ -58,6 +64,19 @@ class SafetyCaps:
         self.total_kill_activations = 0
         self.cap_blocks_this_min = 0
         self.no_progress_pauses_total = 0
+        # Velocity stale guard (item 8)
+        self._velocity_stale = False
+        self._last_nonzero_velocity_ts = time.time()
+        # Reconciliation lag guard (item 9)
+        self._recon_lag_paused = False
+        self._recon_lag_consecutive_count = 0
+        # Duplicate order guard (item 11)
+        self._recent_submits: Dict[str, float] = {}  # "slug|outcome|side" -> ts
+        self.dedup_blocks_this_min = 0
+        # Balance check (item 13)
+        self._last_balance_check_ts = 0.0
+        self._cached_usdc_balance: float = -1.0  # -1 = not yet checked
+        self._balance_paused = False
 
     def record_api_error(self):
         """Record a CLOB API error."""
@@ -105,6 +124,93 @@ class SafetyCaps:
             return False
         return until > 0
 
+    # ── Velocity stale guard (item 8) ─────────────────────────────────
+    def update_velocity(self, vel_bps: float):
+        """Call with current velocity each tick. Tracks last nonzero timestamp."""
+        if abs(vel_bps) > 0.1:
+            self._last_nonzero_velocity_ts = time.time()
+            if self._velocity_stale:
+                self._velocity_stale = False
+                self._write_jsonl({
+                    "event_type": "VELOCITY_STALE_RESOLVED",
+                    "ts_ms": int(time.time() * 1000),
+                })
+
+    def check_velocity_stale(self):
+        """Check if velocity has been frozen for > VELOCITY_STALE_SEC."""
+        if time.time() - self._last_nonzero_velocity_ts > VELOCITY_STALE_SEC:
+            if not self._velocity_stale:
+                self._velocity_stale = True
+                self._write_jsonl({
+                    "event_type": "VELOCITY_STALE",
+                    "stale_sec": round(time.time() - self._last_nonzero_velocity_ts, 1),
+                    "ts_ms": int(time.time() * 1000),
+                })
+                print(f"  [VELOCITY_STALE] No velocity update for "
+                      f"{time.time() - self._last_nonzero_velocity_ts:.0f}s — pausing entries")
+
+    # ── Reconciliation lag guard (item 9) ──────────────────────────────
+    def update_loop_latency(self, loop_ms: float):
+        """Call with loop duration each tick. Tracks consecutive slow loops."""
+        if loop_ms > RECON_LAG_THRESHOLD_MS:
+            self._recon_lag_consecutive_count += 1
+            if (self._recon_lag_consecutive_count >= RECON_LAG_CONSECUTIVE
+                    and not self._recon_lag_paused):
+                self._recon_lag_paused = True
+                self._write_jsonl({
+                    "event_type": "RECON_LAG",
+                    "consecutive_slow_loops": self._recon_lag_consecutive_count,
+                    "last_loop_ms": round(loop_ms, 1),
+                    "ts_ms": int(time.time() * 1000),
+                })
+                print(f"  [RECON_LAG] {self._recon_lag_consecutive_count} consecutive "
+                      f"loops >{RECON_LAG_THRESHOLD_MS:.0f}ms — pausing entries")
+        else:
+            self._recon_lag_consecutive_count = 0
+            if self._recon_lag_paused:
+                self._recon_lag_paused = False
+                self._write_jsonl({
+                    "event_type": "RECON_LAG_RESOLVED",
+                    "ts_ms": int(time.time() * 1000),
+                })
+
+    # ── Duplicate order guard (item 11) ─────────────────────────────────
+    def check_dedup(self, slug: str, outcome: str, side: str) -> bool:
+        """Return True if this is a duplicate submit within DEDUP_WINDOW_MS.
+
+        Call BEFORE submitting an order. If True, block the order.
+        """
+        key = f"{slug}|{outcome}|{side}"
+        now = time.time()
+        last = self._recent_submits.get(key, 0.0)
+        if (now - last) * 1000 < DEDUP_WINDOW_MS:
+            self.dedup_blocks_this_min += 1
+            return True  # duplicate — block
+        self._recent_submits[key] = now
+        return False
+
+    # ── Balance check (item 13) ─────────────────────────────────────────
+    def update_balance(self, usdc_balance: float):
+        """Update cached USDC balance (called periodically from bot)."""
+        self._cached_usdc_balance = usdc_balance
+        self._last_balance_check_ts = time.time()
+        if usdc_balance < BALANCE_MIN_USDC:
+            if not self._balance_paused:
+                self._balance_paused = True
+                self._write_jsonl({
+                    "event_type": "BALANCE_INSUFFICIENT",
+                    "usdc_balance": round(usdc_balance, 2),
+                    "min_required": BALANCE_MIN_USDC,
+                    "ts_ms": int(time.time() * 1000),
+                })
+                print(f"  [BALANCE] Insufficient USDC: ${usdc_balance:.2f} < ${BALANCE_MIN_USDC:.2f}")
+        else:
+            self._balance_paused = False
+
+    def needs_balance_refresh(self) -> bool:
+        """True if USDC balance should be re-fetched from exchange."""
+        return time.time() - self._last_balance_check_ts > BALANCE_CHECK_INTERVAL_SEC
+
     def can_enter(self, slug: str, open_order_count: int,
                   slug_usd: float, total_usd: float) -> tuple:
         """Check if a new entry is allowed. Returns (allowed: bool, reason: str).
@@ -120,6 +226,21 @@ class SafetyCaps:
         if self._drift_paused:
             self.cap_blocks_this_min += 1
             return False, "STATE_DRIFT"
+
+        # Velocity stale blocks entries (item 8)
+        if self._velocity_stale:
+            self.cap_blocks_this_min += 1
+            return False, "VELOCITY_STALE"
+
+        # Reconciliation lag blocks entries (item 9)
+        if self._recon_lag_paused:
+            self.cap_blocks_this_min += 1
+            return False, "RECON_LAG"
+
+        # Balance insufficient blocks entries (item 13)
+        if self._balance_paused:
+            self.cap_blocks_this_min += 1
+            return False, "BALANCE_INSUFFICIENT"
 
         # Per-slug no-progress pause
         if self.is_slug_paused(slug):
@@ -196,5 +317,10 @@ class SafetyCaps:
         self.api_errors_this_min = 0
         self.orphan_cancels_this_min = 0
         self.cap_blocks_this_min = 0
+        self.dedup_blocks_this_min = 0
         self._slug_submits.clear()
         self._slug_fills.clear()
+        # Prune old dedup entries (keep only last 5s)
+        cutoff = time.time() - 5.0
+        self._recent_submits = {k: v for k, v in self._recent_submits.items()
+                                if v > cutoff}

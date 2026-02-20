@@ -288,7 +288,7 @@ ADVERSE_ACCEL_BPS_PER_MIN = 40.0        # velocity threshold to escalate degrade
 FAST_CLONE = bool(os.getenv("FAST_CLONE", "True") not in ("", "0", "False", "false"))
 
 # One-sided auto-hedge -- faster escalation than unpaired management
-HEDGE_TICK_ESCALATION_ENABLED = False   # DISABLED: no micro-neutralizing
+HEDGE_TICK_ESCALATION_ENABLED = bool(os.getenv("HEDGE_TICK_ESCALATION_ENABLED", "True") not in ("", "0", "False", "false"))  # micro-escalation for unpaired fills
 HEDGE_TICK1_MS = 200                    # +1 tick after 200ms (disabled by flag above)
 HEDGE_TICK2_MS = 350                    # +3 ticks after 350ms (disabled by flag above)
 HEDGE_EARLY_CROSS_MS = 1500            # taker cross after 1500ms (no rushing)
@@ -525,6 +525,27 @@ OM_KILL_PAUSE_SEC = float(os.getenv("OM_KILL_PAUSE_SEC", "60"))                 
 OM_MAX_OPEN_ORDERS = int(os.getenv("OM_MAX_OPEN_ORDERS", "50"))                    # hard cap on tracked open orders
 OM_MAX_TOTAL_USD = float(os.getenv("OM_MAX_TOTAL_USD", "500"))                     # max total exposure across all slugs
 OM_MAX_PER_SLUG_USD = float(os.getenv("OM_MAX_PER_SLUG_USD", "60"))                # max exposure per slug
+
+# Hedge max duration (absolute deadline for unpaired resolution)
+HEDGE_MAX_DURATION_MS = float(os.getenv("HEDGE_MAX_DURATION_MS", "4000"))              # 4s hard cap on unpaired exposure
+
+# Velocity stale guard
+VELOCITY_STALE_SEC = float(os.getenv("VELOCITY_STALE_SEC", "30"))                      # pause entries if velocity frozen > 30s
+
+# Reconciliation lag guard
+RECON_LAG_THRESHOLD_MS = float(os.getenv("RECON_LAG_THRESHOLD_MS", "500"))             # pause entries if main loop > 500ms behind
+RECON_LAG_CONSECUTIVE = int(os.getenv("RECON_LAG_CONSECUTIVE", "3"))                   # require N consecutive slow loops
+
+# Duplicate order guard
+DEDUP_WINDOW_MS = float(os.getenv("DEDUP_WINDOW_MS", "500"))                           # block same slug/outcome/side within 500ms
+
+# Balance check
+BALANCE_CHECK_INTERVAL_SEC = float(os.getenv("BALANCE_CHECK_INTERVAL_SEC", "30"))      # verify USDC balance every 30s
+BALANCE_MIN_USDC = float(os.getenv("BALANCE_MIN_USDC", "1.0"))                         # min USDC to allow entries
+
+# Sell retry
+SELL_MAX_RETRIES = int(os.getenv("SELL_MAX_RETRIES", "3"))                              # max sell retries before emergency taker
+SELL_RETRY_DELAY_MS = float(os.getenv("SELL_RETRY_DELAY_MS", "200"))                   # delay between sell retries
 
 # Sanity report
 OM_SANITY_REPORT_INTERVAL_SEC = float(os.getenv("OM_SANITY_REPORT_INTERVAL_SEC", "60"))  # report every 60s
