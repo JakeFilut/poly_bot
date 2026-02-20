@@ -2839,6 +2839,13 @@ class Bot:
         if order_qty < 1:
             return
 
+        # LIVE_SAFE: check entry window + apply size cap
+        if not self._buys_allowed():
+            return
+        step_usd, order_qty = self._live_safe_cap_usd(step_usd, buy_price)
+        if order_qty < 1:
+            return
+
         # Use existing buy infrastructure
         token_id = m.outcome_up_id if outcome == "Up" else m.outcome_down_id
         pos = st.positions[outcome]
@@ -2869,9 +2876,20 @@ class Bot:
                       "cache_age_ms": round(cache_age, 0),
                       "spread_cents": round(book.spread * 100, 2)})
 
-        # Execute buy (paper mode: instant fill)
-        self._paper_buy(st, outcome, order_qty, buy_price)
-        actual_cost = order_qty * buy_price
+        # Execute buy
+        if MODE == "LOG":
+            actual_cost = order_qty * buy_price
+            self._paper_buy(st, outcome, buy_price, order_qty, actual_cost)
+            mt = "maker"
+        else:
+            fill = self._place_layered_buy(m, outcome, order_qty, buy_price)
+            if fill["total_filled"] <= 0:
+                return  # no fill — skip position tracking
+            order_qty = fill["total_filled"]
+            buy_price = fill["avg_price"]
+            actual_cost = fill["total_cost"]
+            self._live_buy(st, outcome, buy_price, order_qty, actual_cost)
+            mt = infer_maker_taker("BUY", buy_price, book)
         self._record_fill_ts(m.slug)  # post-fill cooldown
         self._rate_limit_record(m.slug)
         self._throttle_record_trade()
@@ -2910,7 +2928,7 @@ class Bot:
             hour_start_utc=ctx["hour_start_utc"], t_min=t_min,
             outcome=outcome, side="BUY", qty=order_qty,
             fill_price=buy_price, usdc_cost=actual_cost,
-            maker_taker="maker", decision_id=decision_id,
+            maker_taker=mt, decision_id=decision_id,
             client_order_id=client_oid, position_id=pos.position_id,
             notes=f"dscalp_entry vel={vel:.1f}",
             **build_book_fields(ctx["up_book"], ctx["dn_book"],
