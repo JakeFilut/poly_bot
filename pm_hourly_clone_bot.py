@@ -75,6 +75,7 @@ from src.execution.live_sanity_report import LiveSanityReporter
 from src.execution.state_drift_checker import StateDriftChecker
 from src.execution.position_reconciler import PositionReconciler
 from src.execution.live_safety import LiveSafety
+from src.execution.fills_ledger import FillsLedger
 from src.feeds.polymarket import PolymarketClient, set_jsonl_writer
 from src.bot.app import BotApp
 
@@ -409,6 +410,18 @@ class Bot:
         self._last_reconcile_ts: float = 0.0             # position reconciliation timer
         self._reconcile_after_fill_pending: bool = False  # flag for post-fill reconciliation
         self._live_safety = LiveSafety(write_jsonl)
+        # ── Fills Ledger — append-only accounting layer ──
+        if LEDGER_ENABLED:
+            self._fills_ledger = FillsLedger(
+                ledger_path=LEDGER_PATH,
+                run_id=RUN_ID,
+                write_jsonl_fn=write_jsonl,
+            )
+            self._fills_ledger.load_from_disk()
+            self._last_ledger_reconcile_ts: float = 0.0
+        else:
+            self._fills_ledger = None
+            self._last_ledger_reconcile_ts: float = 0.0
         # ── LIVE_SAFE mode: monotonic process start for entry window ──
         self._process_start_mono = time.monotonic()
         # ── LIVE_SAFE: record starting hour so we exit when it ends ──
@@ -651,12 +664,25 @@ class Bot:
             self._shadow_trades_blocked += 1
         # Hourly stats
         self._hour_trade_count += 1
+        # Fills ledger: record BUY
+        if self._fills_ledger is not None:
+            token_id, market_id = self._token_for_slug_outcome(st.slug, outcome)
+            self._fills_ledger.record_fill(
+                slug=st.slug, crypto=st.crypto, token_id=token_id,
+                market_id=market_id, side=outcome, action="BUY",
+                fill_qty=qty, fill_price=price, source="bot",
+            )
         # Post-fill: periodic reconciliation will verify after cooldown
     def _paper_sell(self, st: MarketState, outcome: str, price: float, qty: float):
         pos = st.positions[outcome]
         qty = min(qty, pos.qty)
         if qty <= 0:
             return 0.0
+        # Ledger sell validation: log attempt, cap if needed
+        if self._fills_ledger is not None:
+            token_id, _ = self._token_for_slug_outcome(st.slug, outcome)
+            print(f"  [LEDGER] Attempting to sell {qty:.6f} {st.slug} {outcome}, "
+                  f"currently owned {pos.qty:.6f}")
         proceeds = price * qty
         cost_basis = pos.vwap * qty
         pnl = proceeds - cost_basis
@@ -681,6 +707,14 @@ class Bot:
         # Hourly stats
         self._hour_trade_count += 1
         self._hour_net_pnl += pnl
+        # Fills ledger: record SELL
+        if self._fills_ledger is not None:
+            token_id, market_id = self._token_for_slug_outcome(st.slug, outcome)
+            self._fills_ledger.record_fill(
+                slug=st.slug, crypto=st.crypto, token_id=token_id,
+                market_id=market_id, side=outcome, action="SELL",
+                fill_qty=qty, fill_price=price, source="bot",
+            )
         # Post-fill: periodic reconciliation will verify after cooldown
         return pnl
     def _live_buy(self, st: MarketState, outcome: str, price: float,
@@ -697,6 +731,14 @@ class Bot:
             pos.opened_at = pos.last_trade_ts
         self.cash_usdc -= usdc_cost
         self._hour_trade_count += 1
+        # Fills ledger: record BUY
+        if self._fills_ledger is not None:
+            token_id, market_id = self._token_for_slug_outcome(st.slug, outcome)
+            self._fills_ledger.record_fill(
+                slug=st.slug, crypto=st.crypto, token_id=token_id,
+                market_id=market_id, side=outcome, action="BUY",
+                fill_qty=qty, fill_price=price, source="bot",
+            )
         # Post-fill: periodic reconciliation will verify after cooldown
     def _live_sell(self, st: MarketState, outcome: str, price: float,
                    qty: float) -> float:
@@ -705,6 +747,10 @@ class Bot:
         qty = min(qty, pos.qty)
         if qty <= 0:
             return 0.0
+        # Ledger sell validation: log attempt
+        if self._fills_ledger is not None:
+            print(f"  [LEDGER] Attempting to sell {qty:.6f} {st.slug} {outcome}, "
+                  f"currently owned {pos.qty:.6f}")
         proceeds = price * qty
         cost_basis = pos.vwap * qty
         pnl = proceeds - cost_basis
@@ -719,6 +765,14 @@ class Bot:
         self._hour_net_pnl += pnl
         # Per-slug PnL
         self._slug_realized_pnl[st.slug] = self._slug_realized_pnl.get(st.slug, 0.0) + pnl
+        # Fills ledger: record SELL
+        if self._fills_ledger is not None:
+            token_id, market_id = self._token_for_slug_outcome(st.slug, outcome)
+            self._fills_ledger.record_fill(
+                slug=st.slug, crypto=st.crypto, token_id=token_id,
+                market_id=market_id, side=outcome, action="SELL",
+                fill_qty=qty, fill_price=price, source="bot",
+            )
         # Post-fill: periodic reconciliation will verify after cooldown
         return pnl
     @staticmethod
@@ -991,6 +1045,10 @@ class Bot:
               f"on_startup={POSITION_RECONCILE_ON_STARTUP} "
               f"after_fill={POSITION_RECONCILE_AFTER_FILL} "
               f"block_on_desync={POSITION_RECONCILE_BLOCK_ON_DESYNC}")
+        print(f"  LEDGER: enabled={LEDGER_ENABLED} "
+              f"path={LEDGER_PATH} "
+              f"reconcile_interval={RECONCILE_INTERVAL_SECONDS}s "
+              f"safe_mode_on_mismatch={SAFE_MODE_ON_MISMATCH}")
         if MODE in ("LIVE", "LIVE_SAFE"):
             print(f"  LIVE SAFETY: hedge_kill={HEDGE_KILL_TIMEOUT_SEC}s/{HEDGE_KILL_TIMEOUT_FINAL_SEC}s "
                   f"slip={HEDGE_MAX_SLIPPAGE_CENTS}c "
@@ -1037,6 +1095,12 @@ class Bot:
         # ── Position reconciliation at startup ──
         if POSITION_RECONCILE_ENABLED and POSITION_RECONCILE_ON_STARTUP:
             self._run_reconciliation("startup")
+
+        # ── Fills ledger reconciliation at startup ──
+        if LEDGER_ENABLED and self._fills_ledger is not None:
+            self._run_ledger_reconciliation()
+            self._last_ledger_reconcile_ts = time.time()
+            self._fills_ledger.print_positions()
 
         if MODE == "LIVE_SAFE":
             print(f"\n  [LIVE_SAFE] Entry window: {LIVE_SAFE_ENTRY_WINDOW_SEC:.0f}s  |  "
@@ -1200,6 +1264,12 @@ class Bot:
                     if reconcile_due:
                         self._run_reconciliation("periodic")
                         self._last_reconcile_ts = now
+
+                # 7d. Fills ledger reconciliation (every RECONCILE_INTERVAL_SECONDS)
+                if (LEDGER_ENABLED and self._fills_ledger is not None
+                        and now - self._last_ledger_reconcile_ts >= RECONCILE_INTERVAL_SECONDS):
+                    self._run_ledger_reconciliation()
+                    self._last_ledger_reconcile_ts = now
 
                 # 8. Tempo parity diagnostics (every 60s)
                 if now - self._tempo_last_report_ts >= 60.0:
@@ -3662,6 +3732,14 @@ class Bot:
                 result[m.outcome_down_id] = (m.slug, "Down")
         return result
 
+    def _token_for_slug_outcome(self, slug: str, outcome: str) -> Tuple[str, str]:
+        """Return (token_id, market_id) for a slug+outcome from cached markets."""
+        for m in self._cached_markets:
+            if m.slug == slug:
+                token_id = m.outcome_up_id if outcome == "Up" else m.outcome_down_id
+                return token_id or "", m.market_id or ""
+        return "", ""
+
     def _sync_clob_balances(self):
         """Reconcile internal position state with actual CLOB balances.
         Runs every 60s in LIVE/LIVE_SAFE. Corrects drift without trading."""
@@ -3765,14 +3843,121 @@ class Bot:
                 "ts_ms": int(time.time() * 1000),
             })
 
+    def _run_ledger_reconciliation(self) -> None:
+        """Run fills ledger reconciliation against wallet balances.
+
+        1. Update unrealized PnL from current book prices
+        2. Register any new token mappings
+        3. Reconcile ledger-derived positions vs on-chain balances
+        4. Enter SAFE MODE on critical mismatch (if configured)
+        """
+        if self._fills_ledger is None:
+            return
+        try:
+            # 1. Register token mappings for any new markets
+            for m in self._cached_markets:
+                if m.outcome_up_id:
+                    self._fills_ledger.register_token(
+                        m.outcome_up_id, m.slug, m.crypto, "Up")
+                if m.outcome_down_id:
+                    self._fills_ledger.register_token(
+                        m.outcome_down_id, m.slug, m.crypto, "Down")
+
+            # 2. Update unrealized PnL from cached book prices
+            price_lookup: Dict[Tuple[str, str], float] = {}
+            for slug, books in self.last_book.items():
+                for outcome, book in books.items():
+                    if not book or book.mid <= 0:
+                        continue
+                    # Look up token_id for this slug+outcome
+                    token_id, _ = self._token_for_slug_outcome(slug, outcome)
+                    if token_id:
+                        price_lookup[(token_id, outcome)] = book.mid
+            self._fills_ledger.update_unrealized_pnl(price_lookup)
+
+            # 3. Fetch wallet balances and reconcile (LIVE modes only)
+            if MODE in ("LIVE", "LIVE_SAFE"):
+                try:
+                    balances = self.client.get_balances()
+                    if balances:
+                        wallet_positions: Dict[Tuple[str, str], float] = {}
+                        for bal in balances:
+                            token_id = bal.get("token_id") or bal.get("asset_id", "")
+                            raw_balance = bal.get("balance", 0)
+                            if raw_balance is None:
+                                raw_balance = 0
+                            qty = float(raw_balance)
+                            if qty <= 0 or not token_id:
+                                continue
+                            # Figure out side from token mapping
+                            meta = self._fills_ledger._token_meta.get(token_id)
+                            side = meta[2] if meta else ""
+                            if not side:
+                                # Try from cached markets
+                                for m in self._cached_markets:
+                                    if m.outcome_up_id == token_id:
+                                        side = "Up"
+                                        break
+                                    if m.outcome_down_id == token_id:
+                                        side = "Down"
+                                        break
+                            if side:
+                                key = (token_id, side)
+                                wallet_positions[key] = wallet_positions.get(key, 0.0) + qty
+
+                        result = self._fills_ledger.reconcile_positions(
+                            wallet_balances=wallet_positions,
+                            tolerance=LEDGER_RECONCILE_TOLERANCE,
+                        )
+
+                        # Enter SAFE MODE on critical mismatch
+                        if result.get("critical") and SAFE_MODE_ON_MISMATCH:
+                            if not self._fills_ledger.safe_mode:
+                                self._fills_ledger.enter_safe_mode(
+                                    reason="Critical position mismatch detected",
+                                    details=result.get("mismatches", []),
+                                )
+                        elif self._fills_ledger.safe_mode and not result.get("critical"):
+                            # Mismatch resolved
+                            self._fills_ledger.exit_safe_mode()
+                except Exception as e:
+                    write_jsonl({
+                        "event_type": "LEDGER_RECONCILE_FETCH_ERROR",
+                        "err": str(e)[:200],
+                        "ts_ms": int(time.time() * 1000),
+                    })
+
+            # 4. Log ledger summary periodically
+            summary = self._fills_ledger.summary()
+            write_jsonl({
+                "event_type": "LEDGER_STATUS",
+                "total_fills": summary["total_fills"],
+                "active_positions": summary["active_positions"],
+                "total_realized_pnl": round(summary["total_realized_pnl"], 4),
+                "total_unrealized_pnl": round(summary["total_unrealized_pnl"], 4),
+                "safe_mode": summary["safe_mode"],
+                "ts_ms": int(time.time() * 1000),
+            })
+
+        except Exception as e:
+            write_jsonl({
+                "event_type": "LEDGER_RECONCILE_ERROR",
+                "err": str(e)[:200],
+                "ts_ms": int(time.time() * 1000),
+            })
+
     def _buys_allowed(self) -> bool:
         """Check if BUY orders are currently allowed.
         LOG: always True. LIVE: always True. LIVE_SAFE: only during entry window.
-        Blocked if position desync detected and POSITION_RECONCILE_BLOCK_ON_DESYNC is True."""
+        Blocked if position desync detected and POSITION_RECONCILE_BLOCK_ON_DESYNC is True.
+        Blocked if ledger SAFE MODE is active."""
         # Block new trades during critical state desync
         if (POSITION_RECONCILE_ENABLED
                 and POSITION_RECONCILE_BLOCK_ON_DESYNC
                 and self._exec_reconciler.is_desynced()):
+            return False
+        # Block new trades during ledger SAFE MODE
+        if self._fills_ledger is not None and self._fills_ledger.safe_mode:
             return False
         if MODE != "LIVE_SAFE":
             return True
@@ -6525,6 +6710,19 @@ class Bot:
         # Enforce CLOB minimum order size for live sells
         if MODE in ("LIVE", "LIVE_SAFE") and qty < CLOB_MIN_ORDER_SIZE:
             return
+        # Ledger sell validation: warn if attempting to sell more than owned
+        if self._fills_ledger is not None:
+            token_id_chk, _ = self._token_for_slug_outcome(m.slug, outcome)
+            allowed, capped_qty, val_reason = self._fills_ledger.validate_sell(
+                token_id_chk, outcome, qty, slug=m.slug)
+            if not allowed:
+                write_jsonl({"event_type": "LEDGER_SELL_BLOCKED",
+                             "slug": m.slug, "outcome": outcome,
+                             "requested_qty": qty, "reason": val_reason,
+                             "ts_ms": int(time.time() * 1000)})
+                return
+            if capped_qty < qty:
+                qty = capped_qty
         # Sell-error cooldown: skip if a recent sell on this (slug,outcome) failed
         if MODE in ("LIVE", "LIVE_SAFE"):
             sell_key = f"{m.slug}|{outcome}"

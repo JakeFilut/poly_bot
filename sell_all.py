@@ -27,6 +27,8 @@ os.environ["MODE"] = "LIVE"
 
 from src.feeds.polymarket import PolymarketClient
 from src.utils.logging import log_trade
+from src.config.settings import LEDGER_ENABLED, LEDGER_PATH
+from src.execution.fills_ledger import FillsLedger
 from py_clob_client.clob_types import OrderArgs, OrderType
 
 DRY_RUN = "--dry-run" in sys.argv or "-n" in sys.argv
@@ -49,6 +51,13 @@ feed = PolymarketClient()
 clob = feed._clob
 wallet = Web3.to_checksum_address(feed._wallet_address)
 print(f"  Wallet: {wallet}")
+
+# ── Init fills ledger ──
+_ledger = None
+if LEDGER_ENABLED:
+    _ledger = FillsLedger(ledger_path=LEDGER_PATH, run_id="sell_all")
+    _ledger.load_from_disk()
+    print(f"  Ledger loaded: {LEDGER_PATH}")
 
 # ── Load state.json for cost basis ──
 state_data = {}
@@ -200,9 +209,9 @@ print("\n[4] Selling positions...")
 results = []  # (crypto, outcome, sell_qty, fill_price, status, vwap, pnl)
 
 for m, outcome, token_id, qty, bid, vwap, cost_usdc in positions:
-    sell_qty = int(qty)  # CLOB requires integer shares for sell
-    if sell_qty < 1:
-        print(f"  SKIP {m.crypto} {outcome}: qty={qty:.2f} < 1 share")
+    sell_qty = qty  # preserve full precision — never cast to int
+    if sell_qty < 0.01:
+        print(f"  SKIP {m.crypto} {outcome}: qty={qty:.6f} < 0.01 share")
         continue
 
     # Sell at bid - 1c for faster fill (aggressive)
@@ -287,6 +296,15 @@ for m, outcome, token_id, qty, bid, vwap, cost_usdc in positions:
             order_id=fill_order_id,
             notes=f"sell_all {m.crypto} {outcome} pnl={pnl:.2f}",
         )
+        # Record in fills ledger
+        if _ledger is not None:
+            _ledger.record_fill(
+                slug=m.slug, crypto=m.crypto, token_id=token_id,
+                market_id=m.market_id, side=outcome, action="SELL",
+                fill_qty=sell_qty, fill_price=fill_price,
+                order_id=fill_order_id, source="bot",
+                extra={"reason": "sell_all"},
+            )
         print(f"    Proceeds: ${proceeds:.2f}  "
               f"Cost basis: ${cost_basis:.2f}  "
               f"P&L: ${pnl:+.2f}")
