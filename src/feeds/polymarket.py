@@ -95,6 +95,8 @@ class PolymarketClient:
         private_key = os.getenv("POLYMARKET_PRIVATE_KEY", "").strip()
         if private_key:
             self._init_clob(private_key)
+            if _settings.MODE in ("LIVE", "LIVE_SAFE"):
+                self._setup_sell_approvals(private_key)
         elif _settings.MODE == "LIVE":
             print("ERROR: POLYMARKET_PRIVATE_KEY required for LIVE mode")
             sys.exit(1)
@@ -138,6 +140,60 @@ class PolymarketClient:
                 print(f"[pm] API Key: {creds.api_key[:8]}...")
         except Exception as e:
             print(f"[pm] WARN: API credential derivation failed: {e}")
+
+    # ------------------------------------------------------------------ #
+    # ERC-1155 approvals for SELL orders
+    # ------------------------------------------------------------------ #
+    _SELL_OPERATORS = [
+        ("0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8ED0a90", "CTF Exchange (legacy)"),
+        ("0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E", "CTF Exchange (SDK)"),
+        ("0xC5d563A36AE78145C45a50134d48A1215220f80a", "Neg Risk CTF Exchange"),
+        ("0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296", "Neg Risk Adapter"),
+    ]
+    _CT_ADDR = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+
+    def _setup_sell_approvals(self, private_key: str):
+        """Ensure the wallet has approved all exchange operators on the
+        Conditional Tokens contract.  Required for SELL orders — the CLOB
+        rejects sells if the exchange can't transfer your tokens."""
+        try:
+            from web3 import Web3
+            w3 = Web3(Web3.HTTPProvider("https://polygon-rpc.com"))
+            if not w3.is_connected():
+                w3 = Web3(Web3.HTTPProvider("https://rpc-mainnet.matic.quiknode.pro"))
+            abi = [
+                {"inputs": [{"name": "operator", "type": "address"},
+                             {"name": "approved", "type": "bool"}],
+                 "name": "setApprovalForAll", "outputs": [],
+                 "stateMutability": "nonpayable", "type": "function"},
+                {"inputs": [{"name": "owner", "type": "address"},
+                             {"name": "operator", "type": "address"}],
+                 "name": "isApprovedForAll",
+                 "outputs": [{"name": "", "type": "bool"}],
+                 "stateMutability": "view", "type": "function"},
+            ]
+            ct = w3.eth.contract(
+                address=Web3.to_checksum_address(self._CT_ADDR), abi=abi)
+            wallet = Web3.to_checksum_address(self._wallet_address)
+            for addr, name in self._SELL_OPERATORS:
+                op = Web3.to_checksum_address(addr)
+                if ct.functions.isApprovedForAll(wallet, op).call():
+                    continue
+                print(f"[pm] Approving {name}...")
+                nonce = w3.eth.get_transaction_count(wallet)
+                tx = ct.functions.setApprovalForAll(op, True).build_transaction({
+                    'from': wallet, 'nonce': nonce, 'gas': 100000,
+                    'gasPrice': w3.eth.gas_price, 'chainId': 137,
+                })
+                signed = w3.eth.account.sign_transaction(tx, private_key)
+                tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+                receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+                if receipt['status'] != 1:
+                    print(f"[pm] WARN: {name} approval tx failed")
+                else:
+                    print(f"[pm] {name} approved")
+        except Exception as e:
+            print(f"[pm] WARN: sell approval setup error: {e}")
 
     # ================================================================== #
     #  1.  MARKET DISCOVERY
