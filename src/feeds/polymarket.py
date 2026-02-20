@@ -21,7 +21,8 @@ from typing import Dict, List, Optional, Tuple
 
 import requests
 
-from src.config.settings import MODE, CRYPTOS, _KEYS_DIR
+import src.config.settings as _settings
+from src.config.settings import CRYPTOS, _KEYS_DIR
 from src.util.time import utc_now
 from src.bot.context import MarketRef, BookTop
 
@@ -94,7 +95,7 @@ class PolymarketClient:
         private_key = os.getenv("POLYMARKET_PRIVATE_KEY", "").strip()
         if private_key:
             self._init_clob(private_key)
-        elif MODE == "LIVE":
+        elif _settings.MODE == "LIVE":
             print("ERROR: POLYMARKET_PRIVATE_KEY required for LIVE mode")
             sys.exit(1)
 
@@ -392,7 +393,7 @@ class PolymarketClient:
         Returns dict with fill info: {order_id, filled, fill_qty, fill_price, status}.
         In LOG mode returns a paper result.
         """
-        if MODE == "LOG":
+        if _settings.MODE == "LOG":
             pid = f"paper_{int(time.time()*1000)}_{random.randint(100,999)}"
             return {"order_id": pid, "filled": True, "fill_qty": int(float(size)),
                     "fill_price": price, "status": "matched"}
@@ -471,7 +472,7 @@ class PolymarketClient:
 
     def cancel_order(self, order_id: str) -> None:
         """Cancel a single order by id."""
-        if MODE == "LOG":
+        if _settings.MODE == "LOG":
             return
         if not self._clob:
             return
