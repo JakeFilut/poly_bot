@@ -535,6 +535,34 @@ LEDGER_RECONCILE_TOLERANCE = float(os.getenv("LEDGER_RECONCILE_TOLERANCE", "0.01
 # ---------------------------------------------------------------------------
 ACTIVE_WINDOW_ONLY = bool(os.getenv("ACTIVE_WINDOW_ONLY", "True") not in ("", "0", "False", "false"))
 STRICT_WINDOW_MODE = bool(os.getenv("STRICT_WINDOW_MODE", "True") not in ("", "0", "False", "false"))
+POST_WINDOW_UNWIND = bool(os.getenv("POST_WINDOW_UNWIND", "True") not in ("", "0", "False", "false"))  # allow reduce-only sells after window
+
+# ---------------------------------------------------------------------------
+# PER-HOUR LEDGER ROTATION — isolate each 1-hour window
+# ---------------------------------------------------------------------------
+HOURLY_LEDGER_ROTATION = bool(os.getenv("HOURLY_LEDGER_ROTATION", "True") not in ("", "0", "False", "false"))
+REQUIRE_CONSISTENT_STATE_ON_RESTART = bool(os.getenv("REQUIRE_CONSISTENT_STATE_ON_RESTART", "True") not in ("", "0", "False", "false"))
+
+# ---------------------------------------------------------------------------
+# ORDER TRACKING + OPEN ORDER HYGIENE
+# ---------------------------------------------------------------------------
+ORDER_TTL_SECONDS = float(os.getenv("ORDER_TTL_SECONDS", "20"))
+CANCEL_ON_STALE = bool(os.getenv("CANCEL_ON_STALE", "True") not in ("", "0", "False", "false"))
+REPRICE_ON_STALE = bool(os.getenv("REPRICE_ON_STALE", "False") not in ("", "0", "False", "false"))
+
+# ---------------------------------------------------------------------------
+# RECONCILIATION — wallet vs ledger comparison
+# ---------------------------------------------------------------------------
+RECONCILE_EVERY_SECONDS = float(os.getenv("RECONCILE_EVERY_SECONDS", "120"))
+RECONCILE_DELTA_THRESHOLD = float(os.getenv("RECONCILE_DELTA_THRESHOLD", "0.5"))
+SAFETY_PAUSE_ON_RECONCILE_FAIL = bool(os.getenv("SAFETY_PAUSE_ON_RECONCILE_FAIL", "True") not in ("", "0", "False", "false"))
+
+# ---------------------------------------------------------------------------
+# HEDGE MISMATCH POLICY — one-side-fill safety
+# ---------------------------------------------------------------------------
+HEDGE_MISMATCH_POLICY = os.getenv("HEDGE_MISMATCH_POLICY", "IMMEDIATE_FLATTEN").upper()  # IMMEDIATE_FLATTEN | HOLD_AND_HEDGE | PAUSE
+MAX_NET_EXPOSURE_SHARES = float(os.getenv("MAX_NET_EXPOSURE_SHARES", "50"))
+MAX_UNHEDGED_SECONDS = float(os.getenv("MAX_UNHEDGED_SECONDS", "10"))
 
 # No-progress pause (per-slug)
 OM_NO_PROGRESS_SUBMITS = int(os.getenv("OM_NO_PROGRESS_SUBMITS", "40"))             # submits in 60s with 0 fills -> pause

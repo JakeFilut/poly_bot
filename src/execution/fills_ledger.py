@@ -20,7 +20,7 @@ import os
 import time
 import threading
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
@@ -132,17 +132,29 @@ class FillsLedger:
         self._write_jsonl = write_jsonl_fn or (lambda d: None)
         self._lock = threading.Lock()
 
-        # All fills in memory (loaded from disk + new)
+        # ── Hour window tracking ──
+        now = datetime.now(timezone.utc)
+        self._hour_start = now.replace(minute=0, second=0, microsecond=0)
+        self._hour_end = self._hour_start + timedelta(hours=1)
+        self._hour_suffix = self._hour_start.strftime("%Y%m%d_%H")
+        self._base_dir = os.path.dirname(os.path.abspath(ledger_path))
+        self._base_name = os.path.splitext(os.path.basename(ledger_path))[0]
+
+        # All fills in memory (CURRENT HOUR ONLY after rotation)
         self._fills: List[FillRecord] = []
 
         # Dedup set: dedup_key -> True
         self._seen_ids: Set[str] = set()
+        self.fills_dedup_skipped: int = 0
 
         # Derived positions: (token_id, side) -> PositionInfo
         self._positions: Dict[Tuple[str, str], PositionInfo] = {}
 
         # Slug/token mapping: token_id -> (slug, crypto, side)
         self._token_meta: Dict[str, Tuple[str, str, str]] = {}
+
+        # Active hour slugs
+        self._active_hour_slugs: Set[str] = set()
 
         # SAFE MODE: no new buys when True (sells that reduce exposure still ok)
         self._safe_mode: bool = False
@@ -167,13 +179,35 @@ class FillsLedger:
     # ══════════════════════════════════════════════════════════════════
 
     def load_from_disk(self) -> int:
-        """Load existing CONFIRMED fills from the JSONL ledger file.
-        Returns number of fills loaded."""
-        if not os.path.exists(self._path):
-            return 0
+        """Load fills for the CURRENT HOUR.
 
-        loaded = 0
+        Tries per-hour file first, falls back to global ledger filtered
+        by timestamp.  Returns count loaded.
+        """
+        hour_path = self._current_hour_path()
+
         with self._lock:
+            # 1. Try per-hour file first
+            if os.path.exists(hour_path):
+                loaded = self._load_hour_file()
+                print(f"  [LEDGER] Loaded {loaded} fills (hour={self._hour_suffix}) "
+                      f"-> {len(self._positions)} positions")
+                self._write_jsonl({
+                    "event_type": "LEDGER_LOADED",
+                    "fills_count": loaded,
+                    "positions_count": len(self._positions),
+                    "hour": self._hour_suffix,
+                    "source": "hour_file",
+                    "ts_ms": int(time.time() * 1000),
+                })
+                return loaded
+
+            # 2. Fallback: load from global ledger, filter by hour
+            if not os.path.exists(self._path):
+                print(f"  [LEDGER] No ledger files found, starting fresh "
+                      f"for hour {self._hour_suffix}")
+                return 0
+            loaded = 0
             with open(self._path, "r", encoding="utf-8") as f:
                 for line_num, line in enumerate(f, 1):
                     line = line.strip()
@@ -184,6 +218,9 @@ class FillsLedger:
                         fill = self._parse_fill(raw)
                         if fill is None:
                             continue
+                        # TIME FILTER: only current hour fills
+                        if not self._is_current_hour_fill(fill):
+                            continue
                         dedup_key = self._dedup_key(fill)
                         if dedup_key in self._seen_ids:
                             continue
@@ -192,22 +229,31 @@ class FillsLedger:
                         self._update_token_meta(fill)
                         loaded += 1
                     except (json.JSONDecodeError, KeyError, ValueError) as e:
-                        print(f"  [LEDGER] WARN: skipping malformed line {line_num}: {e}")
+                        print(f"  [LEDGER] WARN: skip line {line_num}: {e}")
             self._recompute_all()
 
         self._write_jsonl({
             "event_type": "LEDGER_LOADED",
             "fills_count": loaded,
             "positions_count": len(self._positions),
-            "path": self._path,
+            "hour": self._hour_suffix,
+            "source": "global_ledger_filtered",
             "ts_ms": int(time.time() * 1000),
         })
-        print(f"  [LEDGER] Loaded {loaded} fills from {self._path}, "
-              f"{len(self._positions)} positions derived")
+        print(f"  [LEDGER] Loaded {loaded} fills (filtered to hour "
+              f"{self._hour_suffix}) -> {len(self._positions)} positions")
         return loaded
 
+    def _parse_raw_fill(self, raw: dict) -> Optional[FillRecord]:
+        """Alias for _parse_fill (used by _load_hour_file)."""
+        return self._parse_fill(raw)
+
+    def _update_meta_from_fill(self, fill: FillRecord) -> None:
+        """Alias for _update_token_meta (used by _load_hour_file)."""
+        self._update_token_meta(fill)
+
     def _append_to_disk(self, fill: FillRecord) -> None:
-        """Append a single fill record to the JSONL file (string-serialized Decimals)."""
+        """Append a fill to BOTH per-hour file AND global ledger."""
         row = {
             "timestamp": fill.timestamp,
             "slug": fill.slug,
@@ -226,11 +272,14 @@ class FillsLedger:
         }
         if fill.extra:
             row["extra"] = fill.extra
-        try:
-            with open(self._path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(row, separators=(",", ":")) + "\n")
-        except Exception as e:
-            print(f"  [LEDGER] ERROR writing to disk: {e}")
+        line = json.dumps(row, separators=(",", ":")) + "\n"
+        # Write to both per-hour and global ledger (append-only)
+        for path in [self._current_hour_path(), self._path]:
+            try:
+                with open(path, "a", encoding="utf-8") as f:
+                    f.write(line)
+            except Exception as e:
+                print(f"  [LEDGER] ERROR writing to {path}: {e}")
 
     def _parse_fill(self, raw: dict) -> Optional[FillRecord]:
         """Parse a raw dict from JSONL into a FillRecord."""
@@ -282,6 +331,8 @@ class FillsLedger:
         """Register a token_id mapping (called during market discovery)."""
         with self._lock:
             self._token_meta[token_id] = (slug, crypto, side)
+            if slug:
+                self._active_hour_slugs.add(slug)
 
     # ══════════════════════════════════════════════════════════════════
     #  ACTIVE WINDOW FILTER
@@ -319,6 +370,97 @@ class FillsLedger:
                 return {}
             return {k: v for k, v in self._positions.items()
                     if v.net_qty > _ZERO and k[0] not in self._active_window_tokens}
+
+    # ══════════════════════════════════════════════════════════════════
+    #  PER-HOUR ROTATION
+    # ══════════════════════════════════════════════════════════════════
+
+    def _current_hour_path(self) -> str:
+        return os.path.join(
+            self._base_dir,
+            f"{self._base_name}_{self._hour_suffix}.jsonl")
+
+    def _is_current_hour_fill(self, fill: FillRecord) -> bool:
+        """Return True if fill timestamp is within current hour window."""
+        if not fill.timestamp:
+            return False
+        try:
+            fill_dt = datetime.fromisoformat(
+                fill.timestamp.replace("Z", "+00:00"))
+            return self._hour_start <= fill_dt < self._hour_end
+        except (ValueError, TypeError):
+            return False
+
+    def rotate_hour(self, new_hour_start: Optional[datetime] = None) -> None:
+        """Rotate to a new hour window. Clears in-memory state."""
+        with self._lock:
+            old_suffix = self._hour_suffix
+            old_fills = len(self._fills)
+
+            # Compute new hour
+            if new_hour_start is None:
+                new_hour_start = datetime.now(timezone.utc).replace(
+                    minute=0, second=0, microsecond=0)
+            self._hour_start = new_hour_start
+            self._hour_end = new_hour_start + timedelta(hours=1)
+            self._hour_suffix = new_hour_start.strftime("%Y%m%d_%H")
+
+            # Reset in-memory state
+            self._fills.clear()
+            self._seen_ids.clear()
+            self._positions.clear()
+            self._active_hour_slugs.clear()
+            self.fills_dedup_skipped = 0
+
+            # Reset SAFE MODE
+            self._safe_mode = False
+            self._safe_mode_reason = ""
+            self._safe_mode_details.clear()
+
+            # Load per-hour file if it exists (restart mid-hour)
+            loaded = self._load_hour_file()
+
+        print(f"  [LEDGER] HOUR ROTATION: {old_suffix} -> {self._hour_suffix}  "
+              f"cleared={old_fills} fills  loaded={loaded}")
+        self._write_jsonl({
+            "event_type": "LEDGER_HOUR_ROTATION",
+            "old_hour": old_suffix,
+            "new_hour": self._hour_suffix,
+            "cleared_fills": old_fills,
+            "loaded_fills": loaded,
+            "ts_ms": int(time.time() * 1000),
+        })
+
+    def _load_hour_file(self) -> int:
+        """Load fills from current hour's file. Must hold self._lock."""
+        path = self._current_hour_path()
+        if not os.path.exists(path):
+            return 0
+        loaded = 0
+        with open(path, "r", encoding="utf-8") as f:
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    raw = json.loads(line)
+                    fill = self._parse_raw_fill(raw)
+                    if fill is None:
+                        continue
+                    if not self._is_current_hour_fill(fill):
+                        continue
+                    dk = self._dedup_key(fill)
+                    if dk in self._seen_ids:
+                        continue
+                    self._seen_ids.add(dk)
+                    self._fills.append(fill)
+                    self._update_meta_from_fill(fill)
+                    loaded += 1
+                except Exception:
+                    pass
+        if loaded > 0:
+            self._recompute_all()
+        return loaded
 
     # ══════════════════════════════════════════════════════════════════
     #  ORDER INTENT (submit-time, NOT a fill)

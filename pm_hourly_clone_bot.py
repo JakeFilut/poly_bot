@@ -76,7 +76,7 @@ from src.execution.state_drift_checker import StateDriftChecker
 from src.execution.position_reconciler import PositionReconciler
 from src.execution.live_safety import LiveSafety
 from src.execution.fills_ledger import FillsLedger
-from src.positions.truth_capture import TruthCapture
+from src.positions.truth_capture import TruthCapture, WindowState
 from src.feeds.polymarket import PolymarketClient, set_jsonl_writer
 from src.bot.app import BotApp
 
@@ -678,6 +678,13 @@ class Bot:
             self._shadow_positions = {}
             self._shadow_equity_at_trigger = 0.0
             self._shadow_trades_blocked = 0
+            # ── Per-hour ledger rotation ──
+            if HOURLY_LEDGER_ROTATION:
+                self._truth.rotate_hour(current_hour)
+                if self._fills_ledger is not None:
+                    self._fills_ledger.rotate_hour(current_hour)
+                print(f"  [HOUR] Ledger rotation complete for "
+                      f"{current_hour.strftime('%Y-%m-%dT%H:00Z')}")
     # -----------------------------
     # Position helpers (paper-mode)
     # -----------------------------
@@ -1210,6 +1217,9 @@ class Bot:
                             _truth_active_tids,
                             active_only=ACTIVE_WINDOW_ONLY,
                             strict=STRICT_WINDOW_MODE)
+
+                    # Hedge mismatch detection (one-side-fill safety)
+                    self._check_hedge_mismatch()
 
                     # Rule 9: Cancel all open orders 30s before resolution
                     for m_r9 in markets:
@@ -2533,6 +2543,9 @@ class Bot:
         if t_min >= TRADE_HARD_STOP_MIN:
             self.last_book[m.slug]["Up"] = up_book
             self.last_book[m.slug]["Down"] = dn_book
+            # Transition to SETTLEMENT state if still ACTIVE
+            if self._truth.window_state == WindowState.ACTIVE:
+                self._truth.enter_settlement()
             self._cleanup_market(m, st, t_min)
             return
         if hour_open <= 0 or spot <= 0:
@@ -4429,6 +4442,71 @@ class Bot:
             return True
         return False
 
+    def _check_hedge_mismatch(self) -> None:
+        """Detect hedge mismatches: net exposure on one side beyond threshold.
+
+        Policy: HEDGE_MISMATCH_POLICY (IMMEDIATE_FLATTEN / HOLD_AND_HEDGE / PAUSE).
+        """
+        if not hasattr(self, '_hedge_mismatch_last_ts'):
+            self._hedge_mismatch_last_ts = 0.0
+            self._hedge_mismatch_detected: Dict[str, float] = {}  # slug -> first_detected_ts
+        now = time.time()
+        if now - self._hedge_mismatch_last_ts < 5.0:
+            return  # only check every 5s
+        self._hedge_mismatch_last_ts = now
+
+        for slug, st in self.market_states.items():
+            up_qty = st.positions["Up"].qty if st.positions["Up"].qty >= MIN_QTY else 0.0
+            dn_qty = st.positions["Down"].qty if st.positions["Down"].qty >= MIN_QTY else 0.0
+            net_exposure = abs(up_qty - dn_qty)
+            if net_exposure <= MAX_NET_EXPOSURE_SHARES:
+                self._hedge_mismatch_detected.pop(slug, None)
+                continue
+            # Net exposure exceeds threshold
+            first_ts = self._hedge_mismatch_detected.get(slug)
+            if first_ts is None:
+                self._hedge_mismatch_detected[slug] = now
+                first_ts = now
+            unhedged_sec = now - first_ts
+            if unhedged_sec < MAX_UNHEDGED_SECONDS:
+                continue
+            # Mismatch exceeded time limit
+            bigger_side = "Up" if up_qty > dn_qty else "Down"
+            excess = net_exposure
+            write_jsonl({
+                "event_type": "HEDGE_MISMATCH",
+                "slug": slug, "up_qty": round(up_qty, 2),
+                "dn_qty": round(dn_qty, 2),
+                "net_exposure": round(net_exposure, 2),
+                "unhedged_sec": round(unhedged_sec, 1),
+                "policy": HEDGE_MISMATCH_POLICY,
+                "ts_ms": int(now * 1000),
+            })
+            print(f"  [HEDGE] MISMATCH: {slug} {bigger_side} "
+                  f"net={net_exposure:.1f} unhedged={unhedged_sec:.0f}s "
+                  f"policy={HEDGE_MISMATCH_POLICY}")
+
+            if HEDGE_MISMATCH_POLICY == "IMMEDIATE_FLATTEN":
+                # Flatten excess by selling the bigger side
+                m = None
+                for mkt in self._cached_markets:
+                    if mkt.slug == slug:
+                        m = mkt
+                        break
+                if m is not None:
+                    book = self.last_book.get(slug, {}).get(bigger_side)
+                    if book and book.bid > 0:
+                        flatten_qty = min(excess, st.positions[bigger_side].qty)
+                        if flatten_qty >= MIN_QTY:
+                            self._do_sell(m, st, bigger_side, flatten_qty,
+                                          book.bid, reason="HEDGE_MISMATCH_FLATTEN",
+                                          leg="HEDGE_FLATTEN")
+                self._hedge_mismatch_detected.pop(slug, None)
+            elif HEDGE_MISMATCH_POLICY == "PAUSE":
+                # Enter safe mode to stop all new entries
+                self._truth.enter_safe_mode(
+                    f"HEDGE_MISMATCH: {slug} net_exposure={net_exposure:.1f}")
+
     def _exec_safety_can_enter(self, slug: str) -> bool:
         """Execution safety gate. Returns True if entry is allowed."""
         # Active window filter: block buys on non-current-hour tokens
@@ -4441,6 +4519,9 @@ class Bot:
                 print(f"  [TRUTH] WARN: Attempt to trade non-active window token: "
                       f"{slug} BUY")
                 return False
+        # State machine: only ACTIVE state can place new buys
+        if self._truth.window_state != WindowState.ACTIVE:
+            return False
         # Truth Capture SAFE MODE: block all new buys on desync
         if self._truth.safe_mode:
             return False
@@ -7065,6 +7146,12 @@ class Bot:
         qty = max(0.0, qty)
         if qty < MIN_QTY:
             return  # don't sell dust — don't log it either
+        # State machine: block sells in CLOSED state; in SETTLEMENT allow only if POST_WINDOW_UNWIND
+        ws = self._truth.window_state
+        if ws == WindowState.CLOSED:
+            return
+        if ws == WindowState.SETTLEMENT and not POST_WINDOW_UNWIND:
+            return
         # Active window filter: block sells on non-current-hour tokens
         if ACTIVE_WINDOW_ONLY and STRICT_WINDOW_MODE:
             token_id_chk = m.outcome_up_id if outcome == "Up" else m.outcome_down_id
