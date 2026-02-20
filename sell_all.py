@@ -117,13 +117,8 @@ for m in markets:
             continue
         try:
             raw = ct.functions.balanceOf(wallet, int(token_id)).call()
-            qty = float(raw) / 1e6 if raw > 1e12 else float(raw)
-            # Polymarket CT tokens have no decimals (ERC-1155 raw count)
-            # But some setups return in micro-units. Use raw if reasonable.
-            if raw > 0 and raw < 1e12:
-                qty = float(raw)
-            elif raw >= 1e12:
-                qty = float(raw) / 1e6
+            # Polymarket CT tokens (ERC-1155) use 6 decimals, same as USDC
+            qty = float(raw) / 1e6
         except Exception as e:
             print(f"  ERROR reading {m.crypto} {outcome}: {e}")
             continue
@@ -167,7 +162,7 @@ print("\n[4] Selling positions...")
 results = []
 
 for m, outcome, token_id, qty, bid in positions:
-    sell_qty = int(qty)  # CLOB requires integer shares for sell
+    sell_qty = math.floor(qty * 100) / 100  # Round down to 2 decimals
     if sell_qty < 1:
         print(f"  SKIP {m.crypto} {outcome}: qty={qty:.2f} < 1 share")
         continue
@@ -175,7 +170,7 @@ for m, outcome, token_id, qty, bid in positions:
     # Sell at bid - 1c for faster fill (aggressive)
     sell_price = max(0.01, round(bid - 0.01, 3)) if bid > 0.02 else 0.01
 
-    print(f"\n  SELL {m.crypto} {outcome}: {sell_qty} shares @ ${sell_price:.3f}")
+    print(f"\n  SELL {m.crypto} {outcome}: {sell_qty:.2f} shares @ ${sell_price:.3f}")
 
     filled = False
     for attempt in range(3):
@@ -244,7 +239,7 @@ for crypto, outcome, qty, price, status in results:
     proceeds = qty * price if status == "FILLED" else 0
     total_proceeds += proceeds
     marker = "OK" if status == "FILLED" else "FAILED"
-    print(f"  {marker:6s}  {crypto:4s} {outcome:5s}  {qty:6d} shares @ ${price:.3f}  "
+    print(f"  {marker:6s}  {crypto:4s} {outcome:5s}  {qty:9.2f} shares @ ${price:.3f}  "
           f"= ${proceeds:.2f}")
 
 print(f"\n  Total proceeds: ${total_proceeds:.2f}")
