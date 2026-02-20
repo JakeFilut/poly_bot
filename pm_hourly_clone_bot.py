@@ -59,7 +59,7 @@ from src.strategy.f247_like import (
     taker_gate_allows, whipsaw_ok, persistence_ok,
     parity_net_edge_cents, parity_liquidity_ok, compute_fee_usdc,
 )
-from src.strategy.sizing import sizing_mult, zscore, delta_velocity_bps_per_min
+from src.strategy.sizing import sizing_mult, zscore, delta_velocity_bps_per_min, delta_velocity_debug
 from src.gating.gates import GateEvaluator, GateResult
 from src.gating.velocity import VelocityEstimator
 from src.gating.low_vol import LowVolDetector, LowVolThrottler, LowVolResult
@@ -195,6 +195,8 @@ class Bot:
         self.recent_extreme_price: Dict[str, Dict[str, float]] = {} # slug->outcome->extreme
         # Whipsaw filter: slug -> (current_sign, since_ts)
         self._edge_sign_state: Dict[str, Tuple[int, float]] = {}
+        # Velocity debug: slug -> last debug-print epoch
+        self._vel_debug_last_ts: Dict[str, float] = {}
         # No-flip rule: slug -> (last_outcome, last_ts)
         self._last_trade_direction: Dict[str, Tuple[str, float]] = {}
         # Derisk edge worsening tracker: (slug, outcome) -> first_worsen_ts
@@ -2118,7 +2120,7 @@ class Bot:
             "t_min": round(ctx.get("t_min", 0), 1),
             "spot": round(ctx.get("spot", 0), 2),
             "hour_open": round(ctx.get("hour_open", 0), 2),
-            "vel_bps_min": round(ctx.get("vel", 0), 2),
+            "vel_bps_min": round(ctx.get("vel", 0), 4),
             "delta_bps": round(ctx.get("delta_bps", 0), 1),
             "spread_c": round(book.spread * 100, 1) if book else 0,
             "best_bid": round(book.bid, 3) if book else 0,
@@ -2462,10 +2464,13 @@ class Bot:
         prev = self._edge_sign_state.get(m.slug)
         if prev is None or prev[0] != cur_sign:
             self._edge_sign_state[m.slug] = (cur_sign, time.time())
-        st.delta_hist.append((iso_z(now), delta_bps))
-        st.delta_hist = st.delta_hist[-STATE_HIST_MAX:]
-        st.price_hist.append((iso_z(now), spot))
-        st.price_hist = st.price_hist[-STATE_HIST_MAX:]
+        # Only update delta/price history on valid book snapshots
+        _quotes_valid = (up_book.ask > 0 and dn_book.ask > 0)
+        if _quotes_valid:
+            st.delta_hist.append((iso_z(now), delta_bps))
+            st.delta_hist = st.delta_hist[-STATE_HIST_MAX:]
+            st.price_hist.append((iso_z(now), spot))
+            st.price_hist = st.price_hist[-STATE_HIST_MAX:]
         # Lightweight spot history for adverse selection (epoch-based, cheap to query)
         spot_ts = time.time()
         slug_spot_hist = self._spot_history.setdefault(m.slug, [])
@@ -2483,6 +2488,15 @@ class Bot:
         else:
             self._clone_last_spot_move[m.slug] = (spot_ts, spot)
         vel = delta_velocity_bps_per_min(st.delta_hist, lookback_sec=30.0)
+        # Per-minute velocity debug (once per 60 s per slug)
+        _vel_dbg_last = self._vel_debug_last_ts.get(m.slug, 0.0)
+        if spot_ts - _vel_dbg_last >= 60.0:
+            self._vel_debug_last_ts[m.slug] = spot_ts
+            vd = delta_velocity_debug(st.delta_hist, lookback_sec=30.0)
+            print(f"  [VEL_DEBUG] {m.slug} vel={vd['vel']:+.4f} bps/min  "
+                  f"delta_now={vd['delta_now']:+.2f} delta_prev={vd['delta_prev']:+.2f}  "
+                  f"dt={vd['dt_sec']:.1f}s  n={vd['n_points']}  "
+                  f"status={vd['status']}  quotes_valid={_quotes_valid}")
         z = zscore(st.delta_hist) if Z_ENTRY_ENABLED else 0.0
         self.last_book[m.slug]["Up"] = up_book
         self.last_book[m.slug]["Down"] = dn_book
@@ -3021,11 +3035,20 @@ class Bot:
             return
 
         # Velocity must be supportive (per-coin: BTC/ETH 2.5, SOL/XRP 3.5 bps/min)
-        if outcome == "Up" and vel < _coin_vel_min:
+        _vel_blocked = ((outcome == "Up" and vel < _coin_vel_min)
+                        or (outcome == "Down" and vel > -_coin_vel_min))
+        if _vel_blocked:
             self._diag_entry_reject_by_gate["velocity"] = self._diag_entry_reject_by_gate.get("velocity", 0) + 1
-            return
-        if outcome == "Down" and vel > -_coin_vel_min:
-            self._diag_entry_reject_by_gate["velocity"] = self._diag_entry_reject_by_gate.get("velocity", 0) + 1
+            vd = delta_velocity_debug(st.delta_hist, lookback_sec=30.0)
+            write_jsonl({"event_type": "GATE_VELOCITY_BLOCK",
+                         "slug": m.slug, "outcome": outcome,
+                         "vel_used": round(vel, 6),
+                         "vel_threshold": _coin_vel_min,
+                         "delta_now": round(vd["delta_now"], 4),
+                         "delta_prev": round(vd["delta_prev"], 4),
+                         "dt_sec": round(vd["dt_sec"], 1),
+                         "n_hist": vd["n_points"],
+                         "vel_status": vd["status"]})
             return
 
         # Late-move filter (SOL/XRP only): block if spot moved too fast on stale data
@@ -3084,7 +3107,7 @@ class Bot:
                       "qty": round(order_qty, 1),
                       "step_usd": round(step_usd, 2),
                       "delta_bps": round(delta_bps, 1),
-                      "vel": round(vel, 2),
+                      "vel": round(vel, 4),
                       "cache_age_ms": round(cache_age, 0),
                       "spread_cents": round(book.spread * 100, 2)})
 
