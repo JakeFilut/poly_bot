@@ -2839,9 +2839,10 @@ class Bot:
         if order_qty < 1:
             return
 
-        # LIVE_SAFE: check entry window + apply size cap
-        if not self._buys_allowed():
+        # Execution safety gate (kill-switch, drift, loss-tail, LIVE_SAFE entry window)
+        if not self._exec_safety_can_enter(m.slug):
             return
+        # LIVE_SAFE trade-size limiter
         step_usd, order_qty = self._live_safe_cap_usd(step_usd, buy_price)
         if order_qty < 1:
             return
