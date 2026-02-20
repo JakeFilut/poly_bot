@@ -6486,18 +6486,38 @@ class Bot:
                 }, also_csv=True)
         elif fill_result.get("status") == "error":
             self._exec_safety.record_api_error()
-            # Sell-error cooldown: back off 30s on this (slug, outcome) to prevent spam
             sell_key = f"{m.slug}|{outcome}"
-            self._sell_error_until[sell_key] = time.monotonic() + 30.0
-            # If it looks like an allowance issue, try re-approving once
+            # If it looks like an allowance issue, try re-approving once then retry immediately
             if not self._sell_allowance_retried and hasattr(self.client, '_ensure_allowances'):
                 write_jsonl({"event_type": "SELL_REAPPROVAL", "slug": m.slug,
                              "outcome": outcome, "reason": "allowance_error"})
+                self._sell_allowance_retried = True
                 try:
                     self.client._ensure_allowances()
                 except Exception:
                     pass
-                self._sell_allowance_retried = True
+                # Quick retry after re-approval — clear cooldown so next loop picks it up
+                self._sell_error_until.pop(sell_key, None)
+                retry = self.client.place_limit_order(token_id, "SELL", price, qty, post_only=use_maker)
+                if retry.get("filled"):
+                    actual_qty = retry["fill_qty"]
+                    actual_price = retry["fill_price"]
+                    self._exec_safety.record_slug_fill(m.slug)
+                    self._record_fill_ts(m.slug)
+                    self._true_cost_fill_count += 1
+                    self._true_cost_fill_count_min += 1
+                    pnl = self._live_sell(st, outcome, actual_price, actual_qty)
+                    mt = infer_maker_taker("SELL", actual_price, ref_book) if ref_book else ""
+                    sell_notional = actual_price * actual_qty
+                    fee = compute_fee_usdc(sell_notional, mt if mt else ("maker" if use_maker else "taker"))
+                    net_pnl = pnl - fee
+                    self._record_negative_exit(m.slug, net_pnl, reason)
+                    write_jsonl({"event_type": "SELL_RETRY_OK", "slug": m.slug,
+                                 "outcome": outcome, "qty": actual_qty, "price": actual_price})
+                    return
+                # Retry also failed — fall through to cooldown
+            # Sell-error cooldown: back off 30s to prevent spam
+            self._sell_error_until[sell_key] = time.monotonic() + 30.0
 
     def _place_layered_buy(self, m: MarketRef, outcome: str, qty: float, ask: float) -> dict:
         """Place layered buy orders. Returns {total_filled, total_cost, avg_price}."""
