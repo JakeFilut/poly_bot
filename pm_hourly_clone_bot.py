@@ -431,11 +431,23 @@ class Bot:
         _wallet_addr = getattr(self.client, '_wallet_address', '') or ''
 
         def _get_trades_fn():
-            """Fetch recent trades via CLOB client for wallet truth scan."""
+            """Fetch recent trades via CLOB client for wallet truth scan.
+
+            Scoped to current hour: passes after= parameter so the API only
+            returns trades from hour_start onward (fewer results, faster).
+            """
             if not hasattr(self.client, '_clob') or not self.client._clob:
                 return []
             try:
-                trades = self.client._clob.get_trades()
+                # Try to scope the API call to current hour window
+                hour_start_ts = self._hour_window
+                after_ms = int(hour_start_ts.timestamp() * 1000) if hour_start_ts else 0
+                try:
+                    # py-clob-client get_trades supports after= (epoch ms)
+                    trades = self.client._clob.get_trades(after=after_ms) if after_ms else self.client._clob.get_trades()
+                except TypeError:
+                    # Fallback if the CLOB client doesn't support after=
+                    trades = self.client._clob.get_trades()
                 return trades if isinstance(trades, list) else []
             except Exception:
                 return []
@@ -459,6 +471,10 @@ class Bot:
         self._process_start_mono = time.monotonic()
         # ── LIVE_SAFE: record starting hour so we exit when it ends ──
         self._live_safe_start_hour = utc_now().replace(minute=0, second=0, microsecond=0)
+        # ── Wallet balance snapshot for RECONCILE_DIFF display ──
+        self._last_wallet_balances: Dict[str, float] = {}   # token_id -> qty
+        self._balances_empty_count: int = 0                   # consecutive empty responses
+        self._balances_pause_entries: bool = False             # pause buys on empty balances
         # ── Per-slug PnL tracking ──
         self._slug_realized_pnl: Dict[str, float] = {}       # slug -> cumulative realized PnL
         self._slug_neg_exit_count: Dict[str, int] = {}        # slug -> total negative exit count (session)
@@ -2288,9 +2304,10 @@ class Bot:
     def _print_balance_summary(self):
         """Print balance and open positions to console.
 
-        Positions line is derived from BOTH session market_states AND
-        the fills ledger (wallet-wide), so external fills (e.g. BTC bought
-        outside this session) are always visible.
+        Shows three clearly labelled sections:
+        1. LEDGER_POSITIONS — derived from current-hour fills only
+        2. WALLET_BALANCES — on-chain balances (if available)
+        3. RECONCILE_DIFF — per-token delta (wallet - ledger)
         """
         total_cost = 0.0
         pos_parts = []
@@ -2305,57 +2322,69 @@ class Bot:
                     pos_parts.append(f"{st.crypto} {outcome}:{pos.qty:.0f}@{pos.vwap:.3f}")
                     seen_keys.add((st.crypto, outcome))
 
-        # 2. Ledger positions not already in session (wallet-wide / external fills)
-        if self._fills_ledger is not None:
-            ledger_active = self._fills_ledger.get_all_active_positions()
-            for (token_id, side), lpos in ledger_active.items():
-                key = (lpos.crypto, side)
-                if key in seen_keys or not lpos.crypto:
-                    continue
-                # Check this isn't already covered by a session market_state
-                already_in_session = False
-                for slug, st in self.market_states.items():
-                    if st.crypto == lpos.crypto:
-                        sess_pos = st.positions.get(side)
-                        if sess_pos and sess_pos.qty >= MIN_QTY:
-                            already_in_session = True
-                            break
-                if not already_in_session and float(lpos.net_qty) >= MIN_QTY:
-                    cost = float(lpos.total_cost)
-                    total_cost += cost
-                    pos_parts.append(
-                        f"{lpos.crypto} {side}:{float(lpos.net_qty):.0f}"
-                        f"@{float(lpos.avg_entry_price):.3f}[ledger]")
-                    seen_keys.add(key)
-
-        # 3. Truth Capture positions — split by active window
-        truth_window = self._truth.get_active_window_positions()
-        truth_other = self._truth.get_other_positions()
-        truth_window_parts = []
-        for tid, tpos in sorted(truth_window.items(), key=lambda x: x[1].slug):
-            truth_window_parts.append(
-                f"{tpos.slug[-15:]} {tpos.outcome}:{float(tpos.net_qty):.0f}"
-                f"@{float(tpos.avg_price):.3f}")
-        truth_other_parts = []
-        for tid, tpos in sorted(truth_other.items(), key=lambda x: x[1].slug):
-            truth_other_parts.append(
-                f"{tpos.slug[-15:]} {tpos.outcome}:{float(tpos.net_qty):.0f}")
-
-        truth_window_str = "  ".join(truth_window_parts) if truth_window_parts else "none"
-        truth_other_str = "  ".join(truth_other_parts) if truth_other_parts else ""
-
-        pos_str = "  ".join(pos_parts) if pos_parts else "none"
         equity = self._equity()
         daily_pnl = equity - self.day_start_equity
         pnl_str = f"+${daily_pnl:.2f}" if daily_pnl >= 0 else f"-${abs(daily_pnl):.2f}"
         rpnl_str = f"+${self.realized_pnl_usdc:.2f}" if self.realized_pnl_usdc >= 0 else f"-${abs(self.realized_pnl_usdc):.2f}"
         safe_tag = " [SAFE MODE]" if self._truth.safe_mode else ""
+        pos_str = "  ".join(pos_parts) if pos_parts else "none"
+
+        fills_count = len(self._truth._fills) if hasattr(self._truth, '_fills') else 0
         print(f"\n  --- Cash: ${self.cash_usdc:.2f}  |  Equity: ${equity:.2f}  |  Invested: ${total_cost:.2f}"
-              f"  |  Day P&L: {pnl_str}  |  Total P&L: {rpnl_str}  |  Positions: {pos_str}"
+              f"  |  Day P&L: {pnl_str}  |  Total P&L: {rpnl_str}"
+              f"  |  Fills in current hour: {fills_count}"
               f"{safe_tag} ---")
-        print(f"  --- ACTIVE_WINDOW: {truth_window_str} ---")
-        if truth_other_str:
-            print(f"  --- OTHER_WALLET [non-tradable]: {truth_other_str} ---")
+
+        # ── LEDGER_POSITIONS (from current-hour fills) ──
+        truth_window = self._truth.get_active_window_positions()
+        truth_other = self._truth.get_other_positions()
+
+        if truth_window:
+            ledger_parts = []
+            for tid, tpos in sorted(truth_window.items(), key=lambda x: x[1].slug):
+                ledger_parts.append(
+                    f"{tpos.slug[-20:]} {tpos.outcome}:{float(tpos.net_qty):.0f}"
+                    f"@{float(tpos.avg_price):.3f}")
+            print(f"  --- LEDGER_POSITIONS (current hour): "
+                  f"{'  '.join(ledger_parts)} ---")
+        else:
+            print(f"  --- LEDGER_POSITIONS (current hour): none ---")
+
+        # ── WALLET_BALANCES + RECONCILE_DIFF ──
+        # Build wallet balance snapshot from last reconciliation or fetch
+        wallet_map: Dict[str, float] = {}  # token_id -> qty
+        if MODE in ("LIVE", "LIVE_SAFE") and hasattr(self, '_last_wallet_balances'):
+            wallet_map = self._last_wallet_balances
+        if wallet_map:
+            wallet_parts = []
+            diff_parts = []
+            for tid in sorted(wallet_map.keys()):
+                wqty = wallet_map[tid]
+                if wqty < MIN_QTY:
+                    continue
+                tpos = self._truth.get_position(tid)
+                slug_display = tpos.slug[-20:] if tpos.slug else tid[-12:]
+                outcome = tpos.outcome or "?"
+                lqty = float(tpos.net_qty)
+                delta = wqty - lqty
+                wallet_parts.append(f"{slug_display} {outcome}:{wqty:.0f}")
+                if abs(delta) >= 0.5:
+                    diff_parts.append(
+                        f"{slug_display} {outcome}: "
+                        f"wallet={wqty:.0f} ledger={lqty:.0f} "
+                        f"diff={delta:+.0f}")
+            if wallet_parts:
+                print(f"  --- WALLET_BALANCES: {'  '.join(wallet_parts)} ---")
+            if diff_parts:
+                print(f"  --- RECONCILE_DIFF: {'  |  '.join(diff_parts)} ---")
+
+        # Other wallet (non-tradable, old-hour)
+        if truth_other:
+            other_parts = []
+            for tid, tpos in sorted(truth_other.items(), key=lambda x: x[1].slug):
+                other_parts.append(
+                    f"{tpos.slug[-20:]} {tpos.outcome}:{float(tpos.net_qty):.0f}")
+            print(f"  --- OTHER_WALLET [non-tradable]: {'  '.join(other_parts)} ---")
         print()
     def _log_hour_label(self, slug, st, final_price, effective_close,
                         hour_direction, delta_bps,
@@ -4193,13 +4222,38 @@ class Bot:
                         pass
 
                     if not balances:
+                        self._balances_empty_count += 1
                         write_jsonl({
                             "event_type": "LEDGER_RECONCILE_SKIP_EMPTY_BALANCES",
+                            "consecutive_empty": self._balances_empty_count,
                             "ts_ms": int(time.time() * 1000),
                         })
                         print("  [LEDGER] WARN: get_balances() empty after retries "
+                              f"({self._balances_empty_count}x) "
                               "— skipping ledger reconciliation this cycle")
+                        # Pause entries after 2 consecutive empty balance responses
+                        if self._balances_empty_count >= 2:
+                            if not self._balances_pause_entries:
+                                self._balances_pause_entries = True
+                                print("  [LEDGER] *** ENTRIES PAUSED: "
+                                      "get_balances() empty — exits only ***")
+                                write_jsonl({
+                                    "event_type": "BALANCES_PAUSE_ENTRIES",
+                                    "consecutive_empty": self._balances_empty_count,
+                                    "ts_ms": int(time.time() * 1000),
+                                })
                     else:
+                        # Balances recovered — clear pause
+                        if self._balances_empty_count > 0:
+                            self._balances_empty_count = 0
+                        if self._balances_pause_entries:
+                            self._balances_pause_entries = False
+                            print("  [LEDGER] Entries RESUMED: "
+                                  "get_balances() recovered")
+                            write_jsonl({
+                                "event_type": "BALANCES_RESUME_ENTRIES",
+                                "ts_ms": int(time.time() * 1000),
+                            })
                         # Build wallet position map only from CURRENT active
                         # market tokens to avoid comparing expired hourly positions
                         current_token_ids: set = set()
@@ -4232,6 +4286,11 @@ class Bot:
                             if side:
                                 key = (token_id, side)
                                 wallet_positions[key] = wallet_positions.get(key, 0.0) + qty
+
+                        # Store wallet balances for display in _print_balance_summary
+                        self._last_wallet_balances = {
+                            tid: qty for (tid, _side), qty in wallet_positions.items()
+                        }
 
                         # Only reconcile positions for current active markets
                         # Expired hourly positions (token_ids no longer in
@@ -4533,6 +4592,9 @@ class Bot:
             return False
         # Truth Capture SAFE MODE: block all new buys on desync
         if self._truth.safe_mode:
+            return False
+        # Balances-empty pause: block buys until get_balances() recovers
+        if self._balances_pause_entries:
             return False
         # Loss-tail guard (all modes)
         if not self._slug_entry_allowed(slug):

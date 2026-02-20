@@ -997,6 +997,8 @@ class TruthCapture:
         Uses cursor persistence so we don't re-process old trades.
         HOUR FILTER: Only ingests fills whose slug belongs to the current
         active hour window AND whose timestamp falls within the current hour.
+        Fills with NO identifiable slug AND NO parseable timestamp are REJECTED
+        (they cannot be verified as current-hour).
         Returns number of NEW fills discovered.
         """
         if self._get_trades is None:
@@ -1017,6 +1019,8 @@ class TruthCapture:
         cursor = _load_cursor()
         new_count = 0
         skipped_old_hour = 0
+        skipped_no_identity = 0
+        hour_start_epoch = self._hour_start.timestamp()
 
         for raw in raw_trades:
             trade_id = str(raw.get("trade_id") or raw.get("id") or "")
@@ -1040,24 +1044,48 @@ class TruthCapture:
             if not outcome:
                 outcome = raw.get("outcome", "")
 
-            # ── HOUR WINDOW FILTER ──
-            # 1. Slug filter: skip fills from non-current-hour slugs
-            if self._active_hour_slugs and slug:
-                if slug not in self._active_hour_slugs:
-                    skipped_old_hour += 1
-                    continue
-            # 2. Timestamp filter: reject fills outside [hour_start, hour_end)
+            # ── HOUR WINDOW FILTER (strict) ──
+            # Parse the fill's actual timestamp
             fill_ts_str = (raw.get("match_time") or raw.get("created_at")
                            or raw.get("timestamp") or "")
+            fill_epoch = 0.0
             if fill_ts_str:
                 try:
                     fill_dt = datetime.fromisoformat(
                         str(fill_ts_str).replace("Z", "+00:00"))
-                    if not (self._hour_start <= fill_dt < self._hour_end):
-                        skipped_old_hour += 1
-                        continue
+                    fill_epoch = fill_dt.timestamp()
                 except (ValueError, TypeError):
-                    pass  # unparseable — let dedup handle it
+                    pass
+
+            # Early stop: if trades are sorted newest-first and this trade
+            # is before hour_start, all remaining are even older — break.
+            # (Only applies if we have a valid timestamp.)
+            if fill_epoch > 0 and fill_epoch < hour_start_epoch:
+                skipped_old_hour += 1
+                continue
+
+            # Slug filter: if we know the slug and it's not in current hour, skip
+            slug_ok = True
+            if self._active_hour_slugs and slug:
+                if slug not in self._active_hour_slugs:
+                    slug_ok = False
+
+            # Timestamp filter: if we have a parseable timestamp, enforce hour boundary
+            ts_ok = True
+            if fill_epoch > 0:
+                if not (self._hour_start.timestamp() <= fill_epoch < self._hour_end.timestamp()):
+                    ts_ok = False
+
+            # Decision: REJECT if either check explicitly fails.
+            # Also REJECT if we have NEITHER a known slug NOR a valid timestamp
+            # (cannot verify the fill belongs to this hour).
+            if not slug_ok or not ts_ok:
+                skipped_old_hour += 1
+                continue
+            if not slug and fill_epoch == 0:
+                # No slug resolved, no parseable timestamp — unverifiable
+                skipped_no_identity += 1
+                continue
 
             qty = raw.get("size") or raw.get("amount") or 0
             price = raw.get("price") or 0
@@ -1088,15 +1116,17 @@ class TruthCapture:
 
         self._write_jsonl({
             "event_type": "TRUTH_SCAN_DONE",
-            "total_trades": len(raw_trades),
+            "total_api_trades": len(raw_trades),
             "new_fills": new_count,
             "skipped_old_hour": skipped_old_hour,
+            "skipped_no_identity": skipped_no_identity,
             "ts_ms": _ts_ms(),
         })
-        if new_count > 0:
+        if new_count > 0 or skipped_old_hour > 0:
             print(f"  [TRUTH] Wallet scan: {new_count} new fills from "
-                  f"{len(raw_trades)} trades"
-                  f"{f' ({skipped_old_hour} old-hour skipped)' if skipped_old_hour else ''}")
+                  f"{len(raw_trades)} API trades  "
+                  f"({skipped_old_hour} old-hour, "
+                  f"{skipped_no_identity} unidentifiable)")
 
         return new_count
 
@@ -1350,20 +1380,22 @@ class TruthCapture:
                     non_active_diffs.append(entry)
                 tag = "ACTIVE" if is_active else "NON_ACTIVE"
                 print(f"  [TRUTH] RECONCILE {sev} [{tag}]: {slug} {outcome}: "
-                      f"truth={truth_qty:.4f} wallet={wallet_qty:.4f} "
+                      f"ledger={truth_qty:.4f} wallet={wallet_qty:.4f} "
                       f"diff={diff:+.4f}")
 
         # Print reconciliation diff tables
         if active_diffs:
             print(f"  [RECON] ACTIVE_WINDOW_DIFF ({len(active_diffs)}):")
             for d in active_diffs:
-                print(f"  [RECON]   {d['slug']:<30s} expected={d['truth']:.4f} "
-                      f"actual={d['wallet']:.4f} delta={d['diff']:+.4f}")
+                print(f"  [RECON]   {d['slug']:<30s} "
+                      f"wallet={d['wallet']:.4f}  ledger={d['truth']:.4f}  "
+                      f"diff={d['diff']:+.4f}")
         if non_active_diffs:
             print(f"  [RECON] NON_ACTIVE_DIFF ({len(non_active_diffs)}):")
             for d in non_active_diffs:
-                print(f"  [RECON]   {d['slug']:<30s} expected={d['truth']:.4f} "
-                      f"actual={d['wallet']:.4f} delta={d['diff']:+.4f}")
+                print(f"  [RECON]   {d['slug']:<30s} "
+                      f"wallet={d['wallet']:.4f}  ledger={d['truth']:.4f}  "
+                      f"diff={d['diff']:+.4f}")
         recon_status = "OK" if not mismatches else "FAIL"
         max_delta = max((abs(m["diff"]) for m in mismatches), default=0.0)
         print(f"  [RECON] status={recon_status} delta_max={max_delta:.4f}")
@@ -1515,9 +1547,9 @@ class TruthCapture:
 
         safe_tag = " [SAFE MODE]" if self._safe_mode else ""
 
-        # ── ACTIVE WINDOW POSITIONS (tradable) ──
+        # ── LEDGER_POSITIONS — current hour (tradable) ──
         if window_pos:
-            print(f"  [TRUTH] ── ACTIVE_WINDOW_POSITIONS ({len(window_pos)})"
+            print(f"  [TRUTH] ── LEDGER_POSITIONS — current hour ({len(window_pos)})"
                   f"{safe_tag} ──")
             total_cost = _ZERO
             total_rpnl = _ZERO
@@ -1537,7 +1569,7 @@ class TruthCapture:
                   f"(ws={self.fills_from_ws} poll={self.fills_from_poll} "
                   f"scan={self.fills_from_scan})")
         else:
-            print(f"  [TRUTH] ── ACTIVE_WINDOW_POSITIONS: (none){safe_tag} ──")
+            print(f"  [TRUTH] ── LEDGER_POSITIONS — current hour: (none){safe_tag} ──")
 
         # ── OTHER WALLET POSITIONS (non-tradable) ──
         if other_pos:

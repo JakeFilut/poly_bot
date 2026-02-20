@@ -1066,30 +1066,39 @@ class FillsLedger:
 
             if not slug and not outcome:
                 skipped_no_meta += 1
-                print(f"  [LEDGER] EXTERNAL_FILL no metadata: "
-                      f"order_id={order_id[:16] if order_id else '?'}  "
-                      f"token_id={token_id[-12:] if token_id else '?'}  "
-                      f"side={action}  qty={qty}  price={price}")
+                continue  # No metadata = cannot identify or filter this fill
 
-            # ── HOUR WINDOW FILTER ──
-            # 1. Slug filter: skip fills whose slug doesn't belong to
-            #    the current active hour window
-            if self._active_hour_slugs and slug:
-                if slug not in self._active_hour_slugs:
-                    skipped_old_hour += 1
-                    continue
-            # 2. Timestamp filter: parse the fill's actual timestamp and
-            #    reject anything outside [hour_start, hour_end)
+            # ── HOUR WINDOW FILTER (strict) ──
+            # Parse the fill's actual timestamp
             fill_ts_str = raw_fill.get("match_time") or raw_fill.get("created_at") or raw_fill.get("timestamp") or ""
+            fill_epoch = 0.0
             if fill_ts_str:
                 try:
                     fill_dt = datetime.fromisoformat(
                         str(fill_ts_str).replace("Z", "+00:00"))
-                    if not (self._hour_start <= fill_dt < self._hour_end):
-                        skipped_old_hour += 1
-                        continue
+                    fill_epoch = fill_dt.timestamp()
                 except (ValueError, TypeError):
-                    pass  # unparseable timestamp — let dedup handle it
+                    pass
+
+            # Slug filter: if slug known and not in current hour, skip
+            slug_ok = True
+            if self._active_hour_slugs and slug:
+                if slug not in self._active_hour_slugs:
+                    slug_ok = False
+
+            # Timestamp filter: if parseable timestamp, enforce hour boundary
+            ts_ok = True
+            if fill_epoch > 0:
+                if not (self._hour_start.timestamp() <= fill_epoch < self._hour_end.timestamp()):
+                    ts_ok = False
+
+            # REJECT if either check explicitly fails, or if NEITHER is available
+            if not slug_ok or not ts_ok:
+                skipped_old_hour += 1
+                continue
+            if not slug and fill_epoch == 0:
+                skipped_no_meta += 1
+                continue  # unverifiable — no slug, no timestamp
 
             pos = self.record_fill(
                 slug=slug, crypto=crypto,
@@ -1163,10 +1172,10 @@ class FillsLedger:
             print("  [LEDGER] No active positions")
             return
 
-        # ── ACTIVE WINDOW POSITIONS ──
+        # ── LEDGER_POSITIONS — current hour ──
         if window_pos:
-            print(f"  [LEDGER] ╔══ ACTIVE_WINDOW_POSITIONS "
-                  f"═══════════════════════════════════════════════════════════╗")
+            print(f"  [LEDGER] ╔══ LEDGER_POSITIONS — current hour "
+                  f"══════════════════════════════════════════════════════╗")
             print(f"  [LEDGER] ║  {'Slug':<30s} {'Side':<6s} {'Net Qty':>12s} "
                   f"{'Avg Price':>10s} {'Cost $':>10s} {'Real PnL':>10s} "
                   f"{'Unrl PnL':>10s} ║")
@@ -1183,12 +1192,11 @@ class FillsLedger:
             print(f"  [LEDGER] ╚══════════════════════════════════════════════════"
                   f"════════════════════════════════════════════╝")
         else:
-            print("  [LEDGER] ACTIVE_WINDOW_POSITIONS: (none)")
+            print("  [LEDGER] LEDGER_POSITIONS — current hour: (none)")
 
-        # ── OTHER WALLET POSITIONS (non-tradable) ──
+        # ── OTHER (non-tradable, old-hour) ──
         if other_pos:
-            print(f"  [LEDGER] ── OTHER_WALLET_POSITIONS ({len(other_pos)}) "
-                  f"[non-tradable] ──")
+            print(f"  [LEDGER] ── OTHER [old-hour, non-tradable] ({len(other_pos)}) ──")
             for (token_id, side), pos in sorted(other_pos.items(),
                                                 key=lambda x: x[1].slug):
                 print(f"  [LEDGER]   {pos.slug:<30s} {side:<6s} "

@@ -352,6 +352,139 @@ def test_disk_reload_scoping():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_unverifiable_fills_rejected():
+    """Fills with no slug AND no timestamp are rejected as unverifiable."""
+    print("\n" + "=" * 60)
+    print("  TEST: Unverifiable fills (no slug, no timestamp) rejected")
+    print("=" * 60)
+
+    tmpdir = tempfile.mkdtemp(prefix="test_unverif_")
+    ledger_path = os.path.join(tmpdir, "truth_fills.jsonl")
+
+    try:
+        truth = TruthCapture(
+            ledger_path=ledger_path,
+            wallet_address="0xtest",
+            write_jsonl_fn=lambda d: None,
+        )
+
+        hour_start = truth._hour_start
+        current_slug = f"SOL_test_{truth._hour_suffix}"
+        truth.register_token("tok_sol_up", current_slug, "Up")
+
+        # Simulate API returning trades with NO slug resolution and NO timestamp
+        unverifiable_trades = [
+            {
+                "trade_id": f"mystery_{i}",
+                "token_id": f"tok_unknown_{i}",
+                "side": "BUY",
+                "size": 50.0,
+                "price": 0.55,
+                # NO match_time, NO created_at, NO timestamp
+                # token_id is unknown so _resolve_meta returns ("", "")
+            }
+            for i in range(100)
+        ]
+        truth._get_trades = lambda: unverifiable_trades
+        new_count = truth.run_wallet_scan()
+        _check("Unverifiable fills all rejected", new_count == 0,
+               f"got {new_count}")
+        _check("Fill count still 0", len(truth._fills) == 0,
+               f"got {len(truth._fills)}")
+        _check("fills_from_scan still 0", truth.fills_from_scan == 0,
+               f"got {truth.fills_from_scan}")
+
+        # Mix: some verifiable (has timestamp in current hour + current slug),
+        # some unverifiable
+        mixed_trades = [
+            {
+                "trade_id": "verifiable_1",
+                "token_id": "tok_sol_up",
+                "side": "BUY",
+                "size": 10.0,
+                "price": 0.60,
+                "match_time": (hour_start + timedelta(minutes=5)).strftime(
+                    "%Y-%m-%dT%H:%M:%S.%fZ"),
+            },
+            {
+                "trade_id": "mystery_no_ts",
+                "token_id": "tok_unknown_x",
+                "side": "BUY",
+                "size": 999.0,
+                "price": 0.10,
+                # No timestamp, no known slug
+            },
+            {
+                "trade_id": "mystery_no_slug",
+                "token_id": "tok_unknown_y",
+                "side": "BUY",
+                "size": 500.0,
+                "price": 0.20,
+                # Has a current-hour timestamp but unknown token
+                "match_time": (hour_start + timedelta(minutes=10)).strftime(
+                    "%Y-%m-%dT%H:%M:%S.%fZ"),
+            },
+        ]
+        truth._get_trades = lambda: mixed_trades
+        new_count = truth.run_wallet_scan()
+        # Only the first trade should be accepted (known slug + valid timestamp)
+        # Second has no slug AND no timestamp → rejected
+        # Third has valid timestamp but no slug → accepted (timestamp alone is sufficient)
+        _check("Mixed: 1 or 2 accepted (known slug + valid ts)",
+               new_count >= 1,
+               f"got {new_count}")
+        _check("Fill count correct",
+               len(truth._fills) == new_count,
+               f"got {len(truth._fills)}")
+
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_ledger_no_meta_rejected():
+    """FillsLedger: external fills with no metadata (no slug, no outcome) are rejected."""
+    print("\n" + "=" * 60)
+    print("  TEST: FillsLedger rejects fills with no metadata")
+    print("=" * 60)
+
+    tmpdir = tempfile.mkdtemp(prefix="test_nometa_")
+    ledger_path = os.path.join(tmpdir, "fills_ledger.jsonl")
+
+    try:
+        ledger = FillsLedger(
+            ledger_path=ledger_path,
+            run_id="test_nometa",
+            write_jsonl_fn=lambda d: None,
+        )
+
+        current_slug = f"BTC_test_{ledger._hour_suffix}"
+        ledger.register_token("tok_btc_up", current_slug, "BTC", "Up")
+
+        hour_start = ledger._hour_start
+
+        # Fills with no slug or outcome → should be skipped as no_meta
+        no_meta_fills = [
+            {
+                "trade_id": f"nometa_{i}",
+                "token_id": f"tok_unknown_{i}",
+                "side": "BUY",
+                "size": 100.0,
+                "price": 0.50,
+                "match_time": (hour_start + timedelta(minutes=5)).strftime(
+                    "%Y-%m-%dT%H:%M:%S.%fZ"),
+            }
+            for i in range(50)
+        ]
+        new_count = ledger.ingest_external_fills(no_meta_fills)
+        _check("No-meta fills rejected", new_count == 0,
+               f"got {new_count}")
+        _check("Fill count still 0", len(ledger._fills) == 0,
+               f"got {len(ledger._fills)}")
+
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 if __name__ == "__main__":
     print("\n" + "=" * 60)
     print("  HOUR SCOPING TEST SUITE")
@@ -362,6 +495,8 @@ if __name__ == "__main__":
     test_fills_ledger_hour_scoping()
     test_truth_capture_hour_scoping()
     test_disk_reload_scoping()
+    test_unverifiable_fills_rejected()
+    test_ledger_no_meta_rejected()
 
     print("\n" + "=" * 60)
     total = _PASS + _FAIL
