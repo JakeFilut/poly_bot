@@ -128,17 +128,19 @@ class PositionReconciler:
         wallet_positions = self._fetch_wallet_positions(token_to_slug_outcome)
         balance_fetch_ok = wallet_positions is not None
         if not balance_fetch_ok:
-            # Fetch failed after retries — still continue with open orders/fills
-            wallet_positions = {}
+            # Fetch failed after retries — skip position comparison entirely
+            # to avoid false CRITICALs.  Still fetch open orders for logging.
             self._write_jsonl({
-                "event_type": "RECONCILE_BALANCE_FETCH_FAILED_CONTINUING",
+                "event_type": "RECONCILE_SKIP_BALANCE_FAILED",
                 "total_fetch_errors": self.balance_fetch_errors,
                 "total_empty_errors": self.balance_empty_errors,
                 "ts_ms": now_ms,
             })
-            print(f"  [RECONCILE] WARN: balance fetch failed — still reconciling "
-                  f"open orders/fills (fetch_errors={self.balance_fetch_errors}, "
-                  f"empty_errors={self.balance_empty_errors})")
+            print(f"  [RECONCILE] WARN: balance fetch failed after retries "
+                  f"(errors={self.balance_fetch_errors}, "
+                  f"empty={self.balance_empty_errors}) — skipping this cycle")
+            return result
+        wallet_positions = wallet_positions  # type: ignore[assignment]
         result["wallet_positions"] = wallet_positions
 
         # ── 2. Fetch open orders ──

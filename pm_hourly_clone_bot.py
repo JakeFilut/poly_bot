@@ -4029,14 +4029,22 @@ class Bot:
 
                     if not balances:
                         write_jsonl({
-                            "event_type": "LEDGER_RECONCILE_EMPTY_BALANCES",
+                            "event_type": "LEDGER_RECONCILE_SKIP_EMPTY_BALANCES",
                             "ts_ms": int(time.time() * 1000),
                         })
                         print("  [LEDGER] WARN: get_balances() empty after retries "
-                              "— still reconciling open orders")
+                              "— skipping ledger reconciliation this cycle")
+                    else:
+                        # Build wallet position map only from CURRENT active
+                        # market tokens to avoid comparing expired hourly positions
+                        current_token_ids: set = set()
+                        for mk in self._cached_markets:
+                            if mk.outcome_up_id:
+                                current_token_ids.add(mk.outcome_up_id)
+                            if mk.outcome_down_id:
+                                current_token_ids.add(mk.outcome_down_id)
 
-                    wallet_positions: Dict[Tuple[str, str], float] = {}
-                    if balances:
+                        wallet_positions: Dict[Tuple[str, str], float] = {}
                         for bal in balances:
                             token_id = bal.get("token_id") or bal.get("asset_id", "")
                             raw_balance = bal.get("balance", 0)
@@ -4060,21 +4068,26 @@ class Bot:
                                 key = (token_id, side)
                                 wallet_positions[key] = wallet_positions.get(key, 0.0) + qty
 
-                    result = self._fills_ledger.reconcile_positions(
-                        wallet_balances=wallet_positions,
-                        open_orders=open_orders,
-                        tolerance_shares=LEDGER_RECONCILE_TOLERANCE,
-                    )
+                        # Only reconcile positions for current active markets
+                        # Expired hourly positions (token_ids no longer in
+                        # cached_markets) are settled on-chain and naturally
+                        # go to 0 — comparing them triggers false CRITICALs.
+                        result = self._fills_ledger.reconcile_positions(
+                            wallet_balances=wallet_positions,
+                            open_orders=open_orders,
+                            tolerance_shares=LEDGER_RECONCILE_TOLERANCE,
+                            active_token_ids=current_token_ids,
+                        )
 
-                    # Enter SAFE MODE on critical mismatch
-                    if result.get("critical") and SAFE_MODE_ON_MISMATCH:
-                        if not self._fills_ledger.safe_mode:
-                            self._fills_ledger.enter_safe_mode(
-                                reason="Critical position mismatch detected",
-                                details=result.get("mismatches", []),
-                            )
-                    elif self._fills_ledger.safe_mode and not result.get("critical"):
-                        self._fills_ledger.exit_safe_mode()
+                        # Enter SAFE MODE on critical mismatch
+                        if result.get("critical") and SAFE_MODE_ON_MISMATCH:
+                            if not self._fills_ledger.safe_mode:
+                                self._fills_ledger.enter_safe_mode(
+                                    reason="Critical position mismatch detected",
+                                    details=result.get("mismatches", []),
+                                )
+                        elif self._fills_ledger.safe_mode and not result.get("critical"):
+                            self._fills_ledger.exit_safe_mode()
                 except Exception as e:
                     write_jsonl({
                         "event_type": "LEDGER_RECONCILE_FETCH_ERROR",
