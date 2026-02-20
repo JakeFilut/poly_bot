@@ -1032,12 +1032,17 @@ class FillsLedger:
             trade_id (or id), token_id (or asset_id), side (BUY/SELL),
             size (or amount), price
 
+        HOUR FILTER: Only ingests fills whose slug belongs to the current
+        active hour window AND whose timestamp falls within the current hour.
+        Old-hour fills are silently skipped (not counted as dedup).
+
         Returns number of NEW fills appended (after dedup).
         """
         new_count = 0
         skipped_action = 0
         skipped_dedup = 0
         skipped_no_meta = 0
+        skipped_old_hour = 0
 
         for i, raw_fill in enumerate(fills):
             trade_id = str(raw_fill.get("trade_id", raw_fill.get("id", "")))
@@ -1061,11 +1066,30 @@ class FillsLedger:
 
             if not slug and not outcome:
                 skipped_no_meta += 1
-                # Only log no-meta warnings (these indicate a real problem)
                 print(f"  [LEDGER] EXTERNAL_FILL no metadata: "
                       f"order_id={order_id[:16] if order_id else '?'}  "
                       f"token_id={token_id[-12:] if token_id else '?'}  "
                       f"side={action}  qty={qty}  price={price}")
+
+            # ── HOUR WINDOW FILTER ──
+            # 1. Slug filter: skip fills whose slug doesn't belong to
+            #    the current active hour window
+            if self._active_hour_slugs and slug:
+                if slug not in self._active_hour_slugs:
+                    skipped_old_hour += 1
+                    continue
+            # 2. Timestamp filter: parse the fill's actual timestamp and
+            #    reject anything outside [hour_start, hour_end)
+            fill_ts_str = raw_fill.get("match_time") or raw_fill.get("created_at") or raw_fill.get("timestamp") or ""
+            if fill_ts_str:
+                try:
+                    fill_dt = datetime.fromisoformat(
+                        str(fill_ts_str).replace("Z", "+00:00"))
+                    if not (self._hour_start <= fill_dt < self._hour_end):
+                        skipped_old_hour += 1
+                        continue
+                except (ValueError, TypeError):
+                    pass  # unparseable timestamp — let dedup handle it
 
             pos = self.record_fill(
                 slug=slug, crypto=crypto,
@@ -1095,11 +1119,13 @@ class FillsLedger:
             "skipped_action": skipped_action,
             "skipped_dedup": skipped_dedup,
             "skipped_no_meta": skipped_no_meta,
+            "skipped_old_hour": skipped_old_hour,
             "ts_ms": int(time.time() * 1000),
         })
         # One-line summary: always print so operator sees the cycle ran
         print(f"  [LEDGER] External fills: {new_count} new / "
               f"{len(fills)} total ({skipped_dedup} dedup"
+              f"{f', {skipped_old_hour} old_hour' if skipped_old_hour else ''}"
               f"{f', {skipped_no_meta} no_meta' if skipped_no_meta else ''}"
               f"{f', {skipped_action} bad_action' if skipped_action else ''})")
 
@@ -1116,12 +1142,14 @@ class FillsLedger:
             total_unrealized = sum((p.unrealized_pnl for p in active.values()), _ZERO)
             total_cost = sum((p.total_cost for p in active.values()), _ZERO)
         return {
-            "total_fills": len(self._fills),
+            "fills_in_current_hour": len(self._fills),
+            "total_fills": len(self._fills),  # backward compat alias
             "active_positions": len(active),
             "total_positions": len(self._positions),
             "total_realized_pnl": float(total_realized),
             "total_unrealized_pnl": float(total_unrealized),
             "total_cost_basis": float(total_cost),
+            "hour": self._hour_suffix,
             "safe_mode": self._safe_mode,
             "safe_mode_reason": self._safe_mode_reason,
         }
@@ -1168,6 +1196,7 @@ class FillsLedger:
 
         totals = self.summary()
         print(f"  [LEDGER] Totals: {totals['active_positions']} positions  "
+              f"| fills in current hour={totals['fills_in_current_hour']}  "
               f"| realized=${totals['total_realized_pnl']:.4f}  "
               f"| unrealized=${totals['total_unrealized_pnl']:.4f}  "
               f"| cost_basis=${totals['total_cost_basis']:.2f}")
