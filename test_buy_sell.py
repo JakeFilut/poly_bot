@@ -76,11 +76,13 @@ if dn_book.ask <= up_book.ask:
 else:
     side_name, token_id, buy_price = "Up", btc.outcome_up_id, up_book.ask
 
-qty = 5
+import math
 buy_price = round(max(0.01, min(0.99, buy_price)), 3)
+# CLOB requires: min 5 shares AND min $1 total order value
+qty = max(5, math.ceil(1.01 / buy_price))
 cost = buy_price * qty
 print(f"\n    Picking: {side_name} (cheaper @ ${buy_price:.3f})")
-print(f"    Cost: {qty} x ${buy_price:.3f} = ${cost:.2f}")
+print(f"    Qty: {qty} shares (${cost:.2f} total, meets $1 min)")
 
 # Check on-chain balance BEFORE buy
 bal_before = ct.functions.balanceOf(wallet, int(token_id)).call()

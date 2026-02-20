@@ -3602,19 +3602,22 @@ class Bot:
 
     def _live_safe_cap_usd(self, order_usd: float, price: float) -> Tuple[float, float]:
         """Apply LIVE_SAFE trade-size limiter to a BUY order.
-        Returns (capped_usd, capped_qty). If qty < CLOB_MIN_ORDER_SIZE, returns (0, 0) to skip.
+        Returns (capped_usd, capped_qty). If qty < CLOB minimum, returns (0, 0) to skip.
+        CLOB requires: min 5 shares AND min $1 total order value.
         In non-LIVE_SAFE modes, enforces CLOB minimum but no USD cap."""
+        import math as _math
+        min_qty_for_usd = _math.ceil(1.01 / max(1e-9, price))
+        clob_min = max(CLOB_MIN_ORDER_SIZE, min_qty_for_usd)
         if MODE != "LIVE_SAFE":
-            qty = max(CLOB_MIN_ORDER_SIZE, int(order_usd / max(1e-9, price)))
+            qty = max(clob_min, int(order_usd / max(1e-9, price)))
             return qty * price, qty
         capped_usd = min(order_usd, LIVE_SAFE_MAX_ORDER_USD)
         capped_qty = int(capped_usd / max(1e-9, price))
-        # Enforce Polymarket minimum order size
-        if capped_qty < CLOB_MIN_ORDER_SIZE:
-            # Bump to minimum if within the LIVE_SAFE cap
-            min_usd = CLOB_MIN_ORDER_SIZE * price
+        # Enforce Polymarket minimum (shares + $1 value)
+        if capped_qty < clob_min:
+            min_usd = clob_min * price
             if min_usd <= LIVE_SAFE_MAX_ORDER_USD:
-                capped_qty = CLOB_MIN_ORDER_SIZE
+                capped_qty = clob_min
                 capped_usd = min_usd
             else:
                 return 0.0, 0.0  # can't meet minimum within cap

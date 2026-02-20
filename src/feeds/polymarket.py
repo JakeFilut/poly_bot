@@ -403,9 +403,13 @@ class PolymarketClient:
 
         from py_clob_client.clob_types import OrderArgs, OrderType
 
+        import math as _math
         price = round(max(0.01, min(0.99, price)), 3)  # round to tick (0.001)
         qty   = int(float(size))
-        if qty < 5:  # Polymarket CLOB minimum order size
+        # Polymarket CLOB requires: min 5 shares AND min $1 total order value
+        min_qty_for_usd = _math.ceil(1.01 / price) if price > 0 else 5
+        clob_min = max(5, min_qty_for_usd)
+        if qty < clob_min:
             return {"order_id": "", "filled": False, "fill_qty": 0,
                     "fill_price": 0.0, "status": "rejected"}
 
