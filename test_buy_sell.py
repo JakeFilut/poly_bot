@@ -31,7 +31,7 @@ print("  BUY + SELL TEST (5 shares, BTC cheaper side)")
 print("=" * 55)
 
 # Initialize the feed client
-feed = PolymarketClient(private_key=PRIVATE_KEY)
+feed = PolymarketClient()
 
 # Find BTC market
 print("\n[1] Finding current BTC market...")
