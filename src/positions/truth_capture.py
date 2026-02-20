@@ -995,6 +995,8 @@ class TruthCapture:
         """Fetch recent trades for the wallet and ingest any missing fills.
 
         Uses cursor persistence so we don't re-process old trades.
+        HOUR FILTER: Only ingests fills whose slug belongs to the current
+        active hour window AND whose timestamp falls within the current hour.
         Returns number of NEW fills discovered.
         """
         if self._get_trades is None:
@@ -1014,6 +1016,7 @@ class TruthCapture:
 
         cursor = _load_cursor()
         new_count = 0
+        skipped_old_hour = 0
 
         for raw in raw_trades:
             trade_id = str(raw.get("trade_id") or raw.get("id") or "")
@@ -1031,15 +1034,33 @@ class TruthCapture:
             if action not in ("BUY", "SELL"):
                 continue
 
-            qty = raw.get("size") or raw.get("amount") or 0
-            price = raw.get("price") or 0
-
             slug, outcome = self._resolve_meta(token_id)
             if not slug:
                 slug = raw.get("slug", "")
             if not outcome:
                 outcome = raw.get("outcome", "")
 
+            # ── HOUR WINDOW FILTER ──
+            # 1. Slug filter: skip fills from non-current-hour slugs
+            if self._active_hour_slugs and slug:
+                if slug not in self._active_hour_slugs:
+                    skipped_old_hour += 1
+                    continue
+            # 2. Timestamp filter: reject fills outside [hour_start, hour_end)
+            fill_ts_str = (raw.get("match_time") or raw.get("created_at")
+                           or raw.get("timestamp") or "")
+            if fill_ts_str:
+                try:
+                    fill_dt = datetime.fromisoformat(
+                        str(fill_ts_str).replace("Z", "+00:00"))
+                    if not (self._hour_start <= fill_dt < self._hour_end):
+                        skipped_old_hour += 1
+                        continue
+                except (ValueError, TypeError):
+                    pass  # unparseable — let dedup handle it
+
+            qty = raw.get("size") or raw.get("amount") or 0
+            price = raw.get("price") or 0
             order_id = str(raw.get("order_id") or "")
 
             pos = self.record_fill(
@@ -1069,11 +1090,13 @@ class TruthCapture:
             "event_type": "TRUTH_SCAN_DONE",
             "total_trades": len(raw_trades),
             "new_fills": new_count,
+            "skipped_old_hour": skipped_old_hour,
             "ts_ms": _ts_ms(),
         })
         if new_count > 0:
             print(f"  [TRUTH] Wallet scan: {new_count} new fills from "
-                  f"{len(raw_trades)} trades")
+                  f"{len(raw_trades)} trades"
+                  f"{f' ({skipped_old_hour} old-hour skipped)' if skipped_old_hour else ''}")
 
         return new_count
 
@@ -1510,8 +1533,9 @@ class TruthCapture:
                       f"rpnl={float(pos.realized_pnl):+.4f}")
             print(f"  [TRUTH]   Active total cost=${float(total_cost):.2f}  "
                   f"rpnl={float(total_rpnl):+.4f}  "
-                  f"fills_ws={self.fills_from_ws} poll={self.fills_from_poll} "
-                  f"scan={self.fills_from_scan}")
+                  f"fills in current hour={len(self._fills)} "
+                  f"(ws={self.fills_from_ws} poll={self.fills_from_poll} "
+                  f"scan={self.fills_from_scan})")
         else:
             print(f"  [TRUTH] ── ACTIVE_WINDOW_POSITIONS: (none){safe_tag} ──")
 
@@ -1531,10 +1555,12 @@ class TruthCapture:
                          _ZERO)
         total_cost = sum((p.total_cost for p in active.values()), _ZERO)
         return {
-            "total_fills": len(self._fills),
+            "fills_in_current_hour": len(self._fills),
+            "total_fills": len(self._fills),  # backward compat alias
             "active_positions": len(active),
             "total_realized_pnl": float(total_rpnl),
             "total_cost_basis": float(total_cost),
+            "hour": self._hour_suffix,
             "safe_mode": self._safe_mode,
             "fills_ws": self.fills_from_ws,
             "fills_poll": self.fills_from_poll,

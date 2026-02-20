@@ -634,11 +634,15 @@ class Bot:
                     "shadow_delta": round(shadow_delta, 4),
                 })
             avg_edge = (sum(self._hour_edges) / len(self._hour_edges)) if self._hour_edges else 0.0
+            # Get ledger fill count for accurate current-hour reporting
+            _ledger_hour_fills = len(self._fills_ledger._fills) if self._fills_ledger else 0
+            _truth_hour_fills = len(self._truth._fills) if hasattr(self._truth, '_fills') else 0
             write_jsonl({
                 "event_type": "HOUR_SUMMARY",
                 "hour_window": iso_z(self._hour_window),
                 "hour_start_equity": round(self.hour_start_equity, 4),
                 "equity_now": round(equity_now, 4),
+                "fills_in_current_hour": _truth_hour_fills or _ledger_hour_fills,
                 "trades": self._hour_trade_count,
                 "net_pnl": round(self._hour_net_pnl, 4),
                 "fees_estimate": 0.0,
@@ -652,13 +656,15 @@ class Bot:
                 print("  [LIVE_SAFE] Hour window ended — shutting down for log review")
                 print(f"  Started: {iso_z(self._live_safe_start_hour)}")
                 print(f"  Equity:  ${equity_now:.2f}  |  PnL: ${self._hour_net_pnl:+.2f}")
-                print(f"  Trades:  {self._hour_trade_count}")
+                _ls_fills = len(self._truth._fills) if hasattr(self._truth, '_fills') else self._hour_trade_count
+                print(f"  Fills in current hour window:  {_ls_fills}")
                 print("=" * 60)
                 write_jsonl({
                     "event_type": "LIVE_SAFE_HOUR_END_EXIT",
                     "start_hour": iso_z(self._live_safe_start_hour),
                     "equity": round(equity_now, 4),
                     "hour_net_pnl": round(self._hour_net_pnl, 4),
+                    "fills_in_current_hour": _ls_fills,
                     "trades": self._hour_trade_count,
                 })
                 self._save_state()
@@ -1100,6 +1106,7 @@ class Bot:
         if MODE == "LIVE_SAFE":
             print(f"\n  [LIVE_SAFE] Entry window: {LIVE_SAFE_ENTRY_WINDOW_SEC:.0f}s  |  "
                   f"Max order: ${LIVE_SAFE_MAX_ORDER_USD:.2f}  |  "
+                  f"Max total invested: ${LIVE_SAFE_MAX_TOTAL_INVESTED_USD:.2f}  |  "
                   f"Buys disabled after window; sells always allowed")
             print(f"  [LIVE_SAFE] Will EXIT at hour boundary "
                   f"({iso_z(self._live_safe_start_hour)} window)\n")
@@ -4257,10 +4264,12 @@ class Bot:
             summary = self._fills_ledger.summary()
             write_jsonl({
                 "event_type": "LEDGER_STATUS",
+                "fills_in_current_hour": summary.get("fills_in_current_hour", summary["total_fills"]),
                 "total_fills": summary["total_fills"],
                 "active_positions": summary["active_positions"],
                 "total_realized_pnl": round(summary["total_realized_pnl"], 4),
                 "total_unrealized_pnl": round(summary["total_unrealized_pnl"], 4),
+                "hour": summary.get("hour", ""),
                 "safe_mode": summary["safe_mode"],
                 "ts_ms": int(time.time() * 1000),
             })
@@ -4539,6 +4548,13 @@ class Bot:
             for st in self.market_states.values()
             for o in ["Up", "Down"] if st.positions[o].qty >= MIN_QTY
         )
+        # ── LIVE_SAFE total invested cap ($20 default) ──
+        if MODE == "LIVE_SAFE" and total_usd >= LIVE_SAFE_MAX_TOTAL_INVESTED_USD:
+            write_jsonl({"event_type": "LIVE_SAFE_INVESTED_CAP",
+                          "slug": slug, "total_invested_usd": round(total_usd, 2),
+                          "cap_usd": LIVE_SAFE_MAX_TOTAL_INVESTED_USD,
+                          "ts_ms": int(time.time() * 1000)})
+            return False
         slug_st = self.market_states.get(slug)
         slug_usd = 0.0
         if slug_st:
