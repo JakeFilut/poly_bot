@@ -7,6 +7,7 @@ Usage:  python test_buy_sell.py
 import os, sys, time
 from pathlib import Path
 from dotenv import load_dotenv
+from web3 import Web3
 
 # Load .env same as the bot
 _PROJECT_DIR = Path(__file__).resolve().parent
@@ -20,6 +21,7 @@ for env_path in [os.path.join(_KEYS_DIR, ".env"), str(_PROJECT_DIR / ".env")]:
 os.environ["MODE"] = "LIVE"
 
 from src.feeds.polymarket import PolymarketClient
+from py_clob_client.clob_types import OrderArgs, OrderType
 
 PRIVATE_KEY = os.getenv("POLYMARKET_PRIVATE_KEY", "")
 if not PRIVATE_KEY:
@@ -32,6 +34,17 @@ print("=" * 55)
 
 # Initialize the feed client
 feed = PolymarketClient()
+
+# Web3 for balance checks
+w3 = Web3(Web3.HTTPProvider("https://polygon-rpc.com"))
+if not w3.is_connected():
+    w3 = Web3(Web3.HTTPProvider("https://rpc-mainnet.matic.quiknode.pro"))
+CT_ADDR = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+ct_abi = [{"inputs": [{"name": "account", "type": "address"}, {"name": "id", "type": "uint256"}],
+           "name": "balanceOf", "outputs": [{"name": "", "type": "uint256"}],
+           "stateMutability": "view", "type": "function"}]
+ct = w3.eth.contract(address=Web3.to_checksum_address(CT_ADDR), abi=ct_abi)
+wallet = Web3.to_checksum_address(feed.wallet_address)
 
 # Find BTC market
 print("\n[1] Finding current BTC market...")
@@ -47,8 +60,6 @@ if btc is None:
     sys.exit(1)
 
 print(f"    Slug: {btc.slug}")
-print(f"    Up   token: {btc.outcome_up_id}")
-print(f"    Down token: {btc.outcome_down_id}")
 
 # Get book for both sides
 print("\n[2] Reading order books...")
@@ -59,27 +70,18 @@ print(f"    Down ask={dn_book.ask:.3f}  bid={dn_book.bid:.3f}")
 
 # Pick cheaper side
 if dn_book.ask <= up_book.ask:
-    side_name = "Down"
-    token_id = btc.outcome_down_id
-    buy_price = dn_book.ask
-    book = dn_book
+    side_name, token_id, buy_price = "Down", btc.outcome_down_id, dn_book.ask
 else:
-    side_name = "Up"
-    token_id = btc.outcome_up_id
-    buy_price = up_book.ask
-    book = up_book
+    side_name, token_id, buy_price = "Up", btc.outcome_up_id, up_book.ask
 
-qty = 5  # CLOB minimum
+qty = 5
 cost = buy_price * qty
 print(f"\n    Picking: {side_name} (cheaper @ ${buy_price:.3f})")
 print(f"    Cost: {qty} x ${buy_price:.3f} = ${cost:.2f}")
 
-# Confirm
-print(f"\n[3] About to BUY {qty} {side_name} @ ${buy_price:.3f} (${cost:.2f})")
-confirm = input("    Proceed? [y/N]: ").strip().lower()
-if confirm != "y":
-    print("    Aborted.")
-    sys.exit(0)
+# Check on-chain balance BEFORE buy
+bal_before = ct.functions.balanceOf(wallet, int(token_id)).call()
+print(f"\n[3] On-chain balance before buy: {bal_before}")
 
 # BUY
 print(f"\n[4] Placing BUY order...")
@@ -87,45 +89,71 @@ buy_result = feed.place_limit_order(token_id, "BUY", buy_price, qty, post_only=F
 print(f"    Result: {buy_result}")
 
 if not buy_result.get("filled"):
-    print("\n    BUY did not fill. Order may be resting on the book.")
-    print(f"    Order ID: {buy_result.get('order_id', 'N/A')}")
-    print("    Try running again with a more aggressive price, or wait for fill.")
+    print("    BUY did not fill.")
     sys.exit(1)
 
 fill_qty = buy_result["fill_qty"]
 fill_price = buy_result["fill_price"]
 print(f"    FILLED: {fill_qty} @ ${fill_price:.3f}")
 
-# Wait a moment for settlement
-print("\n[5] Waiting 3s for on-chain settlement...")
-time.sleep(3)
+# Wait and poll for on-chain settlement
+print("\n[5] Waiting for on-chain settlement...")
+for i in range(12):
+    time.sleep(2.5)
+    bal_now = ct.functions.balanceOf(wallet, int(token_id)).call()
+    gained = bal_now - bal_before
+    print(f"    {(i+1)*2.5:.0f}s: on-chain balance={bal_now}  (gained={gained})")
+    if gained >= fill_qty:
+        print(f"    Tokens settled!")
+        break
+else:
+    print(f"    WARNING: tokens may not have settled after 30s")
 
 # Re-read book for sell price
 book = feed.get_top_of_book(token_id)
 sell_price = book.bid
-print(f"    Current bid: ${sell_price:.3f}")
+print(f"\n    Current bid: ${sell_price:.3f}")
 
-# SELL
+# SELL — call CLOB directly to see the raw error
 print(f"\n[6] Placing SELL order: {fill_qty} @ ${sell_price:.3f}")
-sell_result = feed.place_limit_order(token_id, "SELL", sell_price, fill_qty, post_only=False)
-print(f"    Result: {sell_result}")
+sell_price = round(max(0.01, min(0.99, sell_price)), 3)
+try:
+    args = OrderArgs(
+        price=sell_price,
+        size=int(fill_qty),
+        side="SELL",
+        token_id=token_id,
+    )
+    signed = feed._clob.create_order(args)
+    response = feed._clob.post_order(signed, OrderType.GTC)
+    print(f"    Raw CLOB response: {response}")
 
-if sell_result.get("filled"):
-    sell_qty = sell_result["fill_qty"]
-    sell_px = sell_result["fill_price"]
-    pnl = (sell_px - fill_price) * sell_qty
-    print(f"\n    SELL FILLED: {sell_qty} @ ${sell_px:.3f}")
-    print(f"    P&L: ${pnl:+.4f}")
+    if response and isinstance(response, dict):
+        status = response.get("status", "").lower()
+        if status == "matched" or response.get("transactionsHashes") or response.get("transactionHashes"):
+            print(f"\n    SELL FILLED!")
+            print("\n" + "=" * 55)
+            print("  SUCCESS: Buy and sell both worked!")
+            print("=" * 55)
+        elif status == "live":
+            print(f"\n    SELL order is live (resting on book)")
+            print(f"    Order ID: {response.get('orderID', 'N/A')}")
+        else:
+            print(f"\n    Unexpected status: {status}")
+    else:
+        print(f"    Unexpected response type: {type(response)}: {response}")
+
+except Exception as e:
+    print(f"\n    SELL ERROR: {e}")
+    print(f"    Error type: {type(e).__name__}")
+    # Check if it's an allowance/balance issue
+    err_str = str(e).lower()
+    if "allowance" in err_str or "balance" in err_str:
+        print("\n    This is a balance/allowance error.")
+        print(f"    On-chain balance: {ct.functions.balanceOf(wallet, int(token_id)).call()}")
+        print("    Approvals were confirmed OK by check_sell_ready.py")
+        print("    The CLOB may need more time to reflect your balance.")
     print("\n" + "=" * 55)
-    print("  SUCCESS: Buy and sell both worked!")
-    print("=" * 55)
-elif sell_result.get("status") == "error":
-    print(f"\n    SELL FAILED: {sell_result}")
-    print("\n" + "=" * 55)
-    print("  FAIL: Sell error — check approvals with check_sell_ready.py")
+    print("  FAIL: Sell error — see above for details")
     print("=" * 55)
     sys.exit(1)
-else:
-    print(f"\n    SELL resting (not filled yet): {sell_result}")
-    print("    The sell order is on the book. You may need to wait or cancel.")
-    print(f"    Order ID: {sell_result.get('order_id', 'N/A')}")
