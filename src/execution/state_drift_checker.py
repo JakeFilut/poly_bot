@@ -123,7 +123,7 @@ class StateDriftChecker:
             for bal in api_balances:
                 tid = bal.get("token_id") or bal.get("asset_id", "")
                 amount = float(bal.get("balance", 0) or 0)
-                if tid in token_to_slug_outcome and amount > 0.5:
+                if tid in token_to_slug_outcome and amount > 0.0:
                     slug, outcome = token_to_slug_outcome[tid]
                     api_positions.setdefault(slug, {})[outcome] = amount
 
@@ -135,13 +135,13 @@ class StateDriftChecker:
                     api_qty = api_positions.get(
                         slug, {}).get(outcome, 0.0)
                     diff = abs(internal_qty - api_qty)
-                    # Flag if difference > 5 shares (tolerance for in-flight)
-                    if diff > 5.0:
+                    # Flag if difference > 1 share (tighter tolerance)
+                    if diff > 1.0:
                         drift_reasons.append(
                             f"pos_mismatch({slug}/{outcome}: "
-                            f"internal={internal_qty:.0f} "
-                            f"api={api_qty:.0f} "
-                            f"diff={diff:.0f})")
+                            f"internal={internal_qty:.6f} "
+                            f"api={api_qty:.6f} "
+                            f"diff={diff:.6f})")
 
         if drift_reasons:
             self._drifted = True
