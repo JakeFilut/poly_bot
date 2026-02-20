@@ -530,6 +530,12 @@ RECONCILE_INTERVAL_SECONDS = float(os.getenv("RECONCILE_INTERVAL_SECONDS", "60")
 SAFE_MODE_ON_MISMATCH = bool(os.getenv("SAFE_MODE_ON_MISMATCH", "True") not in ("", "0", "False", "false"))
 LEDGER_RECONCILE_TOLERANCE = float(os.getenv("LEDGER_RECONCILE_TOLERANCE", "0.01"))  # qty mismatch tolerance before CRITICAL
 
+# ---------------------------------------------------------------------------
+# ACTIVE WINDOW FILTER — restrict trading logic to current 1-hour market only
+# ---------------------------------------------------------------------------
+ACTIVE_WINDOW_ONLY = bool(os.getenv("ACTIVE_WINDOW_ONLY", "True") not in ("", "0", "False", "false"))
+STRICT_WINDOW_MODE = bool(os.getenv("STRICT_WINDOW_MODE", "True") not in ("", "0", "False", "false"))
+
 # No-progress pause (per-slug)
 OM_NO_PROGRESS_SUBMITS = int(os.getenv("OM_NO_PROGRESS_SUBMITS", "40"))             # submits in 60s with 0 fills -> pause
 OM_NO_PROGRESS_PAUSE_SEC = float(os.getenv("OM_NO_PROGRESS_PAUSE_SEC", "120"))     # pause slug for 120s

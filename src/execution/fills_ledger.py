@@ -149,6 +149,11 @@ class FillsLedger:
         self._safe_mode_reason: str = ""
         self._safe_mode_details: List[dict] = []
 
+        # Active window filter: set of token_ids in current hour
+        self._active_window_tokens: Set[str] = set()
+        self._active_window_only: bool = False
+        self._strict_window_mode: bool = False
+
         # Order intent log (in-memory ring buffer, not persisted to ledger)
         self._order_intents: List[OrderIntent] = []
 
@@ -277,6 +282,43 @@ class FillsLedger:
         """Register a token_id mapping (called during market discovery)."""
         with self._lock:
             self._token_meta[token_id] = (slug, crypto, side)
+
+    # ══════════════════════════════════════════════════════════════════
+    #  ACTIVE WINDOW FILTER
+    # ══════════════════════════════════════════════════════════════════
+
+    def set_active_window(self, token_ids: Set[str],
+                          active_only: bool = True,
+                          strict: bool = True) -> None:
+        """Set which token_ids belong to the current active 1-hour market."""
+        with self._lock:
+            self._active_window_tokens = set(token_ids)
+            self._active_window_only = active_only
+            self._strict_window_mode = strict
+
+    def is_active_window_token(self, token_id: str) -> bool:
+        if not self._active_window_only:
+            return True
+        if not self._active_window_tokens:
+            return True
+        return str(token_id) in self._active_window_tokens
+
+    def get_active_window_positions(self) -> Dict[Tuple[str, str], PositionInfo]:
+        """Return only positions for tokens in the current active window."""
+        with self._lock:
+            if not self._active_window_only or not self._active_window_tokens:
+                return {k: v for k, v in self._positions.items()
+                        if v.net_qty > _ZERO}
+            return {k: v for k, v in self._positions.items()
+                    if v.net_qty > _ZERO and k[0] in self._active_window_tokens}
+
+    def get_other_positions(self) -> Dict[Tuple[str, str], PositionInfo]:
+        """Return positions NOT in the current active window."""
+        with self._lock:
+            if not self._active_window_only or not self._active_window_tokens:
+                return {}
+            return {k: v for k, v in self._positions.items()
+                    if v.net_qty > _ZERO and k[0] not in self._active_window_tokens}
 
     # ══════════════════════════════════════════════════════════════════
     #  ORDER INTENT (submit-time, NOT a fill)
@@ -468,10 +510,23 @@ class FillsLedger:
         for fill in self._fills:
             self._update_position_incremental(fill)
 
-    def recompute_positions_from_ledger(self) -> Dict[Tuple[str, str], PositionInfo]:
-        """Public: full recompute.  Returns positions dict."""
+    def recompute_positions_from_ledger(self,
+                                       active_only: bool = False,
+                                       ) -> Dict[Tuple[str, str], PositionInfo]:
+        """Public: full recompute.  Returns positions dict.
+
+        Parameters
+        ----------
+        active_only : bool
+            When True, only return positions for tokens in the active window.
+            When False, return wallet-wide positions (for audit).
+            The full internal positions dict is always recomputed from ALL fills.
+        """
         with self._lock:
             self._recompute_all()
+            if active_only and self._active_window_only and self._active_window_tokens:
+                return {k: v for k, v in self._positions.items()
+                        if k[0] in self._active_window_tokens}
             return dict(self._positions)
 
     # ══════════════════════════════════════════════════════════════════
@@ -552,13 +607,29 @@ class FillsLedger:
         """Validate a sell against ledger-derived position.
 
         Returns (allowed, capped_qty, reason).
+          - block if token not in active window (when strict mode)
           - block if owned <= 0
           - cap qty to owned if within tiny epsilon of owned
           - log: attempting X, owned Y, delta Z
         """
+        display = slug or token_id
+
+        # Active window enforcement: block sells on old-hour tokens
+        if self._active_window_only and self._strict_window_mode:
+            if self._active_window_tokens and str(token_id) not in self._active_window_tokens:
+                msg = (f"SELL BLOCKED: {display} {side} not in active window "
+                       f"(old-hour position, non-tradable)")
+                print(f"  [LEDGER] {msg}")
+                self._write_jsonl({
+                    "event_type": "WINDOW_SELL_BLOCKED",
+                    "token_id": token_id, "slug": slug, "side": side,
+                    "reason": "non_active_window",
+                    "ts_ms": int(time.time() * 1000),
+                })
+                return False, 0.0, msg
+
         req = _to_dec(requested_qty)
         owned = self.get_sellable_qty(token_id, side)
-        display = slug or token_id
         delta = req - owned
 
         # Log the attempt
@@ -914,28 +985,45 @@ class FillsLedger:
         }
 
     def print_positions(self) -> None:
-        """Print positions table: all token_ids with net_qty + avg_entry_price."""
-        all_pos = self.get_all_positions()
-        active = {k: v for k, v in all_pos.items() if v.net_qty > _ZERO}
-        if not active:
+        """Print positions table split by active window vs other."""
+        window_pos = self.get_active_window_positions()
+        other_pos = self.get_other_positions()
+
+        if not window_pos and not other_pos:
             print("  [LEDGER] No active positions")
             return
-        print(f"  [LEDGER] ╔═══════════════════════════════════════════════════"
-              f"═══════════════════════════════════════════╗")
-        print(f"  [LEDGER] ║  {'Slug':<30s} {'Side':<6s} {'Net Qty':>12s} "
-              f"{'Avg Price':>10s} {'Cost $':>10s} {'Real PnL':>10s} "
-              f"{'Unrl PnL':>10s} ║")
-        print(f"  [LEDGER] ╠═══════════════════════════════════════════════════"
-              f"═══════════════════════════════════════════╣")
-        for (token_id, side), pos in sorted(active.items(), key=lambda x: x[1].slug):
-            print(f"  [LEDGER] ║  {pos.slug:<30s} {side:<6s} "
-                  f"{float(pos.net_qty):12.6f} "
-                  f"{float(pos.avg_entry_price):10.4f} "
-                  f"{float(pos.total_cost):10.2f} "
-                  f"{float(pos.realized_pnl):10.4f} "
-                  f"{float(pos.unrealized_pnl):10.4f} ║")
-        print(f"  [LEDGER] ╚═══════════════════════════════════════════════════"
-              f"═══════════════════════════════════════════╝")
+
+        # ── ACTIVE WINDOW POSITIONS ──
+        if window_pos:
+            print(f"  [LEDGER] ╔══ ACTIVE_WINDOW_POSITIONS "
+                  f"═══════════════════════════════════════════════════════════╗")
+            print(f"  [LEDGER] ║  {'Slug':<30s} {'Side':<6s} {'Net Qty':>12s} "
+                  f"{'Avg Price':>10s} {'Cost $':>10s} {'Real PnL':>10s} "
+                  f"{'Unrl PnL':>10s} ║")
+            print(f"  [LEDGER] ╠══════════════════════════════════════════════════"
+                  f"════════════════════════════════════════════╣")
+            for (token_id, side), pos in sorted(window_pos.items(),
+                                                key=lambda x: x[1].slug):
+                print(f"  [LEDGER] ║  {pos.slug:<30s} {side:<6s} "
+                      f"{float(pos.net_qty):12.6f} "
+                      f"{float(pos.avg_entry_price):10.4f} "
+                      f"{float(pos.total_cost):10.2f} "
+                      f"{float(pos.realized_pnl):10.4f} "
+                      f"{float(pos.unrealized_pnl):10.4f} ║")
+            print(f"  [LEDGER] ╚══════════════════════════════════════════════════"
+                  f"════════════════════════════════════════════╝")
+        else:
+            print("  [LEDGER] ACTIVE_WINDOW_POSITIONS: (none)")
+
+        # ── OTHER WALLET POSITIONS (non-tradable) ──
+        if other_pos:
+            print(f"  [LEDGER] ── OTHER_WALLET_POSITIONS ({len(other_pos)}) "
+                  f"[non-tradable] ──")
+            for (token_id, side), pos in sorted(other_pos.items(),
+                                                key=lambda x: x[1].slug):
+                print(f"  [LEDGER]   {pos.slug:<30s} {side:<6s} "
+                      f"qty={float(pos.net_qty):.6f}  (old hour)")
+
         totals = self.summary()
         print(f"  [LEDGER] Totals: {totals['active_positions']} positions  "
               f"| realized=${totals['total_realized_pnl']:.4f}  "

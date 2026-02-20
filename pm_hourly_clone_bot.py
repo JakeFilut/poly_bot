@@ -1200,6 +1200,17 @@ class Bot:
                     _truth_active_tids = set(self._get_token_to_slug_outcome().keys())
                     self._truth.tick(active_token_ids=_truth_active_tids)
 
+                    # Active window filter: tell truth + ledger which tokens are current hour
+                    self._truth.set_active_window(
+                        _truth_active_tids,
+                        active_only=ACTIVE_WINDOW_ONLY,
+                        strict=STRICT_WINDOW_MODE)
+                    if self._fills_ledger is not None:
+                        self._fills_ledger.set_active_window(
+                            _truth_active_tids,
+                            active_only=ACTIVE_WINDOW_ONLY,
+                            strict=STRICT_WINDOW_MODE)
+
                     # Rule 9: Cancel all open orders 30s before resolution
                     for m_r9 in markets:
                         st_r9 = self.market_states.get(m_r9.slug)
@@ -1228,6 +1239,19 @@ class Bot:
                             except Exception:
                                 pass
                             break  # all markets share the same hour — only need one check
+
+                # 4d. Active window filter for LOG mode (LIVE sets it above)
+                if MODE not in ("LIVE", "LIVE_SAFE"):
+                    _log_active_tids = set(self._get_token_to_slug_outcome().keys())
+                    self._truth.set_active_window(
+                        _log_active_tids,
+                        active_only=ACTIVE_WINDOW_ONLY,
+                        strict=STRICT_WINDOW_MODE)
+                    if self._fills_ledger is not None:
+                        self._fills_ledger.set_active_window(
+                            _log_active_tids,
+                            active_only=ACTIVE_WINDOW_ONLY,
+                            strict=STRICT_WINDOW_MODE)
 
                 # 5. Save state periodically (every STATE_SAVE_INTERVAL_SEC)
                 now = time.time()
@@ -2287,14 +2311,21 @@ class Bot:
                         f"@{float(lpos.avg_entry_price):.3f}[ledger]")
                     seen_keys.add(key)
 
-        # 3. Truth Capture positions (wallet-wide, authoritative)
-        truth_active = self._truth.get_all_active()
-        truth_parts = []
-        for tid, tpos in sorted(truth_active.items(), key=lambda x: x[1].slug):
-            truth_parts.append(
+        # 3. Truth Capture positions — split by active window
+        truth_window = self._truth.get_active_window_positions()
+        truth_other = self._truth.get_other_positions()
+        truth_window_parts = []
+        for tid, tpos in sorted(truth_window.items(), key=lambda x: x[1].slug):
+            truth_window_parts.append(
                 f"{tpos.slug[-15:]} {tpos.outcome}:{float(tpos.net_qty):.0f}"
                 f"@{float(tpos.avg_price):.3f}")
-        truth_str = "  ".join(truth_parts) if truth_parts else "none"
+        truth_other_parts = []
+        for tid, tpos in sorted(truth_other.items(), key=lambda x: x[1].slug):
+            truth_other_parts.append(
+                f"{tpos.slug[-15:]} {tpos.outcome}:{float(tpos.net_qty):.0f}")
+
+        truth_window_str = "  ".join(truth_window_parts) if truth_window_parts else "none"
+        truth_other_str = "  ".join(truth_other_parts) if truth_other_parts else ""
 
         pos_str = "  ".join(pos_parts) if pos_parts else "none"
         equity = self._equity()
@@ -2305,7 +2336,10 @@ class Bot:
         print(f"\n  --- Cash: ${self.cash_usdc:.2f}  |  Equity: ${equity:.2f}  |  Invested: ${total_cost:.2f}"
               f"  |  Day P&L: {pnl_str}  |  Total P&L: {rpnl_str}  |  Positions: {pos_str}"
               f"{safe_tag} ---")
-        print(f"  --- Truth: {truth_str} ---\n")
+        print(f"  --- ACTIVE_WINDOW: {truth_window_str} ---")
+        if truth_other_str:
+            print(f"  --- OTHER_WALLET [non-tradable]: {truth_other_str} ---")
+        print()
     def _log_hour_label(self, slug, st, final_price, effective_close,
                         hour_direction, delta_bps,
                         position_direction="NONE", would_win=None,
@@ -4397,6 +4431,16 @@ class Bot:
 
     def _exec_safety_can_enter(self, slug: str) -> bool:
         """Execution safety gate. Returns True if entry is allowed."""
+        # Active window filter: block buys on non-current-hour tokens
+        if ACTIVE_WINDOW_ONLY and STRICT_WINDOW_MODE:
+            token_up, _ = self._token_for_slug_outcome(slug, "Up")
+            if token_up and not self._truth.is_active_window_token(token_up):
+                write_jsonl({"event_type": "WINDOW_BUY_BLOCKED",
+                             "slug": slug, "reason": "non_active_window",
+                             "ts_ms": int(time.time() * 1000)})
+                print(f"  [TRUTH] WARN: Attempt to trade non-active window token: "
+                      f"{slug} BUY")
+                return False
         # Truth Capture SAFE MODE: block all new buys on desync
         if self._truth.safe_mode:
             return False
@@ -7021,6 +7065,17 @@ class Bot:
         qty = max(0.0, qty)
         if qty < MIN_QTY:
             return  # don't sell dust — don't log it either
+        # Active window filter: block sells on non-current-hour tokens
+        if ACTIVE_WINDOW_ONLY and STRICT_WINDOW_MODE:
+            token_id_chk = m.outcome_up_id if outcome == "Up" else m.outcome_down_id
+            if token_id_chk and not self._truth.is_active_window_token(token_id_chk):
+                write_jsonl({"event_type": "WINDOW_SELL_BLOCKED",
+                             "slug": m.slug, "outcome": outcome,
+                             "reason": "non_active_window",
+                             "ts_ms": int(time.time() * 1000)})
+                print(f"  [TRUTH] WARN: Attempt to trade non-active window token: "
+                      f"{m.slug} {outcome} SELL")
+                return
         # Enforce CLOB minimum order size for live sells
         if MODE in ("LIVE", "LIVE_SAFE") and qty < CLOB_MIN_ORDER_SIZE:
             return

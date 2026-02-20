@@ -227,6 +227,11 @@ class TruthCapture:
         self._safe_mode_reason: str = ""
         self._safe_mode_mismatches: List[dict] = []
 
+        # Active window filter: set of token_ids belonging to current hour
+        self._active_window_tokens: Set[str] = set()
+        self._active_window_only: bool = False
+        self._strict_window_mode: bool = False
+
         # Timers
         self._last_scan_ts: float = 0.0
         self._last_reconcile_ts: float = 0.0
@@ -373,6 +378,63 @@ class TruthCapture:
             except Exception:
                 pass
         return ("", "")
+
+    # ══════════════════════════════════════════════════════════════════
+    #  ACTIVE WINDOW FILTER
+    # ══════════════════════════════════════════════════════════════════
+
+    def set_active_window(self, token_ids: Set[str],
+                          active_only: bool = True,
+                          strict: bool = True) -> None:
+        """Set which token_ids belong to the current active 1-hour market.
+
+        Parameters
+        ----------
+        token_ids : set of str
+            Token IDs for the current hour's markets (Up + Down for each slug).
+        active_only : bool
+            When True, trading logic only sees active-window positions.
+        strict : bool
+            When True, block ALL trades on non-active tokens (buys AND sells).
+        """
+        with self._lock:
+            self._active_window_tokens = set(token_ids)
+            self._active_window_only = active_only
+            self._strict_window_mode = strict
+
+    def is_active_window_token(self, token_id: str) -> bool:
+        """Return True if token_id belongs to the current active hour window."""
+        if not self._active_window_only:
+            return True
+        if not self._active_window_tokens:
+            return True  # no window set yet — allow everything
+        return str(token_id) in self._active_window_tokens
+
+    def check_trade_allowed(self, token_id: str, action: str,
+                            slug: str = "") -> Tuple[bool, str]:
+        """Check if a trade on this token_id is allowed by the window filter.
+
+        Returns (allowed, reason).
+        """
+        if not self._active_window_only or not self._strict_window_mode:
+            return True, "ok"
+        if not self._active_window_tokens:
+            return True, "ok"  # window not set yet
+        if str(token_id) in self._active_window_tokens:
+            return True, "ok"
+        # Non-active window token
+        slug_display = slug or token_id[-12:]
+        reason = (f"NON_ACTIVE_WINDOW: {action} blocked for {slug_display} — "
+                  f"token not in current hour window")
+        self._write_jsonl({
+            "event_type": "WINDOW_TRADE_BLOCKED",
+            "token_id": token_id, "slug": slug, "action": action,
+            "reason": "non_active_window",
+            "ts_ms": _ts_ms(),
+        })
+        print(f"  [TRUTH] WARN: Attempt to trade non-active window token: "
+              f"{slug_display} {action}")
+        return False, reason
 
     # ══════════════════════════════════════════════════════════════════
     #  PATH A: RECORD FILL (immediate — from WS/event or bot logic)
@@ -753,10 +815,26 @@ class TruthCapture:
         for fill in self._fills:
             self._apply_fill_to_position(fill)
 
-    def recompute_positions_from_ledger(self) -> Dict[str, TruthPosition]:
-        """Public: full recompute. Returns {token_id: TruthPosition}."""
+    def recompute_positions_from_ledger(self,
+                                       active_only: bool = False,
+                                       ) -> Dict[str, TruthPosition]:
+        """Public: recompute positions from all fills.
+
+        Parameters
+        ----------
+        active_only : bool
+            When True, only return positions for tokens in the active window.
+            When False, return wallet-wide positions (for audit).
+            In BOTH cases, the full internal positions dict is recomputed
+            from ALL fills (the ledger is never filtered).
+
+        Returns {token_id: TruthPosition}.
+        """
         with self._lock:
             self._recompute_positions()
+            if active_only and self._active_window_only and self._active_window_tokens:
+                return {k: v for k, v in self._positions.items()
+                        if k in self._active_window_tokens}
             return dict(self._positions)
 
     # ══════════════════════════════════════════════════════════════════
@@ -772,9 +850,27 @@ class TruthCapture:
             return TruthPosition(token_id=tid, slug=slug, outcome=outcome)
 
     def get_all_active(self) -> Dict[str, TruthPosition]:
+        """Return all positions with net_qty > 0 (wallet-wide, unfiltered)."""
         with self._lock:
             return {k: v for k, v in self._positions.items()
                     if v.net_qty > _ZERO}
+
+    def get_active_window_positions(self) -> Dict[str, TruthPosition]:
+        """Return only positions for tokens in the current active hour window."""
+        with self._lock:
+            if not self._active_window_only or not self._active_window_tokens:
+                return {k: v for k, v in self._positions.items()
+                        if v.net_qty > _ZERO}
+            return {k: v for k, v in self._positions.items()
+                    if v.net_qty > _ZERO and k in self._active_window_tokens}
+
+    def get_other_positions(self) -> Dict[str, TruthPosition]:
+        """Return positions NOT in the current active window (non-tradable)."""
+        with self._lock:
+            if not self._active_window_only or not self._active_window_tokens:
+                return {}
+            return {k: v for k, v in self._positions.items()
+                    if v.net_qty > _ZERO and k not in self._active_window_tokens}
 
     def get_sellable_qty(self, token_id: str) -> Decimal:
         return max(self.get_position(token_id).net_qty, _ZERO)
@@ -782,10 +878,30 @@ class TruthCapture:
     def validate_sell(self, token_id: str, requested_qty: float,
                       slug: str = "") -> Tuple[bool, float, str]:
         """Validate sell against truth positions.
-        Returns (allowed, capped_qty, reason)."""
+
+        When active_window_only + strict_window_mode are set, sells on
+        non-active-window tokens are BLOCKED.
+
+        Returns (allowed, capped_qty, reason).
+        """
+        display = slug or token_id[-12:]
+
+        # Active window enforcement: block sells on old-hour tokens
+        if self._active_window_only and self._strict_window_mode:
+            if self._active_window_tokens and str(token_id) not in self._active_window_tokens:
+                msg = (f"SELL BLOCKED: {display} not in active window "
+                       f"(old-hour position, non-tradable)")
+                print(f"  [TRUTH] {msg}")
+                self._write_jsonl({
+                    "event_type": "WINDOW_SELL_BLOCKED",
+                    "token_id": token_id, "slug": slug,
+                    "reason": "non_active_window",
+                    "ts_ms": _ts_ms(),
+                })
+                return False, 0.0, msg
+
         req = _to_dec(requested_qty)
         owned = self.get_sellable_qty(token_id)
-        display = slug or token_id[-12:]
 
         if owned <= _ZERO:
             msg = f"SELL BLOCKED: no position for {display} (truth net_qty=0)"
@@ -983,28 +1099,48 @@ class TruthCapture:
     # ══════════════════════════════════════════════════════════════════
 
     def print_positions(self) -> None:
-        """Print truth-derived positions + any wallet mismatches."""
-        active = self.get_all_active()
-        if not active:
+        """Print truth-derived positions split by active window vs other."""
+        window_pos = self.get_active_window_positions()
+        other_pos = self.get_other_positions()
+
+        if not window_pos and not other_pos:
             print("  [TRUTH] Positions: (none)")
             return
-        print(f"  [TRUTH] ── Positions ({len(active)}) "
-              f"{'[SAFE MODE]' if self._safe_mode else ''} ──")
-        total_cost = _ZERO
-        total_rpnl = _ZERO
-        for tid, pos in sorted(active.items(), key=lambda x: x[1].slug):
-            cost = float(pos.total_cost)
-            total_cost += pos.total_cost
-            total_rpnl += pos.realized_pnl
-            print(f"  [TRUTH]   {pos.slug:<35s} {pos.outcome:<5s} "
-                  f"qty={float(pos.net_qty):8.2f}  "
-                  f"avg={float(pos.avg_price):.4f}  "
-                  f"cost=${cost:7.2f}  "
-                  f"rpnl={float(pos.realized_pnl):+.4f}")
-        print(f"  [TRUTH]   Total cost=${float(total_cost):.2f}  "
-              f"rpnl={float(total_rpnl):+.4f}  "
-              f"fills_ws={self.fills_from_ws} poll={self.fills_from_poll} "
-              f"scan={self.fills_from_scan}")
+
+        safe_tag = " [SAFE MODE]" if self._safe_mode else ""
+
+        # ── ACTIVE WINDOW POSITIONS (tradable) ──
+        if window_pos:
+            print(f"  [TRUTH] ── ACTIVE_WINDOW_POSITIONS ({len(window_pos)})"
+                  f"{safe_tag} ──")
+            total_cost = _ZERO
+            total_rpnl = _ZERO
+            for tid, pos in sorted(window_pos.items(),
+                                   key=lambda x: x[1].slug):
+                cost = float(pos.total_cost)
+                total_cost += pos.total_cost
+                total_rpnl += pos.realized_pnl
+                print(f"  [TRUTH]   {pos.slug:<35s} {pos.outcome:<5s} "
+                      f"qty={float(pos.net_qty):8.2f}  "
+                      f"avg={float(pos.avg_price):.4f}  "
+                      f"cost=${cost:7.2f}  "
+                      f"rpnl={float(pos.realized_pnl):+.4f}")
+            print(f"  [TRUTH]   Active total cost=${float(total_cost):.2f}  "
+                  f"rpnl={float(total_rpnl):+.4f}  "
+                  f"fills_ws={self.fills_from_ws} poll={self.fills_from_poll} "
+                  f"scan={self.fills_from_scan}")
+        else:
+            print(f"  [TRUTH] ── ACTIVE_WINDOW_POSITIONS: (none){safe_tag} ──")
+
+        # ── OTHER WALLET POSITIONS (non-tradable) ──
+        if other_pos:
+            print(f"  [TRUTH] ── OTHER_WALLET_POSITIONS ({len(other_pos)}) "
+                  f"[non-tradable] ──")
+            for tid, pos in sorted(other_pos.items(),
+                                   key=lambda x: x[1].slug):
+                print(f"  [TRUTH]   {pos.slug:<35s} {pos.outcome:<5s} "
+                      f"qty={float(pos.net_qty):8.2f}  "
+                      f"(old hour — not tradable)")
 
     def summary(self) -> dict:
         active = self.get_all_active()
