@@ -22,7 +22,7 @@ for env_path in [os.path.join(_KEYS_DIR, ".env"), str(_PROJECT_DIR / ".env")]:
 os.environ["MODE"] = "LIVE"
 
 from src.feeds.polymarket import PolymarketClient
-from py_clob_client.clob_types import OrderType
+from py_clob_client.clob_types import MarketOrderArgs, OrderType
 
 PRIVATE_KEY = os.getenv("POLYMARKET_PRIVATE_KEY", "")
 if not PRIVATE_KEY:
@@ -138,12 +138,12 @@ print(f"\n[3] On-chain balance before buy: {bal_before}")
 # ── BUY (FOK market order) ────────────────────────────────────────────
 print(f"\n[4] Placing FOK BUY...")
 try:
-    signed = clob.create_market_order(
+    signed = clob.create_market_order(MarketOrderArgs(
         token_id=token_id,
         side="BUY",
         amount=buy_dollars,
         price=buy_limit,
-    )
+    ))
     response = clob.post_order(signed, OrderType.FOK)
     print(f"    Raw CLOB response: {response}")
 except Exception as e:
@@ -194,12 +194,12 @@ sell_limit = round(max(0.01, current_bid - SLIPPAGE_CENTS), 3)
 # ── SELL (FOK market order) ───────────────────────────────────────────
 print(f"\n[6] Placing FOK SELL: {fill_qty} shares @ limit ${sell_limit:.3f}")
 try:
-    signed = clob.create_market_order(
+    signed = clob.create_market_order(MarketOrderArgs(
         token_id=token_id,
         side="SELL",
         amount=fill_qty,
         price=sell_limit,
-    )
+    ))
     response = clob.post_order(signed, OrderType.FOK)
     print(f"    Raw CLOB response: {response}")
 
