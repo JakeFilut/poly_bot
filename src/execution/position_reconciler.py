@@ -154,6 +154,37 @@ class PositionReconciler:
             if now - ts < FILL_COOLDOWN_SEC:
                 recently_traded.add(slug)
 
+        # ── TOTAL WIPEOUT GUARD ──
+        # If we have significant internal positions but the wallet shows NOTHING
+        # for any of them, this is almost certainly an API glitch — skip reconciliation.
+        internal_positions_with_qty = []
+        for slug, st in market_states.items():
+            for outcome in ("Up", "Down"):
+                pos = st.positions.get(outcome)
+                if pos and pos.qty >= MIN_QTY:
+                    internal_positions_with_qty.append((slug, outcome, pos.qty))
+
+        if internal_positions_with_qty:
+            # Check if wallet has ZERO for ALL our internal positions
+            all_wallet_zero = all(
+                wallet_positions.get((slug, outcome), 0.0) < MIN_QTY
+                for slug, outcome, _ in internal_positions_with_qty
+            )
+            if all_wallet_zero:
+                total_internal_qty = sum(q for _, _, q in internal_positions_with_qty)
+                self._write_jsonl({
+                    "event_type": "RECONCILE_TOTAL_WIPEOUT_BLOCKED",
+                    "internal_positions": len(internal_positions_with_qty),
+                    "total_internal_qty": total_internal_qty,
+                    "wallet_has_zero": True,
+                    "ts_ms": now_ms,
+                })
+                print(f"  [RECONCILE] *** TOTAL WIPEOUT BLOCKED: wallet shows 0 for all "
+                      f"{len(internal_positions_with_qty)} positions "
+                      f"(total {total_internal_qty:.2f} shares) — skipping reconciliation ***")
+                print(f"  [RECONCILE]     This is likely an API glitch. Will retry next cycle.")
+                return result
+
         # ── 3. Compare wallet vs internal state ──
         corrections = []
         critical_desyncs = []
@@ -374,7 +405,7 @@ class PositionReconciler:
     ) -> Optional[Dict[Tuple[str, str], float]]:
         """Fetch token balances from CLOB and normalize to {(slug, outcome): qty}.
 
-        Returns None if the fetch fails entirely.
+        Returns None if the fetch fails entirely OR returns suspicious empty data.
         Quantities are stored as exact floats — no rounding, no int cast.
         """
         try:
@@ -388,7 +419,15 @@ class PositionReconciler:
             return None
 
         if not balances:
-            return {}
+            # API returned empty/None — treat as fetch failure, NOT "wallet is empty".
+            # Returning {} would tell the reconciler every position is 0, which is
+            # catastrophically wrong if we actually hold positions.
+            self._write_jsonl({
+                "event_type": "RECONCILE_EMPTY_BALANCES",
+                "ts_ms": int(time.time() * 1000),
+            })
+            print("  [RECONCILE] WARN: get_balances() returned empty — skipping reconciliation")
+            return None
 
         result: Dict[Tuple[str, str], float] = {}
         for bal in balances:
