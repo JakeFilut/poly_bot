@@ -393,6 +393,8 @@ class Bot:
         self._live_safety = LiveSafety(write_jsonl)
         # ── LIVE_SAFE mode: monotonic process start for entry window ──
         self._process_start_mono = time.monotonic()
+        # ── LIVE_SAFE: record starting hour so we exit when it ends ──
+        self._live_safe_start_hour = utc_now().replace(minute=0, second=0, microsecond=0)
         # ── Per-slug PnL tracking ──
         self._slug_realized_pnl: Dict[str, float] = {}       # slug -> cumulative realized PnL
         self._slug_neg_exit_count: Dict[str, int] = {}        # slug -> total negative exit count (session)
@@ -579,6 +581,24 @@ class Bot:
                 "stop_triggered": any_stop,
                 "shadow_delta": round(shadow_delta, 4),
             })
+            # ── LIVE_SAFE: exit after the starting hour window ends ──
+            if MODE == "LIVE_SAFE" and current_hour != self._live_safe_start_hour:
+                print("\n" + "=" * 60)
+                print("  [LIVE_SAFE] Hour window ended — shutting down for log review")
+                print(f"  Started: {iso_z(self._live_safe_start_hour)}")
+                print(f"  Equity:  ${equity_now:.2f}  |  PnL: ${self._hour_net_pnl:+.2f}")
+                print(f"  Trades:  {self._hour_trade_count}")
+                print("=" * 60)
+                write_jsonl({
+                    "event_type": "LIVE_SAFE_HOUR_END_EXIT",
+                    "start_hour": iso_z(self._live_safe_start_hour),
+                    "equity": round(equity_now, 4),
+                    "hour_net_pnl": round(self._hour_net_pnl, 4),
+                    "trades": self._hour_trade_count,
+                })
+                self._save_state()
+                self.running = False
+                return
             # ── Reset for new hour ──
             self._hour_window = current_hour
             self.hourly_pnl_usdc = 0.0
@@ -987,7 +1007,9 @@ class Bot:
         if MODE == "LIVE_SAFE":
             print(f"\n  [LIVE_SAFE] Entry window: {LIVE_SAFE_ENTRY_WINDOW_SEC:.0f}s  |  "
                   f"Max order: ${LIVE_SAFE_MAX_ORDER_USD:.2f}  |  "
-                  f"Buys disabled after window; sells always allowed\n")
+                  f"Buys disabled after window; sells always allowed")
+            print(f"  [LIVE_SAFE] Will EXIT at hour boundary "
+                  f"({iso_z(self._live_safe_start_hour)} window)\n")
 
         if MODE in ("LIVE", "LIVE_SAFE", "TEST"):
             print(f"  LIVE symbol filter active: {', '.join(LIVE_ALLOWED_SYMBOLS)}")
