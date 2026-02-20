@@ -521,6 +521,15 @@ POSITION_RECONCILE_ON_STARTUP = bool(os.getenv("POSITION_RECONCILE_ON_STARTUP", 
 POSITION_RECONCILE_AFTER_FILL = bool(os.getenv("POSITION_RECONCILE_AFTER_FILL", "True") not in ("", "0", "False", "false"))
 POSITION_RECONCILE_BLOCK_ON_DESYNC = bool(os.getenv("POSITION_RECONCILE_BLOCK_ON_DESYNC", "True") not in ("", "0", "False", "false"))
 
+# ---------------------------------------------------------------------------
+# FILLS LEDGER — append-only fill accounting with position derivation
+# ---------------------------------------------------------------------------
+LEDGER_ENABLED = bool(os.getenv("LEDGER_ENABLED", "True") not in ("", "0", "False", "false"))
+LEDGER_PATH = os.getenv("LEDGER_PATH", os.path.join(_LOG_DIR, "fills_ledger.jsonl"))
+RECONCILE_INTERVAL_SECONDS = float(os.getenv("RECONCILE_INTERVAL_SECONDS", "60"))
+SAFE_MODE_ON_MISMATCH = bool(os.getenv("SAFE_MODE_ON_MISMATCH", "True") not in ("", "0", "False", "false"))
+LEDGER_RECONCILE_TOLERANCE = float(os.getenv("LEDGER_RECONCILE_TOLERANCE", "0.01"))  # qty mismatch tolerance before CRITICAL
+
 # No-progress pause (per-slug)
 OM_NO_PROGRESS_SUBMITS = int(os.getenv("OM_NO_PROGRESS_SUBMITS", "40"))             # submits in 60s with 0 fills -> pause
 OM_NO_PROGRESS_PAUSE_SEC = float(os.getenv("OM_NO_PROGRESS_PAUSE_SEC", "120"))     # pause slug for 120s
