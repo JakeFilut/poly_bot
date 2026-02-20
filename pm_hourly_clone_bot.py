@@ -76,6 +76,7 @@ from src.execution.state_drift_checker import StateDriftChecker
 from src.execution.position_reconciler import PositionReconciler
 from src.execution.live_safety import LiveSafety
 from src.execution.fills_ledger import FillsLedger
+from src.positions.truth_capture import TruthCapture
 from src.feeds.polymarket import PolymarketClient, set_jsonl_writer
 from src.bot.app import BotApp
 
@@ -426,6 +427,34 @@ class Bot:
         else:
             self._fills_ledger = None
             self._last_ledger_reconcile_ts: float = 0.0
+        # ── Truth Capture — authoritative fill tracking ──
+        _wallet_addr = getattr(self.client, '_wallet_address', '') or ''
+
+        def _get_trades_fn():
+            """Fetch recent trades via CLOB client for wallet truth scan."""
+            if not hasattr(self.client, '_clob') or not self.client._clob:
+                return []
+            try:
+                trades = self.client._clob.get_trades()
+                return trades if isinstance(trades, list) else []
+            except Exception:
+                return []
+
+        self._truth = TruthCapture(
+            ledger_path=os.path.join(os.path.dirname(LEDGER_PATH), "truth_fills.jsonl"),
+            wallet_address=_wallet_addr,
+            get_order_status_fn=self.client.get_order_status,
+            get_trades_fn=_get_trades_fn,
+            get_balances_fn=self.client.get_balances,
+            write_jsonl_fn=write_jsonl,
+            token_meta_fn=lambda: self._get_token_to_slug_outcome_for_truth(),
+            poll_interval_sec=1.0,
+            poll_timeout_sec=30.0,
+            scan_interval_sec=60.0,
+            reconcile_interval_sec=60.0,
+            desync_tolerance=0.01,
+        )
+        self._truth.load_from_disk()
         # ── LIVE_SAFE mode: monotonic process start for entry window ──
         self._process_start_mono = time.monotonic()
         # ── LIVE_SAFE: record starting hour so we exit when it ends ──
@@ -1166,6 +1195,10 @@ class Bot:
                         self._get_token_to_slug_outcome())
                     self._exec_safety.set_drift_paused(
                         self._exec_drift.is_drifted())
+
+                    # Truth Capture: poll order watchers, wallet scan, reconcile
+                    _truth_active_tids = set(self._get_token_to_slug_outcome().keys())
+                    self._truth.tick(active_token_ids=_truth_active_tids)
 
                     # Rule 9: Cancel all open orders 30s before resolution
                     for m_r9 in markets:
@@ -2254,13 +2287,25 @@ class Bot:
                         f"@{float(lpos.avg_entry_price):.3f}[ledger]")
                     seen_keys.add(key)
 
+        # 3. Truth Capture positions (wallet-wide, authoritative)
+        truth_active = self._truth.get_all_active()
+        truth_parts = []
+        for tid, tpos in sorted(truth_active.items(), key=lambda x: x[1].slug):
+            truth_parts.append(
+                f"{tpos.slug[-15:]} {tpos.outcome}:{float(tpos.net_qty):.0f}"
+                f"@{float(tpos.avg_price):.3f}")
+        truth_str = "  ".join(truth_parts) if truth_parts else "none"
+
         pos_str = "  ".join(pos_parts) if pos_parts else "none"
         equity = self._equity()
         daily_pnl = equity - self.day_start_equity
         pnl_str = f"+${daily_pnl:.2f}" if daily_pnl >= 0 else f"-${abs(daily_pnl):.2f}"
         rpnl_str = f"+${self.realized_pnl_usdc:.2f}" if self.realized_pnl_usdc >= 0 else f"-${abs(self.realized_pnl_usdc):.2f}"
+        safe_tag = " [SAFE MODE]" if self._truth.safe_mode else ""
         print(f"\n  --- Cash: ${self.cash_usdc:.2f}  |  Equity: ${equity:.2f}  |  Invested: ${total_cost:.2f}"
-              f"  |  Day P&L: {pnl_str}  |  Total P&L: {rpnl_str}  |  Positions: {pos_str} ---\n")
+              f"  |  Day P&L: {pnl_str}  |  Total P&L: {rpnl_str}  |  Positions: {pos_str}"
+              f"{safe_tag} ---")
+        print(f"  --- Truth: {truth_str} ---\n")
     def _log_hour_label(self, slug, st, final_price, effective_close,
                         hour_direction, delta_bps,
                         position_direction="NONE", would_win=None,
@@ -2406,6 +2451,11 @@ class Bot:
         self.signal_hist.setdefault(m.slug, [])
         self.last_book.setdefault(m.slug, {})
         self.recent_extreme_price.setdefault(m.slug, {"Up": None, "Down": None})
+        # Register tokens with truth capture for metadata resolution
+        if m.outcome_up_id:
+            self._truth.register_token(m.outcome_up_id, m.slug, "Up")
+        if m.outcome_down_id:
+            self._truth.register_token(m.outcome_down_id, m.slug, "Down")
     def _make_tick_ctx(self, m: MarketRef, st: MarketState, spot: float, hour_open: float,
                        t_min: float, delta_bps: float, abs_delta_bps: float,
                        vel: float, z: float, up_book: BookTop, dn_book: BookTop) -> dict:
@@ -3753,6 +3803,10 @@ class Bot:
                 result[m.outcome_down_id] = (m.slug, "Down")
         return result
 
+    def _get_token_to_slug_outcome_for_truth(self) -> dict:
+        """Build {token_id: (slug, outcome)} for TruthCapture meta resolution."""
+        return self._get_token_to_slug_outcome()
+
     def _token_for_slug_outcome(self, slug: str, outcome: str) -> Tuple[str, str]:
         """Return (token_id, market_id) for a slug+outcome from cached markets."""
         for m in self._cached_markets:
@@ -3833,29 +3887,44 @@ class Bot:
 
     def _ledger_record_buy_fill(self, m, st, outcome: str, price: float, qty: float,
                                 order_id: str = "", trade_id: str = "") -> None:
-        """Record a CONFIRMED BUY fill in the fills ledger (call AFTER API confirms)."""
-        if self._fills_ledger is None:
-            return
+        """Record a CONFIRMED BUY fill in both fills ledger and truth capture."""
         token_id = m.outcome_up_id if outcome == "Up" else m.outcome_down_id
-        self._fills_ledger.record_fill(
-            slug=st.slug, crypto=st.crypto, token_id=token_id or "",
-            market_id=m.market_id or "", side=outcome, action="BUY",
-            fill_qty=qty, fill_price=price, order_id=order_id,
-            trade_id=trade_id, source="bot",
+        if self._fills_ledger is not None:
+            self._fills_ledger.record_fill(
+                slug=st.slug, crypto=st.crypto, token_id=token_id or "",
+                market_id=m.market_id or "", side=outcome, action="BUY",
+                fill_qty=qty, fill_price=price, order_id=order_id,
+                trade_id=trade_id, source="bot",
+            )
+        # Truth Capture — always record
+        self._truth.record_fill(
+            token_id=token_id or "", slug=st.slug, outcome=outcome,
+            action="BUY", qty=qty, price=price,
+            order_id=order_id, trade_id=trade_id, source="ws",
         )
+        # Notify watcher so it doesn't double-record
+        if order_id:
+            self._truth.notify_fill(order_id, qty)
 
     def _ledger_record_sell_fill(self, m, st, outcome: str, price: float, qty: float,
                                  order_id: str = "", trade_id: str = "") -> None:
-        """Record a CONFIRMED SELL fill in the fills ledger (call AFTER API confirms)."""
-        if self._fills_ledger is None:
-            return
+        """Record a CONFIRMED SELL fill in both fills ledger and truth capture."""
         token_id = m.outcome_up_id if outcome == "Up" else m.outcome_down_id
-        self._fills_ledger.record_fill(
-            slug=st.slug, crypto=st.crypto, token_id=token_id or "",
-            market_id=m.market_id or "", side=outcome, action="SELL",
-            fill_qty=qty, fill_price=price, order_id=order_id,
-            trade_id=trade_id, source="bot",
+        if self._fills_ledger is not None:
+            self._fills_ledger.record_fill(
+                slug=st.slug, crypto=st.crypto, token_id=token_id or "",
+                market_id=m.market_id or "", side=outcome, action="SELL",
+                fill_qty=qty, fill_price=price, order_id=order_id,
+                trade_id=trade_id, source="bot",
+            )
+        # Truth Capture — always record
+        self._truth.record_fill(
+            token_id=token_id or "", slug=st.slug, outcome=outcome,
+            action="SELL", qty=qty, price=price,
+            order_id=order_id, trade_id=trade_id, source="ws",
         )
+        if order_id:
+            self._truth.notify_fill(order_id, qty)
 
     def _ledger_order_intent(self, m, st, outcome: str, action: str,
                              qty: float, price: float, reason: str,
@@ -3869,6 +3938,25 @@ class Bot:
             action=action, requested_qty=qty, requested_price=price,
             reason=reason, order_id=order_id,
         )
+
+    def _truth_watch_after_place(self, fill_result: dict, m, outcome: str,
+                                 side: str, qty: float, price: float) -> None:
+        """Register a truth watcher after any order placement."""
+        oid = fill_result.get("order_id", "")
+        if not oid or oid.startswith("paper_"):
+            return
+        token_id = m.outcome_up_id if outcome == "Up" else m.outcome_down_id
+        st = self.market_states.get(m.slug)
+        slug = st.slug if st else m.slug
+        self._truth.watch_order(
+            order_id=oid, token_id=token_id or "", slug=slug,
+            outcome=outcome, side=side, qty=qty, price=price,
+        )
+        # If the order already filled, notify watcher so it doesn't double-record
+        if fill_result.get("filled"):
+            fill_qty = fill_result.get("fill_qty", 0)
+            if fill_qty > 0:
+                self._truth.notify_fill(oid, fill_qty)
 
     def _sync_clob_balances(self):
         """Reconcile internal position state with actual CLOB balances.
@@ -4309,6 +4397,9 @@ class Bot:
 
     def _exec_safety_can_enter(self, slug: str) -> bool:
         """Execution safety gate. Returns True if entry is allowed."""
+        # Truth Capture SAFE MODE: block all new buys on desync
+        if self._truth.safe_mode:
+            return False
         # Loss-tail guard (all modes)
         if not self._slug_entry_allowed(slug):
             return False
@@ -4498,6 +4589,7 @@ class Bot:
                                                      this_qty, post_only=post_only)
                 oid = fill.get("order_id", "")
                 self._exec_tracker.on_submit(oid, m.slug, outcome, "BUY", order_price, this_qty, "ENTRY_BURST")
+                self._truth_watch_after_place(fill, m, outcome, "BUY", this_qty, order_price)
                 self._exec_safety.record_slug_submit(m.slug)
                 if fill.get("filled"):
                     self._exec_tracker.on_fill(oid, fill["fill_qty"])
@@ -5875,6 +5967,7 @@ class Bot:
             # LIVE mode: post maker bid
             fill = self.client.place_limit_order(token_id, "BUY", bid_price,
                                                   order_qty, post_only=True)
+            self._truth_watch_after_place(fill, m, outcome, "BUY", order_qty, bid_price)
             fill_ts = time.time()
             if fill.get("filled"):
                 fill_latency_ms = (fill_ts - placed_ts) * 1000
@@ -6038,6 +6131,7 @@ class Bot:
             post_only = not use_taker
             fill = self.client.place_limit_order(token_id, "BUY", order_price,
                                                   order_qty, post_only=post_only)
+            self._truth_watch_after_place(fill, m, outcome, "BUY", order_qty, order_price)
             fill_ts = time.time()
             if fill.get("filled"):
                 fill_latency_ms = (fill_ts - placed_ts) * 1000
@@ -6863,6 +6957,7 @@ class Bot:
         fill_result = self.client.place_limit_order(token_id, "SELL", maker_price, qty, post_only=True)
         oid = fill_result.get("order_id", "")
         self._exec_tracker.on_submit(oid, m.slug, outcome, "SELL", maker_price, qty, reason)
+        self._truth_watch_after_place(fill_result, m, outcome, "SELL", qty, maker_price)
 
         if fill_result.get("filled"):
             # Immediate maker fill — great
@@ -7048,6 +7143,7 @@ class Bot:
         fill_result = self.client.place_limit_order(token_id, "SELL", price, qty, post_only=use_maker)
         oid = fill_result.get("order_id", "")
         self._exec_tracker.on_submit(oid, m.slug, outcome, "SELL", price, qty, reason)
+        self._truth_watch_after_place(fill_result, m, outcome, "SELL", qty, price)
         self._exec_safety.record_slug_submit(m.slug)
         if fill_result.get("filled"):
             actual_qty = fill_result["fill_qty"]
@@ -7151,6 +7247,7 @@ class Bot:
         result = {"total_filled": 0, "total_cost": 0.0, "avg_price": 0.0}
         if not LAYER_ORDERS:
             r = self.client.place_limit_order(token_id, "BUY", ask, qty, post_only=POST_ONLY_WHEN_POSSIBLE)
+            self._truth_watch_after_place(r, m, outcome, "BUY", qty, ask)
             if r.get("filled"):
                 result["total_filled"] = r["fill_qty"]
                 result["total_cost"] = r["fill_price"] * r["fill_qty"]
@@ -7161,6 +7258,7 @@ class Bot:
         for i in range(LAYER_COUNT):
             px = max(0.01, ask - i * LAYER_STEP)
             r = self.client.place_limit_order(token_id, "BUY", px, per, post_only=POST_ONLY_WHEN_POSSIBLE)
+            self._truth_watch_after_place(r, m, outcome, "BUY", per, px)
             if r.get("filled"):
                 result["total_filled"] += r["fill_qty"]
                 result["total_cost"] += r["fill_price"] * r["fill_qty"]
