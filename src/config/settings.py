@@ -544,6 +544,15 @@ HOURLY_LEDGER_ROTATION = bool(os.getenv("HOURLY_LEDGER_ROTATION", "True") not in
 REQUIRE_CONSISTENT_STATE_ON_RESTART = bool(os.getenv("REQUIRE_CONSISTENT_STATE_ON_RESTART", "True") not in ("", "0", "False", "false"))
 
 # ---------------------------------------------------------------------------
+# SKIP_HISTORY — on startup, skip all historical fills and start fresh
+# ---------------------------------------------------------------------------
+SKIP_HISTORY = bool(os.getenv("SKIP_HISTORY", "True") not in ("", "0", "False", "false"))
+# Max recent trade IDs to keep in ring buffer for same-timestamp dedup
+SCAN_RECENT_TIDS_MAX = int(os.getenv("SCAN_RECENT_TIDS_MAX", "200"))
+# Position logging: only every N seconds (default 600 = 10 min)
+POSITION_LOG_INTERVAL_SEC = float(os.getenv("POSITION_LOG_INTERVAL_SEC", "600"))
+
+# ---------------------------------------------------------------------------
 # ORDER TRACKING + OPEN ORDER HYGIENE
 # ---------------------------------------------------------------------------
 ORDER_TTL_SECONDS = float(os.getenv("ORDER_TTL_SECONDS", "20"))

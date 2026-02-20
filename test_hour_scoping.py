@@ -485,6 +485,168 @@ def test_ledger_no_meta_rejected():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_cursor_based_scanning():
+    """Cursor-based incremental scanning: skips already-processed trades."""
+    print("\n" + "=" * 60)
+    print("  TEST: Cursor-based incremental scanning")
+    print("=" * 60)
+
+    tmpdir = tempfile.mkdtemp(prefix="test_cursor_")
+    ledger_path = os.path.join(tmpdir, "truth_fills.jsonl")
+
+    try:
+        truth = TruthCapture(
+            ledger_path=ledger_path,
+            wallet_address="0xtest",
+            write_jsonl_fn=lambda d: None,
+        )
+
+        hour_start = truth._hour_start
+        current_slug = f"BTC_cursor_{truth._hour_suffix}"
+        truth.register_token("tok_btc_up", current_slug, "Up")
+
+        # Set up trades with known timestamps
+        ts1 = (hour_start + timedelta(minutes=5))
+        ts2 = (hour_start + timedelta(minutes=10))
+        ts3 = (hour_start + timedelta(minutes=15))
+        ts1_iso = ts1.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        ts2_iso = ts2.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        ts3_iso = ts3.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+        # First scan: 2 trades
+        batch1 = [
+            {"trade_id": "tid_1", "token_id": "tok_btc_up", "side": "BUY",
+             "size": 10, "price": 0.55, "match_time": ts1_iso},
+            {"trade_id": "tid_2", "token_id": "tok_btc_up", "side": "BUY",
+             "size": 5, "price": 0.60, "match_time": ts2_iso},
+        ]
+        truth._get_trades = lambda: batch1
+        new1 = truth.run_wallet_scan()
+        _check("Cursor scan 1: 2 new fills", new1 == 2, f"got {new1}")
+
+        # Cursor should now be at ts2's epoch ms
+        cursor = truth.get_scan_cursor()
+        ts2_ms = int(ts2.timestamp() * 1000)
+        _check("Cursor ts_ms updated to ts2",
+               cursor["last_seen_ts_ms"] == ts2_ms,
+               f"got {cursor['last_seen_ts_ms']} expected {ts2_ms}")
+
+        # Second scan: same 2 trades + 1 new trade
+        batch2 = batch1 + [
+            {"trade_id": "tid_3", "token_id": "tok_btc_up", "side": "BUY",
+             "size": 8, "price": 0.58, "match_time": ts3_iso},
+        ]
+        truth._get_trades = lambda: batch2
+        new2 = truth.run_wallet_scan()
+        _check("Cursor scan 2: only 1 new fill (old 2 skipped by cursor)",
+               new2 == 1, f"got {new2}")
+        _check("Total fills = 3", len(truth._fills) == 3,
+               f"got {len(truth._fills)}")
+
+        # Third scan: same 3 trades — all should be skipped
+        truth._get_trades = lambda: batch2
+        new3 = truth.run_wallet_scan()
+        _check("Cursor scan 3: 0 new (all seen)", new3 == 0, f"got {new3}")
+
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_skip_history():
+    """SKIP_HISTORY: skip_history_now() sets cursor to now, blocking old fills."""
+    print("\n" + "=" * 60)
+    print("  TEST: SKIP_HISTORY sets cursor to now")
+    print("=" * 60)
+
+    tmpdir = tempfile.mkdtemp(prefix="test_skip_hist_")
+    ledger_path = os.path.join(tmpdir, "truth_fills.jsonl")
+
+    try:
+        truth = TruthCapture(
+            ledger_path=ledger_path,
+            wallet_address="0xtest",
+            write_jsonl_fn=lambda d: None,
+        )
+
+        hour_start = truth._hour_start
+        current_slug = f"ETH_skip_{truth._hour_suffix}"
+        truth.register_token("tok_eth_up", current_slug, "Up")
+
+        # Call skip_history_now — cursor should be set to NOW
+        truth.skip_history_now()
+        cursor_before = truth.get_scan_cursor()
+        _check("skip_history: cursor > 0",
+               cursor_before["last_seen_ts_ms"] > 0,
+               f"got {cursor_before['last_seen_ts_ms']}")
+
+        import time
+        now_ms = int(time.time() * 1000)
+        _check("skip_history: cursor close to now",
+               abs(cursor_before["last_seen_ts_ms"] - now_ms) < 5000,
+               f"cursor={cursor_before['last_seen_ts_ms']} now={now_ms}")
+
+        # Trades from earlier in the hour (but before skip_history_now) should be blocked
+        early_trades = [
+            {"trade_id": "early_1", "token_id": "tok_eth_up", "side": "BUY",
+             "size": 10, "price": 0.55,
+             "match_time": (hour_start + timedelta(minutes=1)).strftime(
+                 "%Y-%m-%dT%H:%M:%S.%fZ")},
+            {"trade_id": "early_2", "token_id": "tok_eth_up", "side": "BUY",
+             "size": 5, "price": 0.60,
+             "match_time": (hour_start + timedelta(minutes=2)).strftime(
+                 "%Y-%m-%dT%H:%M:%S.%fZ")},
+        ]
+        truth._get_trades = lambda: early_trades
+        new_count = truth.run_wallet_scan()
+        _check("skip_history: earlier fills blocked by cursor",
+               new_count == 0, f"got {new_count}")
+        _check("skip_history: fill count = 0",
+               len(truth._fills) == 0, f"got {len(truth._fills)}")
+
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_cursor_persistence():
+    """get_scan_cursor / set_scan_cursor round-trip."""
+    print("\n" + "=" * 60)
+    print("  TEST: Cursor persistence (get/set round-trip)")
+    print("=" * 60)
+
+    tmpdir = tempfile.mkdtemp(prefix="test_cursor_persist_")
+    ledger_path = os.path.join(tmpdir, "truth_fills.jsonl")
+
+    try:
+        truth = TruthCapture(
+            ledger_path=ledger_path,
+            wallet_address="0xtest",
+            write_jsonl_fn=lambda d: None,
+        )
+
+        # Set cursor manually
+        test_cursor = {
+            "last_seen_ts_ms": 1234567890000,
+            "last_seen_tid": "test_tid_999",
+            "recent_tids": ["tid_a", "tid_b", "tid_c"],
+        }
+        truth.set_scan_cursor(test_cursor)
+
+        # Get it back
+        result = truth.get_scan_cursor()
+        _check("Cursor round-trip: ts_ms",
+               result["last_seen_ts_ms"] == 1234567890000,
+               f"got {result['last_seen_ts_ms']}")
+        _check("Cursor round-trip: tid",
+               result["last_seen_tid"] == "test_tid_999",
+               f"got {result['last_seen_tid']}")
+        _check("Cursor round-trip: recent_tids",
+               result["recent_tids"] == ["tid_a", "tid_b", "tid_c"],
+               f"got {result['recent_tids']}")
+
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 if __name__ == "__main__":
     print("\n" + "=" * 60)
     print("  HOUR SCOPING TEST SUITE")
@@ -497,6 +659,9 @@ if __name__ == "__main__":
     test_disk_reload_scoping()
     test_unverifiable_fills_rejected()
     test_ledger_no_meta_rejected()
+    test_cursor_based_scanning()
+    test_skip_history()
+    test_cursor_persistence()
 
     print("\n" + "=" * 60)
     total = _PASS + _FAIL

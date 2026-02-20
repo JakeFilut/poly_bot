@@ -467,6 +467,9 @@ class Bot:
             desync_tolerance=0.01,
         )
         self._truth.load_from_disk()
+        # ── SKIP_HISTORY: set cursor to NOW so no historical fills are ingested ──
+        if SKIP_HISTORY:
+            self._truth.skip_history_now()
         # ── LIVE_SAFE mode: monotonic process start for entry window ──
         self._process_start_mono = time.monotonic()
         # ── LIVE_SAFE: record starting hour so we exit when it ends ──
@@ -575,6 +578,10 @@ class Bot:
             for st in self.market_states.values():
                 for outcome in ["Up", "Down"]:
                     self._clean_dust(st.positions[outcome])
+            # Restore scan cursor from state.json
+            saved_cursor = raw.get("scan_cursor")
+            if saved_cursor and isinstance(saved_cursor, dict):
+                self._truth.set_scan_cursor(saved_cursor)
             loaded_schema = raw.get("schema_version", "unknown")
             write_jsonl({"event_type":"STATE_LOADED", "cash": self.cash_usdc,
                          "realized_pnl": self.realized_pnl_usdc,
@@ -603,6 +610,7 @@ class Bot:
                 "hour_window": iso_z(self._hour_window),
                 "equity_usdc": self._equity(),
                 "market_states": ms,
+                "scan_cursor": self._truth.get_scan_cursor(),
             }
             with open(STATE_FILE, "w", encoding="utf-8") as f:
                 json.dump(raw, f, separators=(",", ":"))
@@ -1228,7 +1236,8 @@ class Bot:
 
                     # Truth Capture: poll order watchers, wallet scan, reconcile
                     _truth_active_tids = set(self._get_token_to_slug_outcome().keys())
-                    self._truth.tick(active_token_ids=_truth_active_tids)
+                    self._truth.tick(active_token_ids=_truth_active_tids,
+                                     position_log_interval=POSITION_LOG_INTERVAL_SEC)
 
                     # Active window filter: tell truth + ledger which tokens are current hour
                     self._truth.set_active_window(

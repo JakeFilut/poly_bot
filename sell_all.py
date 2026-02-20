@@ -26,12 +26,31 @@ for env_path in [os.path.join(_KEYS_DIR, ".env"), str(_PROJECT_DIR / ".env")]:
 os.environ["MODE"] = "LIVE"
 
 from src.feeds.polymarket import PolymarketClient
-from src.utils.logging import log_trade
 from src.config.settings import LEDGER_ENABLED, LEDGER_PATH
 from src.execution.fills_ledger import FillsLedger
 from py_clob_client.clob_types import OrderArgs, OrderType
 
 DRY_RUN = "--dry-run" in sys.argv or "-n" in sys.argv
+
+# ── Inline trade logger (was src.utils.logging.log_trade) ──
+import csv as _csv
+_TRADE_LOG_HEADER = ["timestamp", "action", "token_id", "side", "quantity",
+                     "price", "order_type", "status", "order_id", "tx_hash", "notes"]
+_TRADE_LOG_DIR = os.path.join(os.path.dirname(str(_PROJECT_DIR)), "logs", "poly_bot")
+_TRADE_LOG_PATH = os.path.join(_TRADE_LOG_DIR, "trades.csv")
+
+def log_trade(action="", token_id="", side="", quantity=0, price=0,
+              order_type="", status="", order_id="", tx_hash="", notes=""):
+    os.makedirs(_TRADE_LOG_DIR, exist_ok=True)
+    if not os.path.exists(_TRADE_LOG_PATH):
+        with open(_TRADE_LOG_PATH, "w", newline="", encoding="utf-8") as f:
+            _csv.writer(f).writerow(_TRADE_LOG_HEADER)
+    row = [datetime.now(timezone.utc).isoformat(timespec="seconds"),
+           action, token_id[-12:] if token_id else "", side, quantity,
+           f"{price:.4f}" if price else "", order_type, status,
+           order_id[:16] if order_id else "", tx_hash[:16] if tx_hash else "", notes]
+    with open(_TRADE_LOG_PATH, "a", newline="", encoding="utf-8") as f:
+        _csv.writer(f).writerow(row)
 
 PRIVATE_KEY = os.getenv("POLYMARKET_PRIVATE_KEY", "")
 if not PRIVATE_KEY:
