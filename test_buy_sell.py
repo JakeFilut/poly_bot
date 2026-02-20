@@ -53,7 +53,8 @@ wallet = Web3.to_checksum_address(feed._wallet_address)
 # transfer conditional tokens on your behalf.  Without this, SELL orders
 # are rejected with "not enough balance / allowance".
 OPERATORS = [
-    ("0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8ED0a90", "CTF Exchange"),
+    ("0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8ED0a90", "CTF Exchange (legacy)"),
+    ("0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E", "CTF Exchange (SDK)"),
     ("0xC5d563A36AE78145C45a50134d48A1215220f80a", "Neg Risk CTF Exchange"),
     ("0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296", "Neg Risk Adapter"),
 ]
@@ -196,6 +197,10 @@ for i in range(12):
         break
 else:
     print(f"    WARNING: tokens may not have settled after 30s")
+
+# Give the CLOB indexer time to sync the on-chain settlement
+print("    Waiting 5s for CLOB to sync...")
+time.sleep(5)
 
 # Re-read book for sell price
 book = feed.get_top_of_book(token_id)

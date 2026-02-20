@@ -138,7 +138,8 @@ class PolymarketClient:
                 address=Web3.to_checksum_address(self.CONDITIONAL_TOKENS), abi=approval_abi
             )
             operators = [
-                (self.CTF_EXCHANGE, "CTF Exchange"),
+                (self.CTF_EXCHANGE, "CTF Exchange (legacy)"),
+                ("0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E", "CTF Exchange (SDK)"),
                 (self.NEG_RISK_CTF_EXCHANGE, "Neg Risk CTF Exchange"),
                 (self.NEG_RISK_ADAPTER, "Neg Risk Adapter"),
             ]

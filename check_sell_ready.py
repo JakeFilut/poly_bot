@@ -59,8 +59,10 @@ ct = w3.eth.contract(address=Web3.to_checksum_address(CONDITIONAL_TOKENS),
 
 # Check approvals
 print("\n--- ERC1155 Approvals (required for selling) ---")
+CTF_EXCHANGE_SDK = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
 operators = [
-    (CTF_EXCHANGE, "CTF Exchange"),
+    (CTF_EXCHANGE, "CTF Exchange (legacy)"),
+    (CTF_EXCHANGE_SDK, "CTF Exchange (SDK)"),
     (NEG_RISK_CTF_EXCHANGE, "Neg Risk CTF Exchange"),
     (NEG_RISK_ADAPTER, "Neg Risk Adapter"),
 ]
