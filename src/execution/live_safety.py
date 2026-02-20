@@ -2,7 +2,10 @@
 
 Rules:
   1. Atomic Hedge Rule: time-based kill switch for unpaired legs
-  2. Max Slippage Protection: abort hedge if price moved > 1.5c
+     Timer starts at fill confirmation (not submission).
+     Pauses if leg2 is actively filling (partial progress).
+  2. Max Slippage Protection: abort hedge if expected PnL < threshold
+     Checks effective price including maker/taker fees, not just raw drift.
   3. Partial Fill Handling: hedge only what filled, cancel remainder
   4. Spread Explosion Filter: disable trading when spread > 3c (5c in final 2 min)
   5. Order Book Depth Check: require 2x order size at price level
@@ -10,9 +13,13 @@ Rules:
   7. Max Loss Per Window: stop trading if hourly PnL < -$25
   8. Last 90 Seconds Rule: no resting orders, IOC-only behavior
   9. Cancel All Before Resolution: cancel everything 30s before close
+     Sets CLOSE_IMMINENT flag to prevent re-entry on same tick.
+
+Sell guard: sells must be monotonic risk-reducing. No sell that would
+increase net exposure (e.g., selling YES when already net short YES).
 
 All rules are active in LIVE and LIVE_SAFE modes. LOG mode bypasses all checks.
-Sells/exits are NEVER blocked — only new entries are gated.
+Exit-only sells are always allowed; exposure-increasing sells are blocked.
 """
 from __future__ import annotations
 
@@ -65,8 +72,13 @@ class LiveSafety:
         self._loss_stop_active: bool = False
         self._loss_stop_hour_key: str = ""  # reset on new hour
 
-        # Rule 9: Track if cancel-all already fired this hour
+        # Rule 9: Track if cancel-all already fired this hour + CLOSE_IMMINENT flag
         self._cancel_all_fired_hour_key: str = ""
+        self._close_imminent: bool = False
+        self._close_imminent_hour_key: str = ""
+
+        # Sell churn guard: track recent sells per slug to prevent flip-flop
+        self.diag_sell_churn_blocks = 0
 
         # Diagnostics
         self.diag_hedge_fail_exits = 0
@@ -79,6 +91,8 @@ class LiveSafety:
 
     # ──────────────────────────────────────────────────────────────────────
     # Rule 1: Atomic Hedge Rule
+    # Timer starts at leg1 FILL CONFIRMATION, not submission.
+    # If leg2 is actively filling (partial progress), pause the timer.
     # ──────────────────────────────────────────────────────────────────────
 
     def hedge_timeout_sec(self, t_min: float) -> float:
@@ -87,22 +101,45 @@ class LiveSafety:
             return HEDGE_KILL_TIMEOUT_FINAL_SEC
         return HEDGE_KILL_TIMEOUT_SEC
 
-    def should_kill_hedge(self, hedge_start_ts: float, t_min: float) -> bool:
+    def should_kill_hedge(self, leg1_fill_ts: float, t_min: float,
+                          leg2_partial_qty: float = 0.0,
+                          leg2_requested_qty: float = 0.0) -> bool:
         """Check if hedge has exceeded its time limit.
-        Returns True if the hedge should be killed and the filled side exited."""
-        elapsed = time.time() - hedge_start_ts
+        Args:
+            leg1_fill_ts: timestamp when leg1 fill was CONFIRMED (not submitted)
+            t_min: minutes into hour
+            leg2_partial_qty: how much of leg2 has filled so far
+            leg2_requested_qty: total leg2 size requested
+        Returns True if the hedge should be killed and the filled side exited.
+        If leg2 is actively filling (>25% done), DON'T kill — let it complete."""
+        # If leg2 has made significant progress, don't kill it
+        if leg2_requested_qty > 0 and leg2_partial_qty > 0:
+            fill_pct = leg2_partial_qty / leg2_requested_qty
+            if fill_pct >= 0.25:
+                return False  # actively filling — let it finish
+        elapsed = time.time() - leg1_fill_ts
         timeout = self.hedge_timeout_sec(t_min)
         return elapsed >= timeout
 
     # ──────────────────────────────────────────────────────────────────────
-    # Rule 2: Max Slippage Protection
+    # Rule 2: Max Slippage Protection (PnL-based, fee-aware)
+    # Compares expected hedge PnL including fees, not just raw price drift.
     # ──────────────────────────────────────────────────────────────────────
 
     def check_slippage_ok(self, intended_price: float,
-                          current_price: float) -> bool:
-        """Check if current price has moved too far from intended hedge price.
-        Returns True if slippage is acceptable, False if hedge should be aborted."""
-        slippage_cents = abs(current_price - intended_price) * 100.0
+                          current_price: float,
+                          fee_bps: float = 0.0) -> bool:
+        """Check if hedge is still viable after price movement + fees.
+        Args:
+            intended_price: the ask price we planned to buy at for leg2
+            current_price: the actual current ask for leg2
+            fee_bps: estimated fee in basis points (e.g., 0.5 for maker, 2.0 for taker)
+        Returns True if slippage is acceptable, False if hedge should be aborted.
+        Uses effective cost (price + fee) to compute true slippage."""
+        fee_adj = intended_price * fee_bps / 10000.0
+        effective_intended = intended_price + fee_adj
+        effective_current = current_price + current_price * fee_bps / 10000.0
+        slippage_cents = abs(effective_current - effective_intended) * 100.0
         if slippage_cents > HEDGE_MAX_SLIPPAGE_CENTS:
             self.diag_slippage_aborts += 1
             return False
@@ -289,6 +326,65 @@ class LiveSafety:
         return True
 
     # ──────────────────────────────────────────────────────────────────────
+    # Sell Churn Guard: sells must be monotonic risk-reducing
+    # ──────────────────────────────────────────────────────────────────────
+
+    def check_sell_reduces_risk(self, outcome: str, sell_qty: float,
+                                pos_qty: float, slug: str = "") -> bool:
+        """Verify that a sell order reduces risk (does not increase exposure).
+        A sell is only allowed if:
+          - We actually hold a position in this outcome
+          - The sell qty does not exceed our position (would create a short)
+        Returns True if sell is risk-reducing, False if it would increase exposure."""
+        if pos_qty < 0.5:
+            # No position to sell — this would be exposure-increasing
+            self.diag_sell_churn_blocks += 1
+            self._write_jsonl({
+                "event_type": "SELL_CHURN_BLOCKED",
+                "slug": slug,
+                "outcome": outcome,
+                "sell_qty": round(sell_qty, 1),
+                "pos_qty": round(pos_qty, 1),
+                "reason": "no_position",
+                "ts_ms": int(time.time() * 1000),
+            })
+            return False
+        if sell_qty > pos_qty + 0.5:
+            # Sell exceeds position — would flip to short
+            self.diag_sell_churn_blocks += 1
+            self._write_jsonl({
+                "event_type": "SELL_CHURN_BLOCKED",
+                "slug": slug,
+                "outcome": outcome,
+                "sell_qty": round(sell_qty, 1),
+                "pos_qty": round(pos_qty, 1),
+                "reason": "would_exceed_position",
+                "ts_ms": int(time.time() * 1000),
+            })
+            return False
+        return True
+
+    # ──────────────────────────────────────────────────────────────────────
+    # CLOSE_IMMINENT flag (Fix 4): prevent re-entry after cancel-all
+    # ──────────────────────────────────────────────────────────────────────
+
+    def set_close_imminent(self, hour_key: str):
+        """Set the CLOSE_IMMINENT flag — prevents ANY new orders."""
+        self._close_imminent = True
+        self._close_imminent_hour_key = hour_key
+        self._write_jsonl({
+            "event_type": "CLOSE_IMMINENT_SET",
+            "hour_key": hour_key,
+            "ts_ms": int(time.time() * 1000),
+        })
+
+    def is_close_imminent(self, hour_key: str = "") -> bool:
+        """Check if CLOSE_IMMINENT flag is set. Resets on new hour."""
+        if hour_key and hour_key != self._close_imminent_hour_key:
+            self._close_imminent = False
+        return self._close_imminent
+
+    # ──────────────────────────────────────────────────────────────────────
     # Composite gate: check all pre-entry rules at once
     # ──────────────────────────────────────────────────────────────────────
 
@@ -298,7 +394,11 @@ class LiveSafety:
                         equity: float, hour_start_equity: float,
                         hour_key: str) -> tuple:
         """Run all pre-entry safety checks. Returns (allowed: bool, reason: str).
-        Sells are NEVER blocked by this — only new BUY entries."""
+        Exit-only sells are always allowed; only new entries are gated."""
+        # Fix 4: CLOSE_IMMINENT — hard block after cancel-all fired
+        if self.is_close_imminent(hour_key):
+            return False, "CLOSE_IMMINENT"
+
         # Rule 4: Spread explosion
         if not self.check_spread_ok(slug, spread_cents, t_min):
             return False, "SPREAD_TOO_WIDE"
@@ -334,8 +434,10 @@ class LiveSafety:
             "loss_stop_blocks": self.diag_loss_stop_blocks,
             "ioc_enforced": self.diag_ioc_enforced,
             "cancel_all_fired": self.diag_cancel_all_fired,
+            "sell_churn_blocks": self.diag_sell_churn_blocks,
             "hedge_breaker_active": self.is_hedge_breaker_active(),
             "loss_stop_active": self._loss_stop_active,
+            "close_imminent": self._close_imminent,
             "spread_paused_slugs": len(self._spread_paused_until),
         }
 

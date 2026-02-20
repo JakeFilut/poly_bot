@@ -1099,13 +1099,15 @@ class Bot:
                                         if oid:
                                             self.client.cancel_order(oid)
                                     self._exec_tracker._orders.clear()
+                                    # Fix 4: set CLOSE_IMMINENT — prevents ANY new orders
+                                    self._live_safety.set_close_imminent(hour_key)
                                     write_jsonl({"event_type": "CANCEL_ALL_BEFORE_RESOLUTION",
                                                   "slug": m_r9.slug,
                                                   "seconds_to_close": round(sec_to_close, 1),
                                                   "orders_cancelled": len(open_orders),
                                                   "ts_ms": int(time.time() * 1000)})
                                     print(f"  [RULE 9] Cancelled {len(open_orders)} orders "
-                                          f"({sec_to_close:.0f}s to close)")
+                                          f"({sec_to_close:.0f}s to close) — CLOSE_IMMINENT set")
                             except Exception:
                                 pass
                             break  # all markets share the same hour — only need one check
@@ -2426,6 +2428,11 @@ class Bot:
         if DIRECTIONAL_SCALP_ENABLED:
             self._dscalp_manage_exits(m, st, ctx)
         self._directional_lean_exits(m, st, t_min, delta_bps, ctx)
+
+        # ── CLOSE_IMMINENT: after cancel-all, block ALL new orders (not exits) ──
+        if MODE in ("LIVE", "LIVE_SAFE") and self._live_safety.is_close_imminent(
+                st.hour_start_utc):
+            return  # exits already ran above; no new entries/quotes
 
         # ── PARITY: priority #3 — hard-gated by directional state ──
         parity_blocked = self._should_block_parity(m, st)
@@ -4121,9 +4128,11 @@ class Bot:
             if MODE in ("LIVE", "LIVE_SAFE") and up_filled > 0:
                 # Rule 3: clamp leg 2 to what leg 1 actually filled
                 leg2_usd = LiveSafety.clamp_hedge_qty(up_filled, leg_usd)
-                # Rule 2: check slippage — re-read book for leg 2
+                # Rule 2: check slippage (fee-aware) — re-read book for leg 2
                 fresh_dn = self.last_book.get(m.slug, {}).get("Down", dn_book)
-                if not self._live_safety.check_slippage_ok(dn_book.ask, fresh_dn.ask):
+                # Use taker fee for worst-case estimate
+                if not self._live_safety.check_slippage_ok(
+                        dn_book.ask, fresh_dn.ask, fee_bps=TAKER_FEE_BPS):
                     # Slippage too large — unwind leg 1 immediately
                     up_pos = st.positions["Up"]
                     up_unwind_qty = min(up_filled / max(0.01, up_book.ask), up_pos.qty)
@@ -4186,6 +4195,7 @@ class Bot:
                     "filled_qty": filled_usd / max(1e-9, filled_book.ask),
                     "filled_price": filled_book.ask,
                     "pending_outcome": pending_outcome,
+                    "pending_qty_at_start": st.positions[pending_outcome].qty,
                     "ts": time.time(),
                     "edge_net_cents": buy_net,
                 })
@@ -4292,9 +4302,15 @@ class Bot:
             elapsed_sec = now_t - pair["ts"]
 
             # ── Rule 1: Atomic Hedge Kill Switch (LIVE modes) ──
+            #    Timer anchored to fill confirmation (pair["ts"]).
+            #    Pauses if leg2 is actively filling (>25% progress).
             if MODE in ("LIVE", "LIVE_SAFE"):
-                hedge_timeout = self._live_safety.hedge_timeout_sec(t_min)
-                if elapsed_sec >= hedge_timeout:
+                # Check if leg2 has made any partial progress
+                pending_pos = st.positions[pair["pending_outcome"]]
+                leg2_partial = max(0.0, pending_pos.qty - pair.get("pending_qty_at_start", 0.0))
+                leg2_requested = pair["filled_qty"]
+                if self._live_safety.should_kill_hedge(
+                        pair["ts"], t_min, leg2_partial, leg2_requested):
                     # Timeout — force market exit the filled leg immediately
                     filled_book = up_book if pair["filled_outcome"] == "Up" else dn_book
                     pos = st.positions[pair["filled_outcome"]]
@@ -6302,8 +6318,13 @@ class Bot:
         qty = max(0.0, qty)
         if qty < MIN_QTY:
             return  # don't sell dust — don't log it either
-        token_id = m.outcome_up_id if outcome == "Up" else m.outcome_down_id
+        # Sell churn guard: sell must be monotonic risk-reducing (no shorting)
         pos = st.positions[outcome]
+        if MODE in ("LIVE", "LIVE_SAFE"):
+            if not self._live_safety.check_sell_reduces_risk(
+                    outcome, qty, pos.qty, m.slug):
+                return
+        token_id = m.outcome_up_id if outcome == "Up" else m.outcome_down_id
         up_book = self.last_book.get(m.slug, {}).get("Up")
         dn_book = self.last_book.get(m.slug, {}).get("Down")
         ref_book = up_book if outcome == "Up" else dn_book
