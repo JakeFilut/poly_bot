@@ -142,7 +142,7 @@ def whipsaw_ok(delta_bps: float, vel: float,
         delta_sign = 1 if delta_bps > 0 else -1
         vel_sign = 1 if vel > 0 else -1
         if delta_sign != vel_sign:
-            return False, f"vel_opposes(delta={delta_bps:+.1f},vel={vel:+.1f})"
+            return False, f"vel_opposes(delta={delta_bps:+.2f},vel={vel:+.4f},thr={VEL_OPPOSE_THRESHOLD})"
     return True, ""
 
 

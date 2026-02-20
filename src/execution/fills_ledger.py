@@ -650,6 +650,7 @@ class FillsLedger:
         open_orders: Optional[List[dict]] = None,
         tolerance_shares: float = 0.01,
         tolerance_usdc: float = 0.05,
+        active_token_ids: Optional[Set[str]] = None,
     ) -> Dict[str, Any]:
         """Compare ledger-derived positions vs actual wallet positions + open orders.
 
@@ -658,24 +659,36 @@ class FillsLedger:
             open_orders: list of open order dicts (for context logging)
             tolerance_shares: max qty mismatch before WARNING (CRITICAL = 10x)
             tolerance_usdc: max USD mismatch before WARNING
+            active_token_ids: if provided, only reconcile positions whose
+                token_id is in this set (current-hour markets).  Expired
+                hourly positions are settled on-chain and naturally go to 0;
+                comparing them would trigger false CRITICAL alerts.
 
         Returns:
             {"matches": [...], "mismatches": [...], "critical": bool,
-             "open_orders_count": int}
+             "open_orders_count": int, "skipped_expired": int}
         """
         result: Dict[str, Any] = {
             "matches": [],
             "mismatches": [],
             "critical": False,
             "open_orders_count": len(open_orders) if open_orders else 0,
+            "skipped_expired": 0,
         }
 
         # Collect all relevant (token_id, side) keys
         all_keys: Set[Tuple[str, str]] = set(wallet_balances.keys())
+        skipped_expired = 0
         with self._lock:
             for key, pos in self._positions.items():
                 if pos.net_qty > _ZERO:
+                    token_id = key[0]
+                    # Skip expired positions not in current active markets
+                    if active_token_ids is not None and token_id not in active_token_ids:
+                        skipped_expired += 1
+                        continue
                     all_keys.add(key)
+        result["skipped_expired"] = skipped_expired
 
         mismatches = []
         critical_threshold = tolerance_shares * 10  # 10x tolerance = CRITICAL
@@ -723,9 +736,14 @@ class FillsLedger:
             "mismatches": len(mismatches),
             "critical": critical,
             "open_orders_count": result["open_orders_count"],
+            "skipped_expired": skipped_expired,
             "details": mismatches[:20],
             "ts_ms": int(time.time() * 1000),
         })
+
+        if skipped_expired > 0:
+            print(f"  [LEDGER] Reconcile: skipped {skipped_expired} expired "
+                  f"hourly positions (settled on-chain)")
 
         if critical:
             print(f"  [LEDGER] *** CRITICAL MISMATCH: "
@@ -815,19 +833,9 @@ class FillsLedger:
             qty = raw_fill.get("size", raw_fill.get("amount", 0))
             price = raw_fill.get("price", 0)
             order_id = str(raw_fill.get("order_id", ""))
-            timestamp = raw_fill.get("timestamp", raw_fill.get("created_at", ""))
-
-            # DEBUG: print every raw fill row BEFORE filtering/deduping
-            print(f"  [LEDGER] EXTERNAL_FILL_RAW[{i}]: "
-                  f"order_id={order_id[:16] if order_id else '?'}  "
-                  f"token_id={token_id[-12:] if token_id else '?'}  "
-                  f"side={action}  qty={qty}  price={price}  "
-                  f"trade_id={trade_id[:16] if trade_id else '?'}  "
-                  f"ts={timestamp}")
 
             if action not in ("BUY", "SELL"):
                 skipped_action += 1
-                print(f"  [LEDGER]   -> SKIPPED: invalid action '{action}'")
                 continue
 
             # Look up metadata
@@ -840,9 +848,11 @@ class FillsLedger:
 
             if not slug and not outcome:
                 skipped_no_meta += 1
-                print(f"  [LEDGER]   -> WARNING: no slug/outcome metadata "
-                      f"for token_id={token_id[-16:]}  "
-                      f"(not in token_to_slug or _token_meta)")
+                # Only log no-meta warnings (these indicate a real problem)
+                print(f"  [LEDGER] EXTERNAL_FILL no metadata: "
+                      f"order_id={order_id[:16] if order_id else '?'}  "
+                      f"token_id={token_id[-12:] if token_id else '?'}  "
+                      f"side={action}  qty={qty}  price={price}")
 
             pos = self.record_fill(
                 slug=slug, crypto=crypto,
@@ -857,12 +867,13 @@ class FillsLedger:
             )
             if pos is not None:
                 new_count += 1
-                print(f"  [LEDGER]   -> NEW fill recorded: "
-                      f"{slug} {outcome} {action} qty={qty} @ {price}")
+                # Always log newly discovered fills
+                print(f"  [LEDGER] EXTERNAL_FILL NEW: "
+                      f"{slug} {outcome} {action} qty={qty} @ {price}  "
+                      f"order_id={order_id[:16] if order_id else '?'}  "
+                      f"token_id={token_id[-12:] if token_id else '?'}")
             else:
                 skipped_dedup += 1
-                print(f"  [LEDGER]   -> DEDUP: already seen "
-                      f"(trade_id={trade_id[:16] if trade_id else '?'})")
 
         self._write_jsonl({
             "event_type": "LEDGER_EXTERNAL_FILLS_INGESTED",
@@ -873,10 +884,11 @@ class FillsLedger:
             "skipped_no_meta": skipped_no_meta,
             "ts_ms": int(time.time() * 1000),
         })
-        if new_count > 0 or skipped_no_meta > 0:
-            print(f"  [LEDGER] External fill ingestion: {new_count} new, "
-                  f"{skipped_dedup} dedup, {skipped_action} bad_action, "
-                  f"{skipped_no_meta} no_meta (of {len(fills)} total)")
+        # One-line summary: always print so operator sees the cycle ran
+        print(f"  [LEDGER] External fills: {new_count} new / "
+              f"{len(fills)} total ({skipped_dedup} dedup"
+              f"{f', {skipped_no_meta} no_meta' if skipped_no_meta else ''}"
+              f"{f', {skipped_action} bad_action' if skipped_action else ''})")
 
         return new_count
 
