@@ -44,7 +44,7 @@ ct_abi = [{"inputs": [{"name": "account", "type": "address"}, {"name": "id", "ty
            "name": "balanceOf", "outputs": [{"name": "", "type": "uint256"}],
            "stateMutability": "view", "type": "function"}]
 ct = w3.eth.contract(address=Web3.to_checksum_address(CT_ADDR), abi=ct_abi)
-wallet = Web3.to_checksum_address(feed.wallet_address)
+wallet = Web3.to_checksum_address(feed._wallet_address)
 
 # Find BTC market
 print("\n[1] Finding current BTC market...")
