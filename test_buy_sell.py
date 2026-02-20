@@ -19,7 +19,7 @@ for env_path in [os.path.join(_KEYS_DIR, ".env"), str(_PROJECT_DIR / ".env")]:
 # Force LIVE mode so the client actually places orders
 os.environ["MODE"] = "LIVE"
 
-from src.feeds.polymarket import PolymarketFeed
+from src.feeds.polymarket import PolymarketClient
 
 PRIVATE_KEY = os.getenv("POLYMARKET_PRIVATE_KEY", "")
 if not PRIVATE_KEY:
@@ -31,7 +31,7 @@ print("  BUY + SELL TEST (5 shares, BTC cheaper side)")
 print("=" * 55)
 
 # Initialize the feed client
-feed = PolymarketFeed(private_key=PRIVATE_KEY)
+feed = PolymarketClient(private_key=PRIVATE_KEY)
 
 # Find BTC market
 print("\n[1] Finding current BTC market...")
