@@ -546,13 +546,16 @@ class Logger:
         return row
 
     def _console_print(self, event: Dict[str, Any]):
+        import os as _os
+        _quiet = _os.getenv("CONSOLE_LEVEL", "QUIET").upper() == "QUIET"
         etype = event.get("event_type", "")
         if etype == "SNAPSHOT_COMPACT":
-            print(f"  {event.get('crypto', ''):4s}  delta={event.get('delta_bps', 0):+7.1f}bps  "
-                  f"vel={event.get('vel', 0):+6.1f}  "
-                  f"up_ask={event.get('up_ask', 0):.3f}  "
-                  f"dn_ask={event.get('dn_ask', 0):.3f}  "
-                  f"t={event.get('t_min', 0):.1f}m")
+            if not _quiet:
+                print(f"  {event.get('crypto', ''):4s}  delta={event.get('delta_bps', 0):+7.1f}bps  "
+                      f"vel={event.get('vel', 0):+6.1f}  "
+                      f"up_ask={event.get('up_ask', 0):.3f}  "
+                      f"dn_ask={event.get('dn_ask', 0):.3f}  "
+                      f"t={event.get('t_min', 0):.1f}m")
         elif etype == "ORDER_FILL":
             pnl = event.get("realized_pnl_usdc", 0)
             side = event.get("side", "BUY")
@@ -573,8 +576,9 @@ class Logger:
             print(f"      Cash: ${event.get('cash', 0):.2f}  "
                   f"Equity: ${event.get('equity', 0):.2f}\n")
         elif etype == "BOUNDARY":
-            print(f"  --- BOUNDARY {event.get('slug', '')}: {event.get('boundary', '')} "
-                  f"{json.dumps({k: v for k, v in event.items() if k not in ('event_type', 'ts', 'slug', 'boundary')}, default=str)}")
+            if not _quiet:
+                print(f"  --- BOUNDARY {event.get('slug', '')}: {event.get('boundary', '')} "
+                      f"{json.dumps({k: v for k, v in event.items() if k not in ('event_type', 'ts', 'slug', 'boundary')}, default=str)}")
         elif etype == "LOOP_ERROR":
             print(f"  ERROR: {event.get('err', '')}")
         elif etype == "SKIP_NO_PRICE":
@@ -583,9 +587,18 @@ class Logger:
                         "ORDER_SUBMIT", "ORDER_ACK", "ORDER_CANCEL"):
             pass  # quiet
         elif etype not in ("SNAPSHOT_COMPACT",):
-            filt = {k: v for k, v in event.items()
-                    if k not in ("event_type", "ts")}
-            print(f"[{etype}] {json.dumps(filt, default=str)}")
+            # In QUIET mode, only print important events to console
+            if _quiet and etype in (
+                "CLONE_REPORT", "DIAG_REPORT", "TEMPO_REPORT",
+                "GATE_REPORT", "SLUG_PNL_REPORT", "FAST_TP_FIRE",
+                "RESCUE_TRIGGERED", "KILL_SWITCH_ACTIVATED",
+                "STATE_DRIFT",
+            ):
+                pass  # still logged to JSONL, just not printed
+            else:
+                filt = {k: v for k, v in event.items()
+                        if k not in ("event_type", "ts")}
+                print(f"[{etype}] {json.dumps(filt, default=str)}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -42,7 +42,7 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "COMPACT").upper()                           
 LOG_GATES_EVERY_N_SEC = float(os.getenv("LOG_GATES_EVERY_N_SEC", "30"))         # GATE_REPORT summary interval
 LOG_SNAPSHOT_EVERY_N_SEC = float(os.getenv("LOG_SNAPSHOT_EVERY_N_SEC", "60"))   # SNAPSHOT_COMPACT per slug interval
 LOG_SPREAD_BLOCK_SAMPLER = float(os.getenv("LOG_SPREAD_BLOCK_SAMPLER", "0.02")) # 2% sampling for GATE_SPREAD_BLOCK
-CONSOLE_LEVEL = os.getenv("CONSOLE_LEVEL", "NORMAL").upper()                    # NORMAL | QUIET
+CONSOLE_LEVEL = os.getenv("CONSOLE_LEVEL", "QUIET").upper()                     # NORMAL | QUIET
 
 # Markets / coins
 CRYPTOS = ["BTC", "ETH", "SOL", "XRP"]

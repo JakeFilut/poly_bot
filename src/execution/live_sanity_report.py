@@ -18,7 +18,7 @@ from __future__ import annotations
 import time
 from typing import Callable, Dict
 
-from src.config.settings import OM_SANITY_REPORT_INTERVAL_SEC
+from src.config.settings import OM_SANITY_REPORT_INTERVAL_SEC, CONSOLE_LEVEL
 
 
 class LiveSanityReporter:
@@ -72,17 +72,18 @@ class LiveSanityReporter:
             max_usd = stats.get("live_safe_max_order_usd", 0)
             buys_str = f"buys={buys_ok}({remaining:.0f}s)  max_order=${max_usd:.2f}  "
 
-        print(
-            f"  [LIVE_SANITY] "
-            f"{buys_str}"
-            f"open_orders={stats.get('open_orders_count', 0)}  "
-            f"orphan_cx={stats.get('orphan_cancels_last_min', 0)}  "
-            f"api_err={stats.get('api_errors_last_min', 0)}  "
-            f"partial={stats.get('partial_fill_count', 0)}  "
-            f"unpaired={stats.get('unpaired_events_last_min', 0)}  "
-            f"ttl_cx={stats.get('ttl_cancels', 0)}  "
-            f"cap_blk={stats.get('cap_blocks_last_min', 0)}  "
-            f"drift={'YES' if stats.get('drift_detected') else 'no'}  "
-            f"kill={'ON' if stats.get('kill_switch_active') else 'off'}  "
-            f"exposure=${total_usd:.0f}  top=[{top_str}]"
-        )
+        if CONSOLE_LEVEL != "QUIET":
+            print(
+                f"  [LIVE_SANITY] "
+                f"{buys_str}"
+                f"open_orders={stats.get('open_orders_count', 0)}  "
+                f"orphan_cx={stats.get('orphan_cancels_last_min', 0)}  "
+                f"api_err={stats.get('api_errors_last_min', 0)}  "
+                f"partial={stats.get('partial_fill_count', 0)}  "
+                f"unpaired={stats.get('unpaired_events_last_min', 0)}  "
+                f"ttl_cx={stats.get('ttl_cancels', 0)}  "
+                f"cap_blk={stats.get('cap_blocks_last_min', 0)}  "
+                f"drift={'YES' if stats.get('drift_detected') else 'no'}  "
+                f"kill={'ON' if stats.get('kill_switch_active') else 'off'}  "
+                f"exposure=${total_usd:.0f}  top=[{top_str}]"
+            )

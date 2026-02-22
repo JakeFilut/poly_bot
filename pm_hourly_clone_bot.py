@@ -1820,14 +1820,15 @@ class Bot:
         }
         write_jsonl(clone_data)
 
-        # Console print (QUIET mode: only first summary line)
-        print(f"  CLONE: pairs={total_pairs}  "
-              f"r500={paired_500ms_ratio:.0%}  "
-              f"r1.5s={paired_straddle_ratio:.0%}  "
-              f"r10s={paired_10s_ratio:.0%}  "
-              f"delay={med_pair_delay_ms:.0f}ms  "
-              f"gap={med_inter_pair_ms:.0f}ms  "
-              f"sig2fill={med_signal_to_fill_ms:.0f}ms")
+        # Console print (suppressed in QUIET mode)
+        if CONSOLE_LEVEL != "QUIET":
+            print(f"  CLONE: pairs={total_pairs}  "
+                  f"r500={paired_500ms_ratio:.0%}  "
+                  f"r1.5s={paired_straddle_ratio:.0%}  "
+                  f"r10s={paired_10s_ratio:.0%}  "
+                  f"delay={med_pair_delay_ms:.0f}ms  "
+                  f"gap={med_inter_pair_ms:.0f}ms  "
+                  f"sig2fill={med_signal_to_fill_ms:.0f}ms")
         if CONSOLE_LEVEL != "QUIET":
             print(f"  LIFECYCLE: submit={clone_submits}  "
                   f"cancel={clone_cancels}  "
@@ -2087,20 +2088,21 @@ class Bot:
         exit_ok = "OK" if med_exit >= 4.0 else ("--" if med_exit == 0 else "!!")
         par_ok = "OK" if parity_fill_pct <= 0.30 else "!!"
 
-        # Always print: DIAG summary + ASYM + DSCALP
-        print(f"  DIAG [{tpm_ok}] trades/min={trades_per_min:.1f}  "
-              f"[{size_ok}] avg_size=${avg_trade_size:.1f}  "
-              f"[{hold_ok}] hold={med_hold:.0f}s  "
-              f"[{exit_ok}] exit={med_exit:+.1f}c")
-        print(f"  ASYM: win_rate={win_rate:.0%}  avg_win={avg_win_cents:+.1f}c/${avg_win_usdc:+.4f}  "
-              f"avg_loss={avg_loss_cents:+.1f}c/${avg_loss_usdc:+.4f}  med_hold={med_hold:.0f}s")
-        if self._dscalp_positions or dir_exit_count > 0:
-            print(f"  DSCALP: tp1={self._diag_dscalp_tp1} tp2={self._diag_dscalp_tp2} "
-                  f"tp3={self._diag_dscalp_tp3} tp4={self._diag_dscalp_tp4} "
-                  f"runner_fb={self._diag_dscalp_runner_fallbacks} "
-                  f"stop={self._diag_dscalp_stop_exits} early={self._diag_dscalp_early_exits} "
-                  f"timeout={self._diag_dscalp_timeout_exits} "
-                  f"active={len(self._dscalp_positions)}")
+        # DIAG summary + ASYM + DSCALP (suppressed in QUIET mode)
+        if CONSOLE_LEVEL != "QUIET":
+            print(f"  DIAG [{tpm_ok}] trades/min={trades_per_min:.1f}  "
+                  f"[{size_ok}] avg_size=${avg_trade_size:.1f}  "
+                  f"[{hold_ok}] hold={med_hold:.0f}s  "
+                  f"[{exit_ok}] exit={med_exit:+.1f}c")
+            print(f"  ASYM: win_rate={win_rate:.0%}  avg_win={avg_win_cents:+.1f}c/${avg_win_usdc:+.4f}  "
+                  f"avg_loss={avg_loss_cents:+.1f}c/${avg_loss_usdc:+.4f}  med_hold={med_hold:.0f}s")
+            if self._dscalp_positions or dir_exit_count > 0:
+                print(f"  DSCALP: tp1={self._diag_dscalp_tp1} tp2={self._diag_dscalp_tp2} "
+                      f"tp3={self._diag_dscalp_tp3} tp4={self._diag_dscalp_tp4} "
+                      f"runner_fb={self._diag_dscalp_runner_fallbacks} "
+                      f"stop={self._diag_dscalp_stop_exits} early={self._diag_dscalp_early_exits} "
+                      f"timeout={self._diag_dscalp_timeout_exits} "
+                      f"active={len(self._dscalp_positions)}")
         # Sub-detail lines (suppressed in QUIET mode)
         if CONSOLE_LEVEL != "QUIET":
             print(f"  FILL: dir_entry={dir_entry_count}  dir_exit={dir_exit_count}  "
@@ -2308,7 +2310,8 @@ class Bot:
         )
         paused_slugs = [s for s, d in slug_data.items() if d["paused"]]
         pause_str = f"  paused=[{','.join(paused_slugs)}]" if paused_slugs else ""
-        print(f"  [SLUG_PNL] {crypto_str}  worst=[{worst_str}]{pause_str}")
+        if CONSOLE_LEVEL != "QUIET":
+            print(f"  [SLUG_PNL] {crypto_str}  worst=[{worst_str}]{pause_str}")
 
     def _print_balance_summary(self):
         """Print balance and open positions to console.
@@ -2635,10 +2638,11 @@ class Bot:
         if spot_ts - _vel_dbg_last >= 60.0:
             self._vel_debug_last_ts[m.slug] = spot_ts
             vd = delta_velocity_debug(st.delta_hist, lookback_sec=30.0)
-            print(f"  [VEL_DEBUG] {m.slug} vel={vd['vel']:+.4f} bps/min  "
-                  f"delta_now={vd['delta_now']:+.2f} delta_prev={vd['delta_prev']:+.2f}  "
-                  f"dt={vd['dt_sec']:.1f}s  n={vd['n_points']}  "
-                  f"status={vd['status']}  quotes_valid={_quotes_valid}")
+            if CONSOLE_LEVEL != "QUIET":
+                print(f"  [VEL_DEBUG] {m.slug} vel={vd['vel']:+.4f} bps/min  "
+                      f"delta_now={vd['delta_now']:+.2f} delta_prev={vd['delta_prev']:+.2f}  "
+                      f"dt={vd['dt_sec']:.1f}s  n={vd['n_points']}  "
+                      f"status={vd['status']}  quotes_valid={_quotes_valid}")
         z = zscore(st.delta_hist) if Z_ENTRY_ENABLED else 0.0
         self.last_book[m.slug]["Up"] = up_book
         self.last_book[m.slug]["Down"] = dn_book
@@ -3977,6 +3981,31 @@ class Bot:
 
     # ── Fills Ledger helpers: record_order_intent / record_fill at call sites ──
 
+    def _print_fill_summary(self, st: MarketState, action: str, outcome: str,
+                            price: float, qty: float) -> None:
+        """Print a concise one-line portfolio summary after every fill."""
+        equity = self._equity()
+        total_invested = sum(
+            s.positions[o].cost_usdc
+            for s in self.market_states.values()
+            for o in ["Up", "Down"] if s.positions[o].qty >= MIN_QTY
+        )
+        fills_count = len(self._truth._fills) if hasattr(self._truth, '_fills') else 0
+        # Build compact position list
+        pos_parts = []
+        for slug, s in self.market_states.items():
+            for o in ["Up", "Down"]:
+                p = s.positions[o]
+                if p.qty >= MIN_QTY:
+                    pos_parts.append(f"{s.crypto} {o}:{p.qty:.0f}@{p.vwap:.3f}")
+        pos_str = "  ".join(pos_parts) if pos_parts else "none"
+        pnl_str = f"{self.realized_pnl_usdc:+.2f}"
+        print(f"  >>> {action} {st.crypto} {outcome} {qty:.1f}@${price:.3f}  |  "
+              f"Cash: ${self.cash_usdc:.2f}  Equity: ${equity:.2f}  "
+              f"Invested: ${total_invested:.2f}  P&L: {pnl_str}  "
+              f"Fills: {fills_count}")
+        print(f"      Positions: {pos_str}")
+
     def _ledger_record_buy_fill(self, m, st, outcome: str, price: float, qty: float,
                                 order_id: str = "", trade_id: str = "") -> None:
         """Record a CONFIRMED BUY fill in both fills ledger and truth capture."""
@@ -3997,6 +4026,8 @@ class Bot:
         # Notify watcher so it doesn't double-record
         if order_id:
             self._truth.notify_fill(order_id, qty)
+        # Print portfolio summary after fill
+        self._print_fill_summary(st, "BUY", outcome, price, qty)
 
     def _ledger_record_sell_fill(self, m, st, outcome: str, price: float, qty: float,
                                  order_id: str = "", trade_id: str = "") -> None:
@@ -4017,6 +4048,8 @@ class Bot:
         )
         if order_id:
             self._truth.notify_fill(order_id, qty)
+        # Print portfolio summary after fill
+        self._print_fill_summary(st, "SELL", outcome, price, qty)
 
     def _ledger_order_intent(self, m, st, outcome: str, action: str,
                              qty: float, price: float, reason: str,
