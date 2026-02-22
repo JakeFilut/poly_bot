@@ -186,11 +186,7 @@ STOP_LOSS_PCT_PER_DAY  = 0.06        # 6% equity drawdown per calendar day
 SHADOW_STOP_SIM = True                # simulate what would have happened if stop was enforced
 
 # Execution policy
-POST_ONLY_WHEN_POSSIBLE = True
 MAX_CROSS_SLIPPAGE = 0.01         # cross at most 1c if absolutely needed
-LAYER_ORDERS = True
-LAYER_COUNT = 3
-LAYER_STEP = 0.01                 # 1c ladder
 MIN_ORDER_USDC = 0.25             # f247 does tiny prints
 MIN_QTY = float(os.getenv("MIN_QTY", "0.001"))  # below this, position is dust
 EDGE_K = 0.05    # sigmoid steepness: delta_bps -> P(Up)
@@ -211,7 +207,6 @@ BURST_STOP_IF_PRICE_MOVES_CENTS = 0.02  # stop if price moves 2c against us
 BURST_STOP_IF_EDGE_DROPS_BPS = 6.0     # hard edge collapse
 BURST_EDGE_BELOW_HOLD_MS = 500         # edge below threshold must persist 500ms to stop
 BURST_SPREAD_HARD_LIMIT = 0.12         # absolute max spread for any order type
-BURST_CROSS_MAX_SPREAD = 0.01          # cross at ask ONLY when spread <= 1c (used by taker gate)
 
 # Dynamic price cap boost
 CAP_BOOST_EDGE_THRESHOLD = 10.0  # edge_bps above which cap starts boosting
@@ -238,10 +233,6 @@ PARITY_EDGE_BUFFER_CENTS = 0.25         # safety buffer on top of min edge thres
 
 # Partial-fill protection
 PAIR_FILL_TIMEOUT_MS = 1200              # max time to wait for second leg fill
-
-# Maker queue discipline (reduce cancel spam)
-MIN_REPLACE_INTERVAL_MS = 200            # min time between cancel/replace on same order
-MAKER_ORDER_TIMEOUT_MS = 3000            # cancel maker order if unfilled after 3s
 
 # Locked inventory recycle
 LOCKED_MAX_HOLD_SEC = 180                # max seconds to hold locked straddle before recycling

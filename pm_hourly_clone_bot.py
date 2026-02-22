@@ -53,17 +53,13 @@ from src.util.time import (
     utc_now, iso_z, parse_hour_start_from_slug, minutes_into_hour,
     _phase, _hour_label_et, MONTHS,
 )
-from src.util.math import clamp, clamp_to_tick, safe_float, _p_up_model
+from src.util.math import clamp, clamp_to_tick, _p_up_model
 from src.strategy.f247_like import (
     entry_threshold_bps, price_cap, dynamic_cap, spread_limit,
-    taker_gate_allows, whipsaw_ok, persistence_ok,
+    whipsaw_ok, persistence_ok,
     parity_net_edge_cents, parity_liquidity_ok, compute_fee_usdc,
 )
 from src.strategy.sizing import sizing_mult, zscore, delta_velocity_bps_per_min, delta_velocity_debug
-from src.gating.gates import GateEvaluator, GateResult
-from src.gating.velocity import VelocityEstimator
-from src.gating.low_vol import LowVolDetector, LowVolThrottler, LowVolResult
-from src.gating.report import GateReporter
 from src.trading.order_manager import OrderManager
 from src.trading.portfolio import compute_equity, clean_dust
 from src.trading.risk import market_cost_usdc, crypto_cost_usdc
@@ -204,11 +200,9 @@ class Bot:
         self._derisk_edge_worsen_since: Dict[Tuple[str, str], float] = {}
         # Per-minute diagnostic counters
         self._diag_taker_count = 0
-        self._diag_maker_count = 0
         self._diag_derisk_count = 0
         self._diag_derisk_taker_count = 0
         self._diag_blocked_whipsaw = 0
-        self._diag_blocked_taker_gate = 0
         self._diag_blocked_noflip = 0
         # Parity arb tracking
         self._parity_last_order_ts: Dict[str, float] = {}    # slug -> last parity order timestamp
@@ -231,18 +225,10 @@ class Bot:
         self._diag_pair_partial_count = 0
         self._diag_pair_fill_delays: List[float] = []        # ms per pair fill
         self._diag_unpaired_unwind_usd = 0.0
-        self._diag_maker_orders_placed = 0
-        self._diag_maker_fills = 0
-        self._diag_cancel_replace_count = 0
         self._diag_parity_blocked_spread = 0
         self._diag_parity_blocked_liq = 0
         self._diag_parity_blocked_stale = 0
-        self._diag_parity_blocked_fee = 0
         self._diag_recycle_count = 0
-        # Maker fill-quality metrics
-        self._diag_maker_fill_latencies: List[float] = []   # ms from place->fill per maker order
-        self._diag_maker_timeout_cancel_count = 0
-        self._diag_maker_lost_best_count = 0
         # End-of-hour flatten counters
         self._diag_flatten_actions = 0
         self._diag_flatten_taker = 0
@@ -287,8 +273,6 @@ class Bot:
         self._clone_quote_cancel_count = 0
         self._clone_quote_replace_count = 0
         self._clone_quote_fill_count = 0
-        # Maker queue time tracking: list of (submit_ts, fill_ts) for filled maker orders
-        self._diag_maker_queue_times: List[float] = []  # ms from submit to fill
         # Top-of-book tracking: slug -> {outcome -> {is_best: bool, best_since_ts: float}}
         self._top_of_book_state: Dict[str, Dict[str, dict]] = {}
         self._diag_top_of_book_time_ms = 0.0
@@ -1402,10 +1386,6 @@ class Bot:
                            if self._diag_parity_edges else 0.0)
         avg_pair_delay = (sum(self._diag_pair_fill_delays) / len(self._diag_pair_fill_delays)
                           if self._diag_pair_fill_delays else 0.0)
-        maker_fill_rate = (self._diag_maker_fills / max(1, self._diag_maker_orders_placed)
-                           if self._diag_maker_orders_placed > 0 else 0.0)
-        # Maker fill latency percentiles
-        maker_lat_p50, maker_lat_p90 = _p50_p90(self._diag_maker_fill_latencies)
         # Similarity/tempo stats
         trade_ts = sorted(self._diag_parity_trade_timestamps)
         paired_trades_per_min = len(trade_ts)
@@ -1432,11 +1412,9 @@ class Bot:
 
         diag = {
             "taker_count": self._diag_taker_count,
-            "maker_count": self._diag_maker_count,
             "derisk_count": self._diag_derisk_count,
             "derisk_taker_count": self._diag_derisk_taker_count,
             "blocked_whipsaw": self._diag_blocked_whipsaw,
-            "blocked_taker_gate": self._diag_blocked_taker_gate,
             "blocked_noflip": self._diag_blocked_noflip,
             "parity_buy_signals": self._diag_parity_buy_signals,
             "parity_sell_signals": self._diag_parity_sell_signals,
@@ -1447,18 +1425,10 @@ class Bot:
             "pair_partial_count": self._diag_pair_partial_count,
             "avg_pair_fill_delay_ms": round(avg_pair_delay, 1),
             "unpaired_unwind_usd": round(self._diag_unpaired_unwind_usd, 2),
-            "maker_orders_placed": self._diag_maker_orders_placed,
-            "maker_fills": self._diag_maker_fills,
-            "maker_fill_rate": round(maker_fill_rate, 3),
-            "cancel_replace_per_min": self._diag_cancel_replace_count,
             "blocked_spread": self._diag_parity_blocked_spread,
             "blocked_liq": self._diag_parity_blocked_liq,
             "blocked_stale": self._diag_parity_blocked_stale,
             "recycle_count": self._diag_recycle_count,
-            "maker_fill_latency_ms_p50": round(maker_lat_p50, 1),
-            "maker_fill_latency_ms_p90": round(maker_lat_p90, 1),
-            "maker_timeout_cancel_count": self._diag_maker_timeout_cancel_count,
-            "maker_top_of_book_lost_count": self._diag_maker_lost_best_count,
             "flatten_actions_count": self._diag_flatten_actions,
             "flatten_taker_count": self._diag_flatten_taker,
             "rescue_attempts": self._diag_rescue_attempts,
@@ -1605,11 +1575,9 @@ class Bot:
         self._tempo_loop_times.clear()
         self._stale_skip_total = 0
         self._diag_taker_count = 0
-        self._diag_maker_count = 0
         self._diag_derisk_count = 0
         self._diag_derisk_taker_count = 0
         self._diag_blocked_whipsaw = 0
-        self._diag_blocked_taker_gate = 0
         self._diag_blocked_noflip = 0
         self._diag_parity_buy_signals = 0
         self._diag_parity_sell_signals = 0
@@ -1620,16 +1588,10 @@ class Bot:
         self._diag_pair_partial_count = 0
         self._diag_pair_fill_delays.clear()
         self._diag_unpaired_unwind_usd = 0.0
-        self._diag_maker_orders_placed = 0
-        self._diag_maker_fills = 0
-        self._diag_cancel_replace_count = 0
         self._diag_parity_blocked_spread = 0
         self._diag_parity_blocked_liq = 0
         self._diag_parity_blocked_stale = 0
         self._diag_recycle_count = 0
-        self._diag_maker_fill_latencies.clear()
-        self._diag_maker_timeout_cancel_count = 0
-        self._diag_maker_lost_best_count = 0
         self._diag_flatten_actions = 0
         self._diag_flatten_taker = 0
         self._diag_rescue_attempts = 0
@@ -1647,7 +1609,6 @@ class Bot:
         self._diag_quote_submit_count = 0
         self._diag_quote_cancel_count = 0
         self._diag_quote_replace_count = 0
-        self._diag_maker_queue_times.clear()
         self._diag_hedge_tick1 = 0
         self._diag_hedge_tick2 = 0
         self._diag_hedge_cross = 0
@@ -1681,9 +1642,6 @@ class Bot:
         # signal-to-fill latency
         med_signal_to_fill_ms = (statistics.median(self._clone_signal_to_fill)
                                  if self._clone_signal_to_fill else 0.0)
-        # maker queue time percentiles (submit_ts -> fill_ts)
-        queue_p50, queue_p90 = _p50_p90(self._diag_maker_queue_times)
-
         # ── 2. Hold time distribution for paired inventory ──
         hold_p50, hold_p90 = _p50_p90(self._clone_hold_times)
         # Also compute current hold times from active locked positions
@@ -1780,9 +1738,6 @@ class Bot:
             "median_pair_fill_delay_ms": round(med_pair_delay_ms, 1),
             "median_time_between_pairs_ms": round(med_inter_pair_ms, 1),
             "median_signal_to_fill_ms": round(med_signal_to_fill_ms, 1),
-            # Queue/latency
-            "maker_queue_time_p50_ms": round(queue_p50, 1),
-            "maker_queue_time_p90_ms": round(queue_p90, 1),
             # Lifecycle
             "quote_submit_count": clone_submits,
             "quote_cancel_count": clone_cancels,
@@ -1834,9 +1789,7 @@ class Bot:
                   f"cancel={clone_cancels}  "
                   f"replace={clone_replaces}  "
                   f"fills={clone_fills}  "
-                  f"fill_rate={fill_rate:.0%}  "
-                  f"queue_p50={queue_p50:.0f}ms  "
-                  f"queue_p90={queue_p90:.0f}ms")
+                  f"fill_rate={fill_rate:.0%}")
             print(f"  HEDGE: tick1={self._diag_hedge_tick1}  "
                   f"tick2={self._diag_hedge_tick2}  "
                   f"cross_early={self._diag_hedge_cross_early}  "
@@ -3740,11 +3693,8 @@ class Bot:
             sm["signal_detect_ts"] = signal_detect_ts
             # Record trade direction for no-flip rule
             self._last_trade_direction[m.slug] = (outcome, time.time())
-            # Taker gate: only cross if spread <= 1c AND edge >= thr + 12
-            probe_use_taker = taker_gate_allows(book.spread * 100, abs_delta_bps, thr)
-            if not probe_use_taker:
-                self._diag_blocked_taker_gate += 1
-            probe_price = book.ask if probe_use_taker else book.bid
+            # Always buy at ask (taker) for immediate fill
+            probe_price = book.ask
             probe_usd = max(MIN_ORDER_USDC, clip * PROBE_SIZE_FRAC)
             # LIVE_SAFE trade-size limiter
             probe_usd, probe_qty = self._live_safe_cap_usd(probe_usd, probe_price)
@@ -3777,11 +3727,8 @@ class Bot:
                           "order_place_ts": order_place_ts,
                           "signal_to_order_ms": round(signal_to_order_ms, 1),
                           "t_min": round(t_min, 3)})
-            probe_mt = "taker" if probe_use_taker else "maker"
-            if probe_use_taker:
-                self._diag_taker_count += 1
-            else:
-                self._diag_maker_count += 1
+            probe_mt = "taker"
+            self._diag_taker_count += 1
             self.logger.log_order_intent(
                 engine="CORE", reason="ENTRY_PROBE",
                 decision_id=decision_id, position_id=pos.position_id,
@@ -4699,7 +4646,6 @@ class Bot:
         total_filled_usd = 0.0
         burst_count = 0
         skipped_stale = 0
-        maker_count = 0
         taker_count = 0
         stop_reason = ""
         edge_below_since: Optional[float] = None
@@ -4887,7 +4833,7 @@ class Bot:
                       "stop_reason": stop_reason or "all_orders_done",
                       "burst_duration_ms": round(burst_duration_ms, 1),
                       "skipped_stale": skipped_stale,
-                      "maker_count": maker_count, "taker_count": taker_count,
+                      "taker_count": taker_count,
                       "t_min": round(ctx["t_min"], 3)})
 
     # =================================================================
@@ -6379,7 +6325,7 @@ class Bot:
             spread_ok = (book.spread * 100) <= PARITY_TAKER_ALLOWED_SPREAD_CENTS
             use_taker = allow_taker and spread_ok
 
-            # Maker queue discipline: respect MIN_REPLACE_INTERVAL_MS
+            # Maker queue discipline: respect PARITY_MAKER_REFRESH_MS
             if not use_taker:
                 maker_state = self._parity_maker_orders.get(m.slug, {}).get(outcome)
                 if maker_state:
@@ -7032,7 +6978,6 @@ class Bot:
                                 self._do_sell(m, st, outcome, sell_qty, book.bid,
                                               reason="DERISK_EMERGENCY", leg="DERISK", ctx=ctx)
                             elif not DERISK_MAKER_EMERGENCY_ONLY or derisk_is_emergency:
-                                self._diag_maker_count += 1
                                 self._diag_rescue_fallback_sells += 1
                                 maker_price = min(book.ask, book.bid + 0.001) if book.bid > 0 else book.bid
                                 self._do_sell(m, st, outcome, sell_qty, maker_price,
