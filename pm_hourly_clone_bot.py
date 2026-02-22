@@ -53,17 +53,13 @@ from src.util.time import (
     utc_now, iso_z, parse_hour_start_from_slug, minutes_into_hour,
     _phase, _hour_label_et, MONTHS,
 )
-from src.util.math import clamp, clamp_to_tick, safe_float, _p_up_model
+from src.util.math import clamp, clamp_to_tick, _p_up_model
 from src.strategy.f247_like import (
     entry_threshold_bps, price_cap, dynamic_cap, spread_limit,
-    taker_gate_allows, whipsaw_ok, persistence_ok,
+    whipsaw_ok, persistence_ok,
     parity_net_edge_cents, parity_liquidity_ok, compute_fee_usdc,
 )
 from src.strategy.sizing import sizing_mult, zscore, delta_velocity_bps_per_min, delta_velocity_debug
-from src.gating.gates import GateEvaluator, GateResult
-from src.gating.velocity import VelocityEstimator
-from src.gating.low_vol import LowVolDetector, LowVolThrottler, LowVolResult
-from src.gating.report import GateReporter
 from src.trading.order_manager import OrderManager
 from src.trading.portfolio import compute_equity, clean_dust
 from src.trading.risk import market_cost_usdc, crypto_cost_usdc
@@ -204,11 +200,9 @@ class Bot:
         self._derisk_edge_worsen_since: Dict[Tuple[str, str], float] = {}
         # Per-minute diagnostic counters
         self._diag_taker_count = 0
-        self._diag_maker_count = 0
         self._diag_derisk_count = 0
         self._diag_derisk_taker_count = 0
         self._diag_blocked_whipsaw = 0
-        self._diag_blocked_taker_gate = 0
         self._diag_blocked_noflip = 0
         # Parity arb tracking
         self._parity_last_order_ts: Dict[str, float] = {}    # slug -> last parity order timestamp
@@ -231,18 +225,10 @@ class Bot:
         self._diag_pair_partial_count = 0
         self._diag_pair_fill_delays: List[float] = []        # ms per pair fill
         self._diag_unpaired_unwind_usd = 0.0
-        self._diag_maker_orders_placed = 0
-        self._diag_maker_fills = 0
-        self._diag_cancel_replace_count = 0
         self._diag_parity_blocked_spread = 0
         self._diag_parity_blocked_liq = 0
         self._diag_parity_blocked_stale = 0
-        self._diag_parity_blocked_fee = 0
         self._diag_recycle_count = 0
-        # Maker fill-quality metrics
-        self._diag_maker_fill_latencies: List[float] = []   # ms from place->fill per maker order
-        self._diag_maker_timeout_cancel_count = 0
-        self._diag_maker_lost_best_count = 0
         # End-of-hour flatten counters
         self._diag_flatten_actions = 0
         self._diag_flatten_taker = 0
@@ -287,8 +273,6 @@ class Bot:
         self._clone_quote_cancel_count = 0
         self._clone_quote_replace_count = 0
         self._clone_quote_fill_count = 0
-        # Maker queue time tracking: list of (submit_ts, fill_ts) for filled maker orders
-        self._diag_maker_queue_times: List[float] = []  # ms from submit to fill
         # Top-of-book tracking: slug -> {outcome -> {is_best: bool, best_since_ts: float}}
         self._top_of_book_state: Dict[str, Dict[str, dict]] = {}
         self._diag_top_of_book_time_ms = 0.0
@@ -1402,10 +1386,6 @@ class Bot:
                            if self._diag_parity_edges else 0.0)
         avg_pair_delay = (sum(self._diag_pair_fill_delays) / len(self._diag_pair_fill_delays)
                           if self._diag_pair_fill_delays else 0.0)
-        maker_fill_rate = (self._diag_maker_fills / max(1, self._diag_maker_orders_placed)
-                           if self._diag_maker_orders_placed > 0 else 0.0)
-        # Maker fill latency percentiles
-        maker_lat_p50, maker_lat_p90 = _p50_p90(self._diag_maker_fill_latencies)
         # Similarity/tempo stats
         trade_ts = sorted(self._diag_parity_trade_timestamps)
         paired_trades_per_min = len(trade_ts)
@@ -1432,11 +1412,9 @@ class Bot:
 
         diag = {
             "taker_count": self._diag_taker_count,
-            "maker_count": self._diag_maker_count,
             "derisk_count": self._diag_derisk_count,
             "derisk_taker_count": self._diag_derisk_taker_count,
             "blocked_whipsaw": self._diag_blocked_whipsaw,
-            "blocked_taker_gate": self._diag_blocked_taker_gate,
             "blocked_noflip": self._diag_blocked_noflip,
             "parity_buy_signals": self._diag_parity_buy_signals,
             "parity_sell_signals": self._diag_parity_sell_signals,
@@ -1447,18 +1425,10 @@ class Bot:
             "pair_partial_count": self._diag_pair_partial_count,
             "avg_pair_fill_delay_ms": round(avg_pair_delay, 1),
             "unpaired_unwind_usd": round(self._diag_unpaired_unwind_usd, 2),
-            "maker_orders_placed": self._diag_maker_orders_placed,
-            "maker_fills": self._diag_maker_fills,
-            "maker_fill_rate": round(maker_fill_rate, 3),
-            "cancel_replace_per_min": self._diag_cancel_replace_count,
             "blocked_spread": self._diag_parity_blocked_spread,
             "blocked_liq": self._diag_parity_blocked_liq,
             "blocked_stale": self._diag_parity_blocked_stale,
             "recycle_count": self._diag_recycle_count,
-            "maker_fill_latency_ms_p50": round(maker_lat_p50, 1),
-            "maker_fill_latency_ms_p90": round(maker_lat_p90, 1),
-            "maker_timeout_cancel_count": self._diag_maker_timeout_cancel_count,
-            "maker_top_of_book_lost_count": self._diag_maker_lost_best_count,
             "flatten_actions_count": self._diag_flatten_actions,
             "flatten_taker_count": self._diag_flatten_taker,
             "rescue_attempts": self._diag_rescue_attempts,
@@ -1605,11 +1575,9 @@ class Bot:
         self._tempo_loop_times.clear()
         self._stale_skip_total = 0
         self._diag_taker_count = 0
-        self._diag_maker_count = 0
         self._diag_derisk_count = 0
         self._diag_derisk_taker_count = 0
         self._diag_blocked_whipsaw = 0
-        self._diag_blocked_taker_gate = 0
         self._diag_blocked_noflip = 0
         self._diag_parity_buy_signals = 0
         self._diag_parity_sell_signals = 0
@@ -1620,16 +1588,10 @@ class Bot:
         self._diag_pair_partial_count = 0
         self._diag_pair_fill_delays.clear()
         self._diag_unpaired_unwind_usd = 0.0
-        self._diag_maker_orders_placed = 0
-        self._diag_maker_fills = 0
-        self._diag_cancel_replace_count = 0
         self._diag_parity_blocked_spread = 0
         self._diag_parity_blocked_liq = 0
         self._diag_parity_blocked_stale = 0
         self._diag_recycle_count = 0
-        self._diag_maker_fill_latencies.clear()
-        self._diag_maker_timeout_cancel_count = 0
-        self._diag_maker_lost_best_count = 0
         self._diag_flatten_actions = 0
         self._diag_flatten_taker = 0
         self._diag_rescue_attempts = 0
@@ -1647,7 +1609,6 @@ class Bot:
         self._diag_quote_submit_count = 0
         self._diag_quote_cancel_count = 0
         self._diag_quote_replace_count = 0
-        self._diag_maker_queue_times.clear()
         self._diag_hedge_tick1 = 0
         self._diag_hedge_tick2 = 0
         self._diag_hedge_cross = 0
@@ -1681,9 +1642,6 @@ class Bot:
         # signal-to-fill latency
         med_signal_to_fill_ms = (statistics.median(self._clone_signal_to_fill)
                                  if self._clone_signal_to_fill else 0.0)
-        # maker queue time percentiles (submit_ts -> fill_ts)
-        queue_p50, queue_p90 = _p50_p90(self._diag_maker_queue_times)
-
         # ── 2. Hold time distribution for paired inventory ──
         hold_p50, hold_p90 = _p50_p90(self._clone_hold_times)
         # Also compute current hold times from active locked positions
@@ -1780,9 +1738,6 @@ class Bot:
             "median_pair_fill_delay_ms": round(med_pair_delay_ms, 1),
             "median_time_between_pairs_ms": round(med_inter_pair_ms, 1),
             "median_signal_to_fill_ms": round(med_signal_to_fill_ms, 1),
-            # Queue/latency
-            "maker_queue_time_p50_ms": round(queue_p50, 1),
-            "maker_queue_time_p90_ms": round(queue_p90, 1),
             # Lifecycle
             "quote_submit_count": clone_submits,
             "quote_cancel_count": clone_cancels,
@@ -1820,22 +1775,21 @@ class Bot:
         }
         write_jsonl(clone_data)
 
-        # Console print (QUIET mode: only first summary line)
-        print(f"  CLONE: pairs={total_pairs}  "
-              f"r500={paired_500ms_ratio:.0%}  "
-              f"r1.5s={paired_straddle_ratio:.0%}  "
-              f"r10s={paired_10s_ratio:.0%}  "
-              f"delay={med_pair_delay_ms:.0f}ms  "
-              f"gap={med_inter_pair_ms:.0f}ms  "
-              f"sig2fill={med_signal_to_fill_ms:.0f}ms")
+        # Console print (suppressed in QUIET mode)
+        if CONSOLE_LEVEL != "QUIET":
+            print(f"  CLONE: pairs={total_pairs}  "
+                  f"r500={paired_500ms_ratio:.0%}  "
+                  f"r1.5s={paired_straddle_ratio:.0%}  "
+                  f"r10s={paired_10s_ratio:.0%}  "
+                  f"delay={med_pair_delay_ms:.0f}ms  "
+                  f"gap={med_inter_pair_ms:.0f}ms  "
+                  f"sig2fill={med_signal_to_fill_ms:.0f}ms")
         if CONSOLE_LEVEL != "QUIET":
             print(f"  LIFECYCLE: submit={clone_submits}  "
                   f"cancel={clone_cancels}  "
                   f"replace={clone_replaces}  "
                   f"fills={clone_fills}  "
-                  f"fill_rate={fill_rate:.0%}  "
-                  f"queue_p50={queue_p50:.0f}ms  "
-                  f"queue_p90={queue_p90:.0f}ms")
+                  f"fill_rate={fill_rate:.0%}")
             print(f"  HEDGE: tick1={self._diag_hedge_tick1}  "
                   f"tick2={self._diag_hedge_tick2}  "
                   f"cross_early={self._diag_hedge_cross_early}  "
@@ -2087,20 +2041,21 @@ class Bot:
         exit_ok = "OK" if med_exit >= 4.0 else ("--" if med_exit == 0 else "!!")
         par_ok = "OK" if parity_fill_pct <= 0.30 else "!!"
 
-        # Always print: DIAG summary + ASYM + DSCALP
-        print(f"  DIAG [{tpm_ok}] trades/min={trades_per_min:.1f}  "
-              f"[{size_ok}] avg_size=${avg_trade_size:.1f}  "
-              f"[{hold_ok}] hold={med_hold:.0f}s  "
-              f"[{exit_ok}] exit={med_exit:+.1f}c")
-        print(f"  ASYM: win_rate={win_rate:.0%}  avg_win={avg_win_cents:+.1f}c/${avg_win_usdc:+.4f}  "
-              f"avg_loss={avg_loss_cents:+.1f}c/${avg_loss_usdc:+.4f}  med_hold={med_hold:.0f}s")
-        if self._dscalp_positions or dir_exit_count > 0:
-            print(f"  DSCALP: tp1={self._diag_dscalp_tp1} tp2={self._diag_dscalp_tp2} "
-                  f"tp3={self._diag_dscalp_tp3} tp4={self._diag_dscalp_tp4} "
-                  f"runner_fb={self._diag_dscalp_runner_fallbacks} "
-                  f"stop={self._diag_dscalp_stop_exits} early={self._diag_dscalp_early_exits} "
-                  f"timeout={self._diag_dscalp_timeout_exits} "
-                  f"active={len(self._dscalp_positions)}")
+        # DIAG summary + ASYM + DSCALP (suppressed in QUIET mode)
+        if CONSOLE_LEVEL != "QUIET":
+            print(f"  DIAG [{tpm_ok}] trades/min={trades_per_min:.1f}  "
+                  f"[{size_ok}] avg_size=${avg_trade_size:.1f}  "
+                  f"[{hold_ok}] hold={med_hold:.0f}s  "
+                  f"[{exit_ok}] exit={med_exit:+.1f}c")
+            print(f"  ASYM: win_rate={win_rate:.0%}  avg_win={avg_win_cents:+.1f}c/${avg_win_usdc:+.4f}  "
+                  f"avg_loss={avg_loss_cents:+.1f}c/${avg_loss_usdc:+.4f}  med_hold={med_hold:.0f}s")
+            if self._dscalp_positions or dir_exit_count > 0:
+                print(f"  DSCALP: tp1={self._diag_dscalp_tp1} tp2={self._diag_dscalp_tp2} "
+                      f"tp3={self._diag_dscalp_tp3} tp4={self._diag_dscalp_tp4} "
+                      f"runner_fb={self._diag_dscalp_runner_fallbacks} "
+                      f"stop={self._diag_dscalp_stop_exits} early={self._diag_dscalp_early_exits} "
+                      f"timeout={self._diag_dscalp_timeout_exits} "
+                      f"active={len(self._dscalp_positions)}")
         # Sub-detail lines (suppressed in QUIET mode)
         if CONSOLE_LEVEL != "QUIET":
             print(f"  FILL: dir_entry={dir_entry_count}  dir_exit={dir_exit_count}  "
@@ -2308,7 +2263,8 @@ class Bot:
         )
         paused_slugs = [s for s, d in slug_data.items() if d["paused"]]
         pause_str = f"  paused=[{','.join(paused_slugs)}]" if paused_slugs else ""
-        print(f"  [SLUG_PNL] {crypto_str}  worst=[{worst_str}]{pause_str}")
+        if CONSOLE_LEVEL != "QUIET":
+            print(f"  [SLUG_PNL] {crypto_str}  worst=[{worst_str}]{pause_str}")
 
     def _print_balance_summary(self):
         """Print balance and open positions to console.
@@ -2635,10 +2591,11 @@ class Bot:
         if spot_ts - _vel_dbg_last >= 60.0:
             self._vel_debug_last_ts[m.slug] = spot_ts
             vd = delta_velocity_debug(st.delta_hist, lookback_sec=30.0)
-            print(f"  [VEL_DEBUG] {m.slug} vel={vd['vel']:+.4f} bps/min  "
-                  f"delta_now={vd['delta_now']:+.2f} delta_prev={vd['delta_prev']:+.2f}  "
-                  f"dt={vd['dt_sec']:.1f}s  n={vd['n_points']}  "
-                  f"status={vd['status']}  quotes_valid={_quotes_valid}")
+            if CONSOLE_LEVEL != "QUIET":
+                print(f"  [VEL_DEBUG] {m.slug} vel={vd['vel']:+.4f} bps/min  "
+                      f"delta_now={vd['delta_now']:+.2f} delta_prev={vd['delta_prev']:+.2f}  "
+                      f"dt={vd['dt_sec']:.1f}s  n={vd['n_points']}  "
+                      f"status={vd['status']}  quotes_valid={_quotes_valid}")
         z = zscore(st.delta_hist) if Z_ENTRY_ENABLED else 0.0
         self.last_book[m.slug]["Up"] = up_book
         self.last_book[m.slug]["Down"] = dn_book
@@ -3736,11 +3693,8 @@ class Bot:
             sm["signal_detect_ts"] = signal_detect_ts
             # Record trade direction for no-flip rule
             self._last_trade_direction[m.slug] = (outcome, time.time())
-            # Taker gate: only cross if spread <= 1c AND edge >= thr + 12
-            probe_use_taker = taker_gate_allows(book.spread * 100, abs_delta_bps, thr)
-            if not probe_use_taker:
-                self._diag_blocked_taker_gate += 1
-            probe_price = book.ask if probe_use_taker else book.bid
+            # Always buy at ask (taker) for immediate fill
+            probe_price = book.ask
             probe_usd = max(MIN_ORDER_USDC, clip * PROBE_SIZE_FRAC)
             # LIVE_SAFE trade-size limiter
             probe_usd, probe_qty = self._live_safe_cap_usd(probe_usd, probe_price)
@@ -3773,11 +3727,8 @@ class Bot:
                           "order_place_ts": order_place_ts,
                           "signal_to_order_ms": round(signal_to_order_ms, 1),
                           "t_min": round(t_min, 3)})
-            probe_mt = "taker" if probe_use_taker else "maker"
-            if probe_use_taker:
-                self._diag_taker_count += 1
-            else:
-                self._diag_maker_count += 1
+            probe_mt = "taker"
+            self._diag_taker_count += 1
             self.logger.log_order_intent(
                 engine="CORE", reason="ENTRY_PROBE",
                 decision_id=decision_id, position_id=pos.position_id,
@@ -3977,6 +3928,31 @@ class Bot:
 
     # ── Fills Ledger helpers: record_order_intent / record_fill at call sites ──
 
+    def _print_fill_summary(self, st: MarketState, action: str, outcome: str,
+                            price: float, qty: float) -> None:
+        """Print a concise one-line portfolio summary after every fill."""
+        equity = self._equity()
+        total_invested = sum(
+            s.positions[o].cost_usdc
+            for s in self.market_states.values()
+            for o in ["Up", "Down"] if s.positions[o].qty >= MIN_QTY
+        )
+        fills_count = len(self._truth._fills) if hasattr(self._truth, '_fills') else 0
+        # Build compact position list
+        pos_parts = []
+        for slug, s in self.market_states.items():
+            for o in ["Up", "Down"]:
+                p = s.positions[o]
+                if p.qty >= MIN_QTY:
+                    pos_parts.append(f"{s.crypto} {o}:{p.qty:.0f}@{p.vwap:.3f}")
+        pos_str = "  ".join(pos_parts) if pos_parts else "none"
+        pnl_str = f"{self.realized_pnl_usdc:+.2f}"
+        print(f"  >>> {action} {st.crypto} {outcome} {qty:.1f}@${price:.3f}  |  "
+              f"Cash: ${self.cash_usdc:.2f}  Equity: ${equity:.2f}  "
+              f"Invested: ${total_invested:.2f}  P&L: {pnl_str}  "
+              f"Fills: {fills_count}")
+        print(f"      Positions: {pos_str}")
+
     def _ledger_record_buy_fill(self, m, st, outcome: str, price: float, qty: float,
                                 order_id: str = "", trade_id: str = "") -> None:
         """Record a CONFIRMED BUY fill in both fills ledger and truth capture."""
@@ -3997,6 +3973,8 @@ class Bot:
         # Notify watcher so it doesn't double-record
         if order_id:
             self._truth.notify_fill(order_id, qty)
+        # Print portfolio summary after fill
+        self._print_fill_summary(st, "BUY", outcome, price, qty)
 
     def _ledger_record_sell_fill(self, m, st, outcome: str, price: float, qty: float,
                                  order_id: str = "", trade_id: str = "") -> None:
@@ -4017,6 +3995,8 @@ class Bot:
         )
         if order_id:
             self._truth.notify_fill(order_id, qty)
+        # Print portfolio summary after fill
+        self._print_fill_summary(st, "SELL", outcome, price, qty)
 
     def _ledger_order_intent(self, m, st, outcome: str, action: str,
                              qty: float, price: float, reason: str,
@@ -4666,7 +4646,6 @@ class Bot:
         total_filled_usd = 0.0
         burst_count = 0
         skipped_stale = 0
-        maker_count = 0
         taker_count = 0
         stop_reason = ""
         edge_below_since: Optional[float] = None
@@ -4757,15 +4736,14 @@ class Bot:
             client_oid = new_order_id()
             bk_fields = self._book_fields(fresh_up_book, fresh_dn_book, outcome)
 
-            # ── Taker gate: only cross if spread <= 1c AND edge >= thr + 12 ──
-            use_taker = taker_gate_allows(fresh_book.spread * 100, abs_live_delta, thr_bps)
-            order_price = fresh_book.ask if use_taker else fresh_book.bid
+            # ── Always buy at ask (taker) for immediate fill ──
+            order_price = fresh_book.ask
             # LIVE_SAFE trade-size limiter
             this_usd, this_qty = self._live_safe_cap_usd(this_usd, order_price)
             if this_qty < MIN_QTY:
                 stop_reason = "live_safe_size_cap"
                 break
-            order_type = "taker" if use_taker else "maker"
+            order_type = "taker"
 
             write_jsonl({"event_type": "BURST_MICRO_ORDER", "slug": m.slug,
                           "burst_idx": i, "usd": round(this_usd, 2),
@@ -4796,9 +4774,8 @@ class Bot:
                 total_filled_usd += this_usd
                 burst_count += 1
             else:
-                post_only = not use_taker
                 fill = self.client.place_limit_order(token_id, "BUY", order_price,
-                                                     this_qty, post_only=post_only)
+                                                     this_qty, post_only=False)
                 oid = fill.get("order_id", "")
                 self._exec_tracker.on_submit(oid, m.slug, outcome, "BUY", order_price, this_qty, "ENTRY_BURST")
                 self._truth_watch_after_place(fill, m, outcome, "BUY", this_qty, order_price)
@@ -4842,13 +4819,9 @@ class Bot:
                     self._exec_safety.record_api_error()
                     self._exec_tracker.on_cancel(oid)
 
-            # Track diagnostics
-            if use_taker:
-                taker_count += 1
-                self._diag_taker_count += 1
-            else:
-                maker_count += 1
-                self._diag_maker_count += 1
+            # Track diagnostics — always taker now
+            taker_count += 1
+            self._diag_taker_count += 1
             self._tempo_fills[m.slug] = self._tempo_fills.get(m.slug, 0) + 1
             # Sleep between micro-orders
             time.sleep(BURST_INTERVAL_MS / 1000.0)
@@ -4860,7 +4833,7 @@ class Bot:
                       "stop_reason": stop_reason or "all_orders_done",
                       "burst_duration_ms": round(burst_duration_ms, 1),
                       "skipped_stale": skipped_stale,
-                      "maker_count": maker_count, "taker_count": taker_count,
+                      "taker_count": taker_count,
                       "t_min": round(ctx["t_min"], 3)})
 
     # =================================================================
@@ -6005,10 +5978,13 @@ class Bot:
                            outcome: str, book: BookTop, bid_price: float,
                            leg_usd: float, ctx: dict, pair_id: str,
                            quote_step_usd_used: float = 0.0) -> float:
-        """Place a maker buy at bid_price for quoting mode. Returns cost if filled."""
+        """Buy at ask for immediate fill in quoting mode. Returns cost if filled."""
         token_id = m.outcome_up_id if outcome == "Up" else m.outcome_down_id
         pos = st.positions[outcome]
         placed_ts = time.time()
+
+        # Always buy at ask (taker) for immediate fill
+        bid_price = book.ask
 
         # LIVE_SAFE trade-size limiter
         leg_usd, order_qty = self._live_safe_cap_usd(leg_usd, bid_price)
@@ -6089,18 +6065,14 @@ class Bot:
         if MODE == "LOG":
             fill_ts = time.time()
             fill_ts_ms = int(fill_ts * 1000)
-            # In paper mode: maker fill simulated — fill at our bid_price
-            # Only fill if our bid >= current best bid (we'd be at top of book)
-            if bid_price < book.bid - 0.001:
-                # Our bid is below best bid — unlikely to fill, skip
-                return 0.0
+            # In paper mode: taker fill at ask — always fills immediately
             actual_cost = bid_price * order_qty
             self._paper_buy(st, outcome, bid_price, order_qty, actual_cost)
             self._ledger_record_buy_fill(m, st, outcome, bid_price, order_qty)
             self._record_fill_ts(m.slug)  # post-fill cooldown
             fill_latency_ms = (fill_ts - placed_ts) * 1000
             notional = bid_price * order_qty
-            fee = compute_fee_usdc(notional, "maker")
+            fee = compute_fee_usdc(notional, "taker")
             self.logger.log_order_fill(
                 engine="PARITY", reason="PARITY_QUOTE",
                 decision_id=decision_id, client_order_id=client_oid,
@@ -6108,7 +6080,7 @@ class Bot:
                 crypto=m.crypto, slug=m.slug, outcome=outcome,
                 side="BUY", qty=order_qty, fill_price=bid_price,
                 usdc_cost=actual_cost, fees_usdc=fee,
-                maker_taker="maker", did_cross="",
+                maker_taker="taker", did_cross="",
                 vwap=pos.vwap, ctx=ctx, book_fields=bk_fields,
                 extra={"placed_ts_ms": placed_ts_ms, "fill_ts_ms": fill_ts_ms,
                        "fill_latency_ms": round(fill_latency_ms, 1),
@@ -6119,19 +6091,16 @@ class Bot:
                           "slug": m.slug, "outcome": outcome,
                           "order_id": client_oid, "pair_id": pair_id,
                           "price": round(bid_price, 4), "qty": round(order_qty, 1),
-                          "maker_taker": "maker",
+                          "maker_taker": "taker",
                           "fill_latency_ms": round(fill_latency_ms, 1)})
             self._tempo_fills[m.slug] = self._tempo_fills.get(m.slug, 0) + 1
-            self._diag_maker_fills += 1
             self._diag_quote_fills += 1
             self._clone_quote_fill_count += 1
             self._diag_parity_fills_min += 1
             self._diag_total_fills_min += 1
             self._throttle_record_trade()
-            self._diag_maker_fill_latencies.append(fill_latency_ms)
             self._active_orders.pop(client_oid, None)
-            self._diag_maker_queue_times.append(fill_latency_ms)
-            self._record_pair_fill(pair_id, m.slug, m.crypto, outcome, fill_ts, "maker")
+            self._record_pair_fill(pair_id, m.slug, m.crypto, outcome, fill_ts, "taker")
             # Signal-to-fill tracking for clone metrics
             last_move = self._clone_last_spot_move.get(m.slug)
             if last_move:
@@ -6176,9 +6145,9 @@ class Bot:
 
             return actual_cost
         else:
-            # LIVE mode: post maker bid
+            # LIVE mode: buy at ask (taker) for immediate fill
             fill = self.client.place_limit_order(token_id, "BUY", bid_price,
-                                                  order_qty, post_only=True)
+                                                  order_qty, post_only=False)
             self._truth_watch_after_place(fill, m, outcome, "BUY", order_qty, bid_price)
             fill_ts = time.time()
             if fill.get("filled"):
@@ -6188,7 +6157,8 @@ class Bot:
                 self._ledger_record_buy_fill(m, st, outcome, fill["fill_price"], fill["fill_qty"],
                                              order_id=fill.get("order_id", ""))
                 notional = fill["fill_price"] * fill["fill_qty"]
-                fee = compute_fee_usdc(notional, "maker")
+                mt = infer_maker_taker("BUY", fill["fill_price"], book)
+                fee = compute_fee_usdc(notional, mt)
                 self.logger.log_order_fill(
                     engine="PARITY", reason="PARITY_QUOTE",
                     decision_id=decision_id, client_order_id=client_oid,
@@ -6196,23 +6166,20 @@ class Bot:
                     crypto=m.crypto, slug=m.slug, outcome=outcome,
                     side="BUY", qty=fill["fill_qty"], fill_price=fill["fill_price"],
                     usdc_cost=actual_cost, fees_usdc=fee,
-                    maker_taker="maker", did_cross="",
+                    maker_taker=mt, did_cross="",
                     vwap=pos.vwap, ctx=ctx, book_fields=bk_fields,
                     extra={"placed_ts": placed_ts, "fill_ts": fill_ts,
                            "fill_latency_ms": round(fill_latency_ms, 1),
                            "quote_step_usd_used": round(quote_step_usd_used, 2)},
                 )
                 self._tempo_fills[m.slug] = self._tempo_fills.get(m.slug, 0) + 1
-                self._diag_maker_fills += 1
                 self._diag_quote_fills += 1
                 self._clone_quote_fill_count += 1
                 self._diag_parity_fills_min += 1
                 self._diag_total_fills_min += 1
                 self._throttle_record_trade()
-                self._diag_maker_fill_latencies.append(fill_latency_ms)
                 self._active_orders.pop(client_oid, None)
-                self._diag_maker_queue_times.append(fill_latency_ms)
-                self._record_pair_fill(pair_id, m.slug, m.crypto, outcome, fill_ts, "maker")
+                self._record_pair_fill(pair_id, m.slug, m.crypto, outcome, fill_ts, "taker")
                 last_move = self._clone_last_spot_move.get(m.slug)
                 if last_move:
                     s2f = (fill_ts - last_move[0]) * 1000
@@ -6227,49 +6194,14 @@ class Bot:
                         outcome: str, book: BookTop,
                         leg_usd: float, ctx: dict,
                         pair_id: str = "") -> float:
-        """Execute one leg of a parity buy. Returns cost (USDC) of filled order.
-        Uses maker-first: taker only if spread <= 1c. Tracks maker queue discipline
-        including fill latency, timeout cancels, and lost-best-price detection."""
+        """Execute one leg of a parity buy at ask price for immediate fill.
+        Returns cost (USDC) of filled order."""
         token_id = m.outcome_up_id if outcome == "Up" else m.outcome_down_id
         pos = st.positions[outcome]
         placed_ts = time.time()
 
-        # Maker/taker decision
-        use_taker = (book.spread * 100) <= PARITY_TAKER_ALLOWED_SPREAD_CENTS
-        if use_taker:
-            order_price = book.ask
-            self._diag_parity_taker_count += 1
-        else:
-            # Maker queue discipline: only replace if price changed by >= 1 tick
-            order_price = book.bid
-            maker_state = self._parity_maker_orders.get(m.slug, {}).get(outcome)
-            if maker_state:
-                price_diff = abs(order_price - maker_state.get("price", 0))
-                elapsed_ms = (placed_ts - maker_state.get("last_replace_ts", 0)) * 1000
-
-                # Detect: our order is no longer best price (price moved away)
-                if price_diff >= 0.005 and order_price > maker_state.get("price", 0):
-                    self._diag_maker_lost_best_count += 1
-
-                # Detect: maker timeout (unfilled after MAKER_ORDER_TIMEOUT_MS)
-                if elapsed_ms >= MAKER_ORDER_TIMEOUT_MS and not maker_state.get("filled"):
-                    self._diag_maker_timeout_cancel_count += 1
-
-                if price_diff < 0.005 and elapsed_ms < MIN_REPLACE_INTERVAL_MS:
-                    # Price hasn't moved enough and interval not met — skip replace
-                    return 0.0
-                if price_diff >= 0.005 or elapsed_ms >= MIN_REPLACE_INTERVAL_MS:
-                    self._diag_cancel_replace_count += 1
-            self._diag_parity_maker_count += 1
-            self._diag_maker_orders_placed += 1
-            # Track maker order state with timestamps
-            self._parity_maker_orders.setdefault(m.slug, {})[outcome] = {
-                "price": order_price,
-                "last_replace_ts": placed_ts,
-                "placed_ts": placed_ts,
-                "first_not_best_ts": None,
-                "filled": False,
-            }
+        # Always buy at ask (taker) for immediate fill
+        order_price = book.ask
 
         # LIVE_SAFE trade-size limiter
         leg_usd, order_qty = self._live_safe_cap_usd(leg_usd, order_price)
@@ -6290,7 +6222,7 @@ class Bot:
         up_book = ctx["up_book"]
         dn_book = ctx["dn_book"]
         bk_fields = self._book_fields(up_book, dn_book, outcome)
-        mt = "taker" if use_taker else "maker"
+        mt = "taker"
 
         self.logger.log_order_intent(
             engine="PARITY", reason="PARITY_BUY",
@@ -6331,18 +6263,10 @@ class Bot:
                        "fill_latency_ms": round(fill_latency_ms, 1)},
             )
             self._tempo_fills[m.slug] = self._tempo_fills.get(m.slug, 0) + 1
-            if mt == "maker":
-                self._diag_maker_fills += 1
-                self._diag_maker_fill_latencies.append(fill_latency_ms)
-                # Mark maker order as filled
-                ms = self._parity_maker_orders.get(m.slug, {}).get(outcome)
-                if ms:
-                    ms["filled"] = True
             return leg_usd
         else:
-            post_only = not use_taker
             fill = self.client.place_limit_order(token_id, "BUY", order_price,
-                                                  order_qty, post_only=post_only)
+                                                  order_qty, post_only=False)
             self._truth_watch_after_place(fill, m, outcome, "BUY", order_qty, order_price)
             fill_ts = time.time()
             if fill.get("filled"):
@@ -6367,12 +6291,6 @@ class Bot:
                            "fill_latency_ms": round(fill_latency_ms, 1)},
                 )
                 self._tempo_fills[m.slug] = self._tempo_fills.get(m.slug, 0) + 1
-                if actual_mt == "maker":
-                    self._diag_maker_fills += 1
-                    self._diag_maker_fill_latencies.append(fill_latency_ms)
-                    ms = self._parity_maker_orders.get(m.slug, {}).get(outcome)
-                    if ms:
-                        ms["filled"] = True
                 return actual_cost
             return 0.0
 
@@ -6407,7 +6325,7 @@ class Bot:
             spread_ok = (book.spread * 100) <= PARITY_TAKER_ALLOWED_SPREAD_CENTS
             use_taker = allow_taker and spread_ok
 
-            # Maker queue discipline: respect MIN_REPLACE_INTERVAL_MS
+            # Maker queue discipline: respect PARITY_MAKER_REFRESH_MS
             if not use_taker:
                 maker_state = self._parity_maker_orders.get(m.slug, {}).get(outcome)
                 if maker_state:
@@ -7060,7 +6978,6 @@ class Bot:
                                 self._do_sell(m, st, outcome, sell_qty, book.bid,
                                               reason="DERISK_EMERGENCY", leg="DERISK", ctx=ctx)
                             elif not DERISK_MAKER_EMERGENCY_ONLY or derisk_is_emergency:
-                                self._diag_maker_count += 1
                                 self._diag_rescue_fallback_sells += 1
                                 maker_price = min(book.ask, book.bid + 0.001) if book.bid > 0 else book.bid
                                 self._do_sell(m, st, outcome, sell_qty, maker_price,
@@ -7471,28 +7388,16 @@ class Bot:
             self._sell_error_until[sell_key] = time.monotonic() + 30.0
 
     def _place_layered_buy(self, m: MarketRef, outcome: str, qty: float, ask: float) -> dict:
-        """Place layered buy orders. Returns {total_filled, total_cost, avg_price}."""
+        """Place buy at ask for immediate fill. Returns {total_filled, total_cost, avg_price}."""
         token_id = m.outcome_up_id if outcome == "Up" else m.outcome_down_id
         result = {"total_filled": 0, "total_cost": 0.0, "avg_price": 0.0}
-        if not LAYER_ORDERS:
-            r = self.client.place_limit_order(token_id, "BUY", ask, qty, post_only=POST_ONLY_WHEN_POSSIBLE)
-            self._truth_watch_after_place(r, m, outcome, "BUY", qty, ask)
-            if r.get("filled"):
-                result["total_filled"] = r["fill_qty"]
-                result["total_cost"] = r["fill_price"] * r["fill_qty"]
-                result["avg_price"] = r["fill_price"]
-            return result
-        # Split qty across layers around ask and slightly below
-        per = qty / LAYER_COUNT
-        for i in range(LAYER_COUNT):
-            px = max(0.01, ask - i * LAYER_STEP)
-            r = self.client.place_limit_order(token_id, "BUY", px, per, post_only=POST_ONLY_WHEN_POSSIBLE)
-            self._truth_watch_after_place(r, m, outcome, "BUY", per, px)
-            if r.get("filled"):
-                result["total_filled"] += r["fill_qty"]
-                result["total_cost"] += r["fill_price"] * r["fill_qty"]
-        if result["total_filled"] > 0:
-            result["avg_price"] = result["total_cost"] / result["total_filled"]
+        # Always buy at ask (taker) for immediate fill — no layering
+        r = self.client.place_limit_order(token_id, "BUY", ask, qty, post_only=False)
+        self._truth_watch_after_place(r, m, outcome, "BUY", qty, ask)
+        if r.get("filled"):
+            result["total_filled"] = r["fill_qty"]
+            result["total_cost"] = r["fill_price"] * r["fill_qty"]
+            result["avg_price"] = r["fill_price"]
         return result
     def _calc_clip(self, crypto: str, t_min: float, abs_delta_bps: float) -> float:
         base = self.cash_usdc * BASE_CLIP_PCT
