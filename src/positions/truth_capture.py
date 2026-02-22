@@ -146,32 +146,6 @@ def _hour_file_suffix(dt: datetime) -> str:
     return dt.strftime("%Y%m%d_%H")
 
 
-# ---------------------------------------------------------------------------
-# Cursor persistence for wallet truth scan
-# ---------------------------------------------------------------------------
-_CURSOR_FILE = "./logs/truth_scan_cursor.json"
-
-
-def _load_cursor(path: str = _CURSOR_FILE) -> dict:
-    if os.path.exists(path):
-        try:
-            with open(path, "r") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {"last_scan_ts_ms": 0, "last_trade_id": ""}
-
-
-def _save_cursor(data: dict, path: str = _CURSOR_FILE) -> None:
-    try:
-        d = os.path.dirname(os.path.abspath(path))
-        os.makedirs(d, exist_ok=True)
-        with open(path, "w") as f:
-            json.dump(data, f)
-    except Exception:
-        pass
-
-
 # ═══════════════════════════════════════════════════════════════════════════
 # TruthCapture
 # ═══════════════════════════════════════════════════════════════════════════
@@ -272,6 +246,12 @@ class TruthCapture:
         self._active_window_only: bool = False
         self._strict_window_mode: bool = False
 
+        # ── Incremental scan cursor (persisted in state.json) ──
+        self._scan_cursor_ts_ms: int = 0        # last_seen_ts_ms
+        self._scan_cursor_tid: str = ""          # last_seen_tid
+        self._scan_recent_tids: List[str] = []   # ring buffer for same-ts dedup
+        self._scan_recent_tids_max: int = 200
+
         # Timers
         self._last_scan_ts: float = 0.0
         self._last_reconcile_ts: float = 0.0
@@ -302,37 +282,30 @@ class TruthCapture:
             self._ledger_base_dir,
             f"{self._ledger_base_name}_{self._hour_suffix}.jsonl")
 
-    def _dedupe_state_path(self) -> str:
-        """Return path to the current hour's dedupe state JSON."""
-        return os.path.join(
-            self._ledger_base_dir,
-            f"truth_dedupe_{self._hour_suffix}.json")
+    # ── Cursor get/set (integrated into state.json by the bot) ──
 
-    def _persist_dedupe_state(self) -> None:
-        """Save dedupe keys to disk for restart safety."""
-        try:
-            path = self._dedupe_state_path()
-            d = os.path.dirname(os.path.abspath(path))
-            os.makedirs(d, exist_ok=True)
-            with open(path, "w") as f:
-                json.dump(sorted(self._seen_ids), f)
-        except Exception:
-            pass
+    def get_scan_cursor(self) -> dict:
+        """Return the current incremental scan cursor for state persistence."""
+        return {
+            "last_seen_ts_ms": self._scan_cursor_ts_ms,
+            "last_seen_tid": self._scan_cursor_tid,
+            "recent_tids": self._scan_recent_tids[-self._scan_recent_tids_max:],
+        }
 
-    def _load_dedupe_state(self) -> int:
-        """Load persisted dedupe keys for current hour. Returns count."""
-        path = self._dedupe_state_path()
-        if not os.path.exists(path):
-            return 0
-        try:
-            with open(path, "r") as f:
-                keys = json.load(f)
-            if isinstance(keys, list):
-                self._seen_ids.update(keys)
-                return len(keys)
-        except Exception:
-            pass
-        return 0
+    def set_scan_cursor(self, cursor: dict) -> None:
+        """Restore scan cursor from state.json on startup."""
+        self._scan_cursor_ts_ms = int(cursor.get("last_seen_ts_ms", 0))
+        self._scan_cursor_tid = str(cursor.get("last_seen_tid", ""))
+        tids = cursor.get("recent_tids", [])
+        self._scan_recent_tids = list(tids)[-self._scan_recent_tids_max:]
+
+    def skip_history_now(self) -> None:
+        """Set cursor to NOW — skip all earlier fills on next scan."""
+        self._scan_cursor_ts_ms = _ts_ms()
+        self._scan_cursor_tid = ""
+        self._scan_recent_tids.clear()
+        print(f"  [TRUTH] SKIP_HISTORY: cursor set to now "
+              f"({self._scan_cursor_ts_ms}), no historical fills will be ingested")
 
     # ══════════════════════════════════════════════════════════════════
     #  STATE MACHINE
@@ -373,21 +346,18 @@ class TruthCapture:
         with self._lock:
             old_suffix = self._hour_suffix
 
-            # 1. Persist current dedupe state before rotating
-            self._persist_dedupe_state()
-
-            # 2. Transition state machine: old hour -> CLOSED
+            # 1. Transition state machine: old hour -> CLOSED
             self._transition_state(WindowState.CLOSED,
                                    reason=f"hour_end_{old_suffix}")
 
-            # 3. Compute new hour boundaries
+            # 2. Compute new hour boundaries
             if new_hour_start is None:
                 new_hour_start = datetime.now(timezone.utc).replace(
                     minute=0, second=0, microsecond=0)
             self._hour_start, self._hour_end = _hour_boundaries(new_hour_start)
             self._hour_suffix = _hour_file_suffix(self._hour_start)
 
-            # 4. Reset in-memory state
+            # 3. Reset in-memory state
             old_fills = len(self._fills)
             self._fills.clear()
             self._seen_ids.clear()
@@ -395,42 +365,38 @@ class TruthCapture:
             self._watchers.clear()
             self._active_hour_slugs.clear()
 
-            # 5. Reset counters
+            # 4. Reset counters
             self.fills_from_ws = 0
             self.fills_from_poll = 0
             self.fills_from_scan = 0
             self.fills_dedup_skipped = 0
 
-            # 6. Reset SAFE MODE for new hour
+            # 5. Reset SAFE MODE for new hour
             if self._safe_mode:
                 self._safe_mode = False
                 self._safe_mode_reason = ""
                 self._safe_mode_mismatches.clear()
 
-            # 7. Reset scan cursor for new hour
-            _save_cursor({
-                "last_scan_ts_ms": int(self._hour_start.timestamp() * 1000),
-                "last_trade_id": "",
-            })
+            # 6. Set scan cursor to new hour start (skip all before this)
+            self._scan_cursor_ts_ms = int(self._hour_start.timestamp() * 1000)
+            self._scan_cursor_tid = ""
+            self._scan_recent_tids.clear()
 
-            # 8. Load current hour file if it exists (restart mid-hour)
+            # 7. Load current hour file if it exists (restart mid-hour)
             loaded = self._load_hour_file()
-            dedup_loaded = self._load_dedupe_state()
 
-            # 9. Transition to ACTIVE
+            # 8. Transition to ACTIVE
             self._transition_state(WindowState.ACTIVE,
                                    reason=f"hour_start_{self._hour_suffix}")
 
         print(f"  [TRUTH] HOUR ROTATION: {old_suffix} -> {self._hour_suffix}  "
-              f"cleared={old_fills} fills  loaded={loaded} from new file  "
-              f"dedup_keys={dedup_loaded}")
+              f"cleared={old_fills} fills  loaded={loaded}")
         self._write_jsonl({
             "event_type": "HOUR_ROTATION",
             "old_hour": old_suffix,
             "new_hour": self._hour_suffix,
             "cleared_fills": old_fills,
             "loaded_fills": loaded,
-            "dedup_keys_loaded": dedup_loaded,
             "ts_ms": _ts_ms(),
         })
 
@@ -483,20 +449,15 @@ class TruthCapture:
         filters by timestamp.  Returns count loaded.
         """
         hour_path = self._current_hour_path()
-        dedup_loaded = 0
 
         with self._lock:
-            # 1. Load persisted dedupe keys first (restart safety)
-            dedup_loaded = self._load_dedupe_state()
-
-            # 2. Try per-hour file first
+            # 1. Try per-hour file first
             if os.path.exists(hour_path):
                 loaded = self._load_hour_file()
                 active = sum(1 for p in self._positions.values()
                              if p.net_qty > _ZERO)
                 print(f"  [TRUTH] Loaded {loaded} fills (hour={self._hour_suffix}) "
-                      f"-> {active} active positions  "
-                      f"dedup_keys={dedup_loaded}")
+                      f"-> {active} active positions")
                 self._write_jsonl({
                     "event_type": "TRUTH_LOADED",
                     "fills": loaded,
@@ -509,7 +470,7 @@ class TruthCapture:
                                        reason="loaded_from_hour_file")
                 return loaded
 
-            # 3. Fallback: load from global ledger, filter by hour
+            # 2. Fallback: load from global ledger, filter by hour
             if os.path.exists(self._ledger_path):
                 loaded = 0
                 with open(self._ledger_path, "r", encoding="utf-8") as f:
@@ -522,7 +483,6 @@ class TruthCapture:
                             fill = self._parse_fill(raw)
                             if fill is None:
                                 continue
-                            # TIME FILTER: only current hour fills
                             if not self._is_current_hour_fill(fill):
                                 continue
                             dk = self._dedup_key(fill)
@@ -610,9 +570,6 @@ class TruthCapture:
                     f.write(json.dumps(row, separators=(",", ":")) + "\n")
             except Exception as e:
                 print(f"  [TRUTH] ERROR writing {path}: {e}")
-        # Periodically persist dedupe state (every 10 fills)
-        if len(self._seen_ids) % 10 == 0:
-            self._persist_dedupe_state()
 
     def _parse_fill(self, raw: dict) -> Optional[TruthFill]:
         action = (raw.get("action") or "").upper()
@@ -992,11 +949,19 @@ class TruthCapture:
         return self.run_wallet_scan()
 
     def run_wallet_scan(self) -> int:
-        """Fetch recent trades for the wallet and ingest any missing fills.
+        """Incremental wallet scan using persistent cursor.
 
-        Uses cursor persistence so we don't re-process old trades.
-        HOUR FILTER: Only ingests fills whose slug belongs to the current
-        active hour window AND whose timestamp falls within the current hour.
+        Algorithm:
+        1. Fetch newest page of trades from API.
+        2. Walk trades newest-first.  Keep only those where:
+           a) ts_ms > _scan_cursor_ts_ms, OR
+           b) ts_ms == _scan_cursor_ts_ms AND trade_id not in recent_tids.
+        3. Stop paging once we hit ts_ms <= _scan_cursor_ts_ms (all older).
+        4. After ingest, update cursor:
+           _scan_cursor_ts_ms = max(ts_ms of ingested trades)
+           _scan_recent_tids  = ring buffer of trade_ids at max ts_ms.
+        5. Hour window filter still applied: reject fills outside current hour.
+
         Returns number of NEW fills discovered.
         """
         if self._get_trades is None:
@@ -1014,16 +979,46 @@ class TruthCapture:
             })
             return 0
 
-        cursor = _load_cursor()
         new_count = 0
+        skipped_old_cursor = 0
         skipped_old_hour = 0
+        skipped_no_identity = 0
+        hour_start_epoch = self._hour_start.timestamp()
+        hour_end_epoch = self._hour_end.timestamp()
+        cursor_ts = self._scan_cursor_ts_ms
+        recent_tids_set = set(self._scan_recent_tids)
+
+        # Track max ts_ms among ingested fills for cursor update
+        max_ingested_ts_ms = cursor_ts
+        new_recent_tids: List[str] = []
 
         for raw in raw_trades:
             trade_id = str(raw.get("trade_id") or raw.get("id") or "")
             if not trade_id:
                 continue
 
-            # Skip already-seen trades
+            # ── Parse trade timestamp (ms) ──
+            fill_ts_ms = 0
+            fill_ts_str = (raw.get("match_time") or raw.get("created_at")
+                           or raw.get("timestamp") or "")
+            if fill_ts_str:
+                try:
+                    fill_dt = datetime.fromisoformat(
+                        str(fill_ts_str).replace("Z", "+00:00"))
+                    fill_ts_ms = int(fill_dt.timestamp() * 1000)
+                except (ValueError, TypeError):
+                    pass
+
+            # ── Cursor filter: skip already-processed trades ──
+            if fill_ts_ms > 0 and cursor_ts > 0:
+                if fill_ts_ms < cursor_ts:
+                    skipped_old_cursor += 1
+                    continue
+                if fill_ts_ms == cursor_ts and trade_id in recent_tids_set:
+                    skipped_old_cursor += 1
+                    continue
+
+            # Skip already-seen trades (in-memory dedup)
             with self._lock:
                 dk = f"tid:{trade_id}"
                 if dk in self._seen_ids:
@@ -1040,24 +1035,27 @@ class TruthCapture:
             if not outcome:
                 outcome = raw.get("outcome", "")
 
-            # ── HOUR WINDOW FILTER ──
-            # 1. Slug filter: skip fills from non-current-hour slugs
+            # ── HOUR WINDOW FILTER (strict) ──
+            fill_epoch = fill_ts_ms / 1000.0 if fill_ts_ms > 0 else 0.0
+
+            # Slug filter
+            slug_ok = True
             if self._active_hour_slugs and slug:
                 if slug not in self._active_hour_slugs:
-                    skipped_old_hour += 1
-                    continue
-            # 2. Timestamp filter: reject fills outside [hour_start, hour_end)
-            fill_ts_str = (raw.get("match_time") or raw.get("created_at")
-                           or raw.get("timestamp") or "")
-            if fill_ts_str:
-                try:
-                    fill_dt = datetime.fromisoformat(
-                        str(fill_ts_str).replace("Z", "+00:00"))
-                    if not (self._hour_start <= fill_dt < self._hour_end):
-                        skipped_old_hour += 1
-                        continue
-                except (ValueError, TypeError):
-                    pass  # unparseable — let dedup handle it
+                    slug_ok = False
+
+            # Timestamp filter
+            ts_ok = True
+            if fill_epoch > 0:
+                if not (hour_start_epoch <= fill_epoch < hour_end_epoch):
+                    ts_ok = False
+
+            if not slug_ok or not ts_ok:
+                skipped_old_hour += 1
+                continue
+            if not slug and fill_epoch == 0:
+                skipped_no_identity += 1
+                continue
 
             qty = raw.get("size") or raw.get("amount") or 0
             price = raw.get("price") or 0
@@ -1078,25 +1076,40 @@ class TruthCapture:
             if pos is not None:
                 new_count += 1
 
-        # Update cursor
-        if raw_trades:
-            last = raw_trades[-1]
-            cursor["last_scan_ts_ms"] = _ts_ms()
-            cursor["last_trade_id"] = str(
-                last.get("trade_id") or last.get("id") or "")
-            _save_cursor(cursor)
+            # ── Update cursor tracking ──
+            if fill_ts_ms > 0:
+                if fill_ts_ms > max_ingested_ts_ms:
+                    max_ingested_ts_ms = fill_ts_ms
+                    new_recent_tids = [trade_id]
+                elif fill_ts_ms == max_ingested_ts_ms:
+                    new_recent_tids.append(trade_id)
+
+        # ── Persist cursor ──
+        if max_ingested_ts_ms > cursor_ts:
+            self._scan_cursor_ts_ms = max_ingested_ts_ms
+            self._scan_cursor_tid = new_recent_tids[-1] if new_recent_tids else ""
+            self._scan_recent_tids = new_recent_tids[-self._scan_recent_tids_max:]
+        elif max_ingested_ts_ms == cursor_ts and new_recent_tids:
+            # Same timestamp — extend ring buffer
+            combined = list(self._scan_recent_tids) + new_recent_tids
+            self._scan_recent_tids = combined[-self._scan_recent_tids_max:]
 
         self._write_jsonl({
             "event_type": "TRUTH_SCAN_DONE",
-            "total_trades": len(raw_trades),
+            "total_api_trades": len(raw_trades),
             "new_fills": new_count,
+            "skipped_old_cursor": skipped_old_cursor,
             "skipped_old_hour": skipped_old_hour,
+            "skipped_no_identity": skipped_no_identity,
+            "cursor_ts_ms": self._scan_cursor_ts_ms,
             "ts_ms": _ts_ms(),
         })
-        if new_count > 0:
+        if new_count > 0 or skipped_old_cursor > 0 or skipped_old_hour > 0:
             print(f"  [TRUTH] Wallet scan: {new_count} new fills from "
-                  f"{len(raw_trades)} trades"
-                  f"{f' ({skipped_old_hour} old-hour skipped)' if skipped_old_hour else ''}")
+                  f"{len(raw_trades)} API trades  "
+                  f"(cursor_skip={skipped_old_cursor} "
+                  f"hour_skip={skipped_old_hour} "
+                  f"no_id={skipped_no_identity})")
 
         return new_count
 
@@ -1350,20 +1363,22 @@ class TruthCapture:
                     non_active_diffs.append(entry)
                 tag = "ACTIVE" if is_active else "NON_ACTIVE"
                 print(f"  [TRUTH] RECONCILE {sev} [{tag}]: {slug} {outcome}: "
-                      f"truth={truth_qty:.4f} wallet={wallet_qty:.4f} "
+                      f"ledger={truth_qty:.4f} wallet={wallet_qty:.4f} "
                       f"diff={diff:+.4f}")
 
         # Print reconciliation diff tables
         if active_diffs:
             print(f"  [RECON] ACTIVE_WINDOW_DIFF ({len(active_diffs)}):")
             for d in active_diffs:
-                print(f"  [RECON]   {d['slug']:<30s} expected={d['truth']:.4f} "
-                      f"actual={d['wallet']:.4f} delta={d['diff']:+.4f}")
+                print(f"  [RECON]   {d['slug']:<30s} "
+                      f"wallet={d['wallet']:.4f}  ledger={d['truth']:.4f}  "
+                      f"diff={d['diff']:+.4f}")
         if non_active_diffs:
             print(f"  [RECON] NON_ACTIVE_DIFF ({len(non_active_diffs)}):")
             for d in non_active_diffs:
-                print(f"  [RECON]   {d['slug']:<30s} expected={d['truth']:.4f} "
-                      f"actual={d['wallet']:.4f} delta={d['diff']:+.4f}")
+                print(f"  [RECON]   {d['slug']:<30s} "
+                      f"wallet={d['wallet']:.4f}  ledger={d['truth']:.4f}  "
+                      f"diff={d['diff']:+.4f}")
         recon_status = "OK" if not mismatches else "FAIL"
         max_delta = max((abs(m["diff"]) for m in mismatches), default=0.0)
         print(f"  [RECON] status={recon_status} delta_max={max_delta:.4f}")
@@ -1438,9 +1453,16 @@ class TruthCapture:
     #  MAIN TICK — call from bot main loop every iteration
     # ══════════════════════════════════════════════════════════════════
 
-    def tick(self, active_token_ids: Optional[Set[str]] = None) -> None:
+    def tick(self, active_token_ids: Optional[Set[str]] = None,
+             position_log_interval: float = 600.0) -> None:
         """Run all periodic tasks: poll watchers, wallet scan, reconcile,
-        and per-minute position print + structured logging."""
+        and periodic position print + structured logging.
+
+        Parameters
+        ----------
+        position_log_interval : float
+            Seconds between position prints (default 600 = 10 min).
+        """
         now_ts = time.time()
 
         # State machine guard: skip most work if CLOSED
@@ -1456,8 +1478,8 @@ class TruthCapture:
         # 3. Reconciliation (every reconcile_interval_sec)
         self.maybe_run_reconciliation(active_token_ids)
 
-        # 4. Per-minute position print + structured loop log
-        if now_ts - self._last_positions_print_ts >= 60.0:
+        # 4. Position print at configurable interval (default 10 min)
+        if now_ts - self._last_positions_print_ts >= position_log_interval:
             self._last_positions_print_ts = now_ts
             self.print_positions()
 
@@ -1504,50 +1526,55 @@ class TruthCapture:
     #  REPORTING
     # ══════════════════════════════════════════════════════════════════
 
-    def print_positions(self) -> None:
-        """Print truth-derived positions split by active window vs other."""
-        window_pos = self.get_active_window_positions()
-        other_pos = self.get_other_positions()
+    def print_positions(self, max_display: int = 10) -> None:
+        """Print truth-derived positions for current hour only (top N by cost).
 
-        if not window_pos and not other_pos:
-            print("  [TRUTH] Positions: (none)")
+        Parameters
+        ----------
+        max_display : int
+            Maximum positions to display (default 10).
+        """
+        window_pos = self.get_active_window_positions()
+
+        if not window_pos:
+            safe_tag = " [SAFE MODE]" if self._safe_mode else ""
+            print(f"  [TRUTH] ── LEDGER_POSITIONS — current hour: (none){safe_tag} ──")
             return
 
         safe_tag = " [SAFE MODE]" if self._safe_mode else ""
 
-        # ── ACTIVE WINDOW POSITIONS (tradable) ──
-        if window_pos:
-            print(f"  [TRUTH] ── ACTIVE_WINDOW_POSITIONS ({len(window_pos)})"
-                  f"{safe_tag} ──")
-            total_cost = _ZERO
-            total_rpnl = _ZERO
-            for tid, pos in sorted(window_pos.items(),
-                                   key=lambda x: x[1].slug):
-                cost = float(pos.total_cost)
-                total_cost += pos.total_cost
-                total_rpnl += pos.realized_pnl
-                print(f"  [TRUTH]   {pos.slug:<35s} {pos.outcome:<5s} "
-                      f"qty={float(pos.net_qty):8.2f}  "
-                      f"avg={float(pos.avg_price):.4f}  "
-                      f"cost=${cost:7.2f}  "
-                      f"rpnl={float(pos.realized_pnl):+.4f}")
-            print(f"  [TRUTH]   Active total cost=${float(total_cost):.2f}  "
-                  f"rpnl={float(total_rpnl):+.4f}  "
-                  f"fills in current hour={len(self._fills)} "
-                  f"(ws={self.fills_from_ws} poll={self.fills_from_poll} "
-                  f"scan={self.fills_from_scan})")
-        else:
-            print(f"  [TRUTH] ── ACTIVE_WINDOW_POSITIONS: (none){safe_tag} ──")
+        # Sort by cost descending, show top N
+        sorted_pos = sorted(window_pos.items(),
+                            key=lambda x: float(x[1].total_cost),
+                            reverse=True)
+        shown = sorted_pos[:max_display]
+        hidden = len(sorted_pos) - len(shown)
 
-        # ── OTHER WALLET POSITIONS (non-tradable) ──
-        if other_pos:
-            print(f"  [TRUTH] ── OTHER_WALLET_POSITIONS ({len(other_pos)}) "
-                  f"[non-tradable] ──")
-            for tid, pos in sorted(other_pos.items(),
-                                   key=lambda x: x[1].slug):
-                print(f"  [TRUTH]   {pos.slug:<35s} {pos.outcome:<5s} "
-                      f"qty={float(pos.net_qty):8.2f}  "
-                      f"(old hour — not tradable)")
+        print(f"  [TRUTH] ── LEDGER_POSITIONS — current hour "
+              f"({len(window_pos)} positions, top {min(max_display, len(sorted_pos))})"
+              f"{safe_tag} ──")
+        total_cost = _ZERO
+        total_rpnl = _ZERO
+        for tid, pos in shown:
+            cost = float(pos.total_cost)
+            total_cost += pos.total_cost
+            total_rpnl += pos.realized_pnl
+            print(f"  [TRUTH]   {pos.slug:<35s} {pos.outcome:<5s} "
+                  f"qty={float(pos.net_qty):8.2f}  "
+                  f"avg={float(pos.avg_price):.4f}  "
+                  f"cost=${cost:7.2f}  "
+                  f"rpnl={float(pos.realized_pnl):+.4f}")
+        # Add hidden positions to totals
+        for tid, pos in sorted_pos[max_display:]:
+            total_cost += pos.total_cost
+            total_rpnl += pos.realized_pnl
+        if hidden > 0:
+            print(f"  [TRUTH]   ... and {hidden} more positions")
+        print(f"  [TRUTH]   Total cost=${float(total_cost):.2f}  "
+              f"rpnl={float(total_rpnl):+.4f}  "
+              f"fills in current hour={len(self._fills)} "
+              f"(ws={self.fills_from_ws} poll={self.fills_from_poll} "
+              f"scan={self.fills_from_scan})")
 
     def summary(self) -> dict:
         active = self.get_all_active()
