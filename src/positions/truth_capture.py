@@ -1519,8 +1519,7 @@ class TruthCapture:
                   f"scan={self.fills_from_scan} dup={self.fills_dedup_skipped})  "
                   f"active_pos={len(active)} other={len(other)}  "
                   f"watchers={len(self._watchers)}")
-            if pos_summary != "none":
-                print(f"  [TRUTH] [POS] {pos_summary}")
+            # Position details printed by bot's print_positions() with crypto names
 
     # ══════════════════════════════════════════════════════════════════
     #  REPORTING
