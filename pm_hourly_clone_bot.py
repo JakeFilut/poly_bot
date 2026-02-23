@@ -1131,10 +1131,9 @@ class Bot:
             self._fills_ledger.print_positions()
 
         if MODE == "LIVE_SAFE":
-            print(f"\n  [LIVE_SAFE] Entry window: {LIVE_SAFE_ENTRY_WINDOW_SEC:.0f}s  |  "
-                  f"Max order: ${LIVE_SAFE_MAX_ORDER_USD:.2f}  |  "
+            print(f"\n  [LIVE_SAFE] Max order: ${LIVE_SAFE_MAX_ORDER_USD:.2f}  |  "
                   f"Max total invested: ${LIVE_SAFE_MAX_TOTAL_INVESTED_USD:.2f}  |  "
-                  f"Buys disabled after window; sells always allowed")
+                  f"Burst window: first 3 min of each hour")
             print(f"  [LIVE_SAFE] Will run {LIVE_SAFE_NUM_HOURS} hourly windows then exit  "
                   f"(started: {iso_z(self._live_safe_start_hour)})\n")
 
@@ -4163,7 +4162,7 @@ class Bot:
 
     def _buys_allowed(self) -> bool:
         """Check if BUY orders are currently allowed.
-        LOG: always True. LIVE: always True. LIVE_SAFE: only during entry window.
+        All modes: always True (burst window is handled separately).
         Blocked if position desync detected and POSITION_RECONCILE_BLOCK_ON_DESYNC is True.
         Blocked if ledger SAFE MODE is active."""
         # Block new trades during critical state desync
@@ -4174,9 +4173,7 @@ class Bot:
         # Block new trades during ledger SAFE MODE
         if self._fills_ledger is not None and self._fills_ledger.safe_mode:
             return False
-        if MODE != "LIVE_SAFE":
-            return True
-        return (time.monotonic() - self._process_start_mono) < LIVE_SAFE_ENTRY_WINDOW_SEC
+        return True
 
     def _entry_window_remaining_sec(self) -> float:
         """Seconds remaining in LIVE_SAFE entry window. 0 if expired or not LIVE_SAFE."""
