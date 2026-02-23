@@ -44,7 +44,7 @@ from logger import (
 # MODULAR IMPORTS — config, data structures, utils, strategy, feeds, gating
 from src.config.settings import *                       # noqa: F403 — all config constants
 from src.config.settings import (                       # private names not exported by *
-    _PROJECT_DIR, _KEYS_DIR, _LOG_DIR, _THR_TABLE,
+    _PROJECT_DIR, _KEYS_DIR, _LOG_DIR, _THR_TABLE, _IS_MIN_PROFILE,
 )
 MIN_QTY = _LOG_MIN_QTY  # override: logger's MIN_QTY takes precedence
 
@@ -56,9 +56,16 @@ from src.util.time import (
 from src.util.math import clamp, clamp_to_tick, _p_up_model
 from src.strategy.f247_like import (
     entry_threshold_bps, price_cap, dynamic_cap, spread_limit,
-    whipsaw_ok, persistence_ok,
-    parity_net_edge_cents, parity_liquidity_ok, compute_fee_usdc,
+    whipsaw_ok, persistence_ok, compute_fee_usdc,
 )
+# Parity-only strategy functions — not needed for HOURLY_SCALP_MIN
+if not _IS_MIN_PROFILE:
+    from src.strategy.f247_like import parity_net_edge_cents, parity_liquidity_ok
+else:
+    # Stubs: unreachable under HOURLY_SCALP_MIN (parity call sites are guarded)
+    def parity_net_edge_cents(*a, **kw): return (0.0, 0.0, 0.0)  # type: ignore[misc]
+    def parity_liquidity_ok(*a, **kw): return (False, "disabled")   # type: ignore[misc]
+
 from src.strategy.sizing import sizing_mult, zscore, delta_velocity_bps_per_min, delta_velocity_debug
 from src.trading.order_manager import OrderManager
 from src.trading.portfolio import compute_equity, clean_dust
@@ -74,7 +81,12 @@ from src.execution.live_safety import LiveSafety
 from src.execution.fills_ledger import FillsLedger
 from src.positions.truth_capture import TruthCapture, WindowState
 from src.feeds.polymarket import PolymarketClient, set_jsonl_writer
-from src.bot.app import BotApp
+
+# BotApp — subsystem wiring (only needed for full F247_LIKE profile)
+if not _IS_MIN_PROFILE:
+    from src.bot.app import BotApp
+else:
+    BotApp = None  # type: ignore[assignment,misc]
 
 # UTIL / LOGGING — thin wrappers around Logger instance
 _LOGGER: Optional["Logger"] = None
@@ -669,10 +681,30 @@ class Bot:
         #    e) FillsLedger reconciliation:
         #       N/A — compares ledger position sums vs CLOB balances.
         #       Does not ingest new trades from API.
+        # Cursor proof counters (at startup, should all be 0)
+        cursor_counters = {
+            "truth_wallet_scan": {
+                "accepted_fills": self._truth.cursor_accepted_fills,
+                "dropped_old_ts": self._truth.cursor_dropped_old_ts,
+                "dropped_outside_window": self._truth.cursor_dropped_outside_window,
+            },
+            "lifecycle_guard": {
+                "accepted_fills": 0,  # none at startup; only tracks this-session orders
+                "dropped_old_ts": 0,
+                "dropped_outside_window": 0,
+            },
+            "apply_fill_pipeline": {
+                "accepted_fills": 0,
+                "dropped_old_ts": 0,
+                "dropped_outside_window": 0,
+            },
+        }
+
         ingest_paths = {
             "truth_wallet_scan": {
                 "respects_boot_cursor": True,
                 "mechanism": f"_scan_cursor_ts_ms={boot_cursor_ms}; fills with ts<cursor skipped + hour-window filter",
+                "acceptance_predicate": "(ts_ms >= boot_cursor_ms) AND (hour_start <= ts < hour_end)",
             },
             "lifecycle_guard": {
                 "respects_boot_cursor": True,
@@ -715,6 +747,8 @@ class Bot:
             "open_orders_count": len(open_orders),
             "orphan_cancels_at_startup": orphan_cancels,
             "ingest_paths": ingest_paths,
+            "cursor_proof_counters": cursor_counters,
+            "acceptance_predicate": "(ts_ms >= boot_cursor_ms) AND (hour_start <= ts < hour_end)  [AND, not OR]",
             "all_paths_respect_cursor": all(v["respects_boot_cursor"] for v in ingest_paths.values()),
             "burst_gate": {
                 "gate_field": "t_min > BURST_EARLY_WINDOW_MIN",
@@ -749,10 +783,17 @@ class Bot:
                       f"qty={p['qty']}  vwap={p['vwap']}  cost=${p['cost_usd']}")
         else:
             print(f"  ║  Open positions: NONE (starting flat)")
+        print(f"  ║  Acceptance predicate (AND, not OR):")
+        print(f"  ║    ACCEPT iff (ts_ms >= boot_cursor_ms) AND (hour_start <= ts < hour_end)")
+        print(f"  ║    Both conditions MUST be true; either failure → DROP.")
         print(f"  ║  Ingest path cursor verification:")
         for path_name, info in ingest_paths.items():
             status = "OK" if info["respects_boot_cursor"] else "FAIL"
             print(f"  ║    [{status}] {path_name}: {info['mechanism'][:70]}")
+        print(f"  ║  Cursor proof counters (should all be 0 at startup):")
+        for path_name, ctrs in cursor_counters.items():
+            print(f"  ║    {path_name}: accept={ctrs['accepted_fills']} "
+                  f"drop_old={ctrs['dropped_old_ts']} drop_win={ctrs['dropped_outside_window']}")
         all_ok = report["all_paths_respect_cursor"]
         print(f"  ║  ALL PATHS RESPECT CURSOR: {'YES' if all_ok else 'NO — INVESTIGATE'}")
         print(f"  ║  Burst gating:")
@@ -2267,6 +2308,12 @@ class Bot:
                 "late_move_cache_ms": SOLXRP_LATE_MOVE_CACHE_MS,
             },
             "max_spread_exit_solxrp": MAX_SPREAD_EXIT_CENTS_SOLXRP,
+            # Cursor proof counters (cumulative since boot)
+            "cursor_proof": {
+                "accepted_fills": self._truth.cursor_accepted_fills,
+                "dropped_old_ts": self._truth.cursor_dropped_old_ts,
+                "dropped_outside_window": self._truth.cursor_dropped_outside_window,
+            },
         }
         # Per-slug exposure + imbalance
         slug_exposure = {}
@@ -2356,6 +2403,10 @@ class Bot:
                 parts = [f"{s[:20]}=${d['exposure_usd']:.0f}/imb={d['imbalance_shares']:+.0f}"
                          for s, d in top_slugs]
                 print(f"  EXPOSURE: {' | '.join(parts)}")
+            # Cursor proof (cumulative — proves no old fills leaked)
+            print(f"  CURSOR_PROOF: accept={self._truth.cursor_accepted_fills}  "
+                  f"drop_old_ts={self._truth.cursor_dropped_old_ts}  "
+                  f"drop_window={self._truth.cursor_dropped_outside_window}")
 
         # Reset per-minute counters
         self._diag_report_last_ts = now_t
@@ -2904,12 +2955,14 @@ class Bot:
             # (_buys_allowed already returns False via _is_in_flatten_phase)
 
         # ── PARITY: priority #3 — hard-gated by directional state ──
-        parity_blocked = self._should_block_parity(m, st)
-        if parity_blocked:
-            # Only run parity for pending pairs + recycle + flatten — NO new quotes
-            self._parity_arb(ctx, new_quotes_blocked=True)
-        else:
-            self._parity_arb(ctx)
+        # HOURLY_SCALP_MIN: skip parity entirely (impossible to run — stubs + guard)
+        if not _IS_MIN_PROFILE:
+            parity_blocked = self._should_block_parity(m, st)
+            if parity_blocked:
+                # Only run parity for pending pairs + recycle + flatten — NO new quotes
+                self._parity_arb(ctx, new_quotes_blocked=True)
+            else:
+                self._parity_arb(ctx)
 
         # stop adding risk after TRADE_STOP_ADD_MIN or within NO_NEW_ENTRIES_SEC_TO_CLOSE
         seconds_to_close = ctx.get("seconds_to_close", 999.0)
@@ -4467,7 +4520,8 @@ class Bot:
         All modes: always True (burst window is handled separately).
         Blocked if position desync detected and POSITION_RECONCILE_BLOCK_ON_DESYNC is True.
         Blocked if ledger SAFE MODE is active.
-        Blocked during flatten phase (t_min >= FLATTEN_START_MIN)."""
+        Blocked during flatten phase (t_min >= FLATTEN_START_MIN).
+        Blocked by ENTRY_ONLY_EARLY_WINDOW after burst window (sells/flatten still ok)."""
         # Block new trades during critical state desync
         if (POSITION_RECONCILE_ENABLED
                 and POSITION_RECONCILE_BLOCK_ON_DESYNC
@@ -4482,6 +4536,10 @@ class Bot:
         # Block new entries during flatten phase
         if self._is_in_flatten_phase():
             return False
+        # Block ALL new buys after early window (sells/flatten always allowed)
+        if ENTRY_ONLY_EARLY_WINDOW:
+            if self._is_past_early_window():
+                return False
         return True
 
     def _is_in_flatten_phase(self) -> bool:
@@ -4495,6 +4553,25 @@ class Bot:
                 hour_start = _parse_iso_z(st.hour_start_utc)
                 t_min = minutes_into_hour(hour_start, now)
                 if t_min >= FLATTEN_START_MIN:
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _is_past_early_window(self) -> bool:
+        """Check if ANY active market is past BURST_EARLY_WINDOW_MIN.
+
+        Used by ENTRY_ONLY_EARLY_WINDOW to block ALL new buys after the
+        early window (minutes 0-3).  Sells and flatten are unaffected.
+        """
+        now = utc_now()
+        for st in self.market_states.values():
+            if not st.hour_start_utc:
+                continue
+            try:
+                hour_start = _parse_iso_z(st.hour_start_utc)
+                t_min = minutes_into_hour(hour_start, now)
+                if t_min > BURST_EARLY_WINDOW_MIN:
                     return True
             except Exception:
                 continue
