@@ -5488,16 +5488,38 @@ class Bot:
             # Escalation: 3 consecutive drifts → DESYNC_HARD_STOP
             if self._pos_drift_consecutive >= 3 and not self._desync_hard_stop:
                 self._desync_hard_stop = True
+                # Release all budget reservations
+                released_count = len(self._reserved_usd)
+                released_total = sum(self._reserved_usd.values())
+                self._reserved_usd.clear()
+                self._reserved_submit_ts.clear()
                 write_jsonl({
                     "event_type": "DESYNC_FROM_INVARIANT",
                     "source": "position_invariant",
                     "consecutive_checks": self._pos_drift_consecutive,
                     "diffs": diffs,
-                    "action": "cancel_all + block_buys",
+                    "action": "cancel_all + clear_reservations + block_buys",
+                    "reservations_cleared": released_count,
+                    "reservations_usd_released": round(released_total, 2),
                     "ts_ms": int(time.time() * 1000),
                 })
+                if released_count > 0:
+                    write_jsonl({
+                        "event_type": "RESERVED_CLEARED_ON_DESYNC",
+                        "count": released_count,
+                        "total_usd": round(released_total, 2),
+                        "ts_ms": int(time.time() * 1000),
+                    })
                 print(f"  *** DESYNC FROM INVARIANT *** {self._pos_drift_consecutive} "
                       f"consecutive drifts — cancelling all orders, blocking new buys")
+                for d in diffs:
+                    sign = "+" if d["delta"] > 0 else ""
+                    print(f"    {d['slug']} {d['outcome']} drift "
+                          f"{sign}{d['delta']:.2f} "
+                          f"(bot {d['bot_qty']} vs truth {d['truth_qty']})")
+                if released_count > 0:
+                    print(f"  [DESYNC] Released {released_count} reservations "
+                          f"(${released_total:.2f})")
                 try:
                     self.client.cancel_all_orders()
                     print("  [DESYNC] All open orders cancelled")
@@ -7706,12 +7728,14 @@ class Bot:
                             # Profitable — allow TIME_STOP_EXIT
                             ts_key = (m.slug, outcome)
                             # Guard: don't latch/fire for dust positions
+                            _ts_bid = round(book.bid, 4)
                             if pos.qty < MIN_QTY:
                                 self._time_stop_triggered.pop(ts_key, None)
                                 write_jsonl({"event_type": "TIME_STOP_SKIPPED",
                                              "slug": m.slug, "outcome": outcome,
                                              "skip_reason": "below_min_qty",
                                              "qty": round(pos.qty, 2),
+                                             "best_bid": _ts_bid,
                                              "ts_ms": int(time.time() * 1000)})
                                 continue
                             # Per-(slug,outcome) latch: only fire once until qty changes
@@ -7722,6 +7746,7 @@ class Bot:
                                              "skip_reason": "latched_no_qty_change",
                                              "qty": round(pos.qty, 2),
                                              "latched_qty": round(prev_qty, 2),
+                                             "best_bid": _ts_bid,
                                              "ts_ms": int(time.time() * 1000)})
                                 continue
                             # Notional guard: skip if below CLOB min order size
@@ -7732,6 +7757,7 @@ class Bot:
                                              "skip_reason": "below_min_notional",
                                              "qty": round(pos.qty, 2),
                                              "notional": round(notional, 2),
+                                             "best_bid": _ts_bid,
                                              "ts_ms": int(time.time() * 1000)})
                                 continue
                             # Check sell cooldown first to avoid spamming 60 attempts/sec
@@ -7789,6 +7815,7 @@ class Bot:
                                                  "skip_reason": "soft_latched_no_qty_change",
                                                  "qty": round(pos.qty, 2),
                                                  "latched_qty": round(prev_qty_soft, 2),
+                                                 "best_bid": round(book.bid, 4),
                                                  "ts_ms": int(time.time() * 1000)})
                                 elif (spread_cents_ts <= TIME_STOP_SOFT_EXIT_MAX_SPREAD_CENTS
                                         and vel_against):
