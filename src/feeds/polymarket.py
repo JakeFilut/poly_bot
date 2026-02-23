@@ -457,6 +457,12 @@ class PolymarketClient:
         if not self._clob:
             raise RuntimeError("CLOB client not initialised (missing POLYMARKET_PRIVATE_KEY)")
 
+        # API error backoff: if recent order failed, wait before retrying
+        now = time.time()
+        if now < getattr(self, '_api_error_backoff_until', 0.0):
+            return {"order_id": "", "filled": False, "fill_qty": 0.0,
+                    "fill_price": 0.0, "status": "error"}
+
         from py_clob_client.clob_types import OrderArgs, OrderType
 
         import math as _math
@@ -520,6 +526,8 @@ class PolymarketClient:
                                          "order_id": oid, "side": side,
                                          "token_id": token_id[-12:]})
 
+                # Reset backoff on successful API call
+                self._api_error_backoff_sec = 0.0
                 _write_jsonl({"event_type":"ORDER_PLACED", "order_id": oid,
                              "token_id": token_id[-12:], "side": side,
                              "price": price, "qty": qty,
@@ -528,9 +536,15 @@ class PolymarketClient:
                 return {"order_id": oid, "filled": filled, "fill_qty": fill_qty,
                         "fill_price": price, "status": status}
         except Exception as e:
+            # Exponential backoff: 5s → 10s → 20s → cap at 30s
+            prev = getattr(self, '_api_error_backoff_sec', 0.0)
+            backoff = min(max(prev * 2, 5.0), 30.0)
+            self._api_error_backoff_sec = backoff
+            self._api_error_backoff_until = time.time() + backoff
             _write_jsonl({"event_type":"ORDER_ERROR", "err": str(e)[:200],
                          "token_id": token_id[-12:], "side": side,
-                         "price": price, "qty": qty})
+                         "price": price, "qty": qty,
+                         "backoff_sec": backoff})
         return {"order_id": "", "filled": False, "fill_qty": 0.0,
                 "fill_price": 0.0, "status": "error"}
 

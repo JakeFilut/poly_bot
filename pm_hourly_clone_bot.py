@@ -4297,12 +4297,13 @@ class Bot:
     # PRE-8HR SAFETY: coin-specific spread limit for entries
     # -----------------------------------------------------------------
     def _coin_spread_entry_ok(self, crypto: str, spread_cents: float) -> bool:
-        """Check if spread is within coin-specific entry limit."""
+        """Check if spread is within coin-specific entry limit (inclusive)."""
         if crypto in ("BTC", "ETH"):
             limit = MAX_SPREAD_ENTRY_CENTS_BTCETH
         else:
             limit = MAX_SPREAD_ENTRY_CENTS_SOLXRP
-        if spread_cents > limit:
+        # Use small epsilon for floating point: allow spread at exactly the limit
+        if spread_cents > limit + 0.05:
             self._diag_spread_limit_blocks += 1
             return False
         return True
@@ -4427,7 +4428,7 @@ class Bot:
             for st in self.market_states.values()
             for o in ["Up", "Down"] if st.positions[o].qty >= MIN_QTY
         )
-        # ── LIVE_SAFE total invested cap ($20 default) ──
+        # ── LIVE_SAFE total invested cap ($50 default, rolling — sells free up room) ──
         if MODE == "LIVE_SAFE" and total_usd >= LIVE_SAFE_MAX_TOTAL_INVESTED_USD:
             write_jsonl({"event_type": "LIVE_SAFE_INVESTED_CAP",
                           "slug": slug, "total_invested_usd": round(total_usd, 2),
