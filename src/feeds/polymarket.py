@@ -503,11 +503,12 @@ class PolymarketClient:
                     if fill_qty == 0 and oid:
                         fill_qty = self._poll_order_fill(oid, qty, timeout=5)
                     if fill_qty == 0:
-                        # CLOB said matched but we can't confirm qty — treat as unfilled
-                        filled = False
-                        _write_jsonl({"event_type":"FILL_QTY_UNKNOWN",
+                        # CLOB said matched — trust it, assume full fill
+                        fill_qty = qty
+                        _write_jsonl({"event_type":"FILL_QTY_ASSUMED",
                                      "order_id": oid, "status": status,
-                                     "requested_qty": qty})
+                                     "requested_qty": qty,
+                                     "note": "CLOB said matched but size_matched missing; assuming full fill"})
                 elif status == "live" and oid:
                     # Poll briefly to see if it filled
                     fill_qty = self._poll_order_fill(oid, qty, timeout=3)
