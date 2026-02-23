@@ -1502,6 +1502,14 @@ class Bot:
                 markets = list(self._cached_markets)  # atomic snapshot
                 self._resolve_ended_hours(markets)
 
+                # After settlement, refresh hour_start_equity so the new
+                # hour's loss-stop baseline reflects post-settlement equity
+                # (settlement changes cash but runs after the hourly reset).
+                if self.hourly_pnl_usdc == 0.0 and self._hour_trade_count == 0:
+                    post_settle_eq = self._equity()
+                    if abs(post_settle_eq - self.hour_start_equity) > 0.01:
+                        self.hour_start_equity = post_settle_eq
+
                 # 3. Update priority set + deadline-based refresh scheduling
                 self._update_priority_slugs()
                 now_ts = time.time()
@@ -2778,7 +2786,10 @@ class Bot:
                 pnl = payout - pos.cost_usdc
                 self.cash_usdc += payout
                 self.realized_pnl_usdc += pnl
-                self.hourly_pnl_usdc += pnl
+                # NOTE: Do NOT add settlement pnl to hourly_pnl_usdc.
+                # Settlement resolves the *previous* hour's positions after
+                # the hourly reset has already fired, so it would pollute
+                # the new hour's P&L with the old hour's settlement loss.
                 self._hour_net_pnl += pnl
                 pos_details.append({"outcome": outcome, "qty": pos.qty,
                                     "payout": payout, "pnl": pnl})
@@ -2949,8 +2960,16 @@ class Bot:
         if t_min >= TRADE_HARD_STOP_MIN:
             self.last_book[m.slug]["Up"] = up_book
             self.last_book[m.slug]["Down"] = dn_book
-            # Transition to SETTLEMENT state if still ACTIVE
-            if self._truth.window_state == WindowState.ACTIVE:
+            # Transition to SETTLEMENT state if still ACTIVE — but only if
+            # this slug belongs to the CURRENT hour window.  Old/stale slugs
+            # (previous hour) must not flip the global state to SETTLEMENT
+            # because that blocks all new entries for the current-hour markets.
+            current_hour_utc = self._hour_window
+            slug_belongs_to_current_hour = (
+                hour_start.replace(tzinfo=None) >= current_hour_utc.replace(tzinfo=None)
+                if current_hour_utc else True
+            )
+            if self._truth.window_state == WindowState.ACTIVE and slug_belongs_to_current_hour:
                 hour_end_utc = hour_start + timedelta(hours=1)
                 write_jsonl({
                     "event_type": "SETTLEMENT_TRANSITION_DIAG",

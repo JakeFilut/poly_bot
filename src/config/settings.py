@@ -591,8 +591,8 @@ OM_KILL_PAUSE_SEC = float(os.getenv("OM_KILL_PAUSE_SEC", "60"))                 
 
 # Global safety caps
 OM_MAX_OPEN_ORDERS = int(os.getenv("OM_MAX_OPEN_ORDERS", "50"))                    # hard cap on tracked open orders
-OM_MAX_TOTAL_USD = float(os.getenv("OM_MAX_TOTAL_USD", "50"))                      # max total exposure across all slugs
-OM_MAX_PER_SLUG_USD = float(os.getenv("OM_MAX_PER_SLUG_USD", "25"))                # max exposure per slug
+OM_MAX_TOTAL_USD = float(os.getenv("OM_MAX_TOTAL_USD", "100"))                     # max total exposure across all slugs (match MAX_TOTAL_EXPOSURE_USD)
+OM_MAX_PER_SLUG_USD = float(os.getenv("OM_MAX_PER_SLUG_USD", "50"))                # max exposure per slug
 
 # Sanity report
 OM_SANITY_REPORT_INTERVAL_SEC = float(os.getenv("OM_SANITY_REPORT_INTERVAL_SEC", "60"))  # report every 60s
