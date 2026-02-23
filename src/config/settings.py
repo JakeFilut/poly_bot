@@ -91,6 +91,16 @@ _THR_TABLE = {
     "XRP": {"early": 6, "mid":  7, "late": 6},
 }
 
+# Probe-only thresholds (t_min > 3, no burst).  Lower mid-hour bars
+# so probes fire more consistently during LIVE_SAFE testing.
+# Burst thresholds still use _THR_TABLE + BURST_MIN_EDGE_EXTRA_BPS.
+_THR_TABLE_PROBE = {
+    "BTC": {"early": 7, "mid": 7, "late": 4},
+    "SOL": {"early": 7, "mid": 10, "late": 4},
+    "ETH": {"early": 6, "mid":  6, "late": 6},
+    "XRP": {"early": 6, "mid":  7, "late": 6},
+}
+
 # Price cap curve (max price you will pay to BUY), piecewise by time bucket
 CAP_0_5   = 0.67
 CAP_5_15  = 0.82
@@ -112,7 +122,8 @@ IMB_ENABLED = False
 IMB_LEVELS = 5
 IMB_MIN = 1.15                  # bidDepth/askDepth must exceed this for with-drift buys
 IMB_MAX_SPREAD = 0.02           # cross only when spread <= 2c; maker posting ok wider
-MAKER_MAX_SPREAD = 0.06         # allow maker posting up to 6c spread
+MAKER_MAX_SPREAD = 0.06         # allow maker posting up to 6c spread (burst + late)
+PROBE_MAX_SPREAD = 0.08         # probe-only: tolerate up to 8c spread
 
 # Pullback entry
 PULLBACK_ENABLED = False
@@ -211,7 +222,7 @@ EDGE_K = 0.05    # sigmoid steepness: delta_bps -> P(Up)
 # Probe -> Scale state machine
 # -----------------------------------------------------------------------------
 PROBE_SIZE_FRAC = 0.25        # probe = max($1, clip * 0.25)
-PROBE_CONFIRM_SEC = 0.3       # 300ms -- near-instant confirmation (F247)
+PROBE_CONFIRM_SEC = 1.0       # 1s -- reduced premature cancel/retry (was 0.3)
 
 # Count-based burst engine (f247-tuned: less spam, bigger steps)
 BURST_ORDERS = 8                       # max micro-orders per burst
@@ -627,7 +638,7 @@ SLUG_PNL_REPORT_INTERVAL_SEC = float(os.getenv("SLUG_PNL_REPORT_INTERVAL_SEC", "
 
 # 1) Inventory caps — block new BUYS when exceeded, sells always allowed
 MAX_POSITION_USD_PER_SLUG = float(os.getenv("MAX_POSITION_USD_PER_SLUG", "50"))
-MAX_POSITION_SHARES_PER_OUTCOME = float(os.getenv("MAX_POSITION_SHARES_PER_OUTCOME", "25"))
+MAX_POSITION_SHARES_PER_OUTCOME = float(os.getenv("MAX_POSITION_SHARES_PER_OUTCOME", "40"))
 MAX_NET_IMBALANCE_SHARES = float(os.getenv("MAX_NET_IMBALANCE_SHARES", "12"))
 
 # 2) Post-fill cooldown — skip new BUY attempts after any fill on slug

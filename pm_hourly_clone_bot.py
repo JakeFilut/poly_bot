@@ -44,7 +44,7 @@ from logger import (
 # MODULAR IMPORTS — config, data structures, utils, strategy, feeds, gating
 from src.config.settings import *                       # noqa: F403 — all config constants
 from src.config.settings import (                       # private names not exported by *
-    _PROJECT_DIR, _KEYS_DIR, _LOG_DIR, _THR_TABLE, _IS_MIN_PROFILE,
+    _PROJECT_DIR, _KEYS_DIR, _LOG_DIR, _THR_TABLE, _THR_TABLE_PROBE, _IS_MIN_PROFILE,
 )
 MIN_QTY = _LOG_MIN_QTY  # override: logger's MIN_QTY takes precedence
 
@@ -55,7 +55,8 @@ from src.util.time import (
 )
 from src.util.math import clamp, clamp_to_tick, _p_up_model
 from src.strategy.f247_like import (
-    entry_threshold_bps, price_cap, dynamic_cap, spread_limit,
+    entry_threshold_bps, probe_entry_threshold_bps,
+    price_cap, dynamic_cap, spread_limit,
     whipsaw_ok, persistence_ok, compute_fee_usdc,
 )
 # Parity-only strategy functions — not needed for HOURLY_SCALP_MIN
@@ -218,6 +219,7 @@ class Bot:
         self._diag_derisk_taker_count = 0
         self._diag_blocked_whipsaw = 0
         self._diag_blocked_noflip = 0
+        self._probe_block_last_ts: Dict[str, float] = {}  # slug -> last PROBE_BLOCK print ts
         # Parity arb tracking
         self._parity_last_order_ts: Dict[str, float] = {}    # slug -> last parity order timestamp
         self._parity_invested_usd: Dict[str, float] = {}     # slug -> total parity investment
@@ -1953,6 +1955,7 @@ class Bot:
         self._diag_derisk_taker_count = 0
         self._diag_blocked_whipsaw = 0
         self._diag_blocked_noflip = 0
+        self._probe_block_last_ts.clear()
         self._diag_parity_buy_signals = 0
         self._diag_parity_sell_signals = 0
         self._diag_parity_trades = 0
@@ -3976,7 +3979,10 @@ class Bot:
         sm = self._get_sm(m.slug)
 
         # --- Build valid signal (time + coin-specific threshold + dynamic cap) ---
-        thr = entry_threshold_bps(m.crypto, t_min)
+        # Use lower probe-only thresholds when past the burst window
+        _probe_only = (t_min > BURST_EARLY_WINDOW_MIN)
+        thr = (probe_entry_threshold_bps(m.crypto, t_min) if _probe_only
+               else entry_threshold_bps(m.crypto, t_min))
         edge_bps = abs(ctx["edge_up"] if ctx["drift_dir"] == "Up" else ctx["edge_down"]) * 10000.0
         cap = dynamic_cap(t_min, edge_bps)
         valid_time = (t_min >= TRADE_START_MIN)
@@ -3985,9 +3991,10 @@ class Bot:
         outcome = ctx["drift_dir"]
         book = up_book if outcome == "Up" else dn_book
         valid_price = (book.ask <= cap)
-        # Spread: relaxed during PROBING/SCALING
+        # Spread: relaxed during PROBING/SCALING; wider tolerance in probe-only
         in_burst = sm["state"] in ("PROBING", "SCALING")
-        max_spread = spread_limit(t_min, edge_bps, m.crypto, in_burst=in_burst)
+        max_spread = spread_limit(t_min, edge_bps, m.crypto,
+                                  in_burst=in_burst, probe_only=_probe_only)
         valid_spread = (book.spread <= max_spread)
         valid_imb = (not IMB_ENABLED) or (book.imb >= IMB_MIN)
         valid_pullback = True
@@ -4126,7 +4133,17 @@ class Bot:
         # --- State machine: IDLE → PROBING → SCALING → COOLDOWN ---
         if sm["state"] == "IDLE":
             if not sig:
-                if CONSOLE_LEVEL != "QUIET":
+                if _probe_only:
+                    # Identify the primary block reason for diagnostics
+                    if not valid_delta:
+                        self._log_probe_block(m.slug, "edge", ctx, book)
+                    elif not valid_spread:
+                        self._log_probe_block(m.slug, "spread", ctx, book)
+                    elif not valid_price:
+                        self._log_probe_block(m.slug, "price_cap", ctx, book)
+                    elif not valid_time:
+                        self._log_probe_block(m.slug, "window_state", ctx, book)
+                elif CONSOLE_LEVEL != "QUIET":
                     print(f"  [GATE_FAIL] {m.crypto:5s} {skip_reason}")
                 return
             if not persist_ok:
@@ -4134,6 +4151,9 @@ class Bot:
                     print(f"  [PERSIST_FAIL] {m.crypto:5s} sig=True but persistence not met (hist={len(sh)})")
                 return
             if cooldown_active or risk_blocked:
+                if _probe_only:
+                    reason = "cooldown" if cooldown_active else "exposure"
+                    self._log_probe_block(m.slug, reason, ctx, book)
                 return
             if clip < MIN_ORDER_USDC:
                 if CONSOLE_LEVEL != "QUIET":
@@ -4141,13 +4161,21 @@ class Bot:
                 return
             # ---- Place PROBE order (taker-gated) ----
             if not self._exec_safety_can_enter(m.slug):
+                if _probe_only:
+                    self._log_probe_block(m.slug, "exposure", ctx, book)
                 return
             if not self._inventory_cap_ok(m.slug, outcome):
+                if _probe_only:
+                    self._log_probe_block(m.slug, "inventory", ctx, book)
                 return
             if not self._post_fill_cooldown_ok(m.slug):
+                if _probe_only:
+                    self._log_probe_block(m.slug, "cooldown", ctx, book)
                 return
             # Coin-specific spread limit
             if not self._coin_spread_entry_ok(m.crypto, book.spread * 100):
+                if _probe_only:
+                    self._log_probe_block(m.slug, "spread", ctx, book)
                 return
             signal_detect_ts = time.time()
             sm["signal_detect_ts"] = signal_detect_ts
@@ -5435,6 +5463,28 @@ class Bot:
             if tracked and tracked.slug == slug:
                 total += usd
         return total
+
+    # ── Probe-block diagnostic (rate-limited: 1 per slug per 5s) ──
+    def _log_probe_block(self, slug: str, reason: str, ctx: dict,
+                         book=None) -> None:
+        """Print a single PROBE_BLOCK line, max once per slug per 5 seconds."""
+        now = time.time()
+        last = self._probe_block_last_ts.get(slug, 0.0)
+        if now - last < 5.0:
+            return
+        self._probe_block_last_ts[slug] = now
+        t_min = ctx.get("t_min", 0.0)
+        delta_bps = ctx.get("delta_bps", 0.0)
+        vel = ctx.get("vel", 0.0)
+        spread = book.spread if book else 0.0
+        exposure = self._total_exposure_usd()
+        st = self.market_states.get(slug)
+        outcome = ctx.get("drift_dir", "?")
+        shares = st.positions[outcome].qty if st else 0.0
+        print(f"  [PROBE_BLOCK] {slug} reason={reason}  "
+              f"t_min={t_min:.1f}  delta_bps={delta_bps:+.1f}  "
+              f"spread={spread:.3f}  vel={vel:+.2f}  "
+              f"exposure=${exposure:.2f}  shares={shares:.1f}")
 
     def _inventory_cap_ok(self, slug: str, outcome: str = "") -> bool:
         """Return True if inventory caps allow a new BUY on this slug/outcome.
