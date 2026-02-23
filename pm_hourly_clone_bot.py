@@ -2960,8 +2960,16 @@ class Bot:
         if t_min >= TRADE_HARD_STOP_MIN:
             self.last_book[m.slug]["Up"] = up_book
             self.last_book[m.slug]["Down"] = dn_book
-            # Transition to SETTLEMENT state if still ACTIVE
-            if self._truth.window_state == WindowState.ACTIVE:
+            # Transition to SETTLEMENT state if still ACTIVE — but only if
+            # this slug belongs to the CURRENT hour window.  Old/stale slugs
+            # (previous hour) must not flip the global state to SETTLEMENT
+            # because that blocks all new entries for the current-hour markets.
+            current_hour_utc = self._hour_window
+            slug_belongs_to_current_hour = (
+                hour_start.replace(tzinfo=None) >= current_hour_utc.replace(tzinfo=None)
+                if current_hour_utc else True
+            )
+            if self._truth.window_state == WindowState.ACTIVE and slug_belongs_to_current_hour:
                 hour_end_utc = hour_start + timedelta(hours=1)
                 write_jsonl({
                     "event_type": "SETTLEMENT_TRANSITION_DIAG",
