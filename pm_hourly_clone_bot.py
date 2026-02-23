@@ -4356,7 +4356,7 @@ class Bot:
 
             self._apply_fill(slug, outcome, side, qty, price,
                              order_id=oid, reason="RECOVERED_FILL",
-                             source=source)
+                             source=source, skip_truth=True)
 
             # Clear in-flight guard for recovered BUY fills
             token_id = fill.get("token_id", "")
@@ -4397,8 +4397,13 @@ class Bot:
         print(f"      Positions: {pos_str}")
 
     def _ledger_record_buy_fill(self, m, st, outcome: str, price: float, qty: float,
-                                order_id: str = "", trade_id: str = "") -> None:
-        """Record a CONFIRMED BUY fill in both fills ledger and truth capture."""
+                                order_id: str = "", trade_id: str = "",
+                                skip_truth: bool = False) -> None:
+        """Record a CONFIRMED BUY fill in both fills ledger and truth capture.
+
+        skip_truth: If True, skip truth.record_fill (used when truth already
+        recorded this fill, e.g. poll-recovered fills).
+        """
         token_id = m.outcome_up_id if outcome == "Up" else m.outcome_down_id
         if self._fills_ledger is not None:
             self._fills_ledger.record_fill(
@@ -4407,21 +4412,27 @@ class Bot:
                 fill_qty=qty, fill_price=price, order_id=order_id,
                 trade_id=trade_id, source="bot",
             )
-        # Truth Capture — always record
-        self._truth.record_fill(
-            token_id=token_id or "", slug=st.slug, outcome=outcome,
-            action="BUY", qty=qty, price=price,
-            order_id=order_id, trade_id=trade_id, source="ws",
-        )
-        # Notify watcher so it doesn't double-record
-        if order_id:
-            self._truth.notify_fill(order_id, qty)
+        if not skip_truth:
+            # Truth Capture — record unless already applied (e.g. poll recovery)
+            self._truth.record_fill(
+                token_id=token_id or "", slug=st.slug, outcome=outcome,
+                action="BUY", qty=qty, price=price,
+                order_id=order_id, trade_id=trade_id, source="ws",
+            )
+            # Notify watcher so it doesn't double-record
+            if order_id:
+                self._truth.notify_fill(order_id, qty)
         # Print portfolio summary after fill
         self._print_fill_summary(st, "BUY", outcome, price, qty)
 
     def _ledger_record_sell_fill(self, m, st, outcome: str, price: float, qty: float,
-                                 order_id: str = "", trade_id: str = "") -> None:
-        """Record a CONFIRMED SELL fill in both fills ledger and truth capture."""
+                                 order_id: str = "", trade_id: str = "",
+                                 skip_truth: bool = False) -> None:
+        """Record a CONFIRMED SELL fill in both fills ledger and truth capture.
+
+        skip_truth: If True, skip truth.record_fill (used when truth already
+        recorded this fill, e.g. poll-recovered fills).
+        """
         token_id = m.outcome_up_id if outcome == "Up" else m.outcome_down_id
         if self._fills_ledger is not None:
             self._fills_ledger.record_fill(
@@ -4430,14 +4441,15 @@ class Bot:
                 fill_qty=qty, fill_price=price, order_id=order_id,
                 trade_id=trade_id, source="bot",
             )
-        # Truth Capture — always record
-        self._truth.record_fill(
-            token_id=token_id or "", slug=st.slug, outcome=outcome,
-            action="SELL", qty=qty, price=price,
-            order_id=order_id, trade_id=trade_id, source="ws",
-        )
-        if order_id:
-            self._truth.notify_fill(order_id, qty)
+        if not skip_truth:
+            # Truth Capture — record unless already applied (e.g. poll recovery)
+            self._truth.record_fill(
+                token_id=token_id or "", slug=st.slug, outcome=outcome,
+                action="SELL", qty=qty, price=price,
+                order_id=order_id, trade_id=trade_id, source="ws",
+            )
+            if order_id:
+                self._truth.notify_fill(order_id, qty)
         # Print portfolio summary after fill
         self._print_fill_summary(st, "SELL", outcome, price, qty)
 
@@ -4559,11 +4571,7 @@ class Bot:
                     print(f"  *** DESYNC HARD STOP *** balance drift ${total_drift_usd:.2f} — "
                           f"new entries DISABLED until restart")
                     # Cancel all open orders to prevent further fills on stale state
-                    try:
-                        self.client.cancel_all_orders()
-                        print("  [DESYNC] All open orders cancelled")
-                    except Exception as ce:
-                        print(f"  [DESYNC] cancel_all failed: {ce}")
+                    self._cancel_all_orders()
 
         except Exception as e:
             write_jsonl({"event_type": "BALANCE_SYNC_ERROR",
@@ -4617,11 +4625,7 @@ class Bot:
                 })
                 print(f"  *** DESYNC HARD STOP *** reconciliation detected critical desync — "
                       f"new entries DISABLED until restart")
-                try:
-                    self.client.cancel_all_orders()
-                    print("  [DESYNC] All open orders cancelled")
-                except Exception as ce:
-                    print(f"  [DESYNC] cancel_all failed: {ce}")
+                self._cancel_all_orders()
         except Exception as e:
             write_jsonl({
                 "event_type": "RECONCILE_ERROR",
@@ -4772,6 +4776,44 @@ class Bot:
         self._reserved_submit_ts.pop(order_id, None)
         return self._reserved_usd.pop(order_id, 0.0)
 
+    def _cancel_all_orders(self) -> int:
+        """Cancel all open orders. Fetches open orders then cancels each.
+        Returns count of successfully cancelled orders."""
+        cancelled = 0
+        try:
+            open_orders = self.client.get_open_orders()
+        except Exception as e:
+            write_jsonl({"event_type": "CANCEL_ALL_FAIL",
+                         "stage": "fetch_open_orders", "err": str(e)[:200],
+                         "ts_ms": int(time.time() * 1000)})
+            print(f"  [CANCEL_ALL] Failed to fetch open orders: {e}")
+            return 0
+        if not open_orders:
+            write_jsonl({"event_type": "CANCEL_ALL_OK", "cancelled": 0,
+                         "ts_ms": int(time.time() * 1000)})
+            return 0
+        errors = []
+        for o in open_orders:
+            oid = o.get("id") or o.get("orderID") or o.get("order_id", "")
+            if not oid:
+                continue
+            try:
+                self.client.cancel_order(oid)
+                cancelled += 1
+            except Exception as e:
+                errors.append({"order_id": oid[:20], "err": str(e)[:80]})
+        write_jsonl({"event_type": "CANCEL_ALL_OK" if not errors else "CANCEL_ALL_PARTIAL",
+                     "cancelled": cancelled,
+                     "errors": len(errors),
+                     "total_open": len(open_orders),
+                     "ts_ms": int(time.time() * 1000)})
+        if errors:
+            print(f"  [CANCEL_ALL] {cancelled}/{len(open_orders)} cancelled, "
+                  f"{len(errors)} errors")
+        else:
+            print(f"  [CANCEL_ALL] All {cancelled} open orders cancelled")
+        return cancelled
+
     def _audit_reservations(self) -> None:
         """Periodic invariant check: release stuck reservations, log anomalies.
         Called from main loop every tick."""
@@ -4903,7 +4945,8 @@ class Bot:
     def _apply_fill(self, slug: str, outcome: str, side: str,
                     fill_qty: float, fill_price: float,
                     order_id: str = "", reason: str = "",
-                    source: str = "immediate") -> float:
+                    source: str = "immediate",
+                    skip_truth: bool = False) -> float:
         """Unified fill application — used by immediate fills, poll recovery,
         and lifecycle watcher.
 
@@ -4960,13 +5003,15 @@ class Bot:
                     self._hour_budget_remaining += released
                 self._live_buy(st, outcome, fill_price, fill_qty, actual_cost)
             self._ledger_record_buy_fill(m, st, outcome, fill_price, fill_qty,
-                                         order_id=order_id)
+                                         order_id=order_id,
+                                         skip_truth=skip_truth)
             self._clear_buy_inflight(token_id)
         elif side == "SELL":
             if MODE in ("LIVE", "LIVE_SAFE"):
                 pnl = self._live_sell(st, outcome, fill_price, fill_qty)
             self._ledger_record_sell_fill(m, st, outcome, fill_price, fill_qty,
-                                          order_id=order_id)
+                                          order_id=order_id,
+                                          skip_truth=skip_truth)
 
         self._record_fill_ts(slug)
 
@@ -5170,11 +5215,7 @@ class Bot:
         print("  *** HARD FLATTEN *** Force-closing all positions")
 
         # 1. Cancel all open orders first
-        try:
-            self.client.cancel_all_orders()
-        except Exception as e:
-            write_jsonl({"event_type": "HARD_FLATTEN_CANCEL_ERROR",
-                         "err": str(e)[:200]})
+        self._cancel_all_orders()
 
         # 2. Release all reservations
         for oid in list(self._reserved_usd.keys()):
@@ -5520,11 +5561,7 @@ class Bot:
                 if released_count > 0:
                     print(f"  [DESYNC] Released {released_count} reservations "
                           f"(${released_total:.2f})")
-                try:
-                    self.client.cancel_all_orders()
-                    print("  [DESYNC] All open orders cancelled")
-                except Exception as ce:
-                    print(f"  [DESYNC] cancel_all failed: {ce}")
+                self._cancel_all_orders()
                 self._truth.enter_safe_mode(
                     reason=f"position_invariant_drift_{self._pos_drift_consecutive}_consecutive",
                     mismatches=[f"{d['slug']} {d['outcome']}: bot={d['bot_qty']} truth={d['truth_qty']}"
