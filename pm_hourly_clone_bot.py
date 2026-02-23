@@ -4891,19 +4891,31 @@ class Bot:
     # -----------------------------------------------------------------
     # PRE-8HR SAFETY: inventory cap check (block new BUYs when exceeded)
     # -----------------------------------------------------------------
+    def _reserved_usd_for_slug(self, slug: str) -> float:
+        """Sum reserved USD for all pending orders on a given slug.
+        Uses the exec tracker to map order_id → slug."""
+        total = 0.0
+        for oid, usd in self._reserved_usd.items():
+            tracked = self._exec_tracker._orders.get(oid)
+            if tracked and tracked.slug == slug:
+                total += usd
+        return total
+
     def _inventory_cap_ok(self, slug: str, outcome: str = "") -> bool:
         """Return True if inventory caps allow a new BUY on this slug/outcome.
-        Checks: per-slug USD, per-outcome shares, net imbalance shares.
+        Checks: per-slug USD (filled + reserved + dscalp), per-outcome shares,
+        net imbalance shares.
         Sells, rescue-hedge, flatten are NEVER blocked by this gate."""
         st = self.market_states.get(slug)
         if st is None:
             return True
-        # Per-slug USD (positions + dscalp invested)
+        # Per-slug USD (filled positions + reserved/pending + dscalp invested)
         slug_usd = sum(
             st.positions[o].qty * st.positions[o].vwap
             for o in ["Up", "Down"] if st.positions[o].qty >= MIN_QTY
         )
         slug_usd += self._dscalp_invested_usd.get(slug, 0.0)
+        slug_usd += self._reserved_usd_for_slug(slug)
         if slug_usd >= MAX_POSITION_USD_PER_SLUG:
             self._diag_cap_blocks += 1
             write_jsonl({"event_type": "GATE_INVENTORY_CAP", "slug": slug,
