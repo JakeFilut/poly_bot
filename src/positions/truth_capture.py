@@ -252,10 +252,15 @@ class TruthCapture:
         self._scan_recent_tids: List[str] = []   # ring buffer for same-ts dedup
         self._scan_recent_tids_max: int = 200
 
-        # ── Cursor proof counters (cumulative, never reset) ──
-        self.cursor_accepted_fills: int = 0      # fills that passed BOTH cursor AND window
-        self.cursor_dropped_old_ts: int = 0      # fills dropped: ts_ms < boot_cursor_ms
-        self.cursor_dropped_outside_window: int = 0  # fills dropped: outside hour window
+        # ── Cursor proof counters ──
+        # Lifetime (never reset — proves nothing leaked since boot)
+        self.cursor_accepted_fills: int = 0
+        self.cursor_dropped_old_ts: int = 0
+        self.cursor_dropped_outside_window: int = 0
+        # Per-hour (reset on hour boundary — localises spikes)
+        self.cursor_hour_accepted: int = 0
+        self.cursor_hour_dropped_old: int = 0
+        self.cursor_hour_dropped_window: int = 0
 
         # Timers
         self._last_scan_ts: float = 0.0
@@ -311,6 +316,31 @@ class TruthCapture:
         self._scan_recent_tids.clear()
         print(f"  [TRUTH] SKIP_HISTORY: cursor set to now "
               f"({self._scan_cursor_ts_ms}), no historical fills will be ingested")
+
+    def clamp_cursor_to_hour(self, hour_start_ms: int) -> bool:
+        """If boot cursor < hour_start, clamp up and warn. Returns True if clamped."""
+        if self._scan_cursor_ts_ms > 0 and self._scan_cursor_ts_ms < hour_start_ms:
+            old = self._scan_cursor_ts_ms
+            self._scan_cursor_ts_ms = hour_start_ms
+            self._scan_recent_tids.clear()
+            self._write_jsonl({
+                "event_type": "CURSOR_CLAMPED",
+                "old_cursor_ms": old,
+                "new_cursor_ms": hour_start_ms,
+                "delta_ms": hour_start_ms - old,
+                "reason": "boot_cursor < hour_start — clamped to prevent earlier-in-hour ingestion",
+                "ts_ms": _ts_ms(),
+            })
+            print(f"  [TRUTH] WARNING: boot_cursor_ms ({old}) < hour_start_ms ({hour_start_ms})  "
+                  f"→ clamped cursor up by {hour_start_ms - old}ms")
+            return True
+        return False
+
+    def reset_hour_counters(self) -> None:
+        """Reset per-hour cursor proof counters. Call on hour boundary."""
+        self.cursor_hour_accepted = 0
+        self.cursor_hour_dropped_old = 0
+        self.cursor_hour_dropped_window = 0
 
     # ══════════════════════════════════════════════════════════════════
     #  STATE MACHINE
@@ -1020,10 +1050,12 @@ class TruthCapture:
                 if fill_ts_ms < cursor_ts:
                     skipped_old_cursor += 1
                     self.cursor_dropped_old_ts += 1
+                    self.cursor_hour_dropped_old += 1
                     continue
                 if fill_ts_ms == cursor_ts and trade_id in recent_tids_set:
                     skipped_old_cursor += 1
                     self.cursor_dropped_old_ts += 1
+                    self.cursor_hour_dropped_old += 1
                     continue
 
             # Skip already-seen trades (in-memory dedup)
@@ -1061,6 +1093,7 @@ class TruthCapture:
             if not slug_ok or not ts_ok:
                 skipped_old_hour += 1
                 self.cursor_dropped_outside_window += 1
+                self.cursor_hour_dropped_window += 1
                 continue
             if not slug and fill_epoch == 0:
                 skipped_no_identity += 1
@@ -1086,6 +1119,7 @@ class TruthCapture:
             if pos is not None:
                 new_count += 1
                 self.cursor_accepted_fills += 1
+                self.cursor_hour_accepted += 1
 
             # ── Update cursor tracking ──
             if fill_ts_ms > 0:

@@ -624,9 +624,29 @@ class Bot:
         """
         now_ms = int(time.time() * 1000)
 
-        # 1. Boot cursor
+        # 1. Boot cursor + clamp sanity
         boot_cursor_ms = getattr(self._truth, '_scan_cursor_ts_ms', 0)
         skip_history_on = SKIP_HISTORY
+
+        # Derive hour_start_ms from first active market (or truncate now to hour)
+        hour_start_ms = 0
+        for st_hs in self.market_states.values():
+            if st_hs.hour_start_utc:
+                try:
+                    hour_start_ms = int(_parse_iso_z(st_hs.hour_start_utc).timestamp() * 1000)
+                except Exception:
+                    pass
+                break
+        if hour_start_ms == 0:
+            # Fallback: truncate current time to hour boundary
+            _now_dt = datetime.now(tz=timezone.utc)
+            hour_start_ms = int(_now_dt.replace(minute=0, second=0, microsecond=0).timestamp() * 1000)
+
+        cursor_delta_ms = boot_cursor_ms - hour_start_ms if boot_cursor_ms > 0 else None
+        cursor_clamped = False
+        if boot_cursor_ms > 0 and boot_cursor_ms < hour_start_ms:
+            cursor_clamped = self._truth.clamp_cursor_to_hour(hour_start_ms)
+            boot_cursor_ms = getattr(self._truth, '_scan_cursor_ts_ms', 0)
 
         # 2. Open positions (from internal state, which was populated by _load_clob_positions_on_startup)
         positions = []
@@ -738,6 +758,9 @@ class Bot:
             "profile": PROFILE,
             "boot_cursor_ms": boot_cursor_ms,
             "boot_cursor_iso": datetime.fromtimestamp(boot_cursor_ms / 1000.0, tz=timezone.utc).isoformat() if boot_cursor_ms > 0 else "NOT_SET",
+            "hour_start_ms": hour_start_ms,
+            "cursor_vs_hour_delta_ms": cursor_delta_ms,
+            "cursor_clamped": cursor_clamped,
             "skip_history": skip_history_on,
             "now_ms": now_ms,
             "cursor_age_sec": round((now_ms - boot_cursor_ms) / 1000.0, 1) if boot_cursor_ms > 0 else None,
@@ -774,6 +797,10 @@ class Bot:
         print(f"  ║  SKIP_HISTORY: {'ON' if skip_history_on else 'OFF'}                                          ║")
         print(f"  ║  boot_cursor_ms: {boot_cursor_ms}  ({age_str})")
         print(f"  ║  boot_cursor:    {cursor_iso}")
+        delta_str = f"{cursor_delta_ms:+d}ms vs hour_start" if cursor_delta_ms is not None else "N/A"
+        print(f"  ║  hour_start_ms:  {hour_start_ms}  cursor_delta: {delta_str}")
+        if cursor_clamped:
+            print(f"  ║  *** CURSOR CLAMPED: was before hour_start → moved up to hour_start ***")
         print(f"  ║  Orphan orders cancelled at startup: {orphan_cancels}")
         print(f"  ║  Open orders after cleanup: {len(open_orders)}")
         if positions:
@@ -978,6 +1005,8 @@ class Bot:
             self._hour_edges = []
             # Reset flatten state for new hour
             self._hard_flatten_done = False
+            # Reset per-hour cursor proof counters
+            self._truth.reset_hour_counters()
             # Reset shadow
             self._shadow_active = False
             self._shadow_cash = 0.0
@@ -2308,11 +2337,16 @@ class Bot:
                 "late_move_cache_ms": SOLXRP_LATE_MOVE_CACHE_MS,
             },
             "max_spread_exit_solxrp": MAX_SPREAD_EXIT_CENTS_SOLXRP,
-            # Cursor proof counters (cumulative since boot)
-            "cursor_proof": {
+            # Cursor proof counters
+            "cursor_proof_lifetime": {
                 "accepted_fills": self._truth.cursor_accepted_fills,
                 "dropped_old_ts": self._truth.cursor_dropped_old_ts,
                 "dropped_outside_window": self._truth.cursor_dropped_outside_window,
+            },
+            "cursor_proof_hour": {
+                "accepted_fills": self._truth.cursor_hour_accepted,
+                "dropped_old_ts": self._truth.cursor_hour_dropped_old,
+                "dropped_outside_window": self._truth.cursor_hour_dropped_window,
             },
         }
         # Per-slug exposure + imbalance
@@ -2404,9 +2438,14 @@ class Bot:
                          for s, d in top_slugs]
                 print(f"  EXPOSURE: {' | '.join(parts)}")
             # Cursor proof (cumulative — proves no old fills leaked)
-            print(f"  CURSOR_PROOF: accept={self._truth.cursor_accepted_fills}  "
-                  f"drop_old_ts={self._truth.cursor_dropped_old_ts}  "
-                  f"drop_window={self._truth.cursor_dropped_outside_window}")
+            _t = self._truth
+            print(f"  CURSOR_PROOF: "
+                  f"hour(accept={_t.cursor_hour_accepted} "
+                  f"drop_old={_t.cursor_hour_dropped_old} "
+                  f"drop_win={_t.cursor_hour_dropped_window})  "
+                  f"life(accept={_t.cursor_accepted_fills} "
+                  f"drop_old={_t.cursor_dropped_old_ts} "
+                  f"drop_win={_t.cursor_dropped_outside_window})")
 
         # Reset per-minute counters
         self._diag_report_last_ts = now_t

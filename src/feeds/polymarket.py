@@ -777,6 +777,35 @@ class PolymarketClient:
                         "status": status or "killed", "partial": False}
 
         except Exception as e:
+            err_str = str(e).lower()
+
+            # ── "Crosses the book" 400: price on wrong side of spread ──
+            # Retry once at the correct best price + 1 tick for safety.
+            if "crosses" in err_str and not getattr(self, '_cross_retry_active', False):
+                self._cross_retry_active = True
+                try:
+                    book = self.get_top_of_book(token_id, levels=1)
+                    if side.upper() == "BUY" and book.ask > 0:
+                        retry_price = round(min(book.ask + 0.01, 0.99), 3)
+                    elif side.upper() == "SELL" and book.bid > 0:
+                        retry_price = round(max(book.bid - 0.01, 0.01), 3)
+                    else:
+                        retry_price = 0.0
+                    _write_jsonl({"event_type": f"{order_label}_CROSSES_RETRY",
+                                 "token_id": token_id[-12:], "side": side,
+                                 "orig_price": price, "retry_price": retry_price,
+                                 "best_bid": book.bid, "best_ask": book.ask})
+                    if retry_price > 0:
+                        result = self.place_immediate_order(
+                            token_id, side, retry_price, size, use_fok=use_fok)
+                        return result
+                except Exception as retry_err:
+                    _write_jsonl({"event_type": f"{order_label}_CROSSES_RETRY_FAIL",
+                                 "err": str(retry_err)[:200],
+                                 "token_id": token_id[-12:]})
+                finally:
+                    self._cross_retry_active = False
+
             prev = getattr(self, '_api_error_backoff_sec', 0.0)
             backoff = min(max(prev * 2, 5.0), 30.0)
             self._api_error_backoff_sec = backoff
