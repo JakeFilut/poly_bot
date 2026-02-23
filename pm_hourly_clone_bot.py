@@ -3744,6 +3744,13 @@ class Bot:
             if not sig:
                 self._sm_transition(m.slug, "IDLE", "signal_lost_after_probe", ctx)
                 return
+            # Window gate: burst only in early phase (minutes 0-3).
+            # If bot starts mid-window (e.g. minute 30), skip burst → probe only.
+            t_min = ctx["t_min"]
+            if t_min > BURST_EARLY_WINDOW_MIN:
+                st.last_entry_ts = iso_z(utc_now())
+                self._sm_transition(m.slug, "COOLDOWN", "probe_only_past_burst_window", ctx)
+                return
             # Edge gate: only burst if edge >= thr + BURST_MIN_EDGE_EXTRA_BPS
             if abs_delta_bps < thr + BURST_MIN_EDGE_EXTRA_BPS:
                 # Edge not strong enough for burst — stay with probe only
