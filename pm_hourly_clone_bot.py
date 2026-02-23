@@ -4411,11 +4411,15 @@ class Bot:
     # ── In-flight BUY guard ────────────────────────────────────────
 
     def _has_inflight_buy(self, token_id: str) -> bool:
-        """Check if there's already an open BUY for this token."""
+        """Check if there's already an open BUY for this token.
+
+        Normal submit: _inflight_buy_ts[tid] = now → blocked for PER_TOKEN_COOLDOWN_MS.
+        UNKNOWN hold: _inflight_buy_ts[tid] = now + RESERVATION_STUCK_TIMEOUT_SEC
+            → blocked until watcher resolves or timeout expires.
+        """
         if not ONE_INFLIGHT_PER_TOKEN:
             return False
         last_ts = self._inflight_buy_ts.get(token_id, 0.0)
-        # Consider in-flight if submitted within cooldown window
         return (time.time() - last_ts) < (PER_TOKEN_COOLDOWN_MS / 1000.0)
 
     def _record_buy_submit(self, token_id: str) -> None:
@@ -5337,17 +5341,28 @@ class Bot:
                     burst_count += 1
                 elif is_pending:
                     # UNKNOWN: CLOB matched but qty unconfirmed.
-                    # Budget already reserved above.  Cash deducted via reservation.
+                    # Budget reserved above stays locked.
+                    # Cash deducted via reservation.
                     self.cash_usdc -= reserved_amount
                     self._hour_budget_remaining -= reserved_amount
+                    # DO NOT clear inflight guard — hold it until watcher resolves.
+                    # This prevents rapid duplicate orders while confirmation lags.
+                    # Set a long-hold timestamp so _has_inflight_buy blocks for
+                    # the full reservation timeout, not just the 350ms cooldown.
+                    self._inflight_buy_ts[token_id] = time.time() + RESERVATION_STUCK_TIMEOUT_SEC
                     write_jsonl({"event_type": "BUY_PENDING_CONFIRMATION",
                                  "slug": m.slug, "outcome": outcome,
                                  "order_id": oid, "status": fill.get("status"),
                                  "requested_qty": this_qty, "price": order_price,
                                  "reserved_usd": round(reserved_amount, 2),
                                  "reason": "ENTRY_BURST",
+                                 "hold_inflight": True,
                                  "ts_ms": int(time.time() * 1000)})
                     burst_count += 1
+                    # STOP burst for this token — don't stack more orders on an
+                    # unconfirmed fill.
+                    stop_reason = "pending_confirmation"
+                    break
                 elif fill_state is False and fill.get("status") not in ("error",):
                     # IOC/FOK killed — release reservation immediately
                     if oid:

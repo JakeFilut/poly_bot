@@ -668,6 +668,7 @@ class PolymarketClient:
                 fill_qty = self._extract_fill_qty(response)
                 self._log_response_shape_once(response, f"{order_label.lower()}_{status}")
 
+                # ── MATCHED + fill qty confirmed ──
                 if status == "matched" and fill_qty > 0:
                     self._api_error_backoff_sec = 0.0
                     partial = (fill_qty < qty)
@@ -680,8 +681,8 @@ class PolymarketClient:
                             "fill_qty": fill_qty, "fill_price": price,
                             "status": "matched", "partial": partial}
 
+                # ── MATCHED but no fill qty in response ──
                 if status == "matched" and fill_qty == 0:
-                    # Matched but no qty reported — quick check
                     if oid:
                         fill_qty = self._quick_fill_check(oid)
                     if fill_qty > 0:
@@ -693,25 +694,52 @@ class PolymarketClient:
                         return {"order_id": oid, "filled": True,
                                 "fill_qty": fill_qty, "fill_price": price,
                                 "status": "matched", "partial": partial}
-                    # Matched but truly unknown
+                    # Matched but truly unknown — caller MUST:
+                    #   - keep reservation locked
+                    #   - hold in-flight guard for this token_id
+                    #   - let lifecycle watcher confirm/cancel
                     self._api_error_backoff_sec = 0.0
+                    self._immediate_unknown_count = getattr(
+                        self, '_immediate_unknown_count', 0) + 1
                     _write_jsonl({"event_type": f"{order_label}_UNKNOWN",
                                  "order_id": oid, "status": status,
-                                 "requested_qty": qty})
+                                 "requested_qty": qty,
+                                 "unknown_count": self._immediate_unknown_count})
                     return {"order_id": oid, "filled": "UNKNOWN",
                             "fill_qty": 0.0, "fill_price": price,
-                            "status": "matched", "partial": False}
+                            "status": "matched", "partial": False,
+                            "hold_inflight": True}
 
-                # Safety net: if an IOC/FOK order comes back "live" (resting),
-                # that means it wasn't killed — cancel it immediately so it
-                # doesn't sit on the book as an untracked resting order.
+                # ── LIVE/OPEN: IOC came back resting ──
+                # Check for partial fill FIRST — IOC can briefly show "live"
+                # even after a partial fill has occurred.
                 if status in ("live", "open") and oid:
-                    self._immediate_order_live_count = getattr(
-                        self, '_immediate_order_live_count', 0) + 1
+                    self._immediate_live_open_count = getattr(
+                        self, '_immediate_live_open_count', 0) + 1
+                    # Check if any qty was actually filled before we cancel
+                    late_fill_qty = self._quick_fill_check(oid)
+                    if late_fill_qty > 0:
+                        # Partial fill happened — cancel remainder, return what filled
+                        try:
+                            self._clob.cancel(oid)
+                        except Exception:
+                            pass
+                        partial = (late_fill_qty < qty)
+                        self._api_error_backoff_sec = 0.0
+                        _write_jsonl({"event_type": f"{order_label}_LIVE_PARTIAL_FILL",
+                                     "order_id": oid, "side": side,
+                                     "price": price, "requested_qty": qty,
+                                     "fill_qty": late_fill_qty,
+                                     "partial": partial,
+                                     "live_open_count": self._immediate_live_open_count})
+                        return {"order_id": oid, "filled": True,
+                                "fill_qty": late_fill_qty, "fill_price": price,
+                                "status": "live_partial", "partial": partial}
+                    # No fill found — cancel the resting order
                     _write_jsonl({"event_type": f"{order_label}_UNEXPECTED_LIVE",
                                  "order_id": oid, "side": side,
                                  "price": price, "qty": qty,
-                                 "live_count": self._immediate_order_live_count})
+                                 "live_open_count": self._immediate_live_open_count})
                     try:
                         self._clob.cancel(oid)
                         _write_jsonl({"event_type": f"{order_label}_LIVE_CANCELLED",
@@ -723,7 +751,23 @@ class PolymarketClient:
                             "fill_qty": 0.0, "fill_price": price,
                             "status": "live_cancelled", "partial": False}
 
-                # Not matched (killed) — no fill
+                # ── Terminal: killed / cancelled / rejected / other ──
+                # Check for late fills: CLOB may report "killed" even after
+                # a partial fill has already settled on-chain.
+                if oid:
+                    late_fill_qty = self._quick_fill_check(oid)
+                    if late_fill_qty > 0:
+                        self._api_error_backoff_sec = 0.0
+                        partial = (late_fill_qty < qty)
+                        _write_jsonl({"event_type": f"{order_label}_LATE_FILL",
+                                     "order_id": oid, "status": status,
+                                     "fill_qty": late_fill_qty,
+                                     "partial": partial,
+                                     "note": "fill found after terminal status"})
+                        return {"order_id": oid, "filled": True,
+                                "fill_qty": late_fill_qty, "fill_price": price,
+                                "status": "late_fill", "partial": partial}
+
                 self._api_error_backoff_sec = 0.0
                 _write_jsonl({"event_type": f"{order_label}_KILLED",
                              "order_id": oid, "status": status,
