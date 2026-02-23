@@ -661,6 +661,10 @@ HEDGE_FAIL_PAUSE_SEC = float(os.getenv("HEDGE_FAIL_PAUSE_SEC", "900"))          
 # Rule 7: Max Loss Per Window — stop trading if PnL drops below threshold
 MAX_LOSS_PER_HOUR_USD = float(os.getenv("MAX_LOSS_PER_HOUR_USD", "25.0"))            # max loss per hour
 
+# Hourly budget: max dollars that can be invested per hour.
+# Sells return proceeds to the budget so net spend = buys - sell proceeds.
+HOURLY_BUDGET_USD = float(os.getenv("HOURLY_BUDGET_USD", "50.0"))
+
 # Rule 8: Last 90 Seconds Rule — no resting orders, IOC-only
 LAST_SECONDS_IOC_ONLY = float(os.getenv("LAST_SECONDS_IOC_ONLY", "90.0"))           # seconds before close
 

@@ -774,11 +774,6 @@ class FillsLedger:
         owned = self.get_sellable_qty(token_id, side)
         delta = req - owned
 
-        # Log the attempt
-        print(f"  [LEDGER] SELL CHECK: {display} {side}: "
-              f"attempting={float(req):.6f}  owned={float(owned):.6f}  "
-              f"delta={float(delta):+.6f}")
-
         if owned <= _ZERO:
             msg = (f"SELL BLOCKED: no position for {display} {side} "
                    f"(ledger net_qty=0)")

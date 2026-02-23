@@ -179,6 +179,7 @@ class Bot:
         # Hourly stats for HOUR_SUMMARY
         self._hour_trade_count = 0
         self._hour_net_pnl = 0.0
+        self._hour_budget_remaining = HOURLY_BUDGET_USD  # resets each hour
         self._hour_edges: List[float] = []
         # Shadow stop-loss simulation
         self._shadow_active = False
@@ -471,6 +472,7 @@ class Bot:
         self._slug_entry_paused_until: Dict[str, float] = {}
         # ── Pre-8hr safety: post-fill cooldown ──
         self._last_fill_ts: Dict[str, float] = {}             # slug -> last fill epoch ts (buy or sell)
+        self._lean_exit_last_ts: Dict[str, float] = {}        # slug -> last lean exit attempt ts
         # ── Sell-error cooldown: prevent spam on repeated failures ──
         self._sell_error_until: Dict[str, float] = {}          # (slug|outcome) -> monotonic ts cooldown expires
         self._sell_allowance_retried = False                    # True after one re-approval attempt
@@ -684,6 +686,7 @@ class Bot:
             self._hour_risk_stop_hit = False
             self._hour_trade_count = 0
             self._hour_net_pnl = 0.0
+            self._hour_budget_remaining = HOURLY_BUDGET_USD
             self._hour_edges = []
             # Reset shadow
             self._shadow_active = False
@@ -712,6 +715,7 @@ class Bot:
         if pos.opened_at is None:
             pos.opened_at = pos.last_trade_ts
         self.cash_usdc -= usdc_cost
+        self._hour_budget_remaining -= usdc_cost
         # Shadow: new entries are BLOCKED after stop trigger
         if self._shadow_active:
             self._shadow_trades_blocked += 1
@@ -729,6 +733,7 @@ class Bot:
         pos.cost_usdc = max(0.0, pos.cost_usdc - cost_basis)
         pos.last_trade_ts = iso_z(utc_now())
         self.cash_usdc += proceeds
+        self._hour_budget_remaining += proceeds
         self.realized_pnl_usdc += pnl
         self.hourly_pnl_usdc += pnl
         # Per-slug PnL
@@ -760,9 +765,11 @@ class Bot:
         if pos.opened_at is None:
             pos.opened_at = pos.last_trade_ts
         self.cash_usdc -= usdc_cost
+        self._hour_budget_remaining -= usdc_cost
         self._hour_trade_count += 1
         print(f"  [FILL] BUY  {st.crypto} {outcome}: +{qty:.0f}@{price:.3f} "
-              f"-> now {pos.qty:.0f}@{pos.vwap:.3f}  cost=${usdc_cost:.2f}")
+              f"-> now {pos.qty:.0f}@{pos.vwap:.3f}  cost=${usdc_cost:.2f}  "
+              f"budget_left=${self._hour_budget_remaining:.2f}")
     def _live_sell(self, st: MarketState, outcome: str, price: float,
                    qty: float) -> float:
         """Update position state after a real sell fill (mirrors _paper_sell). Returns pnl."""
@@ -777,6 +784,7 @@ class Bot:
         pos.cost_usdc = max(0.0, pos.cost_usdc - cost_basis)
         pos.last_trade_ts = iso_z(utc_now())
         self.cash_usdc += proceeds
+        self._hour_budget_remaining += proceeds  # sell returns money to budget
         self.realized_pnl_usdc += pnl
         self.hourly_pnl_usdc += pnl
         self._clean_dust(pos)
@@ -786,7 +794,8 @@ class Bot:
         self._slug_realized_pnl[st.slug] = self._slug_realized_pnl.get(st.slug, 0.0) + pnl
         pnl_tag = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
         print(f"  [FILL] SELL {st.crypto} {outcome}: -{qty:.0f}@{price:.3f} "
-              f"-> now {pos.qty:.0f}  pnl={pnl_tag}")
+              f"-> now {pos.qty:.0f}  pnl={pnl_tag}  "
+              f"budget_left=${self._hour_budget_remaining:.2f}")
         return pnl
     @staticmethod
     def _clean_dust(pos: Position):
@@ -1069,6 +1078,7 @@ class Bot:
                   f"depth={DEPTH_CHECK_MULTIPLIER}x "
                   f"breaker={HEDGE_FAIL_MAX_COUNT}/{HEDGE_FAIL_WINDOW_SEC:.0f}s/{HEDGE_FAIL_PAUSE_SEC:.0f}s "
                   f"loss=${MAX_LOSS_PER_HOUR_USD} "
+                  f"hourly_budget=${HOURLY_BUDGET_USD} "
                   f"ioc={LAST_SECONDS_IOC_ONLY:.0f}s "
                   f"cancel_all={CANCEL_ALL_BEFORE_CLOSE_SEC:.0f}s")
         self._last_balance_print = 0.0
@@ -2280,9 +2290,10 @@ class Bot:
         safe_tag = " [SAFE MODE]" if self._truth.safe_mode else ""
         pos_str = "  ".join(pos_parts) if pos_parts else "none"
 
+        budget_str = f"  |  Hour Budget: ${self._hour_budget_remaining:.2f}/${HOURLY_BUDGET_USD:.0f}"
         print(f"\n  --- Cash: ${self.cash_usdc:.2f}  |  Equity: ${equity:.2f}  |  Invested: ${total_cost:.2f}"
               f"  |  Day P&L: {pnl_str}  |  Total P&L: {rpnl_str}"
-              f"{safe_tag} ---")
+              f"{budget_str}{safe_tag} ---")
         print(f"  --- POSITIONS: {pos_str} ---")
         print()
     def _log_hour_label(self, slug, st, final_price, effective_close,
@@ -4387,6 +4398,14 @@ class Bot:
             return False
         if MODE == "LOG":
             return True
+        # ── Hourly budget gate (LIVE/LIVE_SAFE) ──
+        if self._hour_budget_remaining <= 0:
+            write_jsonl({"event_type": "HOURLY_BUDGET_EXHAUSTED",
+                          "slug": slug,
+                          "budget_remaining": round(self._hour_budget_remaining, 2),
+                          "budget_total": HOURLY_BUDGET_USD,
+                          "ts_ms": int(time.time() * 1000)})
+            return False
         # LIVE_SAFE: check entry window
         if not self._buys_allowed():
             return False
@@ -6209,6 +6228,10 @@ class Bot:
         Only applies to imbalanced positions."""
         if not LEAN_EXIT_PRIORITY:
             return
+        # Cooldown: at most once per second per slug to avoid spam
+        now = time.time()
+        if now - self._lean_exit_last_ts.get(m.slug, 0.0) < 1.0:
+            return
         spot, hour_open = ctx["spot"], ctx["hour_open"]
         lean_up = spot >= hour_open
 
@@ -6259,6 +6282,8 @@ class Bot:
         # Use maker when spread > 1c
         use_taker = (book.spread * 100) <= PARITY_TAKER_ALLOWED_SPREAD_CENTS
         sell_price = book.bid if use_taker else max(book.bid, book.ask - 0.001)
+
+        self._lean_exit_last_ts[m.slug] = now
 
         write_jsonl({"event_type": "LEAN_EXIT", "slug": m.slug, "crypto": m.crypto,
                       "wrong_side": wrong_side, "sell_qty": round(sell_qty, 1),
