@@ -1472,8 +1472,10 @@ class TruthCapture:
         # 1. Poll order watchers (fast — every tick)
         new_fills = self.poll_watchers()
 
-        # 2. Wallet truth scan (every scan_interval_sec)
-        self.maybe_run_wallet_scan()
+        # 2. Wallet truth scan — DISABLED: positions tracked via verified fills
+        #    The external scan iterated 4600+ old API trades every cycle,
+        #    causing duplicate fills and confusing position tracking.
+        # self.maybe_run_wallet_scan()
 
         # 3. Reconciliation (every reconcile_interval_sec)
         self.maybe_run_reconciliation(active_token_ids)
