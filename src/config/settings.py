@@ -672,3 +672,24 @@ LAST_SECONDS_IOC_ONLY = float(os.getenv("LAST_SECONDS_IOC_ONLY", "90.0"))       
 
 # Rule 9: Cancel All Before Resolution — cancel everything N seconds before close
 CANCEL_ALL_BEFORE_CLOSE_SEC = float(os.getenv("CANCEL_ALL_BEFORE_CLOSE_SEC", "30.0"))  # cancel all open orders
+
+# ---------------------------------------------------------------------------
+# IOC / TAKER ENTRY — immediate-fill for entry orders
+# ---------------------------------------------------------------------------
+IOC_ENTRY_ENABLED = bool(os.getenv("IOC_ENTRY_ENABLED", "True") not in ("", "0", "False", "false"))
+IOC_MAX_RETRIES = int(os.getenv("IOC_MAX_RETRIES", "2"))             # quick_buy attempts (2-3)
+IOC_RETRY_DELAY_MS = float(os.getenv("IOC_RETRY_DELAY_MS", "100"))  # 100ms between attempts
+IOC_TICK_STEP = float(os.getenv("IOC_TICK_STEP", "0.01"))           # +1 tick per retry
+IOC_MAX_SLIPPAGE_CENTS = float(os.getenv("IOC_MAX_SLIPPAGE_CENTS", "1.5"))  # max above ask for buys
+
+# ---------------------------------------------------------------------------
+# BUDGET RESERVATION — reserve capital for pending/open orders
+# ---------------------------------------------------------------------------
+BUDGET_RESERVE_ENABLED = bool(os.getenv("BUDGET_RESERVE_ENABLED", "True") not in ("", "0", "False", "false"))
+
+# ---------------------------------------------------------------------------
+# IN-FLIGHT ORDER GUARD — prevent duplicate entries per token/outcome
+# ---------------------------------------------------------------------------
+ONE_INFLIGHT_PER_TOKEN = bool(os.getenv("ONE_INFLIGHT_PER_TOKEN", "True") not in ("", "0", "False", "false"))
+PER_TOKEN_COOLDOWN_MS = float(os.getenv("PER_TOKEN_COOLDOWN_MS", "350"))        # min ms between orders on same token
+GLOBAL_ORDER_RATE_LIMIT_PER_SEC = float(os.getenv("GLOBAL_ORDER_RATE_LIMIT_PER_SEC", "5"))  # max new orders/sec

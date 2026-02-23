@@ -401,6 +401,16 @@ class Bot:
         self._last_reconcile_ts: float = 0.0             # position reconciliation timer
         self._reconcile_after_fill_pending: bool = False  # flag for post-fill reconciliation
         self._live_safety = LiveSafety(write_jsonl)
+        # ── Budget reservation: reserved_usd per (slug, outcome, side) ──
+        # Tracks notional locked up in open/pending BUY orders.
+        # Key = order_id, Value = reserved_usd amount
+        self._reserved_usd: Dict[str, float] = {}
+        # In-flight BUY guard: (token_id) -> last_order_ts
+        self._inflight_buy_ts: Dict[str, float] = {}
+        # Global order rate limiter: timestamps of recent order submissions
+        self._global_order_ts: List[float] = []
+        # Desync hard stop: if True, all new entries blocked until manual reset
+        self._desync_hard_stop: bool = False
         # ── Fills Ledger — append-only accounting layer ──
         if LEDGER_ENABLED:
             self._fills_ledger = FillsLedger(
@@ -528,6 +538,62 @@ class Bot:
         self.running = False
         self._bg_running = False
         write_jsonl({"event_type":"STOP_SIGNAL"})
+    def _load_clob_positions_on_startup(self):
+        """On startup, fetch open positions from CLOB to initialize ledger state.
+
+        Keeps SKIP_HISTORY behavior (no old trade ingestion) but ensures
+        the bot knows about existing positions so it doesn't think it's flat.
+        """
+        try:
+            balances = self.client.get_balances()
+            if not balances:
+                write_jsonl({"event_type": "STARTUP_POSITIONS_NONE"})
+                return
+
+            token_map = self._get_token_to_slug_outcome() if hasattr(self, '_get_token_to_slug_outcome') else {}
+            loaded = 0
+            for b in balances:
+                tid = b.get("token_id") or b.get("asset_type", "")
+                bal = float(b.get("balance", 0))
+                if bal < MIN_QTY or tid not in token_map:
+                    continue
+                slug, outcome = token_map[tid]
+                st = self.market_states.get(slug)
+                if not st:
+                    continue
+                pos = st.positions.get(outcome)
+                if not pos:
+                    continue
+                # Only initialize if internal state shows flat
+                if pos.qty < MIN_QTY:
+                    # We have on-chain shares but internal state is flat.
+                    # Initialize from CLOB balance (conservative: assume vwap=0.5).
+                    pos.qty = bal
+                    pos.vwap = 0.50  # conservative estimate
+                    pos.cost_usdc = bal * 0.50
+                    pos.last_trade_ts = iso_z(utc_now())
+                    loaded += 1
+                    write_jsonl({"event_type": "STARTUP_POSITION_LOADED",
+                                 "slug": slug, "outcome": outcome,
+                                 "qty": round(bal, 2),
+                                 "assumed_vwap": 0.50})
+
+            if loaded > 0:
+                # Adjust cash for loaded positions
+                total_loaded_cost = sum(
+                    st.positions[o].cost_usdc
+                    for st in self.market_states.values()
+                    for o in ["Up", "Down"] if st.positions[o].qty >= MIN_QTY
+                )
+                write_jsonl({"event_type": "STARTUP_POSITIONS_DONE",
+                             "loaded": loaded,
+                             "total_cost_usd": round(total_loaded_cost, 2)})
+                print(f"  [STARTUP] Loaded {loaded} existing positions "
+                      f"(total cost ~${total_loaded_cost:.2f})")
+        except Exception as e:
+            write_jsonl({"event_type": "STARTUP_POSITIONS_ERROR",
+                         "err": str(e)[:200]})
+
     def _load_state(self):
         if not os.path.exists(STATE_FILE):
             return
@@ -1124,6 +1190,8 @@ class Bot:
         # ── LIVE startup safety: cancel all stale CLOB orders ──
         if MODE in ("LIVE", "LIVE_SAFE"):
             self._exec_orphan.startup_cleanup()
+            # ── Startup state: load existing positions from CLOB balances ──
+            self._load_clob_positions_on_startup()
 
         # ── Fills ledger startup (token registration + PnL update only) ──
         if LEDGER_ENABLED and self._fills_ledger is not None:
@@ -3827,12 +3895,13 @@ class Bot:
     # ── Order Lifecycle Guard: process recovered fills ──
 
     def _process_lifecycle_recovered_fills(self):
-        """Poll tracked orders for missed fills and record them in ledger + positions.
+        """Poll tracked orders for missed fills and apply through unified pipeline.
 
-        Handles both:
-        - Normal recovered fills (order was live, later found filled)
-        - PENDING_CONFIRMATION fills (CLOB said matched but qty was unknown
-          at placement time; capital was already reserved)
+        Uses _apply_fill() which handles:
+          - Position updates (qty, vwap, cost_usdc)
+          - Cash/budget adjustments
+          - Budget reservation release
+          - Fills ledger recording
         """
         recovered = self._exec_tracker.poll_pending_orders()
         if not recovered:
@@ -3850,61 +3919,18 @@ class Bot:
                   f"{slug} {outcome} {side} qty={qty:.2f} @ {price:.4f} "
                   f"reason={reason}")
 
-            # Emit ORDER_FILL event
-            write_jsonl({
-                "event_type": "ORDER_FILL",
-                "source": "lifecycle_guard",
-                "slug": slug, "outcome": outcome,
-                "side": side, "order_id": oid,
-                "price": round(price, 4), "qty": round(qty, 2),
-                "reason": reason,
-                "ts_ms": int(time.time() * 1000),
-            })
+            # Use unified apply_fill pipeline
+            self._apply_fill(slug, outcome, side, qty, price,
+                             order_id=oid, reason=reason,
+                             source="lifecycle_guard")
 
-            # Update internal position state
+            # Also clear in-flight guard for completed tokens
+            token_id = fill.get("token_id", "")
+            if token_id and side == "BUY":
+                self._clear_buy_inflight(token_id)
+
             st = self.market_states.get(slug)
-            m = None
-            for mk in self._cached_markets:
-                if mk.slug == slug:
-                    m = mk
-                    break
-
-            if st and m:
-                if side == "BUY":
-                    if MODE in ("LIVE", "LIVE_SAFE"):
-                        actual_cost = price * qty
-                        # _live_buy decrements cash_usdc.  But if this was a
-                        # PENDING_CONFIRMATION order, cash was already reserved
-                        # at placement time.  Reverse the reservation first,
-                        # then let _live_buy apply the real cost.
-                        # We check if the reason contains BURST (our entry tag)
-                        # and the tracker already cleared pending_confirmation.
-                        # The reservation was: cash -= requested_qty * order_price
-                        # The real cost is:    cash -= fill_qty * fill_price
-                        # So: add back reservation, then subtract real cost
-                        # via _live_buy.
-                        if "PENDING_CONFIRMATION" in reason or "ENTRY_BURST" in reason:
-                            # The tracker returns fill from a formerly-pending order.
-                            # We reserved cash at on_submit time (worst case).
-                            # _live_buy will subtract actual cost again, so we
-                            # need to add back the reservation to avoid double-deducting.
-                            # But we don't know the exact reserved amount here —
-                            # it was requested_qty * order_price at submit time.
-                            # Since the tracker already adjusted filled_qty,
-                            # just add back cash for the actual cost
-                            # (the reservation was worst-case full qty*price).
-                            self.cash_usdc += actual_cost
-                            self._hour_budget_remaining += actual_cost
-                        self._live_buy(st, outcome, price, qty, actual_cost)
-                    self._ledger_record_buy_fill(m, st, outcome, price, qty,
-                                                 order_id=oid)
-                elif side == "SELL":
-                    if MODE in ("LIVE", "LIVE_SAFE"):
-                        self._live_sell(st, outcome, price, qty)
-                    self._ledger_record_sell_fill(m, st, outcome, price, qty,
-                                                  order_id=oid)
-                self._record_fill_ts(slug)
-            elif self._fills_ledger is not None:
+            if st is None and self._fills_ledger is not None:
                 # No market_state for this slug — still record in ledger
                 token_id, market_id = self._token_for_slug_outcome(slug, outcome)
                 crypto = ""
@@ -4075,13 +4101,47 @@ class Bot:
                             pos.cost_usdc = pos.vwap * actual_qty if pos.vwap > 0 else 0.0
 
             if drifts:
+                # Calculate total USD drift for desync severity check
+                total_drift_usd = 0.0
+                for d in drifts:
+                    # Estimate USD impact: use vwap or 0.50 as fallback
+                    pos = self.market_states.get(d["slug"], None)
+                    vwap = 0.50
+                    if pos:
+                        p = pos.positions.get(d["outcome"])
+                        if p and p.vwap > 0:
+                            vwap = p.vwap
+                    total_drift_usd += abs(d["diff"]) * vwap
+
                 write_jsonl({"event_type": "BALANCE_DRIFT_CORRECTED",
                              "drifts": drifts,
+                             "total_drift_usd": round(total_drift_usd, 2),
                              "ts_ms": int(time.time() * 1000)})
                 for d in drifts:
                     print(f"  [DRIFT] {d['slug']} {d['outcome']}: "
                           f"internal={d['internal_qty']} → CLOB={d['clob_qty']} "
                           f"(diff={d['diff']:+.1f})")
+
+                # DESYNC HARD STOP: if total drift exceeds $1 USD, halt trading
+                if total_drift_usd > 1.0 and not self._desync_hard_stop:
+                    self._desync_hard_stop = True
+                    write_jsonl({
+                        "event_type": "DESYNC_HARD_STOP",
+                        "source": "balance_sync",
+                        "total_drift_usd": round(total_drift_usd, 2),
+                        "drift_count": len(drifts),
+                        "drifts": drifts,
+                        "ts_ms": int(time.time() * 1000),
+                    })
+                    print(f"  *** DESYNC HARD STOP *** balance drift ${total_drift_usd:.2f} — "
+                          f"new entries DISABLED until restart")
+                    # Cancel all open orders to prevent further fills on stale state
+                    try:
+                        self.client.cancel_all_orders()
+                        print("  [DESYNC] All open orders cancelled")
+                    except Exception as ce:
+                        print(f"  [DESYNC] cancel_all failed: {ce}")
+
         except Exception as e:
             write_jsonl({"event_type": "BALANCE_SYNC_ERROR",
                          "err": str(e)[:200]})
@@ -4110,16 +4170,35 @@ class Bot:
                 last_fill_ts=self._last_fill_ts,
             )
             corrections = result.get("corrections", [])
+            desync = result.get("desync_detected", False)
             if corrections:
                 write_jsonl({
                     "event_type": "RECONCILE_TRIGGERED",
                     "trigger": trigger,
                     "corrections_count": len(corrections),
-                    "desync": result.get("desync_detected", False),
+                    "desync": desync,
                     "ts_ms": int(time.time() * 1000),
                 })
                 # Save state immediately after corrections
                 self._save_state()
+
+            # DESYNC HARD STOP: if reconciler detects a critical mismatch
+            if desync and not self._desync_hard_stop:
+                self._desync_hard_stop = True
+                write_jsonl({
+                    "event_type": "DESYNC_HARD_STOP",
+                    "source": "reconciliation",
+                    "trigger": trigger,
+                    "corrections_count": len(corrections),
+                    "ts_ms": int(time.time() * 1000),
+                })
+                print(f"  *** DESYNC HARD STOP *** reconciliation detected critical desync — "
+                      f"new entries DISABLED until restart")
+                try:
+                    self.client.cancel_all_orders()
+                    print("  [DESYNC] All open orders cancelled")
+                except Exception as ce:
+                    print(f"  [DESYNC] cancel_all failed: {ce}")
         except Exception as e:
             write_jsonl({
                 "event_type": "RECONCILE_ERROR",
@@ -4203,7 +4282,193 @@ class Bot:
         # Block new trades during ledger SAFE MODE
         if self._fills_ledger is not None and self._fills_ledger.safe_mode:
             return False
+        # Block if desync hard stop active
+        if self._desync_hard_stop:
+            return False
         return True
+
+    # ── Budget reservation helpers ─────────────────────────────────
+
+    def _total_reserved_usd(self) -> float:
+        """Total USD reserved for pending/open BUY orders."""
+        return sum(self._reserved_usd.values())
+
+    def _reserve_budget(self, order_id: str, usd_amount: float) -> None:
+        """Reserve budget for an open/pending BUY order."""
+        if order_id and usd_amount > 0:
+            self._reserved_usd[order_id] = usd_amount
+
+    def _release_reservation(self, order_id: str) -> float:
+        """Release budget reservation for an order.  Returns amount released."""
+        return self._reserved_usd.pop(order_id, 0.0)
+
+    def _total_exposure_usd(self) -> float:
+        """Total exposure = filled positions + reserved (pending) orders.
+        This is the TRUE cap check — prevents overspending."""
+        filled_usd = sum(
+            st.positions[o].qty * st.positions[o].vwap
+            for st in self.market_states.values()
+            for o in ["Up", "Down"] if st.positions[o].qty >= MIN_QTY
+        )
+        return filled_usd + self._total_reserved_usd()
+
+    # ── In-flight BUY guard ────────────────────────────────────────
+
+    def _has_inflight_buy(self, token_id: str) -> bool:
+        """Check if there's already an open BUY for this token."""
+        if not ONE_INFLIGHT_PER_TOKEN:
+            return False
+        last_ts = self._inflight_buy_ts.get(token_id, 0.0)
+        # Consider in-flight if submitted within cooldown window
+        return (time.time() - last_ts) < (PER_TOKEN_COOLDOWN_MS / 1000.0)
+
+    def _record_buy_submit(self, token_id: str) -> None:
+        """Record that a BUY was submitted for this token."""
+        self._inflight_buy_ts[token_id] = time.time()
+
+    def _clear_buy_inflight(self, token_id: str) -> None:
+        """Clear in-flight state for a token (on fill or cancel)."""
+        self._inflight_buy_ts.pop(token_id, None)
+
+    # ── Global order rate limiter ──────────────────────────────────
+
+    def _global_rate_ok(self) -> bool:
+        """Check if we're within the global order rate limit."""
+        now = time.time()
+        # Prune old entries (older than 1 second)
+        self._global_order_ts = [t for t in self._global_order_ts if now - t < 1.0]
+        return len(self._global_order_ts) < GLOBAL_ORDER_RATE_LIMIT_PER_SEC
+
+    def _record_global_order(self) -> None:
+        """Record a global order submission."""
+        self._global_order_ts.append(time.time())
+
+    # ── Unified apply_fill — single entry point for all fill sources ──
+
+    def _apply_fill(self, slug: str, outcome: str, side: str,
+                    fill_qty: float, fill_price: float,
+                    order_id: str = "", reason: str = "",
+                    source: str = "immediate") -> float:
+        """Unified fill application — used by immediate fills, poll recovery,
+        and lifecycle watcher.
+
+        Updates:
+          - positions (qty, vwap, cost_usdc)
+          - cash_usdc
+          - _hour_budget_remaining
+          - reserved_usd (releases reservation)
+          - fills ledger
+          - realized PnL (for SELL)
+
+        Returns: PnL for SELL fills, 0.0 for BUY fills.
+        """
+        st = self.market_states.get(slug)
+        if not st:
+            return 0.0
+
+        m = None
+        for mk in self._cached_markets:
+            if mk.slug == slug:
+                m = mk
+                break
+        if not m:
+            return 0.0
+
+        token_id = m.outcome_up_id if outcome == "Up" else m.outcome_down_id
+        pnl = 0.0
+
+        # Release any budget reservation for this order
+        released = self._release_reservation(order_id)
+
+        if side == "BUY":
+            actual_cost = fill_price * fill_qty
+            if MODE in ("LIVE", "LIVE_SAFE"):
+                if released > 0:
+                    # Reservation was already deducted from cash.
+                    # Add it back, then let _live_buy deduct the real cost.
+                    self.cash_usdc += released
+                    self._hour_budget_remaining += released
+                self._live_buy(st, outcome, fill_price, fill_qty, actual_cost)
+            self._ledger_record_buy_fill(m, st, outcome, fill_price, fill_qty,
+                                         order_id=order_id)
+            self._clear_buy_inflight(token_id)
+        elif side == "SELL":
+            if MODE in ("LIVE", "LIVE_SAFE"):
+                pnl = self._live_sell(st, outcome, fill_price, fill_qty)
+            self._ledger_record_sell_fill(m, st, outcome, fill_price, fill_qty,
+                                          order_id=order_id)
+
+        self._record_fill_ts(slug)
+
+        write_jsonl({
+            "event_type": "FILL_APPLIED",
+            "source": source,
+            "slug": slug, "outcome": outcome,
+            "side": side, "order_id": order_id,
+            "qty": round(fill_qty, 2), "price": round(fill_price, 4),
+            "released_reservation": round(released, 2),
+            "pnl": round(pnl, 4) if side == "SELL" else None,
+            "reason": reason,
+            "ts_ms": int(time.time() * 1000),
+        })
+
+        return pnl
+
+    # ── Quick-buy FOK with retry micro-loop ──────────────────────
+
+    def _quick_buy_fok(self, token_id: str, ask_price: float, qty: float,
+                       book, m, st, outcome: str, reason: str) -> dict:
+        """Place FOK (Fill-Or-Kill) buy at ask with up to IOC_MAX_RETRIES.
+
+        Each retry steps price up by 1 tick (0.01) up to IOC_MAX_SLIPPAGE_CENTS
+        above the original ask.  Returns the fill dict from the first successful
+        fill, or the last attempt's result.
+
+        Guardrails:
+          - spread must be <= DSCALP_MAX_SPREAD_CENTS
+          - slippage must be <= IOC_MAX_SLIPPAGE_CENTS above ask
+          - obeys one-in-flight-per-token (checked by caller)
+        """
+        max_price = min(0.99, ask_price + IOC_MAX_SLIPPAGE_CENTS / 100.0)
+        attempt_price = ask_price
+        last_result = None
+
+        for attempt in range(1 + IOC_MAX_RETRIES):
+            if attempt_price > max_price:
+                break
+            # Spread check
+            if book and book.spread * 100 > DSCALP_MAX_SPREAD_CENTS * 1.5:
+                break
+
+            result = self.client.place_fok_order(token_id, "BUY",
+                                                  attempt_price, qty)
+            last_result = result
+
+            if result.get("filled") is True:
+                write_jsonl({"event_type": "FOK_BUY_OK",
+                             "slug": m.slug, "outcome": outcome,
+                             "attempt": attempt, "price": attempt_price,
+                             "qty": qty, "fill_qty": result.get("fill_qty"),
+                             "reason": reason})
+                return result
+
+            if result.get("filled") == "UNKNOWN":
+                return result  # let lifecycle watcher handle
+
+            # FOK killed — step price up by 1 tick for next attempt
+            attempt_price = round(attempt_price + IOC_TICK_STEP, 3)
+            if attempt < IOC_MAX_RETRIES:
+                time.sleep(IOC_RETRY_DELAY_MS / 1000.0)
+
+        # All attempts failed
+        if last_result is None:
+            last_result = {"order_id": "", "filled": False, "fill_qty": 0.0,
+                           "fill_price": ask_price, "status": "fok_killed"}
+        write_jsonl({"event_type": "FOK_BUY_ALL_KILLED",
+                     "slug": m.slug, "outcome": outcome,
+                     "attempts": 1 + IOC_MAX_RETRIES,
+                     "final_price": attempt_price, "reason": reason})
+        return last_result
 
     def _entry_window_remaining_sec(self) -> float:
         """Seconds remaining in LIVE_SAFE entry window. 0 if expired or not LIVE_SAFE."""
@@ -4458,16 +4723,15 @@ class Bot:
         # LIVE_SAFE: check entry window
         if not self._buys_allowed():
             return False
-        # Safety caps (apply to both LIVE and LIVE_SAFE)
-        total_usd = sum(
-            st.positions[o].qty * st.positions[o].vwap
-            for st in self.market_states.values()
-            for o in ["Up", "Down"] if st.positions[o].qty >= MIN_QTY
-        )
+        # Safety caps: include BOTH filled positions AND reserved (pending) orders
+        total_usd = self._total_exposure_usd()
         # ── LIVE_SAFE total invested cap ($50 default, rolling — sells free up room) ──
         if MODE == "LIVE_SAFE" and total_usd >= LIVE_SAFE_MAX_TOTAL_INVESTED_USD:
             write_jsonl({"event_type": "LIVE_SAFE_INVESTED_CAP",
-                          "slug": slug, "total_invested_usd": round(total_usd, 2),
+                          "slug": slug,
+                          "filled_usd": round(total_usd - self._total_reserved_usd(), 2),
+                          "reserved_usd": round(self._total_reserved_usd(), 2),
+                          "total_exposure_usd": round(total_usd, 2),
                           "cap_usd": LIVE_SAFE_MAX_TOTAL_INVESTED_USD,
                           "ts_ms": int(time.time() * 1000)})
             return False
@@ -4639,27 +4903,55 @@ class Bot:
                 total_filled_usd += this_usd
                 burst_count += 1
             else:
-                fill = self.client.place_limit_order(token_id, "BUY", order_price,
-                                                     this_qty, post_only=False)
+                # ── In-flight guard: one BUY per token ──
+                if self._has_inflight_buy(token_id):
+                    stop_reason = "inflight_buy_guard"
+                    break
+                # ── Global rate limit ──
+                if not self._global_rate_ok():
+                    stop_reason = "global_rate_limit"
+                    break
+                # ── Exposure cap re-check (includes reserved) ──
+                if self._total_exposure_usd() + this_usd >= LIVE_SAFE_MAX_TOTAL_INVESTED_USD:
+                    stop_reason = "exposure_cap"
+                    break
+
+                # ── FOK (Fill-Or-Kill) for immediate taker fill ──
+                if IOC_ENTRY_ENABLED:
+                    fill = self._quick_buy_fok(
+                        token_id, order_price, this_qty, fresh_book,
+                        m, st, outcome, "ENTRY_BURST")
+                else:
+                    fill = self.client.place_limit_order(
+                        token_id, "BUY", order_price, this_qty, post_only=False)
+
                 oid = fill.get("order_id", "")
                 fill_state = fill.get("filled")  # True | False | "UNKNOWN"
                 is_pending = (fill_state == "UNKNOWN")
+
+                # ── Budget reservation: always reserve on submit ──
+                reserved_amount = order_price * this_qty
+                self._reserve_budget(oid, reserved_amount)
+                self._record_buy_submit(token_id)
+                self._record_global_order()
+
                 self._exec_tracker.on_submit(
                     oid, m.slug, outcome, "BUY", order_price, this_qty,
                     "ENTRY_BURST", token_id=token_id,
                     pending_confirmation=is_pending)
                 self._truth_watch_after_place(fill, m, outcome, "BUY", this_qty, order_price)
                 self._exec_safety.record_slug_submit(m.slug)
+
                 if fill_state is True:
-                    # Confirmed fill — update positions immediately
+                    # Confirmed fill — use unified apply_fill
                     self._exec_tracker.on_fill(oid, fill["fill_qty"],
                                                fill_price=fill["fill_price"],
                                                token_id=token_id)
                     self._exec_safety.record_slug_fill(m.slug)
-                    self._record_fill_ts(m.slug)  # post-fill cooldown
-                    self._live_buy(st, outcome, fill["fill_price"], fill["fill_qty"],
-                                   fill["fill_price"] * fill["fill_qty"])
-                    self._ledger_record_buy_fill(m, st, outcome, fill["fill_price"], fill["fill_qty"], order_id=oid)
+                    self._apply_fill(m.slug, outcome, "BUY",
+                                     fill["fill_qty"], fill["fill_price"],
+                                     order_id=oid, reason="ENTRY_BURST",
+                                     source="immediate")
                     mt = infer_maker_taker("BUY", fill["fill_price"], fresh_book)
                     sc = spread_capture_fields("BUY", fill["fill_price"], fresh_book)
                     _burst_notional = fill["fill_price"] * fill["fill_qty"]
@@ -4678,35 +4970,25 @@ class Bot:
                     burst_count += 1
                 elif is_pending:
                     # UNKNOWN: CLOB matched but qty unconfirmed.
-                    # Reserve capital (worst-case full fill), DON'T update
-                    # positions yet — lifecycle watcher will confirm.
-                    reserved_usd = order_price * this_qty
-                    self.cash_usdc -= reserved_usd
-                    self._hour_budget_remaining -= reserved_usd
+                    # Budget already reserved above.  Cash deducted via reservation.
+                    self.cash_usdc -= reserved_amount
+                    self._hour_budget_remaining -= reserved_amount
                     write_jsonl({"event_type": "BUY_PENDING_CONFIRMATION",
                                  "slug": m.slug, "outcome": outcome,
                                  "order_id": oid, "status": fill.get("status"),
                                  "requested_qty": this_qty, "price": order_price,
-                                 "reserved_usd": round(reserved_usd, 2),
+                                 "reserved_usd": round(reserved_amount, 2),
                                  "reason": "ENTRY_BURST",
                                  "ts_ms": int(time.time() * 1000)})
-                    print(f"  [ORDER_LIFECYCLE] BUY PENDING_CONFIRMATION: "
-                          f"{m.slug} {outcome} qty={this_qty:.1f} @ {order_price:.4f} "
-                          f"(reserved ${reserved_usd:.2f}) — watcher will confirm")
-                    # Count as attempted for burst pacing
                     burst_count += 1
-                elif fill.get("status") in ("live", "delayed", "matched"):
-                    # Order placed but not confirmed — lifecycle watcher tracks.
-                    write_jsonl({"event_type": "BUY_NOT_FILLED_YET",
-                                 "slug": m.slug, "outcome": outcome,
-                                 "order_id": oid, "status": fill.get("status"),
-                                 "requested_qty": this_qty, "price": order_price,
-                                 "reason": "ENTRY_BURST",
-                                 "ts_ms": int(time.time() * 1000)})
-                    print(f"  [ORDER_LIFECYCLE] BUY pending: {m.slug} {outcome} "
-                          f"qty={this_qty:.1f} @ {order_price:.4f} "
-                          f"(order_id={oid[:16]}...) — lifecycle guard will poll")
+                elif fill_state is False and fill.get("status") not in ("error",):
+                    # FOK killed or GTC unfilled — release reservation immediately
+                    self._release_reservation(oid)
+                    self._clear_buy_inflight(token_id)
+                    self._exec_tracker.on_cancel(oid)
                 elif fill.get("status") == "error":
+                    self._release_reservation(oid)
+                    self._clear_buy_inflight(token_id)
                     self._exec_safety.record_api_error()
                     self._exec_tracker.on_cancel(oid)
 
