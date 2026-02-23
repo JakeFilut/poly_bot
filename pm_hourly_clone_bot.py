@@ -405,12 +405,18 @@ class Bot:
         # Tracks notional locked up in open/pending BUY orders.
         # Key = order_id, Value = reserved_usd amount
         self._reserved_usd: Dict[str, float] = {}
+        self._reserved_submit_ts: Dict[str, float] = {}  # order_id -> submit time (for stuck detection)
         # In-flight BUY guard: (token_id) -> last_order_ts
         self._inflight_buy_ts: Dict[str, float] = {}
         # Global order rate limiter: timestamps of recent order submissions
         self._global_order_ts: List[float] = []
+        # Per-token attempt breaker: token_id -> list of attempt timestamps
+        self._token_attempt_ts: Dict[str, List[float]] = {}
+        self._token_breaker_until: Dict[str, float] = {}  # token_id -> cooldown-until timestamp
         # Desync hard stop: if True, all new entries blocked until manual reset
         self._desync_hard_stop: bool = False
+        # Flatten state: set True when hard flatten fires, prevents re-entry
+        self._hard_flatten_done: bool = False
         # ── Fills Ledger — append-only accounting layer ──
         if LEDGER_ENABLED:
             self._fills_ledger = FillsLedger(
@@ -764,6 +770,8 @@ class Bot:
             self._hour_net_pnl = 0.0
             self._hour_budget_remaining = HOURLY_BUDGET_USD
             self._hour_edges = []
+            # Reset flatten state for new hour
+            self._hard_flatten_done = False
             # Reset shadow
             self._shadow_active = False
             self._shadow_cash = 0.0
@@ -1323,6 +1331,9 @@ class Bot:
 
                     # Hedge mismatch detection (one-side-fill safety)
                     self._check_hedge_mismatch()
+
+                    # Reservation invariant audit (releases stuck, logs anomalies)
+                    self._audit_reservations()
 
                     # Rule 9: Cancel all open orders 30s before resolution
                     for m_r9 in markets:
@@ -2709,6 +2720,17 @@ class Bot:
         if MODE in ("LIVE", "LIVE_SAFE") and self._live_safety.is_close_imminent(
                 st.hour_start_utc):
             return  # exits already ran above; no new entries/quotes
+
+        # ── HARD FLATTEN: force-close all positions at HARD_FLATTEN_MIN ──
+        if t_min >= HARD_FLATTEN_MIN:
+            self._hard_flatten_all()
+            return  # no more trading this hour
+
+        # ── SOFT FLATTEN: trim positions starting at FLATTEN_START_MIN ──
+        if t_min >= FLATTEN_START_MIN:
+            self._flatten_trim_positions(t_min)
+            # Still allow parity flatten and exits, but block new entries
+            # (_buys_allowed already returns False via _is_in_flatten_phase)
 
         # ── PARITY: priority #3 — hard-gated by directional state ──
         parity_blocked = self._should_block_parity(m, st)
@@ -4273,7 +4295,8 @@ class Bot:
         """Check if BUY orders are currently allowed.
         All modes: always True (burst window is handled separately).
         Blocked if position desync detected and POSITION_RECONCILE_BLOCK_ON_DESYNC is True.
-        Blocked if ledger SAFE MODE is active."""
+        Blocked if ledger SAFE MODE is active.
+        Blocked during flatten phase (t_min >= FLATTEN_START_MIN)."""
         # Block new trades during critical state desync
         if (POSITION_RECONCILE_ENABLED
                 and POSITION_RECONCILE_BLOCK_ON_DESYNC
@@ -4285,7 +4308,26 @@ class Bot:
         # Block if desync hard stop active
         if self._desync_hard_stop:
             return False
+        # Block new entries during flatten phase
+        if self._is_in_flatten_phase():
+            return False
         return True
+
+    def _is_in_flatten_phase(self) -> bool:
+        """Check if ANY active market is past FLATTEN_START_MIN.
+        Uses the first market with valid hour_start_utc."""
+        now = utc_now()
+        for st in self.market_states.values():
+            if not st.hour_start_utc:
+                continue
+            try:
+                hour_start = _parse_iso_z(st.hour_start_utc)
+                t_min = minutes_into_hour(hour_start, now)
+                if t_min >= FLATTEN_START_MIN:
+                    return True
+            except Exception:
+                continue
+        return False
 
     # ── Budget reservation helpers ─────────────────────────────────
 
@@ -4297,10 +4339,55 @@ class Bot:
         """Reserve budget for an open/pending BUY order."""
         if order_id and usd_amount > 0:
             self._reserved_usd[order_id] = usd_amount
+            self._reserved_submit_ts[order_id] = time.time()
 
     def _release_reservation(self, order_id: str) -> float:
-        """Release budget reservation for an order.  Returns amount released."""
+        """Release budget reservation for an order.  Returns amount released.
+        Safe to call multiple times — second call returns 0."""
+        self._reserved_submit_ts.pop(order_id, None)
         return self._reserved_usd.pop(order_id, 0.0)
+
+    def _audit_reservations(self) -> None:
+        """Periodic invariant check: release stuck reservations, log anomalies.
+        Called from main loop every ~10s."""
+        now = time.time()
+        total = self._total_reserved_usd()
+
+        # Invariant: sum must never be negative
+        if total < -0.001:
+            write_jsonl({"event_type": "RESERVATION_INVARIANT_VIOLATION",
+                         "total_reserved_usd": round(total, 4),
+                         "count": len(self._reserved_usd),
+                         "ts_ms": int(now * 1000)})
+            # Force clear — something is very wrong
+            self._reserved_usd.clear()
+            self._reserved_submit_ts.clear()
+            return
+
+        # Release stuck reservations (older than RESERVATION_STUCK_TIMEOUT_SEC)
+        stuck_ids = []
+        for oid, submit_ts in list(self._reserved_submit_ts.items()):
+            age = now - submit_ts
+            if age > RESERVATION_STUCK_TIMEOUT_SEC:
+                stuck_ids.append(oid)
+
+        for oid in stuck_ids:
+            released = self._release_reservation(oid)
+            if released > 0:
+                write_jsonl({"event_type": "RESERVATION_STUCK_RELEASED",
+                             "order_id": oid,
+                             "released_usd": round(released, 2),
+                             "age_sec": round(now - (self._reserved_submit_ts.get(oid, now)), 1),
+                             "ts_ms": int(now * 1000)})
+                print(f"  [RESERVATION] Released stuck reservation ${released:.2f} "
+                      f"for order {oid[:16]}...")
+
+        # Log summary if any reservations exist
+        if self._reserved_usd:
+            write_jsonl({"event_type": "RESERVATION_AUDIT",
+                         "count": len(self._reserved_usd),
+                         "total_usd": round(self._total_reserved_usd(), 2),
+                         "ts_ms": int(now * 1000)})
 
     def _total_exposure_usd(self) -> float:
         """Total exposure = filled positions + reserved (pending) orders.
@@ -4342,6 +4429,36 @@ class Bot:
     def _record_global_order(self) -> None:
         """Record a global order submission."""
         self._global_order_ts.append(time.time())
+
+    # ── Per-token attempt breaker ──────────────────────────────────
+
+    def _token_attempt_ok(self, token_id: str) -> bool:
+        """Check if this token has hit its per-minute attempt limit.
+        Returns True if OK to attempt, False if breaker is tripped."""
+        now = time.time()
+        # Check existing cooldown
+        if now < self._token_breaker_until.get(token_id, 0.0):
+            return False
+        # Prune old attempts (> 60s)
+        attempts = self._token_attempt_ts.get(token_id, [])
+        attempts = [t for t in attempts if now - t < 60.0]
+        self._token_attempt_ts[token_id] = attempts
+        if len(attempts) >= TOKEN_ATTEMPT_MAX_PER_MIN:
+            # Trip breaker
+            self._token_breaker_until[token_id] = now + TOKEN_ATTEMPT_COOLDOWN_SEC
+            write_jsonl({"event_type": "TOKEN_BREAKER_TRIPPED",
+                         "token_id": token_id[-12:],
+                         "attempts_in_60s": len(attempts),
+                         "cooldown_sec": TOKEN_ATTEMPT_COOLDOWN_SEC,
+                         "ts_ms": int(now * 1000)})
+            print(f"  [BREAKER] Token {token_id[-12:]} hit {len(attempts)} attempts/min — "
+                  f"cooling down {TOKEN_ATTEMPT_COOLDOWN_SEC:.0f}s")
+            return False
+        return True
+
+    def _record_token_attempt(self, token_id: str) -> None:
+        """Record an order attempt for the per-token breaker."""
+        self._token_attempt_ts.setdefault(token_id, []).append(time.time())
 
     # ── Unified apply_fill — single entry point for all fill sources ──
 
@@ -4414,61 +4531,207 @@ class Bot:
 
         return pnl
 
-    # ── Quick-buy FOK with retry micro-loop ──────────────────────
+    # ── Quick-buy IOC with retry micro-loop ──────────────────────
 
-    def _quick_buy_fok(self, token_id: str, ask_price: float, qty: float,
+    def _quick_buy_ioc(self, token_id: str, ask_price: float, qty: float,
                        book, m, st, outcome: str, reason: str) -> dict:
-        """Place FOK (Fill-Or-Kill) buy at ask with up to IOC_MAX_RETRIES.
+        """Place IOC (or FOK if ENTRY_USE_FOK=True) buy at ask with up to IOC_MAX_RETRIES.
 
+        IOC allows partial fills (better on thin books).
         Each retry steps price up by 1 tick (0.01) up to IOC_MAX_SLIPPAGE_CENTS
-        above the original ask.  Returns the fill dict from the first successful
-        fill, or the last attempt's result.
+        above the original ask.
+
+        Returns the fill dict from the first successful fill (which may be
+        partial for IOC), or the last attempt's result.
 
         Guardrails:
-          - spread must be <= DSCALP_MAX_SPREAD_CENTS
+          - spread must be <= DSCALP_MAX_SPREAD_CENTS * 1.5
           - slippage must be <= IOC_MAX_SLIPPAGE_CENTS above ask
           - obeys one-in-flight-per-token (checked by caller)
         """
         max_price = min(0.99, ask_price + IOC_MAX_SLIPPAGE_CENTS / 100.0)
         attempt_price = ask_price
         last_result = None
+        total_filled = 0.0
+        remaining_qty = qty
 
         for attempt in range(1 + IOC_MAX_RETRIES):
             if attempt_price > max_price:
+                break
+            if remaining_qty < MIN_QTY:
                 break
             # Spread check
             if book and book.spread * 100 > DSCALP_MAX_SPREAD_CENTS * 1.5:
                 break
 
-            result = self.client.place_fok_order(token_id, "BUY",
-                                                  attempt_price, qty)
+            result = self.client.place_immediate_order(
+                token_id, "BUY", attempt_price, remaining_qty,
+                use_fok=ENTRY_USE_FOK)
             last_result = result
 
             if result.get("filled") is True:
-                write_jsonl({"event_type": "FOK_BUY_OK",
+                fill_qty = result.get("fill_qty", 0.0)
+                partial = result.get("partial", False)
+                total_filled += fill_qty
+                label = "IOC" if not ENTRY_USE_FOK else "FOK"
+                write_jsonl({"event_type": f"{label}_BUY_OK",
                              "slug": m.slug, "outcome": outcome,
                              "attempt": attempt, "price": attempt_price,
-                             "qty": qty, "fill_qty": result.get("fill_qty"),
+                             "requested_qty": remaining_qty,
+                             "fill_qty": fill_qty,
+                             "partial": partial,
                              "reason": reason})
+                if partial and not ENTRY_USE_FOK:
+                    # IOC partial fill: reduce remaining, try next tick
+                    remaining_qty = round(remaining_qty - fill_qty, 2)
+                    # Update result to reflect cumulative fill
+                    result = dict(result)
+                    result["fill_qty"] = total_filled
+                    if remaining_qty < MIN_QTY:
+                        return result  # close enough to full fill
+                    # Step price up for remainder
+                    attempt_price = round(attempt_price + IOC_TICK_STEP, 3)
+                    if attempt < IOC_MAX_RETRIES:
+                        time.sleep(IOC_RETRY_DELAY_MS / 1000.0)
+                    continue
                 return result
 
             if result.get("filled") == "UNKNOWN":
                 return result  # let lifecycle watcher handle
 
-            # FOK killed — step price up by 1 tick for next attempt
+            # Killed — step price up by 1 tick for next attempt
             attempt_price = round(attempt_price + IOC_TICK_STEP, 3)
             if attempt < IOC_MAX_RETRIES:
                 time.sleep(IOC_RETRY_DELAY_MS / 1000.0)
 
-        # All attempts failed
+        # If we got partial fills across retries, return cumulative result
+        if total_filled > 0 and last_result:
+            last_result = dict(last_result)
+            last_result["filled"] = True
+            last_result["fill_qty"] = total_filled
+            last_result["partial"] = True
+            return last_result
+
+        # All attempts failed — no fill at all
         if last_result is None:
             last_result = {"order_id": "", "filled": False, "fill_qty": 0.0,
-                           "fill_price": ask_price, "status": "fok_killed"}
-        write_jsonl({"event_type": "FOK_BUY_ALL_KILLED",
+                           "fill_price": ask_price, "status": "ioc_killed",
+                           "partial": False}
+        label = "IOC" if not ENTRY_USE_FOK else "FOK"
+        write_jsonl({"event_type": f"{label}_BUY_ALL_KILLED",
                      "slug": m.slug, "outcome": outcome,
                      "attempts": 1 + IOC_MAX_RETRIES,
                      "final_price": attempt_price, "reason": reason})
         return last_result
+
+    # ── End-of-hour flatten logic ─────────────────────────────────
+
+    def _is_flatten_phase(self, t_min: float) -> bool:
+        """Are we past FLATTEN_START_MIN (stop new entries, start trimming)?"""
+        return t_min >= FLATTEN_START_MIN
+
+    def _is_hard_flatten_phase(self, t_min: float) -> bool:
+        """Are we past HARD_FLATTEN_MIN (force-close everything)?"""
+        return t_min >= HARD_FLATTEN_MIN
+
+    def _flatten_trim_positions(self, t_min: float):
+        """Soft flatten: sell positions that are profitable or near-breakeven.
+        Called each tick when t_min >= FLATTEN_START_MIN."""
+        for slug, st in self.market_states.items():
+            m = None
+            for mk in self._cached_markets:
+                if mk.slug == slug:
+                    m = mk
+                    break
+            if not m:
+                continue
+            for outcome in ("Up", "Down"):
+                pos = st.positions[outcome]
+                if pos.qty < MIN_QTY:
+                    continue
+                book = self.last_book.get(slug, {}).get(outcome)
+                if not book or book.bid <= 0:
+                    continue
+                # Sell at bid for immediate fill
+                self._do_sell(m, st, outcome, pos.qty, book.bid,
+                              reason="FLATTEN_TRIM", leg="FLATTEN")
+
+    def _hard_flatten_all(self):
+        """Hard flatten: force-close ALL positions with IOC sells, cancel all orders.
+        Called once when t_min >= HARD_FLATTEN_MIN."""
+        if self._hard_flatten_done:
+            return
+        self._hard_flatten_done = True
+
+        write_jsonl({"event_type": "HARD_FLATTEN_START",
+                     "ts_ms": int(time.time() * 1000)})
+        print("  *** HARD FLATTEN *** Force-closing all positions")
+
+        # 1. Cancel all open orders first
+        try:
+            self.client.cancel_all_orders()
+        except Exception as e:
+            write_jsonl({"event_type": "HARD_FLATTEN_CANCEL_ERROR",
+                         "err": str(e)[:200]})
+
+        # 2. Release all reservations
+        for oid in list(self._reserved_usd.keys()):
+            self._release_reservation(oid)
+
+        # 3. Force-sell every position with IOC at bid - slippage
+        positions_closed = 0
+        for slug, st in self.market_states.items():
+            m = None
+            for mk in self._cached_markets:
+                if mk.slug == slug:
+                    m = mk
+                    break
+            if not m:
+                continue
+            for outcome in ("Up", "Down"):
+                pos = st.positions[outcome]
+                if pos.qty < MIN_QTY:
+                    continue
+                book = self.last_book.get(slug, {}).get(outcome)
+                if not book or book.bid <= 0:
+                    continue
+                token_id = m.outcome_up_id if outcome == "Up" else m.outcome_down_id
+                # IOC sell at bid - slippage (bounded)
+                sell_price = max(0.01, book.bid - FLATTEN_IOC_SLIPPAGE_CENTS / 100.0)
+                if MODE in ("LIVE", "LIVE_SAFE"):
+                    result = self.client.place_immediate_order(
+                        token_id, "SELL", sell_price, pos.qty, use_fok=False)
+                    if result.get("filled") is True:
+                        fill_qty = result.get("fill_qty", 0.0)
+                        self._apply_fill(slug, outcome, "SELL",
+                                         fill_qty, result["fill_price"],
+                                         order_id=result.get("order_id", ""),
+                                         reason="HARD_FLATTEN",
+                                         source="hard_flatten")
+                        positions_closed += 1
+                    elif result.get("filled") == "UNKNOWN":
+                        oid = result.get("order_id", "")
+                        if oid:
+                            self._exec_tracker.on_submit(
+                                oid, slug, outcome, "SELL", sell_price, pos.qty,
+                                "HARD_FLATTEN", token_id=token_id,
+                                pending_confirmation=True)
+                        positions_closed += 1
+                    else:
+                        # Fallback: try limit sell at bid
+                        self._do_sell(m, st, outcome, pos.qty, book.bid,
+                                      reason="HARD_FLATTEN_FALLBACK", leg="FLATTEN")
+                        positions_closed += 1
+                else:
+                    # Paper mode
+                    self._do_sell(m, st, outcome, pos.qty, book.bid,
+                                  reason="HARD_FLATTEN", leg="FLATTEN")
+                    positions_closed += 1
+
+        write_jsonl({"event_type": "HARD_FLATTEN_DONE",
+                     "positions_closed": positions_closed,
+                     "ts_ms": int(time.time() * 1000)})
+        print(f"  [HARD_FLATTEN] Closed {positions_closed} positions")
 
     def _entry_window_remaining_sec(self) -> float:
         """Seconds remaining in LIVE_SAFE entry window. 0 if expired or not LIVE_SAFE."""
@@ -4903,6 +5166,10 @@ class Bot:
                 total_filled_usd += this_usd
                 burst_count += 1
             else:
+                # ── Per-token attempt breaker ──
+                if not self._token_attempt_ok(token_id):
+                    stop_reason = "token_breaker"
+                    break
                 # ── In-flight guard: one BUY per token ──
                 if self._has_inflight_buy(token_id):
                     stop_reason = "inflight_buy_guard"
@@ -4916,9 +5183,12 @@ class Bot:
                     stop_reason = "exposure_cap"
                     break
 
-                # ── FOK (Fill-Or-Kill) for immediate taker fill ──
+                # ── Record attempt for breaker tracking ──
+                self._record_token_attempt(token_id)
+
+                # ── IOC/FOK for immediate taker fill ──
                 if IOC_ENTRY_ENABLED:
-                    fill = self._quick_buy_fok(
+                    fill = self._quick_buy_ioc(
                         token_id, order_price, this_qty, fresh_book,
                         m, st, outcome, "ENTRY_BURST")
                 else:
@@ -4928,45 +5198,53 @@ class Bot:
                 oid = fill.get("order_id", "")
                 fill_state = fill.get("filled")  # True | False | "UNKNOWN"
                 is_pending = (fill_state == "UNKNOWN")
+                actual_fill_qty = fill.get("fill_qty", 0.0)
 
-                # ── Budget reservation: always reserve on submit ──
+                # ── Budget reservation: reserve on submit ──
                 reserved_amount = order_price * this_qty
-                self._reserve_budget(oid, reserved_amount)
+                if oid:
+                    self._reserve_budget(oid, reserved_amount)
                 self._record_buy_submit(token_id)
                 self._record_global_order()
 
-                self._exec_tracker.on_submit(
-                    oid, m.slug, outcome, "BUY", order_price, this_qty,
-                    "ENTRY_BURST", token_id=token_id,
-                    pending_confirmation=is_pending)
+                if oid:
+                    self._exec_tracker.on_submit(
+                        oid, m.slug, outcome, "BUY", order_price, this_qty,
+                        "ENTRY_BURST", token_id=token_id,
+                        pending_confirmation=is_pending)
                 self._truth_watch_after_place(fill, m, outcome, "BUY", this_qty, order_price)
                 self._exec_safety.record_slug_submit(m.slug)
 
                 if fill_state is True:
-                    # Confirmed fill — use unified apply_fill
-                    self._exec_tracker.on_fill(oid, fill["fill_qty"],
-                                               fill_price=fill["fill_price"],
-                                               token_id=token_id)
+                    # Confirmed fill (full or partial) — use unified apply_fill
+                    if oid:
+                        self._exec_tracker.on_fill(oid, actual_fill_qty,
+                                                   fill_price=fill["fill_price"],
+                                                   token_id=token_id)
                     self._exec_safety.record_slug_fill(m.slug)
+                    # For partial IOC fills, adjust reservation to actual cost
+                    if actual_fill_qty < this_qty and oid:
+                        # Partial fill: release full reservation, apply_fill re-deducts actual
+                        pass  # apply_fill handles reservation release
                     self._apply_fill(m.slug, outcome, "BUY",
-                                     fill["fill_qty"], fill["fill_price"],
+                                     actual_fill_qty, fill["fill_price"],
                                      order_id=oid, reason="ENTRY_BURST",
                                      source="immediate")
                     mt = infer_maker_taker("BUY", fill["fill_price"], fresh_book)
                     sc = spread_capture_fields("BUY", fill["fill_price"], fresh_book)
-                    _burst_notional = fill["fill_price"] * fill["fill_qty"]
+                    _burst_notional = fill["fill_price"] * actual_fill_qty
                     _fee = compute_fee_usdc(_burst_notional, mt)
                     self.logger.log_order_fill(
                         engine="CORE", reason="ENTRY_BURST",
                         decision_id=decision_id, client_order_id=client_oid,
                         position_id=pos.position_id or "",
                         crypto=m.crypto, slug=m.slug, outcome=outcome,
-                        side="BUY", qty=fill["fill_qty"], fill_price=fill["fill_price"],
+                        side="BUY", qty=actual_fill_qty, fill_price=fill["fill_price"],
                         usdc_cost=_burst_notional, fees_usdc=_fee,
                         maker_taker=mt, did_cross=sc.get("did_cross", ""),
                         vwap=pos.vwap, ctx=ctx, book_fields=bk_fields,
                     )
-                    total_filled_usd += fill["fill_price"] * fill["fill_qty"]
+                    total_filled_usd += fill["fill_price"] * actual_fill_qty
                     burst_count += 1
                 elif is_pending:
                     # UNKNOWN: CLOB matched but qty unconfirmed.
@@ -4982,15 +5260,19 @@ class Bot:
                                  "ts_ms": int(time.time() * 1000)})
                     burst_count += 1
                 elif fill_state is False and fill.get("status") not in ("error",):
-                    # FOK killed or GTC unfilled — release reservation immediately
-                    self._release_reservation(oid)
+                    # IOC/FOK killed — release reservation immediately
+                    if oid:
+                        self._release_reservation(oid)
                     self._clear_buy_inflight(token_id)
-                    self._exec_tracker.on_cancel(oid)
+                    if oid:
+                        self._exec_tracker.on_cancel(oid)
                 elif fill.get("status") == "error":
-                    self._release_reservation(oid)
+                    if oid:
+                        self._release_reservation(oid)
                     self._clear_buy_inflight(token_id)
                     self._exec_safety.record_api_error()
-                    self._exec_tracker.on_cancel(oid)
+                    if oid:
+                        self._exec_tracker.on_cancel(oid)
 
             # Track diagnostics — always taker now
             taker_count += 1

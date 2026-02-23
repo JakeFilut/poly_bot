@@ -608,21 +608,22 @@ class PolymarketClient:
             pass
         return 0.0
 
-    def place_fok_order(self, token_id: str, side: str, price: float,
-                        size: float) -> dict:
-        """Place a Fill-Or-Kill (FOK) order — immediate fill or nothing.
+    def place_immediate_order(self, token_id: str, side: str, price: float,
+                              size: float, use_fok: bool = False) -> dict:
+        """Place an immediate-execution order (IOC or FOK).
+
+        IOC (use_fok=False, default): Fill whatever is available, kill remainder.
+            Allows partial fills — better on thin books.
+        FOK (use_fok=True): Fill entire qty or kill the whole order.
 
         Returns same dict as place_limit_order:
-            {order_id, filled, fill_qty, fill_price, status}
-
-        FOK orders never rest on the book.  If the full qty can't be filled
-        immediately at the specified price or better, the entire order is
-        killed.  Perfect for entry taker orders.
+            {order_id, filled, fill_qty, fill_price, status, partial}
         """
+        order_label = "FOK" if use_fok else "IOC"
         if _settings.MODE == "LOG":
             pid = f"paper_{int(time.time()*1000)}_{random.randint(100,999)}"
             return {"order_id": pid, "filled": True, "fill_qty": float(size),
-                    "fill_price": price, "status": "matched"}
+                    "fill_price": price, "status": "matched", "partial": False}
 
         if not self._clob:
             raise RuntimeError("CLOB client not initialised")
@@ -630,7 +631,7 @@ class PolymarketClient:
         now = time.time()
         if now < getattr(self, '_api_error_backoff_until', 0.0):
             return {"order_id": "", "filled": False, "fill_qty": 0.0,
-                    "fill_price": 0.0, "status": "error"}
+                    "fill_price": 0.0, "status": "error", "partial": False}
 
         from py_clob_client.clob_types import OrderArgs, OrderType
 
@@ -641,7 +642,17 @@ class PolymarketClient:
         clob_min = max(5, min_qty_for_usd)
         if qty < clob_min:
             return {"order_id": "", "filled": False, "fill_qty": 0.0,
-                    "fill_price": 0.0, "status": "rejected"}
+                    "fill_price": 0.0, "status": "rejected", "partial": False}
+
+        # Select order type: FOK or FAK (IOC).  FAK = Fill-And-Kill = IOC.
+        if use_fok:
+            otype = OrderType.FOK
+        elif hasattr(OrderType, "FAK"):
+            otype = OrderType.FAK
+        else:
+            # Fallback: if FAK not available in this py_clob_client version, use FOK
+            otype = OrderType.FOK
+            order_label = "FOK_FALLBACK"
 
         try:
             args = OrderArgs(
@@ -649,64 +660,74 @@ class PolymarketClient:
                 side=side.upper(), token_id=token_id,
             )
             signed = self._clob.create_order(args)
-            response = self._clob.post_order(signed, OrderType.FOK)
+            response = self._clob.post_order(signed, otype)
 
             if response and isinstance(response, dict):
                 oid = response.get("orderID", "")
                 status = response.get("status", "").lower()
                 fill_qty = self._extract_fill_qty(response)
-                self._log_response_shape_once(response, f"fok_{status}")
+                self._log_response_shape_once(response, f"{order_label.lower()}_{status}")
 
                 if status == "matched" and fill_qty > 0:
                     self._api_error_backoff_sec = 0.0
-                    _write_jsonl({"event_type": "FOK_FILLED",
+                    partial = (fill_qty < qty)
+                    _write_jsonl({"event_type": f"{order_label}_FILLED",
                                  "order_id": oid, "side": side,
-                                 "price": price, "qty": qty,
-                                 "fill_qty": fill_qty})
+                                 "price": price, "requested_qty": qty,
+                                 "fill_qty": fill_qty,
+                                 "partial": partial})
                     return {"order_id": oid, "filled": True,
                             "fill_qty": fill_qty, "fill_price": price,
-                            "status": "matched"}
+                            "status": "matched", "partial": partial}
 
                 if status == "matched" and fill_qty == 0:
-                    # FOK matched but no qty — quick check
+                    # Matched but no qty reported — quick check
                     if oid:
                         fill_qty = self._quick_fill_check(oid)
                     if fill_qty > 0:
                         self._api_error_backoff_sec = 0.0
-                        _write_jsonl({"event_type": "FOK_FILLED_DELAYED",
-                                     "order_id": oid, "fill_qty": fill_qty})
+                        partial = (fill_qty < qty)
+                        _write_jsonl({"event_type": f"{order_label}_FILLED_DELAYED",
+                                     "order_id": oid, "fill_qty": fill_qty,
+                                     "partial": partial})
                         return {"order_id": oid, "filled": True,
                                 "fill_qty": fill_qty, "fill_price": price,
-                                "status": "matched"}
-                    # FOK matched but truly unknown — treat as UNKNOWN
+                                "status": "matched", "partial": partial}
+                    # Matched but truly unknown
                     self._api_error_backoff_sec = 0.0
-                    _write_jsonl({"event_type": "FOK_UNKNOWN",
+                    _write_jsonl({"event_type": f"{order_label}_UNKNOWN",
                                  "order_id": oid, "status": status,
                                  "requested_qty": qty})
                     return {"order_id": oid, "filled": "UNKNOWN",
                             "fill_qty": 0.0, "fill_price": price,
-                            "status": "matched"}
+                            "status": "matched", "partial": False}
 
-                # FOK not matched (killed) — no fill
+                # Not matched (killed) — no fill
                 self._api_error_backoff_sec = 0.0
-                _write_jsonl({"event_type": "FOK_KILLED",
+                _write_jsonl({"event_type": f"{order_label}_KILLED",
                              "order_id": oid, "status": status,
                              "side": side, "price": price, "qty": qty})
                 return {"order_id": oid, "filled": False,
                         "fill_qty": 0.0, "fill_price": price,
-                        "status": status or "killed"}
+                        "status": status or "killed", "partial": False}
 
         except Exception as e:
             prev = getattr(self, '_api_error_backoff_sec', 0.0)
             backoff = min(max(prev * 2, 5.0), 30.0)
             self._api_error_backoff_sec = backoff
             self._api_error_backoff_until = time.time() + backoff
-            _write_jsonl({"event_type": "FOK_ERROR", "err": str(e)[:200],
+            _write_jsonl({"event_type": f"{order_label}_ERROR",
+                         "err": str(e)[:200],
                          "token_id": token_id[-12:], "side": side,
                          "price": price, "qty": qty,
                          "backoff_sec": backoff})
         return {"order_id": "", "filled": False, "fill_qty": 0.0,
-                "fill_price": 0.0, "status": "error"}
+                "fill_price": 0.0, "status": "error", "partial": False}
+
+    def place_fok_order(self, token_id: str, side: str, price: float,
+                        size: float) -> dict:
+        """Backwards-compatible alias: delegates to place_immediate_order(use_fok=True)."""
+        return self.place_immediate_order(token_id, side, price, size, use_fok=True)
 
     def get_order_status(self, order_id: str) -> Optional[dict]:
         """Get order status from CLOB by order_id. Returns dict or None."""

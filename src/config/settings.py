@@ -677,8 +677,9 @@ CANCEL_ALL_BEFORE_CLOSE_SEC = float(os.getenv("CANCEL_ALL_BEFORE_CLOSE_SEC", "30
 # IOC / TAKER ENTRY — immediate-fill for entry orders
 # ---------------------------------------------------------------------------
 IOC_ENTRY_ENABLED = bool(os.getenv("IOC_ENTRY_ENABLED", "True") not in ("", "0", "False", "false"))
+ENTRY_USE_FOK = bool(os.getenv("ENTRY_USE_FOK", "False") not in ("", "0", "False", "false"))  # False=IOC (partial OK), True=FOK (all-or-nothing)
 IOC_MAX_RETRIES = int(os.getenv("IOC_MAX_RETRIES", "2"))             # quick_buy attempts (2-3)
-IOC_RETRY_DELAY_MS = float(os.getenv("IOC_RETRY_DELAY_MS", "100"))  # 100ms between attempts
+IOC_RETRY_DELAY_MS = float(os.getenv("IOC_RETRY_DELAY_MS", "100"))  # 75-150ms between attempts
 IOC_TICK_STEP = float(os.getenv("IOC_TICK_STEP", "0.01"))           # +1 tick per retry
 IOC_MAX_SLIPPAGE_CENTS = float(os.getenv("IOC_MAX_SLIPPAGE_CENTS", "1.5"))  # max above ask for buys
 
@@ -686,6 +687,7 @@ IOC_MAX_SLIPPAGE_CENTS = float(os.getenv("IOC_MAX_SLIPPAGE_CENTS", "1.5"))  # ma
 # BUDGET RESERVATION — reserve capital for pending/open orders
 # ---------------------------------------------------------------------------
 BUDGET_RESERVE_ENABLED = bool(os.getenv("BUDGET_RESERVE_ENABLED", "True") not in ("", "0", "False", "false"))
+RESERVATION_STUCK_TIMEOUT_SEC = float(os.getenv("RESERVATION_STUCK_TIMEOUT_SEC", "120"))  # release stuck reservations after 2 min
 
 # ---------------------------------------------------------------------------
 # IN-FLIGHT ORDER GUARD — prevent duplicate entries per token/outcome
@@ -693,3 +695,16 @@ BUDGET_RESERVE_ENABLED = bool(os.getenv("BUDGET_RESERVE_ENABLED", "True") not in
 ONE_INFLIGHT_PER_TOKEN = bool(os.getenv("ONE_INFLIGHT_PER_TOKEN", "True") not in ("", "0", "False", "false"))
 PER_TOKEN_COOLDOWN_MS = float(os.getenv("PER_TOKEN_COOLDOWN_MS", "350"))        # min ms between orders on same token
 GLOBAL_ORDER_RATE_LIMIT_PER_SEC = float(os.getenv("GLOBAL_ORDER_RATE_LIMIT_PER_SEC", "5"))  # max new orders/sec
+
+# ---------------------------------------------------------------------------
+# PER-TOKEN ATTEMPT BREAKER — prevent runaway loops on one token
+# ---------------------------------------------------------------------------
+TOKEN_ATTEMPT_MAX_PER_MIN = int(os.getenv("TOKEN_ATTEMPT_MAX_PER_MIN", "10"))     # max attempts per token per 60s
+TOKEN_ATTEMPT_COOLDOWN_SEC = float(os.getenv("TOKEN_ATTEMPT_COOLDOWN_SEC", "45"))  # cooldown when breaker trips (30-60s)
+
+# ---------------------------------------------------------------------------
+# END-OF-HOUR FLATTEN — wind down positions before hour close
+# ---------------------------------------------------------------------------
+FLATTEN_START_MIN = float(os.getenv("FLATTEN_START_MIN", "57.0"))       # stop new entries, start trimming
+HARD_FLATTEN_MIN = float(os.getenv("HARD_FLATTEN_MIN", "59.0"))         # force-close ALL with IOC sells
+FLATTEN_IOC_SLIPPAGE_CENTS = float(os.getenv("FLATTEN_IOC_SLIPPAGE_CENTS", "2.0"))  # max slippage on flatten IOC sells
