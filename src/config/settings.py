@@ -64,9 +64,23 @@ BURST_EARLY_WINDOW_MIN = 3.0                                                    
 NO_NEW_ENTRIES_SEC_TO_CLOSE = float(os.getenv("NO_NEW_ENTRIES_SEC_TO_CLOSE", "180"))       # 3 min to close → block new entries
 
 # -----------------------------------------------------------------------------
+# Runtime profile — selects which subsystems are active
+# -----------------------------------------------------------------------------
+PROFILE = os.getenv("PROFILE", "F247_LIKE")    # F247_LIKE | HOURLY_SCALP_MIN
+
+# HOURLY_SCALP_MIN: minimal profile for BTC/ETH IOC scalping.
+# Keeps: IOC buy/sell, fill confirmation/recovery, reservation + exposure caps,
+#        flatten/hard flatten, burst engine.
+# Disables: parity arb, quoting, rescue, hedging, maker orders, SOL/XRP.
+_IS_MIN_PROFILE = (PROFILE == "HOURLY_SCALP_MIN")
+
+# When HOURLY_SCALP_MIN: force BTC,ETH only regardless of env
+if _IS_MIN_PROFILE:
+    LIVE_ALLOWED_SYMBOLS = ["BTC", "ETH"]
+
+# -----------------------------------------------------------------------------
 # Entry thresholds (bps) -- coin-specific, time-varying
 # -----------------------------------------------------------------------------
-PROFILE = "F247_LIKE"
 
 # Coin-specific threshold tables: coin -> {early, mid, late}
 _THR_TABLE = {
@@ -708,3 +722,25 @@ TOKEN_ATTEMPT_COOLDOWN_SEC = float(os.getenv("TOKEN_ATTEMPT_COOLDOWN_SEC", "45")
 FLATTEN_START_MIN = float(os.getenv("FLATTEN_START_MIN", "57.0"))       # stop new entries, start trimming
 HARD_FLATTEN_MIN = float(os.getenv("HARD_FLATTEN_MIN", "59.0"))         # force-close ALL with IOC sells
 FLATTEN_IOC_SLIPPAGE_CENTS = float(os.getenv("FLATTEN_IOC_SLIPPAGE_CENTS", "2.0"))  # max slippage on flatten IOC sells
+
+# ---------------------------------------------------------------------------
+# HOURLY_SCALP_MIN profile overrides — strip to bare essentials
+# ---------------------------------------------------------------------------
+if _IS_MIN_PROFILE:
+    # Disable parity/quoting/rescue/hedge subsystems
+    PARITY_BUY_ENABLED = False
+    PARITY_SELL_ENABLED = False
+    PARITY_QUOTE_ENABLED = False
+    DERISK_RESCUE_TO_STRADDLE = False
+    HEDGE_TICK_ESCALATION_ENABLED = False
+    # Disable SOL/XRP
+    ENABLE_XRP = False
+    XRP_PARITY_QUOTE_ENABLED = False
+    XRP_PARITY_BUY_ENABLED = False
+    CRYPTOS = ["BTC", "ETH"]
+    # Disable correlation exposure scaling (only 2 assets)
+    CORR_SCALE_ENABLED = False
+    # Keep all safety systems ON:
+    #   IOC_ENTRY_ENABLED, BUDGET_RESERVE_ENABLED, ONE_INFLIGHT_PER_TOKEN,
+    #   TOKEN_ATTEMPT_MAX_PER_MIN, FLATTEN_START_MIN, HARD_FLATTEN_MIN,
+    #   LIVE_SAFE_MAX_TOTAL_INVESTED_USD, MAX_POSITION_USD_PER_SLUG, etc.
