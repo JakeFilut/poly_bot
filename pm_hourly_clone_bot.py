@@ -3316,12 +3316,13 @@ class Bot:
                 return
             return  # still in min hold, no bypass triggered
 
-        # ── Timeout exit (maker-grace then taker) ──
+        # ── Timeout exit (taker at bid for immediate fill) ──
         if hold_sec >= DSCALP_MAX_HOLD_SEC:
             sell_qty = pos.qty
             sell_price = book.bid
-            self._do_sell_maker_then_taker(m, st, outcome, sell_qty,
-                                            reason="DSCALP_TIMEOUT", ctx=ctx)
+            self._do_sell(m, st, outcome, sell_qty, sell_price,
+                          reason="DSCALP_TIMEOUT", leg="DSCALP_TIMEOUT",
+                          ctx=ctx, use_maker=False)
             self._diag_dscalp_timeout_exits += 1
             self._diag_dscalp_exits += 1
             self._diag_dscalp_hold_times.append(hold_sec)
@@ -3337,13 +3338,14 @@ class Bot:
                           "pnl_cents": round(pnl_cents, 2), "hold_sec": round(hold_sec, 1)})
             return
 
-        # ── TP1: +4c, sell 25% (maker-grace then taker) ──
+        # ── TP1: +4c, sell 25% (taker at bid for immediate fill) ──
         if pnl_cents >= DSCALP_TP1_CENTS and not dpos["tp1_done"]:
             sell_qty = min(pos.qty * DSCALP_TP1_FRAC, pos.qty)
             if sell_qty >= MIN_QTY:
                 sell_price = book.bid
-                self._do_sell_maker_then_taker(m, st, outcome, sell_qty,
-                                                reason="DSCALP_TP1", ctx=ctx)
+                self._do_sell(m, st, outcome, sell_qty, sell_price,
+                              reason="DSCALP_TP1", leg="TP1",
+                              ctx=ctx, use_maker=False)
                 self._diag_dscalp_tp1 += 1
                 self._diag_dscalp_exits += 1
                 self._diag_directional_fills_min += 1
@@ -3357,13 +3359,14 @@ class Bot:
                               "hold_sec": round(hold_sec, 1)})
             dpos["tp1_done"] = True
 
-        # ── TP2: +7c, sell 25% (maker-grace then taker) ──
+        # ── TP2: +7c, sell 25% (taker at bid for immediate fill) ──
         if pnl_cents >= DSCALP_TP2_CENTS and not dpos["tp2_done"]:
             sell_qty = min(pos.qty * DSCALP_TP2_FRAC, pos.qty)
             if sell_qty >= MIN_QTY:
                 sell_price = book.bid
-                self._do_sell_maker_then_taker(m, st, outcome, sell_qty,
-                                                reason="DSCALP_TP2", ctx=ctx)
+                self._do_sell(m, st, outcome, sell_qty, sell_price,
+                              reason="DSCALP_TP2", leg="TP2",
+                              ctx=ctx, use_maker=False)
                 self._diag_dscalp_tp2 += 1
                 self._diag_dscalp_exits += 1
                 self._diag_directional_fills_min += 1
@@ -3377,13 +3380,14 @@ class Bot:
                               "hold_sec": round(hold_sec, 1)})
             dpos["tp2_done"] = True
 
-        # ── TP3: +10c, sell 25% (maker-grace then taker) ──
+        # ── TP3: +10c, sell 25% (taker at bid for immediate fill) ──
         if pnl_cents >= DSCALP_TP3_CENTS and not dpos.get("tp3_done"):
             sell_qty = min(pos.qty * DSCALP_TP3_FRAC, pos.qty)
             if sell_qty >= MIN_QTY:
                 sell_price = book.bid
-                self._do_sell_maker_then_taker(m, st, outcome, sell_qty,
-                                                reason="DSCALP_TP3", ctx=ctx)
+                self._do_sell(m, st, outcome, sell_qty, sell_price,
+                              reason="DSCALP_TP3", leg="TP3",
+                              ctx=ctx, use_maker=False)
                 self._diag_dscalp_tp3 += 1
                 self._diag_dscalp_exits += 1
                 self._diag_directional_fills_min += 1
@@ -3397,13 +3401,14 @@ class Bot:
                               "hold_sec": round(hold_sec, 1)})
             dpos["tp3_done"] = True
 
-        # ── TP4 "runner": +12c, sell remaining 15% (maker-grace then taker) ──
+        # ── TP4 "runner": +12c, sell remaining 15% (taker at bid for immediate fill) ──
         if pnl_cents >= DSCALP_TP4_CENTS and not dpos.get("tp4_done"):
             sell_qty = min(pos.qty * DSCALP_TP4_FRAC, pos.qty)
             if sell_qty >= MIN_QTY:
                 sell_price = book.bid
-                self._do_sell_maker_then_taker(m, st, outcome, sell_qty,
-                                                reason="DSCALP_TP4", ctx=ctx)
+                self._do_sell(m, st, outcome, sell_qty, sell_price,
+                              reason="DSCALP_TP4", leg="TP4",
+                              ctx=ctx, use_maker=False)
                 self._diag_dscalp_tp4 += 1
                 self._diag_dscalp_exits += 1
                 self._diag_directional_fills_min += 1
@@ -3430,11 +3435,11 @@ class Bot:
             if runner_timeout or vel_against:
                 fallback_reason = "runner_timeout" if runner_timeout else "runner_vel_reversal"
                 sell_qty = pos.qty  # sell entire remaining runner portion
-                # Fall back to TP3 target price (10c above entry) via maker→taker
-                tp3_target_price = entry_price + DSCALP_TP3_CENTS / 100.0
-                sell_price = max(min(book.bid, tp3_target_price), 0.01)
-                self._do_sell_maker_then_taker(m, st, outcome, sell_qty,
-                                                reason="DSCALP_RUNNER_FALLBACK", ctx=ctx)
+                # Fall back to bid (taker) for immediate fill
+                sell_price = max(book.bid, 0.01)
+                self._do_sell(m, st, outcome, sell_qty, sell_price,
+                              reason="DSCALP_RUNNER_FALLBACK", leg="RUNNER_FALLBACK",
+                              ctx=ctx, use_maker=False)
                 self._diag_dscalp_runner_fallbacks += 1
                 self._diag_dscalp_exits += 1
                 self._diag_directional_fills_min += 1
@@ -5772,7 +5777,7 @@ class Bot:
                     unwind_price = max(filled_book.bid, filled_book.ask - 0.001)
                     self._do_sell(m, st, filled_outcome, pos.qty, unwind_price,
                                   reason="QUOTE_UNPAIRED_UNWIND", leg="PARITY_QUOTE",
-                                  ctx=ctx, use_maker=True)
+                                  ctx=ctx, use_maker=False)
                     self._diag_unpaired_unwind_usd += unwind_price * pos.qty
                     self._diag_hedge_unwind += 1
                     self._diag_unpaired_count_min += 1
@@ -6222,78 +6227,58 @@ class Bot:
     # =================================================================
     def _directional_lean_exits(self, m: MarketRef, st: MarketState,
                                  t_min: float, delta_bps: float, ctx: dict):
-        """Directional lean: prioritize exits on the "wrong" side of spot vs hour_open.
-        If spot > hour_open (up trend): unload Down inventory first.
-        If spot < hour_open (down trend): unload Up inventory first.
-        Only applies to imbalanced positions."""
+        """Directional lean: sell excess on the "wrong" side at bid (taker).
+        Cooldown: 5 seconds per slug to avoid spam."""
         if not LEAN_EXIT_PRIORITY:
             return
-        # Cooldown: at most once per second per slug to avoid spam
         now = time.time()
-        if now - self._lean_exit_last_ts.get(m.slug, 0.0) < 1.0:
+        if now - self._lean_exit_last_ts.get(m.slug, 0.0) < 5.0:
             return
         spot, hour_open = ctx["spot"], ctx["hour_open"]
         lean_up = spot >= hour_open
 
         pos_up = st.positions["Up"]
         pos_dn = st.positions["Down"]
-        imbalance = pos_up.qty - pos_dn.qty  # positive = more Up than Down
 
-        # Determine which side to preferentially exit
         if lean_up:
-            # Up trend: prefer holding Up, unload excess Down
-            wrong_side = "Down"
-            wrong_pos = pos_dn
-            right_pos = pos_up
+            wrong_side, wrong_pos, right_pos = "Down", pos_dn, pos_up
         else:
-            # Down trend: prefer holding Down, unload excess Up
-            wrong_side = "Up"
-            wrong_pos = pos_up
-            right_pos = pos_dn
+            wrong_side, wrong_pos, right_pos = "Up", pos_up, pos_dn
 
-        # Only act if we have "wrong side" inventory exceeding the right side
         if wrong_pos.qty < MIN_QTY:
             return
-
         book = self.last_book.get(m.slug, {}).get(wrong_side)
         if not book or book.bid <= 0:
             return
-
-        # Sell excess on wrong side to bring closer to balance
         excess = wrong_pos.qty - right_pos.qty
         if excess <= 0:
-            return  # already balanced or right-side heavy
+            return
 
-        # Sell up to LEAN_MAX_IMBALANCE_SHARES reduction, but at most 25% of wrong-side
         sell_qty = min(excess, wrong_pos.qty * 0.25, float(LEAN_MAX_IMBALANCE_SHARES))
         if sell_qty < MIN_QTY:
             return
-        # Enforce CLOB minimum — if we can't sell enough, bump to min or skip
         if MODE in ("LIVE", "LIVE_SAFE") and sell_qty < CLOB_MIN_ORDER_SIZE:
             if excess >= CLOB_MIN_ORDER_SIZE and wrong_pos.qty >= CLOB_MIN_ORDER_SIZE:
                 sell_qty = float(CLOB_MIN_ORDER_SIZE)
             else:
-                return  # not enough to meet CLOB minimum
+                return
 
-        # Only sell if we're profitable on this side (don't force a loss)
         if book.bid < wrong_pos.vwap:
             return
 
-        # Use maker when spread > 1c
-        use_taker = (book.spread * 100) <= PARITY_TAKER_ALLOWED_SPREAD_CENTS
-        sell_price = book.bid if use_taker else max(book.bid, book.ask - 0.001)
-
+        # Always set cooldown BEFORE attempting sell
         self._lean_exit_last_ts[m.slug] = now
 
+        # Always sell at bid (taker) for immediate fill — never use maker
         write_jsonl({"event_type": "LEAN_EXIT", "slug": m.slug, "crypto": m.crypto,
                       "wrong_side": wrong_side, "sell_qty": round(sell_qty, 1),
-                      "imbalance": round(pos_up.qty - pos_dn.qty, 1),
+                      "imbalance": round(excess, 1),
                       "lean": "Up" if lean_up else "Down",
                       "t_min": round(t_min, 3)})
 
-        self._do_sell(m, st, wrong_side, sell_qty, sell_price,
+        self._do_sell(m, st, wrong_side, sell_qty, book.bid,
                       reason="LEAN_EXIT", leg="LEAN_EXIT",
-                      ctx=ctx, use_maker=not use_taker)
+                      ctx=ctx, use_maker=False)
 
     def _late_scalps(self, ctx: dict):
         if not self._buys_allowed():
@@ -6453,8 +6438,9 @@ class Bot:
                                           "mark_pnl_cents": round(mark_pnl_cents, 2),
                                           "qty": round(pos.qty, 1),
                                           "ts_ms": int(time.time() * 1000)})
-                            self._do_sell_maker_then_taker(m, st, outcome, pos.qty,
-                                                            reason="TIME_STOP_EXIT", ctx=ctx)
+                            self._do_sell(m, st, outcome, pos.qty, max(book.bid, 0.01),
+                                      reason="TIME_STOP_EXIT", leg="TIME_STOP",
+                                      ctx=ctx, use_maker=False)
                             continue
                         else:
                             # Negative PnL — DO NOT time-stop into a loss
@@ -6490,7 +6476,7 @@ class Bot:
                                         soft_price = max(book.bid, 0.01)
                                         self._do_sell(m, st, outcome, soft_qty, soft_price,
                                                       reason="TIME_STOP_SOFT_EXIT", leg="TIME_STOP",
-                                                      ctx=ctx, use_maker=True)
+                                                      ctx=ctx, use_maker=False)
                                         self._diag_time_stop_soft_exits += 1
                                         write_jsonl({"event_type": "TIME_STOP_SOFT_EXIT",
                                                       "slug": m.slug, "crypto": m.crypto,
@@ -6802,9 +6788,9 @@ class Bot:
                             elif not DERISK_MAKER_EMERGENCY_ONLY or derisk_is_emergency:
                                 self._diag_rescue_fallback_sells += 1
                                 maker_price = min(book.ask, book.bid + 0.001) if book.bid > 0 else book.bid
-                                self._do_sell(m, st, outcome, sell_qty, maker_price,
+                                self._do_sell(m, st, outcome, sell_qty, book.bid,
                                               reason="DERISK_MAKER", leg="DERISK", ctx=ctx,
-                                              use_maker=True)
+                                              use_maker=False)
                             else:
                                 # DERISK_MAKER blocked by emergency-only gate — defer to hedge
                                 self._diag_derisk_maker_defers += 1
@@ -6897,10 +6883,9 @@ class Bot:
                       "ts_ms": ts_ms})
 
         if MODE == "LOG":
-            # In paper mode: simulate maker grace → always fall back to taker
-            # (paper mode can't wait, so use maker price as fill)
+            # In paper mode: sell at bid (taker) for immediate fill
             self._do_sell(m, st, outcome, qty, maker_price,
-                          reason=reason, leg=reason, ctx=ctx, use_maker=True)
+                          reason=reason, leg=reason, ctx=ctx, use_maker=False)
             return
 
         # LIVE mode: place maker, wait grace period, then taker fallback
