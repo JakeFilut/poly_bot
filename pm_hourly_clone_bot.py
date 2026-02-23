@@ -5193,8 +5193,13 @@ class Bot:
                     self._do_sell(m, st, outcome, pos.qty, book.bid,
                                   reason="FLATTEN_TRIM", leg="FLATTEN")
                 else:
-                    # Wide spread — sell half at midpoint to limit slippage
-                    trim_qty = max(MIN_QTY, round(pos.qty * 0.5, 2))
+                    # Wide spread — sell at midpoint to limit slippage
+                    # If position is small (< 1 share or < $1 value), sell it all
+                    # to avoid dust-trimming loops
+                    if pos.qty <= 1.0 or pos.cost_usdc < 1.0:
+                        trim_qty = pos.qty
+                    else:
+                        trim_qty = max(MIN_QTY, round(pos.qty * 0.5, 2))
                     # Use midpoint between bid and ask for better execution
                     mid_price = round((book.bid + book.ask) / 2.0, 3)
                     sell_price = max(0.01, min(mid_price, book.ask - 0.01))
