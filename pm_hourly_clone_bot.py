@@ -83,6 +83,7 @@ from src.execution.live_safety import LiveSafety
 from src.execution.fills_ledger import FillsLedger
 from src.execution.exposure_tracker import ExposureTracker
 from src.execution.scalp_engine import ScalpEngine
+from src.execution.diag_reporter import DiagReporter
 from src.positions.truth_capture import TruthCapture, WindowState
 from src.feeds.polymarket import PolymarketClient, set_jsonl_writer
 
@@ -116,6 +117,8 @@ _ALWAYS_LOG_EVENTS = frozenset({
     "SCALP_SIGNAL", "SCALP_ENTRY", "SCALP_EXIT_TP", "SCALP_EXIT_STOP",
     "SCALP_EXIT_TIME", "SCALP_FLATTEN", "SCALP_CONSEC_STOP_PAUSE",
     "ENGINE_FILL", "RUN_ONE_HOUR_END",
+    # DIAG_MODE events
+    "DIAG_SNAPSHOT", "GATE_TRACE", "ORDER_TRACE", "BUG_EXPOSURE_OVER_CAP",
     # Parity trades
     "PARITY_BUY_STRADDLE", "PARITY_SELL_STRADDLE", "PARITY_PAIR_COMPLETED",
     "PARITY_PAIR_COMPLETED_LATE", "PAIR_COMPLETED", "PARITY_QUOTE_STRADDLE",
@@ -531,6 +534,8 @@ class Bot:
         # ── RUN_ONE_HOUR: track the starting hour for auto-exit ──
         self._run_one_hour_start = utc_now().replace(minute=0, second=0, microsecond=0) if RUN_ONE_HOUR else None
         self._run_one_hour_done: bool = False
+        # ── DIAG_MODE: structured runtime diagnostics ──
+        self._diag_reporter: Optional[DiagReporter] = None  # initialized after logger
         # ── Pre-8hr safety: diagnostic counters (reset per DIAG cycle) ──
         self._diag_cap_blocks = 0                              # inventory cap blocks this minute
         self._diag_post_fill_cooldown_blocks = 0               # post-fill cooldown blocks this minute
@@ -574,6 +579,11 @@ class Bot:
             profile=PROFILE,
         )
         _LOGGER = self.logger  # expose globally for write_jsonl shim
+        # Initialize DIAG reporter now that logger is ready
+        if DIAG_MODE:
+            self._diag_reporter = DiagReporter(self, write_jsonl)
+            print(f"  [DIAG] DIAG_MODE enabled — snapshot every {DIAG_INTERVAL_SEC}s"
+                  f" → {DIAG_FILE}")
         self._load_state()
         signal.signal(signal.SIGINT, self._handle_stop)
         signal.signal(signal.SIGTERM, self._handle_stop)
@@ -1720,6 +1730,10 @@ class Bot:
                 if now - self._last_balance_print >= 30.0:
                     self._print_balance_summary()
                     self._last_balance_print = now
+
+                # 7-diag. DIAG_MODE structured snapshot (rate-limited internally)
+                if self._diag_reporter is not None:
+                    self._diag_reporter.tick()
 
                 # 7b. CLOB balance reconciliation (every 60s in LIVE modes)
                 if MODE in ("LIVE", "LIVE_SAFE") and now - self._last_balance_sync_ts >= 60.0:
@@ -3243,6 +3257,8 @@ class Bot:
         # ── CLOSE_IMMINENT: after cancel-all, block ALL new orders (not exits) ──
         if MODE in ("LIVE", "LIVE_SAFE") and self._live_safety.is_close_imminent(
                 st.hour_start_utc):
+            DiagReporter.gate_trace(m.slug, "", "global", "CLOSE_IMMINENT",
+                                    t_min=t_min, exposure_total=self._total_exposure_usd(), write_fn=write_jsonl)
             return  # exits already ran above; no new entries/quotes
 
         # ── HARD FLATTEN: force-close all positions at HARD_FLATTEN_MIN ──
@@ -3269,17 +3285,25 @@ class Bot:
         # stop adding risk after TRADE_STOP_ADD_MIN or within NO_NEW_ENTRIES_SEC_TO_CLOSE
         seconds_to_close = ctx.get("seconds_to_close", 999.0)
         if t_min > TRADE_STOP_ADD_MIN or seconds_to_close < NO_NEW_ENTRIES_SEC_TO_CLOSE:
+            DiagReporter.gate_trace(m.slug, "", "time", "TRADE_STOP_ADD_MIN",
+                                    t_min=t_min, exposure_total=self._total_exposure_usd(), write_fn=write_jsonl)
             return
         # risk gate
         if not self._risk_ok(st):
+            DiagReporter.gate_trace(m.slug, "", "risk", "RISK_GATE",
+                                    t_min=t_min, exposure_total=self._total_exposure_usd(), write_fn=write_jsonl)
             return
 
         # ── Global trades/min throttle ──
         if self._throttle_exceeded():
+            DiagReporter.gate_trace(m.slug, "", "rate", "THROTTLE_EXCEEDED",
+                                    t_min=t_min, exposure_total=self._total_exposure_usd(), write_fn=write_jsonl)
             return
 
         # ── LIVE/TEST symbol filter: block new entries for non-allowed symbols ──
         if MODE in ("LIVE", "LIVE_SAFE", "TEST") and m.crypto not in LIVE_ALLOWED_SYMBOLS:
+            DiagReporter.gate_trace(m.slug, "", "global", "SYMBOL_NOT_ALLOWED",
+                                    t_min=t_min, write_fn=write_jsonl)
             return
 
         # ── LIVE SAFETY RULES (Rules 4,5,6,7,8 — composite pre-entry gate) ──
@@ -3304,6 +3328,10 @@ class Bot:
                               "slug": m.slug, "reason": ls_reason,
                               "t_min": round(t_min, 3),
                               "ts_ms": int(time.time() * 1000)})
+                DiagReporter.gate_trace(m.slug, "", "exec", ls_reason,
+                                        t_min=t_min, spread=ref_book_e.spread * 100,
+                                        delta_bps=ctx.get("delta_bps", 0),
+                                        exposure_total=self._total_exposure_usd(), write_fn=write_jsonl)
                 return
 
         # ── PRIMARY: Directional scalp entries (priority #1) ──
@@ -3645,11 +3673,15 @@ class Bot:
         # Inventory cap check
         if not self._inventory_cap_ok(m.slug, outcome):
             self._diag_entry_reject_by_gate["inventory_cap"] = self._diag_entry_reject_by_gate.get("inventory_cap", 0) + 1
+            DiagReporter.gate_trace(m.slug, outcome, "inventory", "INVENTORY_CAP",
+                                    t_min=t_min, delta_bps=delta_bps, exposure_total=self._total_exposure_usd(), write_fn=write_jsonl)
             return
 
         # Post-fill cooldown
         if not self._post_fill_cooldown_ok(m.slug):
             self._diag_entry_reject_by_gate["post_fill_cooldown"] = self._diag_entry_reject_by_gate.get("post_fill_cooldown", 0) + 1
+            DiagReporter.gate_trace(m.slug, outcome, "throttle", "POST_FILL_COOLDOWN",
+                                    t_min=t_min, delta_bps=delta_bps, exposure_total=self._total_exposure_usd(), write_fn=write_jsonl)
             return
 
         # Determine coin group for per-coin thresholds
@@ -3663,11 +3695,16 @@ class Bot:
         last_fill = self._last_fill_ts.get(m.slug, 0.0)
         if (now_t - last_fill) * 1000 < _coin_cooldown_ms:
             self._diag_entry_reject_by_gate["entry_stacking"] = self._diag_entry_reject_by_gate.get("entry_stacking", 0) + 1
+            DiagReporter.gate_trace(m.slug, outcome, "throttle", "ENTRY_STACKING",
+                                    t_min=t_min, delta_bps=delta_bps, exposure_total=self._total_exposure_usd(), write_fn=write_jsonl)
             return
 
         # Cache freshness (per-coin: SOL/XRP need fresher data)
         cache_age = self._cache_age_ms(m.slug)
         if cache_age > _coin_cache_max_ms:
+            self._diag_entry_reject_by_gate["cache_freshness"] = self._diag_entry_reject_by_gate.get("cache_freshness", 0) + 1
+            DiagReporter.gate_trace(m.slug, outcome, "data", "CACHE_STALE",
+                                    t_min=t_min, delta_bps=delta_bps, exposure_total=self._total_exposure_usd(), write_fn=write_jsonl)
             return
 
         # Coin-specific spread gate (BTC/ETH: <=2c, SOL/XRP: <=4c)
@@ -3679,22 +3716,34 @@ class Bot:
                 write_jsonl({"event_type": "GATE_SPREAD_BLOCK", "ts_ms": int(now_t * 1000),
                               "slug": m.slug, "crypto": m.crypto, "spread_cents": round(spread_cents, 2),
                               "limit_cents": MAX_SPREAD_ENTRY_CENTS_BTCETH if m.crypto in ("BTC", "ETH") else MAX_SPREAD_ENTRY_CENTS_SOLXRP})
+            DiagReporter.gate_trace(m.slug, outcome, "spread", "SPREAD_FILTER",
+                                    t_min=t_min, spread=spread_cents, delta_bps=delta_bps,
+                                    exposure_total=self._total_exposure_usd(), write_fn=write_jsonl)
             return
 
         # Spread gate (existing)
         if book.spread * 100 > DSCALP_MAX_SPREAD_CENTS:
             self._diag_entry_reject_by_gate["spread_general"] = self._diag_entry_reject_by_gate.get("spread_general", 0) + 1
+            DiagReporter.gate_trace(m.slug, outcome, "spread", "SPREAD_GENERAL",
+                                    t_min=t_min, spread=book.spread*100, delta_bps=delta_bps,
+                                    exposure_total=self._total_exposure_usd(), write_fn=write_jsonl)
             return
 
         # Noisy-spread chop guard: block if spread wide AND velocity low (choppy conditions)
         if spread_cents > NOISY_SPREAD_BLOCK_CENTS and abs(vel) < NOISY_SPREAD_BLOCK_VEL:
             self._diag_entry_reject_by_gate["noisy_spread"] = self._diag_entry_reject_by_gate.get("noisy_spread", 0) + 1
+            DiagReporter.gate_trace(m.slug, outcome, "spread", "NOISY_SPREAD",
+                                    t_min=t_min, spread=spread_cents, delta_bps=delta_bps,
+                                    exposure_total=self._total_exposure_usd(), write_fn=write_jsonl)
             return
 
         # Entry edge gate: per-coin (BTC/ETH: 3c, SOL/XRP: 4c above 50c neutral)
         entry_edge_cents = (book.mid - 0.50) * 100
         if entry_edge_cents < _coin_edge_cents:
             self._diag_entry_reject_by_gate["entry_edge"] = self._diag_entry_reject_by_gate.get("entry_edge", 0) + 1
+            DiagReporter.gate_trace(m.slug, outcome, "signal", "ENTRY_EDGE_LOW",
+                                    t_min=t_min, spread=spread_cents, delta_bps=delta_bps,
+                                    exposure_total=self._total_exposure_usd(), write_fn=write_jsonl)
             return
 
         # ── ENTRY SIGNAL: delta >= 15bps OR spot moved >= 8bps in 10s ──
@@ -3702,6 +3751,9 @@ class Bot:
         spot_move_ok = self._spot_move_10s_bps(m.slug) >= DSCALP_SPOT_MOVE_10S_BPS
         if not delta_ok and not spot_move_ok:
             self._diag_entry_reject_by_gate["signal"] = self._diag_entry_reject_by_gate.get("signal", 0) + 1
+            DiagReporter.gate_trace(m.slug, outcome, "signal", "SIGNAL_TOO_WEAK",
+                                    t_min=t_min, spread=spread_cents, delta_bps=delta_bps,
+                                    exposure_total=self._total_exposure_usd(), write_fn=write_jsonl)
             return
 
         # Velocity must be supportive (per-coin: BTC/ETH 2.5, SOL/XRP 3.5 bps/min)
@@ -3719,6 +3771,9 @@ class Bot:
                          "dt_sec": round(vd["dt_sec"], 1),
                          "n_hist": vd["n_points"],
                          "vel_status": vd["status"]})
+            DiagReporter.gate_trace(m.slug, outcome, "signal", "VELOCITY_BLOCK",
+                                    t_min=t_min, spread=spread_cents, delta_bps=delta_bps,
+                                    exposure_total=self._total_exposure_usd(), write_fn=write_jsonl)
             return
 
         # Late-move filter (SOL/XRP only): block if spot moved too fast on stale data
@@ -3726,6 +3781,9 @@ class Bot:
             spot_move_2s = self._spot_move_2s_bps(m.slug)
             if spot_move_2s > SOLXRP_LATE_MOVE_BPS:
                 self._diag_entry_reject_by_gate["late_move"] = self._diag_entry_reject_by_gate.get("late_move", 0) + 1
+                DiagReporter.gate_trace(m.slug, outcome, "data", "LATE_MOVE",
+                                        t_min=t_min, spread=spread_cents, delta_bps=delta_bps,
+                                        exposure_total=self._total_exposure_usd(), write_fn=write_jsonl)
                 return
 
         # Size: $5-10 per entry, no micro-splits
@@ -3745,6 +3803,9 @@ class Bot:
 
         # Execution safety gate (kill-switch, drift, loss-tail, LIVE_SAFE entry window)
         if not self._exec_safety_can_enter(m.slug):
+            DiagReporter.gate_trace(m.slug, outcome, "exec", "EXEC_SAFETY_BLOCK",
+                                    t_min=t_min, spread=spread_cents, delta_bps=delta_bps,
+                                    exposure_total=self._total_exposure_usd(), write_fn=write_jsonl)
             return
         # LIVE_SAFE trade-size limiter
         step_usd, order_qty = self._live_safe_cap_usd(step_usd, buy_price)
@@ -3782,6 +3843,11 @@ class Bot:
                       "spread_cents": round(book.spread * 100, 2)})
 
         # Execute buy
+        _pre_exp_dir = self._total_exposure_usd()
+        _pre_qty_dir = st.positions[outcome].qty if outcome in st.positions else 0.0
+        DiagReporter.order_trace("DIR_BUY_SUBMIT", m.slug, outcome, "BUY",
+                                 "", buy_price, order_qty, pre_exposure=_pre_exp_dir,
+                                 pre_qty=_pre_qty_dir, engine="DIR", write_fn=write_jsonl)
         self._ledger_order_intent(m, st, outcome, "BUY", order_qty, buy_price, "DSCALP_ENTRY")
         if MODE == "LOG":
             actual_cost = order_qty * buy_price
@@ -4960,8 +5026,12 @@ class Bot:
             # Tag order for engine attribution
             self._exposure_tracker.tag_order(f"scalp_{slug}_{int(time.time()*1000)}", "SCALP")
 
+            _pre_exp = self._total_exposure_usd()
             if MODE in ("LIVE", "LIVE_SAFE"):
                 # IOC buy
+                DiagReporter.order_trace("SCALP_BUY_SUBMIT", slug, outcome, "BUY",
+                                         "", price, qty, pre_exposure=_pre_exp,
+                                         engine="SCALP", write_fn=write_jsonl)
                 result = self.client.place_immediate_order(
                     token_id, "BUY", price, qty, use_fok=False)
                 self._record_global_order()
@@ -4994,7 +5064,11 @@ class Bot:
             if price <= 0:
                 return
 
+            _pre_exp_sell = self._total_exposure_usd()
             if MODE in ("LIVE", "LIVE_SAFE"):
+                DiagReporter.order_trace("SCALP_SELL_SUBMIT", slug, outcome, "SELL",
+                                         "", price, qty, pre_exposure=_pre_exp_sell,
+                                         engine="SCALP", write_fn=write_jsonl)
                 result = self.client.place_immediate_order(
                     token_id, "SELL", price, qty, use_fok=False)
                 self._record_global_order()
@@ -5073,6 +5147,10 @@ class Bot:
         Tries client.cancel_all_orders() batch method first, falls back to
         fetching open orders then cancelling each individually.
         Returns count of successfully cancelled orders."""
+        _pre_exp_cancel = self._total_exposure_usd()
+        DiagReporter.order_trace("CANCEL_ALL_START", "", "", "CANCEL",
+                                 "", 0, 0, pre_exposure=_pre_exp_cancel,
+                                 engine="ALL", write_fn=write_jsonl)
         # Try the client's batch cancel first (handles both batch API and fallback)
         try:
             result = self.client.cancel_all_orders()
@@ -5080,6 +5158,11 @@ class Bot:
                 # Release all reservations since all orders are cancelled
                 for oid in list(self._reserved_usd.keys()):
                     self._release_reservation(oid)
+                _post_exp_cancel = self._total_exposure_usd()
+                DiagReporter.order_trace("CANCEL_ALL_DONE", "", "", "CANCEL",
+                                         "", 0, 0, pre_exposure=_pre_exp_cancel,
+                                         post_exposure=_post_exp_cancel,
+                                         engine="ALL", write_fn=write_jsonl)
                 print(f"  [CANCEL_ALL] Batch cancel succeeded (result={result})")
                 return abs(result) if result > 0 else 0
         except Exception as e:
@@ -5300,6 +5383,10 @@ class Bot:
         token_id = m.outcome_up_id if outcome == "Up" else m.outcome_down_id
         pnl = 0.0
 
+        # Capture pre-fill state for ORDER TRACE
+        _pre_exposure = self._total_exposure_usd()
+        _pre_qty = st.positions[outcome].qty if outcome in st.positions else 0.0
+
         # Release any budget reservation for this order
         released = self._release_reservation(order_id)
 
@@ -5335,6 +5422,21 @@ class Bot:
 
         self._record_fill_ts(slug)
 
+        # Capture post-fill state
+        _post_exposure = self._total_exposure_usd()
+        _post_qty = st.positions[outcome].qty if outcome in st.positions else 0.0
+        _engine_tag = self._exposure_tracker.get_order_engine(order_id) if (_IS_HYBRID and order_id) else "DIR"
+        _dedup_key = f"{order_id}_{side}_{round(fill_qty, 2)}" if order_id else ""
+
+        # ORDER TRACE
+        DiagReporter.order_trace(
+            event_type="FILL", slug=slug, outcome=outcome, side=side,
+            order_id=order_id, price=fill_price, qty=fill_qty,
+            pre_exposure=_pre_exposure, post_exposure=_post_exposure,
+            pre_qty=_pre_qty, post_qty=_post_qty,
+            engine=_engine_tag, dedupe_key=_dedup_key,
+            write_fn=write_jsonl)
+
         write_jsonl({
             "event_type": "FILL_APPLIED",
             "source": source,
@@ -5344,7 +5446,7 @@ class Bot:
             "released_reservation": round(released, 2),
             "pnl": round(pnl, 4) if side == "SELL" else None,
             "reason": reason,
-            "engine": self._exposure_tracker.get_order_engine(order_id) if (_IS_HYBRID and order_id) else None,
+            "engine": _engine_tag,
             "ts_ms": int(time.time() * 1000),
         })
 

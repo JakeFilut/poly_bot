@@ -44,6 +44,13 @@ LOG_SNAPSHOT_EVERY_N_SEC = float(os.getenv("LOG_SNAPSHOT_EVERY_N_SEC", "60"))   
 LOG_SPREAD_BLOCK_SAMPLER = float(os.getenv("LOG_SPREAD_BLOCK_SAMPLER", "0.02")) # 2% sampling for GATE_SPREAD_BLOCK
 CONSOLE_LEVEL = os.getenv("CONSOLE_LEVEL", "QUIET").upper()                     # NORMAL | QUIET
 
+# ---------------------------------------------------------------------------
+# DIAG_MODE — structured runtime snapshot for external consumption (ChatGPT etc)
+# ---------------------------------------------------------------------------
+DIAG_MODE = bool(os.getenv("DIAG_MODE", "False") not in ("", "0", "False", "false"))
+DIAG_INTERVAL_SEC = float(os.getenv("DIAG_INTERVAL_SEC", "10"))
+DIAG_FILE = os.getenv("DIAG_FILE", os.path.join(_LOG_DIR, "diag_state.jsonl"))
+
 # Markets / coins
 CRYPTOS = ["BTC", "ETH", "SOL", "XRP"]
 ENABLE_XRP = bool(os.getenv("ENABLE_XRP", "False") not in ("", "0", "False", "false"))   # default OFF
