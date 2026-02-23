@@ -866,16 +866,18 @@ class TruthCapture:
                 if w.cumulative_filled >= w.requested_qty - 0.5:
                     w.terminal = True
 
-    def poll_watchers(self) -> int:
+    def poll_watchers(self) -> List[dict]:
         """Poll all active order watchers. Call from main loop tick.
 
-        Returns number of new fills discovered.
+        Returns list of recovered fill dicts for the bot to apply through
+        _apply_fill().  Each dict has keys: order_id, token_id, slug,
+        outcome, side, fill_qty, fill_price, source.
         """
         if self._get_order_status is None:
-            return 0
+            return []
 
         now = time.time()
-        new_fills = 0
+        recovered_fills: List[dict] = []
         to_remove: List[str] = []
 
         with self._lock:
@@ -917,7 +919,7 @@ class TruthCapture:
                     if delta > 0.5:  # at least 0.5 share new fill
                         w.cumulative_filled = size_matched
                         fill_price = float(resp.get("price") or w.price)
-                        # Record via the primary path
+                        # Record in TRUTH
                         trade_id = resp.get("id") or resp.get("trade_id") or ""
                         pos = self.record_fill(
                             token_id=w.token_id,
@@ -931,7 +933,16 @@ class TruthCapture:
                             source="poll",
                         )
                         if pos is not None:
-                            new_fills += 1
+                            recovered_fills.append({
+                                "order_id": oid,
+                                "token_id": w.token_id,
+                                "slug": w.slug,
+                                "outcome": w.outcome,
+                                "side": w.side,
+                                "fill_qty": delta,
+                                "fill_price": fill_price,
+                                "source": "poll",
+                            })
                     w.terminal = True
                     to_remove.append(oid)
 
@@ -954,7 +965,16 @@ class TruthCapture:
                                 source="poll",
                             )
                             if pos is not None:
-                                new_fills += 1
+                                recovered_fills.append({
+                                    "order_id": oid,
+                                    "token_id": w.token_id,
+                                    "slug": w.slug,
+                                    "outcome": w.outcome,
+                                    "side": w.side,
+                                    "fill_qty": delta,
+                                    "fill_price": fill_price,
+                                    "source": "poll_partial",
+                                })
                     w.terminal = True
                     to_remove.append(oid)
 
@@ -969,7 +989,7 @@ class TruthCapture:
             for oid in to_remove:
                 self._watchers.pop(oid, None)
 
-        return new_fills
+        return recovered_fills
 
     # ══════════════════════════════════════════════════════════════════
     #  WALLET TRUTH SCAN (periodic catch-all)
@@ -1509,7 +1529,7 @@ class TruthCapture:
     # ══════════════════════════════════════════════════════════════════
 
     def tick(self, active_token_ids: Optional[Set[str]] = None,
-             position_log_interval: float = 600.0) -> None:
+             position_log_interval: float = 600.0) -> List[dict]:
         """Run all periodic tasks: poll watchers, wallet scan, reconcile,
         and periodic position print + structured logging.
 
@@ -1517,15 +1537,21 @@ class TruthCapture:
         ----------
         position_log_interval : float
             Seconds between position prints (default 600 = 10 min).
+
+        Returns
+        -------
+        List[dict]
+            Recovered fills from poll_watchers() that the bot must apply
+            through _apply_fill() to update positions/ledger/cash.
         """
         now_ts = time.time()
 
         # State machine guard: skip most work if CLOSED
         if self._window_state == WindowState.CLOSED:
-            return
+            return []
 
         # 1. Poll order watchers (fast — every tick)
-        new_fills = self.poll_watchers()
+        recovered_fills = self.poll_watchers()
 
         # 2. Wallet truth scan — DISABLED: positions tracked via verified fills
         #    The external scan iterated 4600+ old API trades every cycle,
@@ -1577,6 +1603,8 @@ class TruthCapture:
                   f"active_pos={len(active)} other={len(other)}  "
                   f"watchers={len(self._watchers)}")
             # Position details printed by bot's print_positions() with crypto names
+
+        return recovered_fills
 
     # ══════════════════════════════════════════════════════════════════
     #  REPORTING

@@ -506,6 +506,8 @@ class Bot:
         # ── Sell-error cooldown: prevent spam on repeated failures ──
         self._sell_error_until: Dict[str, float] = {}          # (slug|outcome) -> monotonic ts cooldown expires
         self._sell_allowance_retried = False                    # True after one re-approval attempt
+        # ── Fill dedup: prevents double-apply when same fill arrives via ws + poll + lifecycle ──
+        self._applied_fills: set = set()  # {(order_id, side, round(qty,2))}
         # ── Pre-8hr safety: diagnostic counters (reset per DIAG cycle) ──
         self._diag_cap_blocks = 0                              # inventory cap blocks this minute
         self._diag_post_fill_cooldown_blocks = 0               # post-fill cooldown blocks this minute
@@ -1556,8 +1558,13 @@ class Bot:
 
                     # Truth Capture: poll order watchers, wallet scan, reconcile
                     _truth_active_tids = set(self._get_token_to_slug_outcome().keys())
-                    self._truth.tick(active_token_ids=_truth_active_tids,
-                                     position_log_interval=POSITION_LOG_INTERVAL_SEC)
+                    _recovered = self._truth.tick(
+                        active_token_ids=_truth_active_tids,
+                        position_log_interval=POSITION_LOG_INTERVAL_SEC)
+
+                    # Process any recovered fills through unified pipeline
+                    if _recovered:
+                        self._process_truth_recovered_fills(_recovered)
 
                     # Active window filter: tell truth + ledger which tokens are current hour
                     self._truth.set_active_window(
@@ -4231,6 +4238,46 @@ class Bot:
                     order_id=oid, source="bot",
                 )
 
+    def _process_truth_recovered_fills(self, fills: list) -> None:
+        """Apply fills recovered by TruthCapture poll_watchers through the
+        unified _apply_fill pipeline.  This closes the gap where poll-recovered
+        fills updated TRUTH but not bot positions/ledger/cash/reservations.
+        """
+        for fill in fills:
+            oid = fill["order_id"]
+            slug = fill["slug"]
+            outcome = fill["outcome"]
+            side = fill["side"]
+            qty = fill["fill_qty"]
+            price = fill["fill_price"]
+            source = fill.get("source", "poll")
+
+            write_jsonl({
+                "event_type": "RECOVERED_FILL",
+                "source": source,
+                "slug": slug, "outcome": outcome,
+                "side": side, "order_id": oid,
+                "qty": round(qty, 2), "price": round(price, 4),
+                "ts_ms": int(time.time() * 1000),
+            })
+            print(f"  [TRUTH→BOT] RECOVERED_FILL: {slug} {outcome} {side} "
+                  f"qty={qty:.2f} @ {price:.4f} order={oid[:16]}... src={source}")
+
+            self._apply_fill(slug, outcome, side, qty, price,
+                             order_id=oid, reason="RECOVERED_FILL",
+                             source=source)
+
+            # Clear in-flight guard for recovered BUY fills
+            token_id = fill.get("token_id", "")
+            if token_id and side == "BUY":
+                self._clear_buy_inflight(token_id)
+
+        # Force immediate reconciliation so drift is caught quickly
+        if fills:
+            self._truth._last_reconcile_ts = 0.0
+            print(f"  [TRUTH→BOT] {len(fills)} recovered fill(s) applied — "
+                  f"reconciliation scheduled for next tick")
+
     # ── Fills Ledger helpers: record_order_intent / record_fill at call sites ──
 
     def _print_fill_summary(self, st: MarketState, action: str, outcome: str,
@@ -4779,6 +4826,21 @@ class Bot:
 
         Returns: PnL for SELL fills, 0.0 for BUY fills.
         """
+        # ── Dedup: prevent double-apply from ws + poll + lifecycle ──
+        if order_id:
+            dedup_key = (order_id, side, round(fill_qty, 2))
+            if dedup_key in self._applied_fills:
+                write_jsonl({
+                    "event_type": "FILL_APPLY_DEDUP",
+                    "source": source,
+                    "slug": slug, "outcome": outcome,
+                    "side": side, "order_id": order_id,
+                    "qty": round(fill_qty, 2),
+                    "ts_ms": int(time.time() * 1000),
+                })
+                return 0.0
+            self._applied_fills.add(dedup_key)
+
         st = self.market_states.get(slug)
         if not st:
             return 0.0
