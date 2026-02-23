@@ -259,9 +259,13 @@ class LiveSafety:
     # ──────────────────────────────────────────────────────────────────────
 
     def check_loss_limit(self, equity: float, hour_start_equity: float,
-                         hour_key: str) -> bool:
+                         hour_key: str, hour_pnl: float | None = None) -> bool:
         """Check if hourly loss limit has been hit.
-        Returns True if trading is allowed, False if loss limit exceeded."""
+        Returns True if trading is allowed, False if loss limit exceeded.
+
+        If hour_pnl is provided (realized + unrealized P&L for the hour),
+        use that directly so the check matches the displayed Hour P&L.
+        Otherwise fall back to equity - hour_start_equity."""
         # Reset on new hour
         if hour_key != self._loss_stop_hour_key:
             self._loss_stop_active = False
@@ -271,10 +275,14 @@ class LiveSafety:
             self.diag_loss_stop_blocks += 1
             return False
 
-        if hour_start_equity <= 0:
-            return True
+        # Use hour_pnl if provided; otherwise fall back to equity delta
+        if hour_pnl is not None:
+            loss = -hour_pnl  # hour_pnl is negative when losing
+        else:
+            if hour_start_equity <= 0:
+                return True
+            loss = hour_start_equity - equity
 
-        loss = hour_start_equity - equity
         if loss >= MAX_LOSS_PER_HOUR_USD:
             self._loss_stop_active = True
             self.diag_loss_stop_blocks += 1
@@ -284,6 +292,7 @@ class LiveSafety:
                 "threshold_usd": MAX_LOSS_PER_HOUR_USD,
                 "equity": round(equity, 2),
                 "hour_start_equity": round(hour_start_equity, 2),
+                "hour_pnl": round(hour_pnl, 2) if hour_pnl is not None else None,
                 "hour_key": hour_key,
                 "ts_ms": int(time.time() * 1000),
             })
@@ -392,7 +401,7 @@ class LiveSafety:
                         order_qty: float, book_depth: float,
                         t_min: float, seconds_to_close: float,
                         equity: float, hour_start_equity: float,
-                        hour_key: str) -> tuple:
+                        hour_key: str, hour_pnl: float | None = None) -> tuple:
         """Run all pre-entry safety checks. Returns (allowed: bool, reason: str).
         Exit-only sells are always allowed; only new entries are gated."""
         # Fix 4: CLOSE_IMMINENT — hard block after cancel-all fired
@@ -411,8 +420,8 @@ class LiveSafety:
         if self.is_hedge_breaker_active():
             return False, "HEDGE_FAIL_CIRCUIT_BREAKER"
 
-        # Rule 7: Max loss per window
-        if not self.check_loss_limit(equity, hour_start_equity, hour_key):
+        # Rule 7: Max loss per window (use hour_pnl for consistency with display)
+        if not self.check_loss_limit(equity, hour_start_equity, hour_key, hour_pnl=hour_pnl):
             return False, "MAX_LOSS_STOP"
 
         # Rule 8: Last 90 seconds — block new entries
