@@ -430,6 +430,9 @@ class Bot:
         self._token_breaker_until: Dict[str, float] = {}  # token_id -> cooldown-until timestamp
         # Desync hard stop: if True, all new entries blocked until manual reset
         self._desync_hard_stop: bool = False
+        # Stale hour_start refresh: backoff counter per slug
+        self._stale_hour_refresh_ts: Dict[str, float] = {}  # slug -> last refresh attempt ts
+        self._stale_hour_refresh_count: Dict[str, int] = {}  # slug -> attempt count
         # Flatten state: set True when hard flatten fires, prevents re-entry
         self._hard_flatten_done: bool = False
         # ── Fills Ledger — append-only accounting layer ──
@@ -2853,17 +2856,65 @@ class Bot:
         # Sanity: if t_min > 60, hour_start_utc is stale — clamp to prevent
         # premature SETTLEMENT (e.g. 15 min into hour with stale hour_start).
         if t_min > 65.0:
+            attempt_count = self._stale_hour_refresh_count.get(m.slug, 0)
+            last_refresh = self._stale_hour_refresh_ts.get(m.slug, 0.0)
+            # Exponential backoff: 0s, 30s, 60s, 120s, cap at 300s
+            backoff = min(30.0 * (2 ** max(0, attempt_count - 1)), 300.0) if attempt_count > 0 else 0.0
+            now_mono = time.time()
+
             write_jsonl({
                 "event_type": "STALE_HOUR_START_DETECTED",
                 "slug": m.slug, "now_utc": iso_z(now),
                 "hour_start_utc": st.hour_start_utc,
                 "t_min": round(t_min, 2),
-                "note": "t_min > 65 — hour_start_utc likely stale, skipping settlement",
+                "refresh_attempt": attempt_count,
+                "next_refresh_in_sec": round(max(0, (last_refresh + backoff) - now_mono), 1),
                 "ts_ms": int(time.time() * 1000),
             })
-            print(f"  [WARN] STALE hour_start_utc for {m.slug}: "
-                  f"t_min={t_min:.1f} (now={iso_z(now)}, "
-                  f"hour_start={st.hour_start_utc}) — NOT entering SETTLEMENT")
+
+            # Force-refresh market hour_start_utc if backoff has elapsed
+            if now_mono >= last_refresh + backoff:
+                self._stale_hour_refresh_ts[m.slug] = now_mono
+                self._stale_hour_refresh_count[m.slug] = attempt_count + 1
+                try:
+                    fresh_markets = self._get_markets()
+                    for fm in fresh_markets:
+                        if fm.slug == m.slug:
+                            new_hour_start = iso_z(fm.hour_start_utc)
+                            old_hour_start = st.hour_start_utc
+                            st.hour_start_utc = new_hour_start
+                            st.hour_open = fm.hour_open
+                            # Recompute t_min with fresh data
+                            fresh_start = _parse_iso_z(new_hour_start)
+                            fresh_t_min = minutes_into_hour(fresh_start, now)
+                            write_jsonl({
+                                "event_type": "STALE_HOUR_START_REFRESHED",
+                                "slug": m.slug,
+                                "old_hour_start": old_hour_start,
+                                "new_hour_start": new_hour_start,
+                                "old_t_min": round(t_min, 2),
+                                "new_t_min": round(fresh_t_min, 2),
+                                "attempt": attempt_count + 1,
+                                "ts_ms": int(time.time() * 1000),
+                            })
+                            print(f"  [STALE] Refreshed {m.slug} hour_start: "
+                                  f"{old_hour_start} → {new_hour_start} "
+                                  f"(t_min: {t_min:.1f} → {fresh_t_min:.1f})")
+                            # Clear backoff on successful refresh
+                            if fresh_t_min <= 65.0:
+                                self._stale_hour_refresh_count.pop(m.slug, None)
+                                self._stale_hour_refresh_ts.pop(m.slug, None)
+                            break
+                except Exception as e:
+                    write_jsonl({"event_type": "STALE_HOUR_REFRESH_ERROR",
+                                 "slug": m.slug, "err": str(e)[:200],
+                                 "attempt": attempt_count + 1})
+                    print(f"  [STALE] Refresh failed for {m.slug}: {str(e)[:80]}")
+            else:
+                print(f"  [WARN] STALE hour_start_utc for {m.slug}: "
+                      f"t_min={t_min:.1f} — refresh backoff "
+                      f"(attempt {attempt_count}, next in "
+                      f"{max(0, (last_refresh + backoff) - now_mono):.0f}s)")
             return
         if t_min >= TRADE_HARD_STOP_MIN:
             self.last_book[m.slug]["Up"] = up_book
@@ -5384,6 +5435,7 @@ class Bot:
     def _check_position_invariant(self) -> None:
         """Compare bot positions vs truth positions each tick.
         Prints POSITION_DRIFT line if mismatch > 0.01 shares on any token.
+        If drift persists for 3 consecutive checks, trigger DESYNC_HARD_STOP.
         Throttled to once every 10s to avoid log spam.
         """
         now_t = time.time()
@@ -5417,14 +5469,48 @@ class Bot:
                               "bot_qty": round(bq, 2), "truth_qty": round(tq, 2),
                               "delta": round(bq - tq, 2)})
         if diffs:
+            # Track consecutive drift count
+            if not hasattr(self, '_pos_drift_consecutive'):
+                self._pos_drift_consecutive = 0
+            self._pos_drift_consecutive += 1
+
             write_jsonl({
                 "event_type": "POSITION_DRIFT",
                 "diffs": diffs,
+                "consecutive": self._pos_drift_consecutive,
                 "ts_ms": int(time.time() * 1000),
             })
             parts = [f"{d['slug'][-15:]} {d['outcome']}: bot={d['bot_qty']} truth={d['truth_qty']} Δ={d['delta']}"
                      for d in diffs]
-            print(f"  [INVARIANT] POSITION_DRIFT ({len(diffs)}): " + " | ".join(parts))
+            print(f"  [INVARIANT] POSITION_DRIFT #{self._pos_drift_consecutive} "
+                  f"({len(diffs)}): " + " | ".join(parts))
+
+            # Escalation: 3 consecutive drifts → DESYNC_HARD_STOP
+            if self._pos_drift_consecutive >= 3 and not self._desync_hard_stop:
+                self._desync_hard_stop = True
+                write_jsonl({
+                    "event_type": "DESYNC_FROM_INVARIANT",
+                    "source": "position_invariant",
+                    "consecutive_checks": self._pos_drift_consecutive,
+                    "diffs": diffs,
+                    "action": "cancel_all + block_buys",
+                    "ts_ms": int(time.time() * 1000),
+                })
+                print(f"  *** DESYNC FROM INVARIANT *** {self._pos_drift_consecutive} "
+                      f"consecutive drifts — cancelling all orders, blocking new buys")
+                try:
+                    self.client.cancel_all_orders()
+                    print("  [DESYNC] All open orders cancelled")
+                except Exception as ce:
+                    print(f"  [DESYNC] cancel_all failed: {ce}")
+                self._truth.enter_safe_mode(
+                    reason=f"position_invariant_drift_{self._pos_drift_consecutive}_consecutive",
+                    mismatches=[f"{d['slug']} {d['outcome']}: bot={d['bot_qty']} truth={d['truth_qty']}"
+                                for d in diffs])
+        else:
+            # No drift — reset consecutive counter
+            if getattr(self, '_pos_drift_consecutive', 0) > 0:
+                self._pos_drift_consecutive = 0
 
     def _check_hedge_mismatch(self) -> None:
         """Detect hedge mismatches: net exposure on one side beyond threshold.
@@ -7618,11 +7704,36 @@ class Bot:
 
                         if mark_pnl_cents >= TIME_STOP_MIN_PNL_CENTS:
                             # Profitable — allow TIME_STOP_EXIT
-                            # Per-(slug,outcome) latch: only fire once until qty changes
                             ts_key = (m.slug, outcome)
+                            # Guard: don't latch/fire for dust positions
+                            if pos.qty < MIN_QTY:
+                                self._time_stop_triggered.pop(ts_key, None)
+                                write_jsonl({"event_type": "TIME_STOP_SKIPPED",
+                                             "slug": m.slug, "outcome": outcome,
+                                             "skip_reason": "below_min_qty",
+                                             "qty": round(pos.qty, 2),
+                                             "ts_ms": int(time.time() * 1000)})
+                                continue
+                            # Per-(slug,outcome) latch: only fire once until qty changes
                             prev_qty = self._time_stop_triggered.get(ts_key)
                             if prev_qty is not None and abs(pos.qty - prev_qty) < 0.01:
-                                continue  # already triggered at this qty, skip
+                                write_jsonl({"event_type": "TIME_STOP_SKIPPED",
+                                             "slug": m.slug, "outcome": outcome,
+                                             "skip_reason": "latched_no_qty_change",
+                                             "qty": round(pos.qty, 2),
+                                             "latched_qty": round(prev_qty, 2),
+                                             "ts_ms": int(time.time() * 1000)})
+                                continue
+                            # Notional guard: skip if below CLOB min order size
+                            notional = pos.qty * max(book.bid, 0.01)
+                            if notional < 1.0:
+                                write_jsonl({"event_type": "TIME_STOP_SKIPPED",
+                                             "slug": m.slug, "outcome": outcome,
+                                             "skip_reason": "below_min_notional",
+                                             "qty": round(pos.qty, 2),
+                                             "notional": round(notional, 2),
+                                             "ts_ms": int(time.time() * 1000)})
+                                continue
                             # Check sell cooldown first to avoid spamming 60 attempts/sec
                             sell_key_ts = f"{m.slug}|{outcome}"
                             if time.monotonic() < self._sell_error_until.get(sell_key_ts, 0.0):
@@ -7672,8 +7783,15 @@ class Bot:
                                 prev_qty_soft = self._time_stop_triggered.get(ts_key_soft)
                                 soft_latched = (prev_qty_soft is not None
                                                 and abs(pos.qty - prev_qty_soft) < 0.01)
-                                if (spread_cents_ts <= TIME_STOP_SOFT_EXIT_MAX_SPREAD_CENTS
-                                        and vel_against and not soft_latched):
+                                if soft_latched:
+                                    write_jsonl({"event_type": "TIME_STOP_SKIPPED",
+                                                 "slug": m.slug, "outcome": outcome,
+                                                 "skip_reason": "soft_latched_no_qty_change",
+                                                 "qty": round(pos.qty, 2),
+                                                 "latched_qty": round(prev_qty_soft, 2),
+                                                 "ts_ms": int(time.time() * 1000)})
+                                elif (spread_cents_ts <= TIME_STOP_SOFT_EXIT_MAX_SPREAD_CENTS
+                                        and vel_against):
                                     soft_qty = pos.qty * TIME_STOP_SOFT_EXIT_FRAC
                                     if soft_qty >= MIN_QTY:
                                         soft_price = max(book.bid, 0.01)
