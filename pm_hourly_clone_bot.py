@@ -3744,6 +3744,13 @@ class Bot:
             if not sig:
                 self._sm_transition(m.slug, "IDLE", "signal_lost_after_probe", ctx)
                 return
+            # Window gate: burst only in early phase (minutes 0-3).
+            # If bot starts mid-window (e.g. minute 30), skip burst → probe only.
+            t_min = ctx["t_min"]
+            if t_min > BURST_EARLY_WINDOW_MIN:
+                st.last_entry_ts = iso_z(utc_now())
+                self._sm_transition(m.slug, "COOLDOWN", "probe_only_past_burst_window", ctx)
+                return
             # Edge gate: only burst if edge >= thr + BURST_MIN_EDGE_EXTRA_BPS
             if abs_delta_bps < thr + BURST_MIN_EDGE_EXTRA_BPS:
                 # Edge not strong enough for burst — stay with probe only
@@ -6411,9 +6418,11 @@ class Bot:
                     pos.scalp_mode = False
                     continue
             if t_min >= TRADE_HARD_STOP_MIN:
-                self._do_sell(m, st, outcome, pos.qty,
-                              max(book.bid, book.ask - MAX_CROSS_SLIPPAGE),
-                              reason="HARD_STOP", leg="STOP", ctx=ctx)
+                sell_key_hs = f"{m.slug}|{outcome}"
+                if time.monotonic() >= self._sell_error_until.get(sell_key_hs, 0.0):
+                    self._do_sell(m, st, outcome, pos.qty,
+                                  max(book.bid, book.ask - MAX_CROSS_SLIPPAGE),
+                                  reason="HARD_STOP", leg="STOP", ctx=ctx)
                 continue
 
             # --- TIME STOP EXIT: parity/core positions held too long ---
@@ -6430,6 +6439,10 @@ class Bot:
 
                         if mark_pnl_cents >= TIME_STOP_MIN_PNL_CENTS:
                             # Profitable — allow TIME_STOP_EXIT
+                            # Check sell cooldown first to avoid spamming 60 attempts/sec
+                            sell_key_ts = f"{m.slug}|{outcome}"
+                            if time.monotonic() < self._sell_error_until.get(sell_key_ts, 0.0):
+                                continue  # recently attempted, wait for cooldown
                             self._diag_time_stop_exits += 1
                             write_jsonl({"event_type": "TIME_STOP_EXIT",
                                           "slug": m.slug, "crypto": m.crypto,
@@ -7151,6 +7164,8 @@ class Bot:
         elif fill_result.get("status") in ("live", "delayed"):
             # Order was placed but didn't fill within polling window.
             # The feed adapter already cancelled it. Don't update position state.
+            sell_key = f"{m.slug}|{outcome}"
+            self._sell_error_until[sell_key] = time.monotonic() + 5.0  # cooldown 5s before retry
             write_jsonl({"event_type": "SELL_NOT_FILLED",
                          "slug": m.slug, "outcome": outcome,
                          "order_id": oid, "status": fill_result.get("status"),

@@ -60,6 +60,7 @@ ORDER_REPRICE_SEC = float(os.getenv("ORDER_REPRICE_SEC", "10.0"))
 TRADE_START_MIN = 2.0
 TRADE_STOP_ADD_MIN = 55.0                                                                  # was 57 — stop entries 2 min earlier
 TRADE_HARD_STOP_MIN = 59.25
+BURST_EARLY_WINDOW_MIN = 3.0                                                               # burst only in minutes 0-3; after that probe-only
 NO_NEW_ENTRIES_SEC_TO_CLOSE = float(os.getenv("NO_NEW_ENTRIES_SEC_TO_CLOSE", "180"))       # 3 min to close → block new entries
 
 # -----------------------------------------------------------------------------
