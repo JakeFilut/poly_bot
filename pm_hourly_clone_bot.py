@@ -191,7 +191,8 @@ class Bot:
         # Hourly stats for HOUR_SUMMARY
         self._hour_trade_count = 0
         self._hour_net_pnl = 0.0
-        self._hour_budget_remaining = HOURLY_BUDGET_USD  # resets each hour
+        self._hour_budget_remaining = HOURLY_BUDGET_USD  # legacy — reporting only
+        self._hour_budget_spent = 0.0  # tracking only — not used for gating
         self._hour_edges: List[float] = []
         # Shadow stop-loss simulation
         self._shadow_active = False
@@ -1009,7 +1010,8 @@ class Bot:
             self._hour_risk_stop_hit = False
             self._hour_trade_count = 0
             self._hour_net_pnl = 0.0
-            self._hour_budget_remaining = HOURLY_BUDGET_USD
+            self._hour_budget_remaining = HOURLY_BUDGET_USD  # legacy — reporting only
+            self._hour_budget_spent = 0.0
             self._hour_edges = []
             # Reset flatten state for new hour
             self._hard_flatten_done = False
@@ -1044,7 +1046,7 @@ class Bot:
         if pos.opened_at is None:
             pos.opened_at = pos.last_trade_ts
         self.cash_usdc -= usdc_cost
-        self._hour_budget_remaining -= usdc_cost
+        self._hour_budget_spent += usdc_cost  # tracking only — not used for gating
         # Shadow: new entries are BLOCKED after stop trigger
         if self._shadow_active:
             self._shadow_trades_blocked += 1
@@ -1062,7 +1064,6 @@ class Bot:
         pos.cost_usdc = max(0.0, pos.cost_usdc - cost_basis)
         pos.last_trade_ts = iso_z(utc_now())
         self.cash_usdc += proceeds
-        self._hour_budget_remaining += proceeds
         self.realized_pnl_usdc += pnl
         self.hourly_pnl_usdc += pnl
         # Per-slug PnL
@@ -1094,11 +1095,12 @@ class Bot:
         if pos.opened_at is None:
             pos.opened_at = pos.last_trade_ts
         self.cash_usdc -= usdc_cost
-        self._hour_budget_remaining -= usdc_cost
+        self._hour_budget_spent += usdc_cost  # tracking only — not used for gating
         self._hour_trade_count += 1
+        exposure = self._total_exposure_usd()
         print(f"  [FILL] BUY  {st.crypto} {outcome}: +{qty:.0f}@{price:.3f} "
               f"-> now {pos.qty:.0f}@{pos.vwap:.3f}  cost=${usdc_cost:.2f}  "
-              f"budget_left=${self._hour_budget_remaining:.2f}")
+              f"exposure=${exposure:.2f}/${MAX_TOTAL_EXPOSURE_USD:.0f}")
     def _live_sell(self, st: MarketState, outcome: str, price: float,
                    qty: float) -> float:
         """Update position state after a real sell fill (mirrors _paper_sell). Returns pnl."""
@@ -1113,7 +1115,7 @@ class Bot:
         pos.cost_usdc = max(0.0, pos.cost_usdc - cost_basis)
         pos.last_trade_ts = iso_z(utc_now())
         self.cash_usdc += proceeds
-        self._hour_budget_remaining += proceeds  # sell returns money to budget
+        # No budget mutation — exposure drops automatically via lower cost_usdc
         self.realized_pnl_usdc += pnl
         self.hourly_pnl_usdc += pnl
         self._clean_dust(pos)
@@ -1122,9 +1124,10 @@ class Bot:
         # Per-slug PnL
         self._slug_realized_pnl[st.slug] = self._slug_realized_pnl.get(st.slug, 0.0) + pnl
         pnl_tag = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
+        exposure = self._total_exposure_usd()
         print(f"  [FILL] SELL {st.crypto} {outcome}: -{qty:.0f}@{price:.3f} "
               f"-> now {pos.qty:.0f}  pnl={pnl_tag}  "
-              f"budget_left=${self._hour_budget_remaining:.2f}")
+              f"exposure=${exposure:.2f}/${MAX_TOTAL_EXPOSURE_USD:.0f}")
         return pnl
     @staticmethod
     def _clean_dust(pos: Position):
@@ -1454,7 +1457,7 @@ class Bot:
 
         if MODE == "LIVE_SAFE":
             print(f"\n  [LIVE_SAFE] Max order: ${LIVE_SAFE_MAX_ORDER_USD:.2f}  |  "
-                  f"Max total invested: ${LIVE_SAFE_MAX_TOTAL_INVESTED_USD:.2f}  |  "
+                  f"Max exposure: ${MAX_TOTAL_EXPOSURE_USD:.2f}  |  "
                   f"Burst window: first 3 min of each hour")
             print(f"  [LIVE_SAFE] Will run {LIVE_SAFE_NUM_HOURS} hourly windows then exit  "
                   f"(started: {iso_z(self._live_safe_start_hour)})\n")
@@ -2657,10 +2660,12 @@ class Bot:
         safe_tag = " [SAFE MODE]" if self._truth.safe_mode else ""
         pos_str = "  ".join(pos_parts) if pos_parts else "none"
 
-        budget_str = f"  |  Hour Budget: ${self._hour_budget_remaining:.2f}/${HOURLY_BUDGET_USD:.0f}"
+        exposure = self._total_exposure_usd()
+        exposure_left = max(0.0, MAX_TOTAL_EXPOSURE_USD - exposure)
+        exposure_str = f"  |  Exposure: ${exposure:.2f}/${MAX_TOTAL_EXPOSURE_USD:.0f}  Left: ${exposure_left:.2f}"
         print(f"\n  --- Cash: ${self.cash_usdc:.2f}  |  Equity: ${equity:.2f}  |  Invested: ${total_cost:.2f}"
               f"  |  Day P&L: {pnl_str}  |  Total P&L: {rpnl_str}"
-              f"{budget_str}{safe_tag} ---")
+              f"{exposure_str}{safe_tag} ---")
         print(f"  --- POSITIONS: {pos_str} ---")
         print()
     def _log_hour_label(self, slug, st, final_price, effective_close,
@@ -4866,10 +4871,10 @@ class Bot:
                              "ts_ms": int(now * 1000)})
 
     def _total_exposure_usd(self) -> float:
-        """Total exposure = filled positions + reserved (pending) orders.
-        This is the TRUE cap check — prevents overspending."""
+        """Total exposure = open position cost basis + reserved (pending) orders.
+        This is the SINGLE SOURCE OF TRUTH for the always-on exposure cap."""
         filled_usd = sum(
-            st.positions[o].qty * st.positions[o].vwap
+            st.positions[o].cost_usdc
             for st in self.market_states.values()
             for o in ["Up", "Down"] if st.positions[o].qty >= MIN_QTY
         )
@@ -4953,7 +4958,7 @@ class Bot:
         Updates:
           - positions (qty, vwap, cost_usdc)
           - cash_usdc
-          - _hour_budget_remaining
+          - _hour_budget_spent (reporting only)
           - reserved_usd (releases reservation)
           - fills ledger
           - realized PnL (for SELL)
@@ -5000,7 +5005,6 @@ class Bot:
                     # Reservation was already deducted from cash.
                     # Add it back, then let _live_buy deduct the real cost.
                     self.cash_usdc += released
-                    self._hour_budget_remaining += released
                 self._live_buy(st, outcome, fill_price, fill_qty, actual_cost)
             self._ledger_record_buy_fill(m, st, outcome, fill_price, fill_qty,
                                          order_id=order_id,
@@ -5526,6 +5530,41 @@ class Bot:
             print(f"  [INVARIANT] POSITION_DRIFT #{self._pos_drift_consecutive} "
                   f"({len(diffs)}): " + " | ".join(parts))
 
+            # One-shot diagnostic: fetch CLOB balances on first drift
+            if self._pos_drift_consecutive == 1:
+                try:
+                    clob_bals = self.client.get_balances()
+                    tok_map = self._get_token_to_slug_outcome()
+                    clob_by_so: Dict[tuple, float] = {}
+                    for b in clob_bals:
+                        tid = str(b.get("token_id") or b.get("asset_id", ""))
+                        bal = float(b.get("balance", 0))
+                        if tid in tok_map and bal > 0:
+                            clob_by_so[tok_map[tid]] = bal
+                    for d in diffs:
+                        key = (d["slug"], d["outcome"])
+                        clob_q = round(clob_by_so.get(key, 0.0), 2)
+                        print(f"  [DIAG] {d['slug']} {d['outcome']}: "
+                              f"CLOB={clob_q}  truth={d['truth_qty']}  bot={d['bot_qty']}")
+                        write_jsonl({"event_type": "DRIFT_DIAGNOSTIC",
+                                     "slug": d["slug"], "outcome": d["outcome"],
+                                     "clob_qty": clob_q,
+                                     "truth_qty": d["truth_qty"],
+                                     "bot_qty": d["bot_qty"],
+                                     "ts_ms": int(time.time() * 1000)})
+                except Exception as diag_e:
+                    print(f"  [DIAG] Failed to fetch CLOB balances: {diag_e}")
+
+            # Auto-heal: attempt truth dedup at drift #2 before DESYNC escalation
+            if self._pos_drift_consecutive == 2:
+                removed = self._truth.dedup_fills()
+                if removed > 0:
+                    print(f"  [INVARIANT] Truth dedup removed {removed} duplicate fill(s) "
+                          f"— re-checking next tick")
+                    # Reset consecutive counter to give the fix a chance
+                    self._pos_drift_consecutive = 0
+                    return
+
             # Escalation: 3 consecutive drifts → DESYNC_HARD_STOP
             if self._pos_drift_consecutive >= 3 and not self._desync_hard_stop:
                 self._desync_hard_stop = True
@@ -5659,27 +5698,19 @@ class Bot:
             return False
         if MODE == "LOG":
             return True
-        # ── Hourly budget gate (LIVE/LIVE_SAFE) ──
-        if self._hour_budget_remaining <= 0:
-            write_jsonl({"event_type": "HOURLY_BUDGET_EXHAUSTED",
-                          "slug": slug,
-                          "budget_remaining": round(self._hour_budget_remaining, 2),
-                          "budget_total": HOURLY_BUDGET_USD,
-                          "ts_ms": int(time.time() * 1000)})
-            return False
         # LIVE_SAFE: check entry window
         if not self._buys_allowed():
             return False
-        # Safety caps: include BOTH filled positions AND reserved (pending) orders
+        # ── Strict always-on exposure cap (all live modes) ──
+        # exposure = open position cost basis + reserved pending buys
         total_usd = self._total_exposure_usd()
-        # ── LIVE_SAFE total invested cap ($50 default, rolling — sells free up room) ──
-        if MODE == "LIVE_SAFE" and total_usd >= LIVE_SAFE_MAX_TOTAL_INVESTED_USD:
-            write_jsonl({"event_type": "LIVE_SAFE_INVESTED_CAP",
+        if total_usd >= MAX_TOTAL_EXPOSURE_USD:
+            write_jsonl({"event_type": "EXPOSURE_CAP_HIT",
                           "slug": slug,
                           "filled_usd": round(total_usd - self._total_reserved_usd(), 2),
                           "reserved_usd": round(self._total_reserved_usd(), 2),
                           "total_exposure_usd": round(total_usd, 2),
-                          "cap_usd": LIVE_SAFE_MAX_TOTAL_INVESTED_USD,
+                          "cap_usd": MAX_TOTAL_EXPOSURE_USD,
                           "ts_ms": int(time.time() * 1000)})
             return False
         slug_st = self.market_states.get(slug)
@@ -5863,7 +5894,7 @@ class Bot:
                     stop_reason = "global_rate_limit"
                     break
                 # ── Exposure cap re-check (includes reserved) ──
-                if self._total_exposure_usd() + this_usd >= LIVE_SAFE_MAX_TOTAL_INVESTED_USD:
+                if self._total_exposure_usd() + this_usd >= MAX_TOTAL_EXPOSURE_USD:
                     stop_reason = "exposure_cap"
                     break
 
@@ -5935,7 +5966,7 @@ class Bot:
                     # Budget reserved above stays locked.
                     # Cash deducted via reservation.
                     self.cash_usdc -= reserved_amount
-                    self._hour_budget_remaining -= reserved_amount
+                    # Exposure already includes this via _reserved_usd — no budget mutation
                     # DO NOT clear inflight guard — hold it until watcher resolves.
                     # This prevents rapid duplicate orders while confirmation lags.
                     # Set a long-hold timestamp so _has_inflight_buy blocks for
