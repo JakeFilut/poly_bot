@@ -702,6 +702,27 @@ class PolymarketClient:
                             "fill_qty": 0.0, "fill_price": price,
                             "status": "matched", "partial": False}
 
+                # Safety net: if an IOC/FOK order comes back "live" (resting),
+                # that means it wasn't killed — cancel it immediately so it
+                # doesn't sit on the book as an untracked resting order.
+                if status in ("live", "open") and oid:
+                    self._immediate_order_live_count = getattr(
+                        self, '_immediate_order_live_count', 0) + 1
+                    _write_jsonl({"event_type": f"{order_label}_UNEXPECTED_LIVE",
+                                 "order_id": oid, "side": side,
+                                 "price": price, "qty": qty,
+                                 "live_count": self._immediate_order_live_count})
+                    try:
+                        self._clob.cancel(oid)
+                        _write_jsonl({"event_type": f"{order_label}_LIVE_CANCELLED",
+                                     "order_id": oid})
+                    except Exception as ce:
+                        _write_jsonl({"event_type": f"{order_label}_LIVE_CANCEL_FAIL",
+                                     "order_id": oid, "err": str(ce)[:120]})
+                    return {"order_id": oid, "filled": False,
+                            "fill_qty": 0.0, "fill_price": price,
+                            "status": "live_cancelled", "partial": False}
+
                 # Not matched (killed) — no fill
                 self._api_error_backoff_sec = 0.0
                 _write_jsonl({"event_type": f"{order_label}_KILLED",

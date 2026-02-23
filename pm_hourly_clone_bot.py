@@ -4349,7 +4349,7 @@ class Bot:
 
     def _audit_reservations(self) -> None:
         """Periodic invariant check: release stuck reservations, log anomalies.
-        Called from main loop every ~10s."""
+        Called from main loop every tick."""
         now = time.time()
         total = self._total_reserved_usd()
 
@@ -4369,25 +4369,34 @@ class Bot:
         for oid, submit_ts in list(self._reserved_submit_ts.items()):
             age = now - submit_ts
             if age > RESERVATION_STUCK_TIMEOUT_SEC:
-                stuck_ids.append(oid)
+                stuck_ids.append((oid, age))
 
-        for oid in stuck_ids:
+        for oid, age in stuck_ids:
+            # Try to cancel the order first — it may still be resting
+            if oid and MODE in ("LIVE", "LIVE_SAFE"):
+                try:
+                    self.client.cancel_order(oid)
+                except Exception:
+                    pass  # already cancelled or filled
             released = self._release_reservation(oid)
             if released > 0:
                 write_jsonl({"event_type": "RESERVATION_STUCK_RELEASED",
                              "order_id": oid,
                              "released_usd": round(released, 2),
-                             "age_sec": round(now - (self._reserved_submit_ts.get(oid, now)), 1),
+                             "age_sec": round(age, 1),
                              "ts_ms": int(now * 1000)})
-                print(f"  [RESERVATION] Released stuck reservation ${released:.2f} "
-                      f"for order {oid[:16]}...")
+                print(f"  [RESERVATION] STUCK ${released:.2f} held {age:.0f}s — "
+                      f"cancelled + released (order {oid[:16]}...)")
 
-        # Log summary if any reservations exist
+        # Log summary if any reservations exist (throttled to every 10s)
         if self._reserved_usd:
-            write_jsonl({"event_type": "RESERVATION_AUDIT",
-                         "count": len(self._reserved_usd),
-                         "total_usd": round(self._total_reserved_usd(), 2),
-                         "ts_ms": int(now * 1000)})
+            last_audit_log = getattr(self, '_last_reservation_audit_log', 0.0)
+            if now - last_audit_log >= 10.0:
+                self._last_reservation_audit_log = now
+                write_jsonl({"event_type": "RESERVATION_AUDIT",
+                             "count": len(self._reserved_usd),
+                             "total_usd": round(self._total_reserved_usd(), 2),
+                             "ts_ms": int(now * 1000)})
 
     def _total_exposure_usd(self) -> float:
         """Total exposure = filled positions + reserved (pending) orders.
@@ -4634,9 +4643,15 @@ class Bot:
         """Are we past HARD_FLATTEN_MIN (force-close everything)?"""
         return t_min >= HARD_FLATTEN_MIN
 
+    _FLATTEN_TRIM_MAX_SPREAD_CENTS = 5.0  # don't dump into wide spreads
+
     def _flatten_trim_positions(self, t_min: float):
-        """Soft flatten: sell positions that are profitable or near-breakeven.
-        Called each tick when t_min >= FLATTEN_START_MIN."""
+        """Soft flatten: sell positions, spread-aware.
+        Called each tick when t_min >= FLATTEN_START_MIN.
+
+        If spread <= max (5c): sell at bid (full trim).
+        If spread > max: sell only half the position with IOC at mid-point
+            (don't blindly dump into a wide spread)."""
         for slug, st in self.market_states.items():
             m = None
             for mk in self._cached_markets:
@@ -4652,13 +4667,56 @@ class Bot:
                 book = self.last_book.get(slug, {}).get(outcome)
                 if not book or book.bid <= 0:
                     continue
-                # Sell at bid for immediate fill
-                self._do_sell(m, st, outcome, pos.qty, book.bid,
-                              reason="FLATTEN_TRIM", leg="FLATTEN")
+
+                spread_cents = book.spread * 100.0
+                if spread_cents <= self._FLATTEN_TRIM_MAX_SPREAD_CENTS:
+                    # Tight spread — sell full position at bid
+                    self._do_sell(m, st, outcome, pos.qty, book.bid,
+                                  reason="FLATTEN_TRIM", leg="FLATTEN")
+                else:
+                    # Wide spread — sell half at midpoint to limit slippage
+                    trim_qty = max(MIN_QTY, round(pos.qty * 0.5, 2))
+                    # Use midpoint between bid and ask for better execution
+                    mid_price = round((book.bid + book.ask) / 2.0, 3)
+                    sell_price = max(0.01, min(mid_price, book.ask - 0.01))
+                    token_id = m.outcome_up_id if outcome == "Up" else m.outcome_down_id
+                    if MODE in ("LIVE", "LIVE_SAFE"):
+                        result = self.client.place_immediate_order(
+                            token_id, "SELL", sell_price, trim_qty,
+                            use_fok=False)
+                        if result.get("filled") is True:
+                            fill_qty = result.get("fill_qty", 0.0)
+                            self._apply_fill(slug, outcome, "SELL",
+                                             fill_qty, result["fill_price"],
+                                             order_id=result.get("order_id", ""),
+                                             reason="FLATTEN_TRIM_WIDE",
+                                             source="flatten")
+                        elif result.get("filled") == "UNKNOWN":
+                            oid = result.get("order_id", "")
+                            if oid:
+                                self._exec_tracker.on_submit(
+                                    oid, slug, outcome, "SELL", sell_price,
+                                    trim_qty, "FLATTEN_TRIM_WIDE",
+                                    token_id=token_id,
+                                    pending_confirmation=True)
+                        # If killed — do nothing, wait for next tick
+                    else:
+                        # Paper mode
+                        self._do_sell(m, st, outcome, trim_qty, sell_price,
+                                      reason="FLATTEN_TRIM_WIDE", leg="FLATTEN")
+                    write_jsonl({"event_type": "FLATTEN_TRIM_WIDE_SPREAD",
+                                 "slug": slug, "outcome": outcome,
+                                 "spread_cents": round(spread_cents, 1),
+                                 "trim_qty": trim_qty,
+                                 "total_qty": pos.qty,
+                                 "sell_price": sell_price})
 
     def _hard_flatten_all(self):
-        """Hard flatten: force-close ALL positions with IOC sells, cancel all orders.
-        Called once when t_min >= HARD_FLATTEN_MIN."""
+        """Hard flatten: force-close ALL positions with escalating IOC sells.
+        Called once when t_min >= HARD_FLATTEN_MIN.
+
+        Escalation: 2c -> 3c -> 5c slippage, 300ms between attempts.
+        Must succeed even if it costs edge."""
         if self._hard_flatten_done:
             return
         self._hard_flatten_done = True
@@ -4678,7 +4736,8 @@ class Bot:
         for oid in list(self._reserved_usd.keys()):
             self._release_reservation(oid)
 
-        # 3. Force-sell every position with IOC at bid - slippage
+        # 3. Force-sell every position with escalating IOC slippage
+        slippage_steps_cents = [2.0, 3.0, 5.0]
         positions_closed = 0
         for slug, st in self.market_states.items():
             m = None
@@ -4696,11 +4755,24 @@ class Bot:
                 if not book or book.bid <= 0:
                     continue
                 token_id = m.outcome_up_id if outcome == "Up" else m.outcome_down_id
-                # IOC sell at bid - slippage (bounded)
-                sell_price = max(0.01, book.bid - FLATTEN_IOC_SLIPPAGE_CENTS / 100.0)
-                if MODE in ("LIVE", "LIVE_SAFE"):
+                remaining_qty = pos.qty
+
+                if MODE not in ("LIVE", "LIVE_SAFE"):
+                    # Paper mode — instant close
+                    self._do_sell(m, st, outcome, remaining_qty, book.bid,
+                                  reason="HARD_FLATTEN", leg="FLATTEN")
+                    positions_closed += 1
+                    continue
+
+                # Escalating IOC sell attempts
+                for step_idx, slip_c in enumerate(slippage_steps_cents):
+                    if remaining_qty < MIN_QTY:
+                        break
+                    sell_price = max(0.01, book.bid - slip_c / 100.0)
                     result = self.client.place_immediate_order(
-                        token_id, "SELL", sell_price, pos.qty, use_fok=False)
+                        token_id, "SELL", sell_price, remaining_qty,
+                        use_fok=False)
+
                     if result.get("filled") is True:
                         fill_qty = result.get("fill_qty", 0.0)
                         self._apply_fill(slug, outcome, "SELL",
@@ -4708,25 +4780,42 @@ class Bot:
                                          order_id=result.get("order_id", ""),
                                          reason="HARD_FLATTEN",
                                          source="hard_flatten")
-                        positions_closed += 1
-                    elif result.get("filled") == "UNKNOWN":
+                        remaining_qty = round(remaining_qty - fill_qty, 2)
+                        write_jsonl({"event_type": "HARD_FLATTEN_STEP_FILL",
+                                     "slug": slug, "outcome": outcome,
+                                     "step": step_idx, "slip_c": slip_c,
+                                     "fill_qty": fill_qty,
+                                     "remaining_qty": remaining_qty})
+                        if remaining_qty < MIN_QTY:
+                            break
+                        # Partial fill on this step — wait then try wider slippage
+                        time.sleep(0.3)
+                        continue
+
+                    if result.get("filled") == "UNKNOWN":
                         oid = result.get("order_id", "")
                         if oid:
                             self._exec_tracker.on_submit(
-                                oid, slug, outcome, "SELL", sell_price, pos.qty,
-                                "HARD_FLATTEN", token_id=token_id,
+                                oid, slug, outcome, "SELL", sell_price,
+                                remaining_qty, "HARD_FLATTEN",
+                                token_id=token_id,
                                 pending_confirmation=True)
-                        positions_closed += 1
-                    else:
-                        # Fallback: try limit sell at bid
-                        self._do_sell(m, st, outcome, pos.qty, book.bid,
-                                      reason="HARD_FLATTEN_FALLBACK", leg="FLATTEN")
-                        positions_closed += 1
-                else:
-                    # Paper mode
-                    self._do_sell(m, st, outcome, pos.qty, book.bid,
-                                  reason="HARD_FLATTEN", leg="FLATTEN")
-                    positions_closed += 1
+                        remaining_qty = 0.0  # assume it went through
+                        break
+
+                    # Not filled — wait 300ms then escalate
+                    write_jsonl({"event_type": "HARD_FLATTEN_STEP_MISS",
+                                 "slug": slug, "outcome": outcome,
+                                 "step": step_idx, "slip_c": slip_c,
+                                 "status": result.get("status")})
+                    time.sleep(0.3)
+
+                # Fallback: if still holding after all slippage steps
+                if remaining_qty >= MIN_QTY:
+                    self._do_sell(m, st, outcome, remaining_qty, book.bid,
+                                  reason="HARD_FLATTEN_FALLBACK", leg="FLATTEN")
+
+                positions_closed += 1
 
         write_jsonl({"event_type": "HARD_FLATTEN_DONE",
                      "positions_closed": positions_closed,

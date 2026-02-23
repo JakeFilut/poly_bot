@@ -687,7 +687,7 @@ IOC_MAX_SLIPPAGE_CENTS = float(os.getenv("IOC_MAX_SLIPPAGE_CENTS", "1.5"))  # ma
 # BUDGET RESERVATION — reserve capital for pending/open orders
 # ---------------------------------------------------------------------------
 BUDGET_RESERVE_ENABLED = bool(os.getenv("BUDGET_RESERVE_ENABLED", "True") not in ("", "0", "False", "false"))
-RESERVATION_STUCK_TIMEOUT_SEC = float(os.getenv("RESERVATION_STUCK_TIMEOUT_SEC", "120"))  # release stuck reservations after 2 min
+RESERVATION_STUCK_TIMEOUT_SEC = float(os.getenv("RESERVATION_STUCK_TIMEOUT_SEC", "25"))   # release stuck reservations — short for fast hourly windows
 
 # ---------------------------------------------------------------------------
 # IN-FLIGHT ORDER GUARD — prevent duplicate entries per token/outcome
