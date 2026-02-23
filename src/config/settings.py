@@ -61,12 +61,27 @@ TRADE_START_MIN = 2.0
 TRADE_STOP_ADD_MIN = 55.0                                                                  # was 57 — stop entries 2 min earlier
 TRADE_HARD_STOP_MIN = 59.25
 BURST_EARLY_WINDOW_MIN = 3.0                                                               # burst only in minutes 0-3; after that probe-only
+ENTRY_ONLY_EARLY_WINDOW = bool(os.getenv("ENTRY_ONLY_EARLY_WINDOW", "False") not in ("", "0", "False", "false"))  # block ALL buys after BURST_EARLY_WINDOW_MIN
 NO_NEW_ENTRIES_SEC_TO_CLOSE = float(os.getenv("NO_NEW_ENTRIES_SEC_TO_CLOSE", "180"))       # 3 min to close → block new entries
+
+# -----------------------------------------------------------------------------
+# Runtime profile — selects which subsystems are active
+# -----------------------------------------------------------------------------
+PROFILE = os.getenv("PROFILE", "F247_LIKE")    # F247_LIKE | HOURLY_SCALP_MIN
+
+# HOURLY_SCALP_MIN: minimal profile for BTC/ETH IOC scalping.
+# Keeps: IOC buy/sell, fill confirmation/recovery, reservation + exposure caps,
+#        flatten/hard flatten, burst engine.
+# Disables: parity arb, quoting, rescue, hedging, maker orders, SOL/XRP.
+_IS_MIN_PROFILE = (PROFILE == "HOURLY_SCALP_MIN")
+
+# When HOURLY_SCALP_MIN: force BTC,ETH only regardless of env
+if _IS_MIN_PROFILE:
+    LIVE_ALLOWED_SYMBOLS = ["BTC", "ETH"]
 
 # -----------------------------------------------------------------------------
 # Entry thresholds (bps) -- coin-specific, time-varying
 # -----------------------------------------------------------------------------
-PROFILE = "F247_LIKE"
 
 # Coin-specific threshold tables: coin -> {early, mid, late}
 _THR_TABLE = {
@@ -672,3 +687,61 @@ LAST_SECONDS_IOC_ONLY = float(os.getenv("LAST_SECONDS_IOC_ONLY", "90.0"))       
 
 # Rule 9: Cancel All Before Resolution — cancel everything N seconds before close
 CANCEL_ALL_BEFORE_CLOSE_SEC = float(os.getenv("CANCEL_ALL_BEFORE_CLOSE_SEC", "30.0"))  # cancel all open orders
+
+# ---------------------------------------------------------------------------
+# IOC / TAKER ENTRY — immediate-fill for entry orders
+# ---------------------------------------------------------------------------
+IOC_ENTRY_ENABLED = bool(os.getenv("IOC_ENTRY_ENABLED", "True") not in ("", "0", "False", "false"))
+ENTRY_USE_FOK = bool(os.getenv("ENTRY_USE_FOK", "False") not in ("", "0", "False", "false"))  # False=IOC (partial OK), True=FOK (all-or-nothing)
+IOC_MAX_RETRIES = int(os.getenv("IOC_MAX_RETRIES", "2"))             # quick_buy attempts (2-3)
+IOC_RETRY_DELAY_MS = float(os.getenv("IOC_RETRY_DELAY_MS", "100"))  # 75-150ms between attempts
+IOC_TICK_STEP = float(os.getenv("IOC_TICK_STEP", "0.01"))           # +1 tick per retry
+IOC_MAX_SLIPPAGE_CENTS = float(os.getenv("IOC_MAX_SLIPPAGE_CENTS", "1.5"))  # max above ask for buys
+
+# ---------------------------------------------------------------------------
+# BUDGET RESERVATION — reserve capital for pending/open orders
+# ---------------------------------------------------------------------------
+BUDGET_RESERVE_ENABLED = bool(os.getenv("BUDGET_RESERVE_ENABLED", "True") not in ("", "0", "False", "false"))
+RESERVATION_STUCK_TIMEOUT_SEC = float(os.getenv("RESERVATION_STUCK_TIMEOUT_SEC", "25"))   # release stuck reservations — short for fast hourly windows
+
+# ---------------------------------------------------------------------------
+# IN-FLIGHT ORDER GUARD — prevent duplicate entries per token/outcome
+# ---------------------------------------------------------------------------
+ONE_INFLIGHT_PER_TOKEN = bool(os.getenv("ONE_INFLIGHT_PER_TOKEN", "True") not in ("", "0", "False", "false"))
+PER_TOKEN_COOLDOWN_MS = float(os.getenv("PER_TOKEN_COOLDOWN_MS", "350"))        # min ms between orders on same token
+GLOBAL_ORDER_RATE_LIMIT_PER_SEC = float(os.getenv("GLOBAL_ORDER_RATE_LIMIT_PER_SEC", "5"))  # max new orders/sec
+
+# ---------------------------------------------------------------------------
+# PER-TOKEN ATTEMPT BREAKER — prevent runaway loops on one token
+# ---------------------------------------------------------------------------
+TOKEN_ATTEMPT_MAX_PER_MIN = int(os.getenv("TOKEN_ATTEMPT_MAX_PER_MIN", "10"))     # max attempts per token per 60s
+TOKEN_ATTEMPT_COOLDOWN_SEC = float(os.getenv("TOKEN_ATTEMPT_COOLDOWN_SEC", "45"))  # cooldown when breaker trips (30-60s)
+
+# ---------------------------------------------------------------------------
+# END-OF-HOUR FLATTEN — wind down positions before hour close
+# ---------------------------------------------------------------------------
+FLATTEN_START_MIN = float(os.getenv("FLATTEN_START_MIN", "57.0"))       # stop new entries, start trimming
+HARD_FLATTEN_MIN = float(os.getenv("HARD_FLATTEN_MIN", "59.0"))         # force-close ALL with IOC sells
+FLATTEN_IOC_SLIPPAGE_CENTS = float(os.getenv("FLATTEN_IOC_SLIPPAGE_CENTS", "2.0"))  # max slippage on flatten IOC sells
+
+# ---------------------------------------------------------------------------
+# HOURLY_SCALP_MIN profile overrides — strip to bare essentials
+# ---------------------------------------------------------------------------
+if _IS_MIN_PROFILE:
+    # Disable parity/quoting/rescue/hedge subsystems
+    PARITY_BUY_ENABLED = False
+    PARITY_SELL_ENABLED = False
+    PARITY_QUOTE_ENABLED = False
+    DERISK_RESCUE_TO_STRADDLE = False
+    HEDGE_TICK_ESCALATION_ENABLED = False
+    # Disable SOL/XRP
+    ENABLE_XRP = False
+    XRP_PARITY_QUOTE_ENABLED = False
+    XRP_PARITY_BUY_ENABLED = False
+    CRYPTOS = ["BTC", "ETH"]
+    # Disable correlation exposure scaling (only 2 assets)
+    CORR_SCALE_ENABLED = False
+    # Keep all safety systems ON:
+    #   IOC_ENTRY_ENABLED, BUDGET_RESERVE_ENABLED, ONE_INFLIGHT_PER_TOKEN,
+    #   TOKEN_ATTEMPT_MAX_PER_MIN, FLATTEN_START_MIN, HARD_FLATTEN_MIN,
+    #   LIVE_SAFE_MAX_TOTAL_INVESTED_USD, MAX_POSITION_USD_PER_SLUG, etc.

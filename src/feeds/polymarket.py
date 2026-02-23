@@ -608,6 +608,221 @@ class PolymarketClient:
             pass
         return 0.0
 
+    def place_immediate_order(self, token_id: str, side: str, price: float,
+                              size: float, use_fok: bool = False) -> dict:
+        """Place an immediate-execution order (IOC or FOK).
+
+        IOC (use_fok=False, default): Fill whatever is available, kill remainder.
+            Allows partial fills — better on thin books.
+        FOK (use_fok=True): Fill entire qty or kill the whole order.
+
+        Returns same dict as place_limit_order:
+            {order_id, filled, fill_qty, fill_price, status, partial}
+        """
+        order_label = "FOK" if use_fok else "IOC"
+        if _settings.MODE == "LOG":
+            pid = f"paper_{int(time.time()*1000)}_{random.randint(100,999)}"
+            return {"order_id": pid, "filled": True, "fill_qty": float(size),
+                    "fill_price": price, "status": "matched", "partial": False}
+
+        if not self._clob:
+            raise RuntimeError("CLOB client not initialised")
+
+        now = time.time()
+        if now < getattr(self, '_api_error_backoff_until', 0.0):
+            return {"order_id": "", "filled": False, "fill_qty": 0.0,
+                    "fill_price": 0.0, "status": "error", "partial": False}
+
+        from py_clob_client.clob_types import OrderArgs, OrderType
+
+        import math as _math
+        price = round(max(0.01, min(0.99, price)), 3)
+        qty = float(size)
+        min_qty_for_usd = _math.ceil(1.01 / price) if price > 0 else 5
+        clob_min = max(5, min_qty_for_usd)
+        if qty < clob_min:
+            return {"order_id": "", "filled": False, "fill_qty": 0.0,
+                    "fill_price": 0.0, "status": "rejected", "partial": False}
+
+        # Select order type: FOK or FAK (IOC).  FAK = Fill-And-Kill = IOC.
+        if use_fok:
+            otype = OrderType.FOK
+        elif hasattr(OrderType, "FAK"):
+            otype = OrderType.FAK
+        else:
+            # Fallback: if FAK not available in this py_clob_client version, use FOK
+            otype = OrderType.FOK
+            order_label = "FOK_FALLBACK"
+
+        try:
+            args = OrderArgs(
+                price=price, size=qty,
+                side=side.upper(), token_id=token_id,
+            )
+            signed = self._clob.create_order(args)
+            response = self._clob.post_order(signed, otype)
+
+            if response and isinstance(response, dict):
+                oid = response.get("orderID", "")
+                status = response.get("status", "").lower()
+                fill_qty = self._extract_fill_qty(response)
+                self._log_response_shape_once(response, f"{order_label.lower()}_{status}")
+
+                # ── MATCHED + fill qty confirmed ──
+                if status == "matched" and fill_qty > 0:
+                    self._api_error_backoff_sec = 0.0
+                    partial = (fill_qty < qty)
+                    _write_jsonl({"event_type": f"{order_label}_FILLED",
+                                 "order_id": oid, "side": side,
+                                 "price": price, "requested_qty": qty,
+                                 "fill_qty": fill_qty,
+                                 "partial": partial})
+                    return {"order_id": oid, "filled": True,
+                            "fill_qty": fill_qty, "fill_price": price,
+                            "status": "matched", "partial": partial}
+
+                # ── MATCHED but no fill qty in response ──
+                if status == "matched" and fill_qty == 0:
+                    if oid:
+                        fill_qty = self._quick_fill_check(oid)
+                    if fill_qty > 0:
+                        self._api_error_backoff_sec = 0.0
+                        partial = (fill_qty < qty)
+                        _write_jsonl({"event_type": f"{order_label}_FILLED_DELAYED",
+                                     "order_id": oid, "fill_qty": fill_qty,
+                                     "partial": partial})
+                        return {"order_id": oid, "filled": True,
+                                "fill_qty": fill_qty, "fill_price": price,
+                                "status": "matched", "partial": partial}
+                    # Matched but truly unknown — caller MUST:
+                    #   - keep reservation locked
+                    #   - hold in-flight guard for this token_id
+                    #   - let lifecycle watcher confirm/cancel
+                    self._api_error_backoff_sec = 0.0
+                    self._immediate_unknown_count = getattr(
+                        self, '_immediate_unknown_count', 0) + 1
+                    _write_jsonl({"event_type": f"{order_label}_UNKNOWN",
+                                 "order_id": oid, "status": status,
+                                 "requested_qty": qty,
+                                 "unknown_count": self._immediate_unknown_count})
+                    return {"order_id": oid, "filled": "UNKNOWN",
+                            "fill_qty": 0.0, "fill_price": price,
+                            "status": "matched", "partial": False,
+                            "hold_inflight": True}
+
+                # ── LIVE/OPEN: IOC came back resting ──
+                # Check for partial fill FIRST — IOC can briefly show "live"
+                # even after a partial fill has occurred.
+                if status in ("live", "open") and oid:
+                    self._immediate_live_open_count = getattr(
+                        self, '_immediate_live_open_count', 0) + 1
+                    # Check if any qty was actually filled before we cancel
+                    late_fill_qty = self._quick_fill_check(oid)
+                    if late_fill_qty > 0:
+                        # Partial fill happened — cancel remainder, return what filled
+                        try:
+                            self._clob.cancel(oid)
+                        except Exception:
+                            pass
+                        partial = (late_fill_qty < qty)
+                        self._api_error_backoff_sec = 0.0
+                        _write_jsonl({"event_type": f"{order_label}_LIVE_PARTIAL_FILL",
+                                     "order_id": oid, "side": side,
+                                     "price": price, "requested_qty": qty,
+                                     "fill_qty": late_fill_qty,
+                                     "partial": partial,
+                                     "live_open_count": self._immediate_live_open_count})
+                        return {"order_id": oid, "filled": True,
+                                "fill_qty": late_fill_qty, "fill_price": price,
+                                "status": "live_partial", "partial": partial}
+                    # No fill found — cancel the resting order
+                    _write_jsonl({"event_type": f"{order_label}_UNEXPECTED_LIVE",
+                                 "order_id": oid, "side": side,
+                                 "price": price, "qty": qty,
+                                 "live_open_count": self._immediate_live_open_count})
+                    try:
+                        self._clob.cancel(oid)
+                        _write_jsonl({"event_type": f"{order_label}_LIVE_CANCELLED",
+                                     "order_id": oid})
+                    except Exception as ce:
+                        _write_jsonl({"event_type": f"{order_label}_LIVE_CANCEL_FAIL",
+                                     "order_id": oid, "err": str(ce)[:120]})
+                    return {"order_id": oid, "filled": False,
+                            "fill_qty": 0.0, "fill_price": price,
+                            "status": "live_cancelled", "partial": False}
+
+                # ── Terminal: killed / cancelled / rejected / other ──
+                # Check for late fills: CLOB may report "killed" even after
+                # a partial fill has already settled on-chain.
+                if oid:
+                    late_fill_qty = self._quick_fill_check(oid)
+                    if late_fill_qty > 0:
+                        self._api_error_backoff_sec = 0.0
+                        partial = (late_fill_qty < qty)
+                        _write_jsonl({"event_type": f"{order_label}_LATE_FILL",
+                                     "order_id": oid, "status": status,
+                                     "fill_qty": late_fill_qty,
+                                     "partial": partial,
+                                     "note": "fill found after terminal status"})
+                        return {"order_id": oid, "filled": True,
+                                "fill_qty": late_fill_qty, "fill_price": price,
+                                "status": "late_fill", "partial": partial}
+
+                self._api_error_backoff_sec = 0.0
+                _write_jsonl({"event_type": f"{order_label}_KILLED",
+                             "order_id": oid, "status": status,
+                             "side": side, "price": price, "qty": qty})
+                return {"order_id": oid, "filled": False,
+                        "fill_qty": 0.0, "fill_price": price,
+                        "status": status or "killed", "partial": False}
+
+        except Exception as e:
+            err_str = str(e).lower()
+
+            # ── "Crosses the book" 400: price on wrong side of spread ──
+            # Retry once at the correct best price + 1 tick for safety.
+            if "crosses" in err_str and not getattr(self, '_cross_retry_active', False):
+                self._cross_retry_active = True
+                try:
+                    book = self.get_top_of_book(token_id, levels=1)
+                    if side.upper() == "BUY" and book.ask > 0:
+                        retry_price = round(min(book.ask + 0.01, 0.99), 3)
+                    elif side.upper() == "SELL" and book.bid > 0:
+                        retry_price = round(max(book.bid - 0.01, 0.01), 3)
+                    else:
+                        retry_price = 0.0
+                    _write_jsonl({"event_type": f"{order_label}_CROSSES_RETRY",
+                                 "token_id": token_id[-12:], "side": side,
+                                 "orig_price": price, "retry_price": retry_price,
+                                 "best_bid": book.bid, "best_ask": book.ask})
+                    if retry_price > 0:
+                        result = self.place_immediate_order(
+                            token_id, side, retry_price, size, use_fok=use_fok)
+                        return result
+                except Exception as retry_err:
+                    _write_jsonl({"event_type": f"{order_label}_CROSSES_RETRY_FAIL",
+                                 "err": str(retry_err)[:200],
+                                 "token_id": token_id[-12:]})
+                finally:
+                    self._cross_retry_active = False
+
+            prev = getattr(self, '_api_error_backoff_sec', 0.0)
+            backoff = min(max(prev * 2, 5.0), 30.0)
+            self._api_error_backoff_sec = backoff
+            self._api_error_backoff_until = time.time() + backoff
+            _write_jsonl({"event_type": f"{order_label}_ERROR",
+                         "err": str(e)[:200],
+                         "token_id": token_id[-12:], "side": side,
+                         "price": price, "qty": qty,
+                         "backoff_sec": backoff})
+        return {"order_id": "", "filled": False, "fill_qty": 0.0,
+                "fill_price": 0.0, "status": "error", "partial": False}
+
+    def place_fok_order(self, token_id: str, side: str, price: float,
+                        size: float) -> dict:
+        """Backwards-compatible alias: delegates to place_immediate_order(use_fok=True)."""
+        return self.place_immediate_order(token_id, side, price, size, use_fok=True)
+
     def get_order_status(self, order_id: str) -> Optional[dict]:
         """Get order status from CLOB by order_id. Returns dict or None."""
         if not self._clob or not order_id:

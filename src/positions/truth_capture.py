@@ -252,6 +252,16 @@ class TruthCapture:
         self._scan_recent_tids: List[str] = []   # ring buffer for same-ts dedup
         self._scan_recent_tids_max: int = 200
 
+        # ── Cursor proof counters ──
+        # Lifetime (never reset — proves nothing leaked since boot)
+        self.cursor_accepted_fills: int = 0
+        self.cursor_dropped_old_ts: int = 0
+        self.cursor_dropped_outside_window: int = 0
+        # Per-hour (reset on hour boundary — localises spikes)
+        self.cursor_hour_accepted: int = 0
+        self.cursor_hour_dropped_old: int = 0
+        self.cursor_hour_dropped_window: int = 0
+
         # Timers
         self._last_scan_ts: float = 0.0
         self._last_reconcile_ts: float = 0.0
@@ -306,6 +316,31 @@ class TruthCapture:
         self._scan_recent_tids.clear()
         print(f"  [TRUTH] SKIP_HISTORY: cursor set to now "
               f"({self._scan_cursor_ts_ms}), no historical fills will be ingested")
+
+    def clamp_cursor_to_hour(self, hour_start_ms: int) -> bool:
+        """If boot cursor < hour_start, clamp up and warn. Returns True if clamped."""
+        if self._scan_cursor_ts_ms > 0 and self._scan_cursor_ts_ms < hour_start_ms:
+            old = self._scan_cursor_ts_ms
+            self._scan_cursor_ts_ms = hour_start_ms
+            self._scan_recent_tids.clear()
+            self._write_jsonl({
+                "event_type": "CURSOR_CLAMPED",
+                "old_cursor_ms": old,
+                "new_cursor_ms": hour_start_ms,
+                "delta_ms": hour_start_ms - old,
+                "reason": "boot_cursor < hour_start — clamped to prevent earlier-in-hour ingestion",
+                "ts_ms": _ts_ms(),
+            })
+            print(f"  [TRUTH] WARNING: boot_cursor_ms ({old}) < hour_start_ms ({hour_start_ms})  "
+                  f"→ clamped cursor up by {hour_start_ms - old}ms")
+            return True
+        return False
+
+    def reset_hour_counters(self) -> None:
+        """Reset per-hour cursor proof counters. Call on hour boundary."""
+        self.cursor_hour_accepted = 0
+        self.cursor_hour_dropped_old = 0
+        self.cursor_hour_dropped_window = 0
 
     # ══════════════════════════════════════════════════════════════════
     #  STATE MACHINE
@@ -1010,12 +1045,17 @@ class TruthCapture:
                     pass
 
             # ── Cursor filter: skip already-processed trades ──
+            # Predicate: REJECT if ts_ms < cursor (old fill).
             if fill_ts_ms > 0 and cursor_ts > 0:
                 if fill_ts_ms < cursor_ts:
                     skipped_old_cursor += 1
+                    self.cursor_dropped_old_ts += 1
+                    self.cursor_hour_dropped_old += 1
                     continue
                 if fill_ts_ms == cursor_ts and trade_id in recent_tids_set:
                     skipped_old_cursor += 1
+                    self.cursor_dropped_old_ts += 1
+                    self.cursor_hour_dropped_old += 1
                     continue
 
             # Skip already-seen trades (in-memory dedup)
@@ -1052,6 +1092,8 @@ class TruthCapture:
 
             if not slug_ok or not ts_ok:
                 skipped_old_hour += 1
+                self.cursor_dropped_outside_window += 1
+                self.cursor_hour_dropped_window += 1
                 continue
             if not slug and fill_epoch == 0:
                 skipped_no_identity += 1
@@ -1061,6 +1103,7 @@ class TruthCapture:
             price = raw.get("price") or 0
             order_id = str(raw.get("order_id") or "")
 
+            # ── ACCEPTANCE: fill passed BOTH cursor gate AND hour-window gate ──
             pos = self.record_fill(
                 token_id=token_id,
                 slug=slug,
@@ -1075,6 +1118,8 @@ class TruthCapture:
             )
             if pos is not None:
                 new_count += 1
+                self.cursor_accepted_fills += 1
+                self.cursor_hour_accepted += 1
 
             # ── Update cursor tracking ──
             if fill_ts_ms > 0:
@@ -1102,6 +1147,13 @@ class TruthCapture:
             "skipped_old_hour": skipped_old_hour,
             "skipped_no_identity": skipped_no_identity,
             "cursor_ts_ms": self._scan_cursor_ts_ms,
+            # Acceptance predicate (explicit AND — not OR):
+            #   ACCEPT iff (ts_ms >= cursor_ts_ms) AND (hour_start <= ts < hour_end)
+            #   Both conditions must be true; either failure → drop.
+            "acceptance_predicate": "(ts_ms >= cursor_ts_ms) AND (hour_start <= ts < hour_end)",
+            "cumulative_accepted": self.cursor_accepted_fills,
+            "cumulative_dropped_old_ts": self.cursor_dropped_old_ts,
+            "cumulative_dropped_outside_window": self.cursor_dropped_outside_window,
             "ts_ms": _ts_ms(),
         })
         if new_count > 0 or skipped_old_cursor > 0 or skipped_old_hour > 0:
@@ -1109,7 +1161,10 @@ class TruthCapture:
                   f"{len(raw_trades)} API trades  "
                   f"(cursor_skip={skipped_old_cursor} "
                   f"hour_skip={skipped_old_hour} "
-                  f"no_id={skipped_no_identity})")
+                  f"no_id={skipped_no_identity})  "
+                  f"[cum: accept={self.cursor_accepted_fills} "
+                  f"drop_old={self.cursor_dropped_old_ts} "
+                  f"drop_win={self.cursor_dropped_outside_window}]")
 
         return new_count
 
