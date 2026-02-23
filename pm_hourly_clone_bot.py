@@ -929,6 +929,21 @@ class Bot:
                 mid = book.mid if book else pos.vwap  # fallback to vwap if no book yet
                 mtm += pos.qty * mid
         return self.cash_usdc + mtm
+
+    def _hour_pnl(self) -> float:
+        """Hour P&L: realized hourly pnl + unrealized mark-to-market on open positions.
+        This matches the 'Hour P&L' shown in the status line."""
+        unrealized = 0.0
+        for slug, st in self.market_states.items():
+            for outcome in ["Up", "Down"]:
+                pos = st.positions[outcome]
+                if pos.qty < MIN_QTY:
+                    continue
+                book = self.last_book.get(slug, {}).get(outcome)
+                mid = book.mid if book else pos.vwap
+                unrealized += pos.qty * (mid - pos.vwap)
+        return self.hourly_pnl_usdc + unrealized
+
     def _reset_daily_if_needed(self):
         today = utc_now().date()
         if today != self.day_start:
@@ -3147,6 +3162,7 @@ class Bot:
                 equity=self._equity(),
                 hour_start_equity=self.hour_start_equity,
                 hour_key=st.hour_start_utc,
+                hour_pnl=self._hour_pnl(),
             )
             if not ls_ok:
                 write_jsonl({"event_type": "LIVE_SAFETY_BLOCK",
