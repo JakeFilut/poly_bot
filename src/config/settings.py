@@ -603,7 +603,8 @@ OM_SANITY_REPORT_INTERVAL_SEC = float(os.getenv("OM_SANITY_REPORT_INTERVAL_SEC",
 LIVE_SAFE_ENTRY_WINDOW_SEC = float(os.getenv("LIVE_SAFE_ENTRY_WINDOW_SEC", "300"))        # buys allowed for 300s after start
 LIVE_SAFE_NUM_HOURS = int(os.getenv("LIVE_SAFE_NUM_HOURS", "3"))                         # run for N hourly windows before auto-exit
 LIVE_SAFE_MAX_ORDER_USD = float(os.getenv("LIVE_SAFE_MAX_ORDER_USD", "5.00"))             # max buy order size in LIVE_SAFE
-LIVE_SAFE_MAX_TOTAL_INVESTED_USD = float(os.getenv("LIVE_SAFE_MAX_TOTAL_INVESTED_USD", "50.0"))  # max total invested at any time in LIVE_SAFE
+LIVE_SAFE_MAX_TOTAL_INVESTED_USD = float(os.getenv("LIVE_SAFE_MAX_TOTAL_INVESTED_USD", "50.0"))  # legacy alias — use MAX_TOTAL_EXPOSURE_USD
+MAX_TOTAL_EXPOSURE_USD = float(os.getenv("MAX_TOTAL_EXPOSURE_USD", "50.0"))                    # strict always-on exposure cap (positions + reserved)
 CLOB_MIN_ORDER_SIZE = 5                                                                   # Polymarket CLOB minimum order size (shares)
 CLOB_MIN_ORDER_USD = 1.0                                                                   # Polymarket CLOB minimum order value ($1)
 

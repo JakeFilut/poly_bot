@@ -223,6 +223,9 @@ class TruthCapture:
         # All fills in memory (CURRENT HOUR ONLY after rotation)
         self._fills: List[TruthFill] = []
         self._seen_ids: Set[str] = set()
+        # Secondary dedup: (order_id, side, qty_rounded) catches poll+ws
+        # duplicates that have different trade_ids but same order/fill
+        self._seen_order_fills: Set[Tuple[str, str, float]] = set()
 
         # Positions: token_id -> TruthPosition (derived from current-hour fills ONLY)
         self._positions: Dict[str, TruthPosition] = {}
@@ -396,6 +399,7 @@ class TruthCapture:
             old_fills = len(self._fills)
             self._fills.clear()
             self._seen_ids.clear()
+            self._seen_order_fills.clear()
             self._positions.clear()
             self._watchers.clear()
             self._active_hour_slugs.clear()
@@ -783,6 +787,24 @@ class TruthCapture:
                     "ts_ms": _ts_ms(),
                 })
                 return None
+            # Secondary dedup: (order_id, side, qty_rounded) catches
+            # poll+ws duplicates with different trade_ids for the same fill
+            if fill.order_id:
+                okey = (fill.order_id, fill.action, round(float(fill.qty), 2))
+                if okey in self._seen_order_fills:
+                    self.fills_dedup_skipped += 1
+                    self._write_jsonl({
+                        "event_type": "TRUTH_DEDUP_HIT",
+                        "order_id": fill.order_id,
+                        "side": fill.action,
+                        "qty": round(float(fill.qty), 2),
+                        "source": source,
+                        "primary_key": dk[:80],
+                        "reason": "order_side_qty_already_seen",
+                        "ts_ms": _ts_ms(),
+                    })
+                    return None
+                self._seen_order_fills.add(okey)
             self._seen_ids.add(dk)
             self._fills.append(fill)
             self._update_token_meta_from_fill(fill)
@@ -1234,6 +1256,44 @@ class TruthCapture:
         self._positions.clear()
         for fill in self._fills:
             self._apply_fill_to_position(fill)
+
+    def dedup_fills(self) -> int:
+        """Remove duplicate fills from in-memory _fills list and recompute
+        positions.  Dedup key: (order_id, action, round(qty,2)).
+
+        Returns the number of duplicates removed.  Safe to call multiple
+        times — idempotent after first pass.
+        """
+        with self._lock:
+            seen: set = set()
+            clean: list = []
+            removed = 0
+            for fill in self._fills:
+                if fill.order_id:
+                    okey = (fill.order_id, fill.action, round(float(fill.qty), 2))
+                    if okey in seen:
+                        removed += 1
+                        continue
+                    seen.add(okey)
+                clean.append(fill)
+            if removed > 0:
+                self._fills = clean
+                self._recompute_positions()
+                # Rebuild dedup sets to match cleaned fills
+                self._seen_order_fills = {
+                    (f.order_id, f.action, round(float(f.qty), 2))
+                    for f in clean if f.order_id
+                }
+        if removed > 0:
+            self._write_jsonl({
+                "event_type": "TRUTH_DEDUP_CLEANUP",
+                "removed": removed,
+                "remaining_fills": len(self._fills),
+                "ts_ms": _ts_ms(),
+            })
+            print(f"  [TRUTH] dedup_fills: removed {removed} duplicate(s), "
+                  f"{len(self._fills)} fills remain")
+        return removed
 
     def recompute_positions_from_ledger(self,
                                        active_only: bool = False,
