@@ -2654,9 +2654,19 @@ class Bot:
                     pos_parts.append(f"{st.crypto} {outcome}:{pos.qty:.0f}@{pos.vwap:.3f}")
 
         equity = self._equity()
-        hour_pnl = self.hourly_pnl_usdc
+        # Unrealized P&L from open positions (current mid vs cost basis)
+        unrealized_pnl = 0.0
+        for slug, st in self.market_states.items():
+            for outcome in ["Up", "Down"]:
+                pos = st.positions[outcome]
+                if pos.qty >= MIN_QTY:
+                    book = self.last_book.get(slug, {}).get(outcome)
+                    mid = book.mid if book else pos.vwap
+                    unrealized_pnl += pos.qty * (mid - pos.vwap)
+        hour_pnl = self.hourly_pnl_usdc + unrealized_pnl
+        session_pnl = self.realized_pnl_usdc + unrealized_pnl
         hpnl_str = f"+${hour_pnl:.2f}" if hour_pnl >= 0 else f"-${abs(hour_pnl):.2f}"
-        rpnl_str = f"+${self.realized_pnl_usdc:.2f}" if self.realized_pnl_usdc >= 0 else f"-${abs(self.realized_pnl_usdc):.2f}"
+        rpnl_str = f"+${session_pnl:.2f}" if session_pnl >= 0 else f"-${abs(session_pnl):.2f}"
         safe_tag = " [SAFE MODE]" if self._truth.safe_mode else ""
         pos_str = "  ".join(pos_parts) if pos_parts else "none"
 
