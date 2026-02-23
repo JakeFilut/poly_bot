@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 from src.config.settings import (
     _THR_TABLE,
+    _THR_TABLE_PROBE,
+    BURST_EARLY_WINDOW_MIN,
     BURST_SPREAD_HARD_LIMIT,
     CAP_0_5,
     CAP_5_15,
@@ -31,6 +33,7 @@ from src.config.settings import (
     MIN_TOP_LIQ_USD,
     PARITY_TAKER_ALLOWED_SPREAD_CENTS,
     PERSISTENCE_SEC,
+    PROBE_MAX_SPREAD,
     SPREAD_RELAXED_MAX,
     TAKER_FEE_BPS,
     TAKER_MAX_SPREAD_CENTS,
@@ -65,6 +68,26 @@ def entry_threshold_bps(coin: str, t_min: float) -> float:
     return thr
 
 
+def probe_entry_threshold_bps(coin: str, t_min: float) -> float:
+    """Return the *probe-only* entry threshold (lower mid-hour bars).
+
+    Used when t_min > BURST_EARLY_WINDOW_MIN so probes fire more often
+    without changing burst entry requirements.
+    """
+    tbl = _THR_TABLE_PROBE.get(coin, _THR_TABLE.get(coin, {"early": 8, "mid": 10, "late": 6}))
+    if TRADE_START_MIN <= t_min < 15:
+        thr = tbl["early"]
+    elif 15 <= t_min < 45:
+        thr = tbl["mid"]
+    elif 45 <= t_min <= 57:
+        thr = tbl["late"]
+    else:
+        return 10_000
+    if coin == "XRP" and 30 <= t_min < 40:
+        thr = max(1, thr - 2)
+    return thr
+
+
 # =============================================================================
 # Price cap (max price to BUY), piecewise by time bucket
 # =============================================================================
@@ -94,12 +117,13 @@ def dynamic_cap(t_min: float, abs_edge_bps: float) -> float:
 # =============================================================================
 
 def spread_limit(t_min: float, abs_edge_bps: float, coin: str,
-                 in_burst: bool = False) -> float:
+                 in_burst: bool = False, probe_only: bool = False) -> float:
     """Return max allowed spread for entry gating.
 
     Crossing only when spread <= 2c (IMB_MAX_SPREAD).
     Maker posting allowed up to MAKER_MAX_SPREAD (6c).
     During burst: controlled by burst engine's own maker/taker logic.
+    Probe-only (t_min > 3, no burst): uses PROBE_MAX_SPREAD (8c).
     """
     if in_burst:
         return BURST_SPREAD_HARD_LIMIT  # burst engine manages its own spread logic
@@ -107,6 +131,8 @@ def spread_limit(t_min: float, abs_edge_bps: float, coin: str,
     thr = entry_threshold_bps(coin, t_min)
     if 45 <= t_min <= 57 or abs_edge_bps >= thr + 10:
         return SPREAD_RELAXED_MAX
+    if probe_only:
+        return PROBE_MAX_SPREAD
     return MAKER_MAX_SPREAD
 
 
