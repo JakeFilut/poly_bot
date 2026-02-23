@@ -2654,8 +2654,8 @@ class Bot:
                     pos_parts.append(f"{st.crypto} {outcome}:{pos.qty:.0f}@{pos.vwap:.3f}")
 
         equity = self._equity()
-        daily_pnl = equity - self.day_start_equity
-        pnl_str = f"+${daily_pnl:.2f}" if daily_pnl >= 0 else f"-${abs(daily_pnl):.2f}"
+        hour_pnl = self.hourly_pnl_usdc
+        hpnl_str = f"+${hour_pnl:.2f}" if hour_pnl >= 0 else f"-${abs(hour_pnl):.2f}"
         rpnl_str = f"+${self.realized_pnl_usdc:.2f}" if self.realized_pnl_usdc >= 0 else f"-${abs(self.realized_pnl_usdc):.2f}"
         safe_tag = " [SAFE MODE]" if self._truth.safe_mode else ""
         pos_str = "  ".join(pos_parts) if pos_parts else "none"
@@ -2664,7 +2664,7 @@ class Bot:
         exposure_left = max(0.0, MAX_TOTAL_EXPOSURE_USD - exposure)
         exposure_str = f"  |  Exposure: ${exposure:.2f}/${MAX_TOTAL_EXPOSURE_USD:.0f}  Left: ${exposure_left:.2f}"
         print(f"\n  --- Cash: ${self.cash_usdc:.2f}  |  Equity: ${equity:.2f}  |  Invested: ${total_cost:.2f}"
-              f"  |  Day P&L: {pnl_str}  |  Total P&L: {rpnl_str}"
+              f"  |  Hour P&L: {hpnl_str}  |  Session P&L: {rpnl_str}"
               f"{exposure_str}{safe_tag} ---")
         print(f"  --- POSITIONS: {pos_str} ---")
         print()
