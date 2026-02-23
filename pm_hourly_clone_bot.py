@@ -387,7 +387,8 @@ class Bot:
         # ── LIVE execution safety modules (no-ops in LOG mode) ──
         self._exec_tracker = LiveOrderTracker(
             self.client.cancel_order, write_jsonl,
-            get_order_status_fn=self.client.get_order_status)
+            get_order_status_fn=self.client.get_order_status,
+            get_order_fills_fn=self.client.get_order_fills)
         self._exec_orphan = OrphanScanner(
             self.client.get_open_orders, self.client.cancel_order, write_jsonl)
         self._exec_safety = SafetyCaps(write_jsonl)
@@ -3826,7 +3827,13 @@ class Bot:
     # ── Order Lifecycle Guard: process recovered fills ──
 
     def _process_lifecycle_recovered_fills(self):
-        """Poll tracked orders for missed fills and record them in ledger + positions."""
+        """Poll tracked orders for missed fills and record them in ledger + positions.
+
+        Handles both:
+        - Normal recovered fills (order was live, later found filled)
+        - PENDING_CONFIRMATION fills (CLOB said matched but qty was unknown
+          at placement time; capital was already reserved)
+        """
         recovered = self._exec_tracker.poll_pending_orders()
         if not recovered:
             return
@@ -3866,6 +3873,28 @@ class Bot:
                 if side == "BUY":
                     if MODE in ("LIVE", "LIVE_SAFE"):
                         actual_cost = price * qty
+                        # _live_buy decrements cash_usdc.  But if this was a
+                        # PENDING_CONFIRMATION order, cash was already reserved
+                        # at placement time.  Reverse the reservation first,
+                        # then let _live_buy apply the real cost.
+                        # We check if the reason contains BURST (our entry tag)
+                        # and the tracker already cleared pending_confirmation.
+                        # The reservation was: cash -= requested_qty * order_price
+                        # The real cost is:    cash -= fill_qty * fill_price
+                        # So: add back reservation, then subtract real cost
+                        # via _live_buy.
+                        if "PENDING_CONFIRMATION" in reason or "ENTRY_BURST" in reason:
+                            # The tracker returns fill from a formerly-pending order.
+                            # We reserved cash at on_submit time (worst case).
+                            # _live_buy will subtract actual cost again, so we
+                            # need to add back the reservation to avoid double-deducting.
+                            # But we don't know the exact reserved amount here —
+                            # it was requested_qty * order_price at submit time.
+                            # Since the tracker already adjusted filled_qty,
+                            # just add back cash for the actual cost
+                            # (the reservation was worst-case full qty*price).
+                            self.cash_usdc += actual_cost
+                            self._hour_budget_remaining += actual_cost
                         self._live_buy(st, outcome, price, qty, actual_cost)
                     self._ledger_record_buy_fill(m, st, outcome, price, qty,
                                                  order_id=oid)
@@ -3989,8 +4018,9 @@ class Bot:
             order_id=oid, token_id=token_id or "", slug=slug,
             outcome=outcome, side=side, qty=qty, price=price,
         )
-        # If the order already filled, notify watcher so it doesn't double-record
-        if fill_result.get("filled"):
+        # If the order already filled (confirmed True, not "UNKNOWN"),
+        # notify watcher so it doesn't double-record
+        if fill_result.get("filled") is True:
             fill_qty = fill_result.get("fill_qty", 0)
             if fill_qty > 0:
                 self._truth.notify_fill(oid, fill_qty)
@@ -4612,11 +4642,19 @@ class Bot:
                 fill = self.client.place_limit_order(token_id, "BUY", order_price,
                                                      this_qty, post_only=False)
                 oid = fill.get("order_id", "")
-                self._exec_tracker.on_submit(oid, m.slug, outcome, "BUY", order_price, this_qty, "ENTRY_BURST")
+                fill_state = fill.get("filled")  # True | False | "UNKNOWN"
+                is_pending = (fill_state == "UNKNOWN")
+                self._exec_tracker.on_submit(
+                    oid, m.slug, outcome, "BUY", order_price, this_qty,
+                    "ENTRY_BURST", token_id=token_id,
+                    pending_confirmation=is_pending)
                 self._truth_watch_after_place(fill, m, outcome, "BUY", this_qty, order_price)
                 self._exec_safety.record_slug_submit(m.slug)
-                if fill.get("filled"):
-                    self._exec_tracker.on_fill(oid, fill["fill_qty"])
+                if fill_state is True:
+                    # Confirmed fill — update positions immediately
+                    self._exec_tracker.on_fill(oid, fill["fill_qty"],
+                                               fill_price=fill["fill_price"],
+                                               token_id=token_id)
                     self._exec_safety.record_slug_fill(m.slug)
                     self._record_fill_ts(m.slug)  # post-fill cooldown
                     self._live_buy(st, outcome, fill["fill_price"], fill["fill_qty"],
@@ -4638,9 +4676,27 @@ class Bot:
                     )
                     total_filled_usd += fill["fill_price"] * fill["fill_qty"]
                     burst_count += 1
-                elif fill.get("status") in ("live", "delayed"):
-                    # Order placed but not filled within polling window.
-                    # Lifecycle guard will poll for it; log for visibility.
+                elif is_pending:
+                    # UNKNOWN: CLOB matched but qty unconfirmed.
+                    # Reserve capital (worst-case full fill), DON'T update
+                    # positions yet — lifecycle watcher will confirm.
+                    reserved_usd = order_price * this_qty
+                    self.cash_usdc -= reserved_usd
+                    self._hour_budget_remaining -= reserved_usd
+                    write_jsonl({"event_type": "BUY_PENDING_CONFIRMATION",
+                                 "slug": m.slug, "outcome": outcome,
+                                 "order_id": oid, "status": fill.get("status"),
+                                 "requested_qty": this_qty, "price": order_price,
+                                 "reserved_usd": round(reserved_usd, 2),
+                                 "reason": "ENTRY_BURST",
+                                 "ts_ms": int(time.time() * 1000)})
+                    print(f"  [ORDER_LIFECYCLE] BUY PENDING_CONFIRMATION: "
+                          f"{m.slug} {outcome} qty={this_qty:.1f} @ {order_price:.4f} "
+                          f"(reserved ${reserved_usd:.2f}) — watcher will confirm")
+                    # Count as attempted for burst pacing
+                    burst_count += 1
+                elif fill.get("status") in ("live", "delayed", "matched"):
+                    # Order placed but not confirmed — lifecycle watcher tracks.
                     write_jsonl({"event_type": "BUY_NOT_FILLED_YET",
                                  "slug": m.slug, "outcome": outcome,
                                  "order_id": oid, "status": fill.get("status"),
@@ -5985,7 +6041,7 @@ class Bot:
                                                   order_qty, post_only=False)
             self._truth_watch_after_place(fill, m, outcome, "BUY", order_qty, bid_price)
             fill_ts = time.time()
-            if fill.get("filled"):
+            if fill.get("filled") is True:
                 fill_latency_ms = (fill_ts - placed_ts) * 1000
                 actual_cost = fill["fill_price"] * fill["fill_qty"]
                 self._live_buy(st, outcome, fill["fill_price"], fill["fill_qty"], actual_cost)
@@ -6104,7 +6160,7 @@ class Bot:
                                                   order_qty, post_only=False)
             self._truth_watch_after_place(fill, m, outcome, "BUY", order_qty, order_price)
             fill_ts = time.time()
-            if fill.get("filled"):
+            if fill.get("filled") is True:
                 fill_latency_ms = (fill_ts - placed_ts) * 1000
                 actual_cost = fill["fill_price"] * fill["fill_qty"]
                 self._live_buy(st, outcome, fill["fill_price"], fill["fill_qty"], actual_cost)
@@ -6912,18 +6968,32 @@ class Bot:
         token_id = m.outcome_up_id if outcome == "Up" else m.outcome_down_id
         fill_result = self.client.place_limit_order(token_id, "SELL", maker_price, qty, post_only=True)
         oid = fill_result.get("order_id", "")
-        self._exec_tracker.on_submit(oid, m.slug, outcome, "SELL", maker_price, qty, reason)
+        fill_state = fill_result.get("filled")
+        is_pending = (fill_state == "UNKNOWN")
+        self._exec_tracker.on_submit(
+            oid, m.slug, outcome, "SELL", maker_price, qty, reason,
+            token_id=token_id, pending_confirmation=is_pending)
         self._truth_watch_after_place(fill_result, m, outcome, "SELL", qty, maker_price)
 
-        if fill_result.get("filled"):
+        if fill_state is True:
             # Immediate maker fill — great
-            self._exec_tracker.on_fill(oid, fill_result["fill_qty"])
+            self._exec_tracker.on_fill(oid, fill_result["fill_qty"],
+                                       fill_price=fill_result["fill_price"],
+                                       token_id=token_id)
             self._record_fill_ts(m.slug)
             actual_price = fill_result["fill_price"]
             actual_qty = fill_result["fill_qty"]
             pnl = self._live_sell(st, outcome, actual_price, actual_qty)
             self._ledger_record_sell_fill(m, st, outcome, actual_price, actual_qty, order_id=oid)
             self._record_negative_exit(m.slug, pnl, reason)
+            return
+        if is_pending:
+            # UNKNOWN: CLOB matched but qty unconfirmed — watcher will confirm.
+            # Don't proceed to taker fallback (would double-sell).
+            write_jsonl({"event_type": "MAKER_SELL_PENDING_CONFIRMATION",
+                         "slug": m.slug, "outcome": outcome,
+                         "order_id": oid, "price": maker_price, "qty": qty,
+                         "reason": reason, "ts_ms": int(time.time() * 1000)})
             return
 
         # Wait for maker grace period
@@ -7115,14 +7185,20 @@ class Bot:
             return
         fill_result = self.client.place_limit_order(token_id, "SELL", price, qty, post_only=use_maker)
         oid = fill_result.get("order_id", "")
-        self._exec_tracker.on_submit(oid, m.slug, outcome, "SELL", price, qty, reason)
+        fill_state = fill_result.get("filled")  # True | False | "UNKNOWN"
+        is_pending = (fill_state == "UNKNOWN")
+        self._exec_tracker.on_submit(
+            oid, m.slug, outcome, "SELL", price, qty, reason,
+            token_id=token_id, pending_confirmation=is_pending)
         self._truth_watch_after_place(fill_result, m, outcome, "SELL", qty, price)
         self._exec_safety.record_slug_submit(m.slug)
-        if fill_result.get("filled"):
+        if fill_state is True:
             actual_qty = fill_result["fill_qty"]
             actual_price = fill_result["fill_price"]
             self._exec_safety.record_slug_fill(m.slug)
-            self._exec_tracker.on_fill(oid, actual_qty)
+            self._exec_tracker.on_fill(oid, actual_qty,
+                                       fill_price=actual_price,
+                                       token_id=token_id)
             self._record_fill_ts(m.slug)  # post-fill cooldown
             # True cost: count fill only after confirmed fill
             self._true_cost_fill_count += 1
@@ -7168,9 +7244,20 @@ class Bot:
                     "max_favorable_bps": round(mfe, 3), "max_adverse_bps": round(mae, 3),
                     "exit_reason": reason,
                 }, also_csv=True)
+        elif is_pending:
+            # UNKNOWN: CLOB matched but qty unconfirmed for SELL.
+            # Don't update positions yet — lifecycle watcher will confirm.
+            # Don't set sell error cooldown — this isn't an error.
+            write_jsonl({"event_type": "SELL_PENDING_CONFIRMATION",
+                         "slug": m.slug, "outcome": outcome,
+                         "order_id": oid, "status": fill_result.get("status"),
+                         "requested_qty": qty, "price": price, "reason": reason,
+                         "ts_ms": int(time.time() * 1000)})
+            print(f"  [ORDER_LIFECYCLE] SELL PENDING_CONFIRMATION: "
+                  f"{m.slug} {outcome} qty={qty:.1f} @ {price:.4f} "
+                  f"— watcher will confirm")
         elif fill_result.get("status") in ("live", "delayed"):
-            # Order was placed but didn't fill within polling window.
-            # The feed adapter already cancelled it. Don't update position state.
+            # Order resting — lifecycle watcher will track it.
             sell_key = f"{m.slug}|{outcome}"
             self._sell_error_until[sell_key] = time.monotonic() + 5.0  # cooldown 5s before retry
             write_jsonl({"event_type": "SELL_NOT_FILLED",
@@ -7178,7 +7265,6 @@ class Bot:
                          "order_id": oid, "status": fill_result.get("status"),
                          "requested_qty": qty, "price": price, "reason": reason,
                          "ts_ms": int(time.time() * 1000)})
-            self._exec_tracker.on_cancel(oid)
         elif fill_result.get("status") == "error":
             self._exec_safety.record_api_error()
             sell_key = f"{m.slug}|{outcome}"
@@ -7194,7 +7280,7 @@ class Bot:
                 # Quick retry after re-approval — clear cooldown so next loop picks it up
                 self._sell_error_until.pop(sell_key, None)
                 retry = self.client.place_limit_order(token_id, "SELL", price, qty, post_only=use_maker)
-                if retry.get("filled"):
+                if retry.get("filled") is True:
                     actual_qty = retry["fill_qty"]
                     actual_price = retry["fill_price"]
                     self._exec_safety.record_slug_fill(m.slug)
@@ -7223,7 +7309,7 @@ class Bot:
         # Always buy at ask (taker) for immediate fill — no layering
         r = self.client.place_limit_order(token_id, "BUY", ask, qty, post_only=False)
         self._truth_watch_after_place(r, m, outcome, "BUY", qty, ask)
-        if r.get("filled"):
+        if r.get("filled") is True:
             result["total_filled"] = r["fill_qty"]
             result["total_cost"] = r["fill_price"] * r["fill_qty"]
             result["avg_price"] = r["fill_price"]

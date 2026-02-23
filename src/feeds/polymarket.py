@@ -442,12 +442,58 @@ class PolymarketClient:
     # ================================================================== #
     #  4.  ORDER PLACEMENT / CANCEL
     # ================================================================== #
+    # ── Fill qty extraction helper ──────────────────────────────────
+    @staticmethod
+    def _extract_fill_qty(resp: dict) -> float:
+        """Extract fill quantity from a CLOB response/order dict.
+        Checks multiple field names the API may use."""
+        for key in ("size_matched", "sizeMatched", "filled_size",
+                     "filledSize", "matchedSize", "executedQty"):
+            val = resp.get(key)
+            if val:
+                try:
+                    return float(val)
+                except (ValueError, TypeError):
+                    continue
+        return 0.0
+
+    # ── Key-shape logging (once per unique shape) ─────────────────
+    _logged_key_shapes: set = set()
+
+    @classmethod
+    def _log_response_shape_once(cls, resp: dict, context: str) -> None:
+        """Log sorted(response.keys()) once per unique key structure."""
+        shape = tuple(sorted(resp.keys()))
+        if shape not in cls._logged_key_shapes:
+            cls._logged_key_shapes.add(shape)
+            # Also log nested dict keys (one level deep)
+            nested = {}
+            for k, v in resp.items():
+                if isinstance(v, dict):
+                    nested[k] = sorted(v.keys())
+            _write_jsonl({"event_type": "RESPONSE_SHAPE_NEW",
+                         "context": context,
+                         "keys": list(shape),
+                         "nested_keys": nested})
+
     def place_limit_order(self, token_id: str, side: str, price: float,
                           size: float, post_only: bool = True) -> dict:
         """
         Place a limit order on the CLOB.
-        Returns dict with fill info: {order_id, filled, fill_qty, fill_price, status}.
-        In LOG mode returns a paper result.
+
+        Returns dict:
+            order_id  : str
+            filled    : True | False | "UNKNOWN"
+            fill_qty  : float  (0.0 if not confirmed yet)
+            fill_price: float
+            status    : str    (raw CLOB status)
+
+        filled="UNKNOWN" means CLOB said "matched" but we could not confirm
+        the fill quantity.  The caller MUST NOT treat this as unfilled — it
+        must reserve capital and let the lifecycle watcher confirm.
+
+        This method NEVER blocks more than ~1s.  All long-running confirmation
+        is delegated to the lifecycle watcher.
         """
         if _settings.MODE == "LOG":
             pid = f"paper_{int(time.time()*1000)}_{random.randint(100,999)}"
@@ -490,45 +536,46 @@ class PolymarketClient:
             if response and isinstance(response, dict):
                 oid = response.get("orderID", "")
                 status = response.get("status", "").lower()
-                size_matched = response.get("size_matched") or 0
+                fill_qty = self._extract_fill_qty(response)
                 tx_hashes = (response.get("transactionsHashes", [])
                              or response.get("transactionHashes", []))
 
-                filled = False
-                fill_qty = 0.0
+                # Log response shape once per unique key structure
+                self._log_response_shape_once(response, f"post_order_{status}")
+
+                filled = False  # True | False | "UNKNOWN"
+
                 if status == "matched" or tx_hashes:
-                    filled = True
-                    fill_qty = float(size_matched) if size_matched else 0.0
-                    # If CLOB said "matched" but gave no size_matched, poll to confirm
-                    if fill_qty == 0 and oid:
-                        fill_qty = self._poll_order_fill(oid, qty, timeout=5)
-                    if fill_qty == 0:
-                        # CLOB said matched but we can't confirm qty — treat as unfilled
-                        filled = False
-                        _write_jsonl({"event_type":"FILL_QTY_UNKNOWN",
-                                     "order_id": oid, "status": status,
-                                     "requested_qty": qty})
+                    if fill_qty > 0:
+                        # Confirmed fill — we have the qty
+                        filled = True
+                    else:
+                        # CLOB said "matched" but no fill qty in response.
+                        # Do ONE quick check (non-blocking) then hand off to
+                        # lifecycle watcher.  NEVER return filled=False here.
+                        if oid:
+                            fill_qty = self._quick_fill_check(oid)
+                        if fill_qty > 0:
+                            filled = True
+                        else:
+                            # UNKNOWN: matched but unconfirmed — lifecycle
+                            # watcher will track until terminal state.
+                            filled = "UNKNOWN"
+                            _write_jsonl({"event_type": "FILL_UNKNOWN",
+                                         "order_id": oid, "status": status,
+                                         "requested_qty": qty,
+                                         "raw_keys": sorted(response.keys()),
+                                         "note": "CLOB matched but no size; "
+                                                 "handed to lifecycle watcher"})
+
                 elif status == "live" and oid:
-                    # Poll briefly to see if it filled
-                    fill_qty = self._poll_order_fill(oid, qty, timeout=3)
-                    filled = fill_qty > 0
-                    # Cancel unfilled orders — don't leave resting orders
-                    # that could fill later without the bot tracking them
-                    if not filled:
-                        try:
-                            self._clob.cancel(oid)
-                            _write_jsonl({"event_type":"ORDER_CANCELLED_UNFILLED",
-                                         "order_id": oid, "side": side,
-                                         "token_id": token_id[-12:],
-                                         "note": "cancelled after 3s poll"})
-                        except Exception:
-                            _write_jsonl({"event_type":"ORDER_CANCEL_FAILED",
-                                         "order_id": oid, "side": side,
-                                         "token_id": token_id[-12:]})
+                    # Order resting — lifecycle watcher will track it.
+                    # Don't block here.  Don't cancel — let the watcher handle.
+                    filled = False
 
                 # Reset backoff on successful API call
                 self._api_error_backoff_sec = 0.0
-                _write_jsonl({"event_type":"ORDER_PLACED", "order_id": oid,
+                _write_jsonl({"event_type": "ORDER_PLACED", "order_id": oid,
                              "token_id": token_id[-12:], "side": side,
                              "price": price, "qty": qty,
                              "status": status, "filled": filled,
@@ -541,32 +588,24 @@ class PolymarketClient:
             backoff = min(max(prev * 2, 5.0), 30.0)
             self._api_error_backoff_sec = backoff
             self._api_error_backoff_until = time.time() + backoff
-            _write_jsonl({"event_type":"ORDER_ERROR", "err": str(e)[:200],
+            _write_jsonl({"event_type": "ORDER_ERROR", "err": str(e)[:200],
                          "token_id": token_id[-12:], "side": side,
                          "price": price, "qty": qty,
                          "backoff_sec": backoff})
         return {"order_id": "", "filled": False, "fill_qty": 0.0,
                 "fill_price": 0.0, "status": "error"}
 
-    def _poll_order_fill(self, order_id: str, expected_qty: float,
-                         timeout: int = 5) -> float:
-        """Poll CLOB briefly for GTC order fill. Returns filled qty (0.0 if not confirmed)."""
-        start = time.time()
-        while time.time() - start < timeout:
-            try:
-                order = self._clob.get_order(order_id)
-                if order and isinstance(order, dict):
-                    status = order.get("status", "").lower()
-                    if status in ("matched", "filled"):
-                        sm = order.get("size_matched")
-                        if sm:
-                            return float(sm)
-                        # status says matched but no size — keep polling
-                    if status in ("cancelled", "canceled", "expired"):
-                        return 0.0
-            except Exception:
-                pass
-            time.sleep(1)
+    def _quick_fill_check(self, order_id: str) -> float:
+        """Single non-blocking check of order status.  Returns fill qty or 0."""
+        try:
+            order = self._clob.get_order(order_id)
+            if order and isinstance(order, dict):
+                self._log_response_shape_once(order, "get_order")
+                status = order.get("status", "").lower()
+                if status in ("matched", "filled"):
+                    return self._extract_fill_qty(order)
+        except Exception:
+            pass
         return 0.0
 
     def get_order_status(self, order_id: str) -> Optional[dict]:
@@ -576,10 +615,39 @@ class PolymarketClient:
         try:
             result = self._clob.get_order(order_id)
             if isinstance(result, dict):
+                self._log_response_shape_once(result, "get_order_status")
                 return result
             return None
         except Exception:
             return None
+
+    def get_order_fills(self, order_id: str) -> List[dict]:
+        """Fetch fills for a specific order from the CLOB trades/fills endpoint.
+
+        Returns list of fill dicts [{price, size, ...}, ...] or [].
+        This is confirmation source C — used when get_order shows matched
+        but no size_matched field.
+        """
+        if not self._clob or not order_id:
+            return []
+        try:
+            # py_clob_client may have get_trades or similar
+            if hasattr(self._clob, 'get_trades'):
+                trades = self._clob.get_trades(order_id=order_id)
+                if isinstance(trades, list):
+                    return trades
+            # Fallback: try the REST endpoint directly
+            url = f"{self.clob_host}/trades"
+            r = self.session.get(url,
+                                 params={"order_id": order_id},
+                                 timeout=5)
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, list):
+                    return data
+        except Exception:
+            pass
+        return []
 
     def cancel_order(self, order_id: str) -> None:
         """Cancel a single order by id."""
