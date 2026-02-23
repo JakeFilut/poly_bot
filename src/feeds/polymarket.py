@@ -490,25 +490,36 @@ class PolymarketClient:
             if response and isinstance(response, dict):
                 oid = response.get("orderID", "")
                 status = response.get("status", "").lower()
-                size_matched = response.get("size_matched") or 0
+                size_matched = (response.get("size_matched")
+                                or response.get("sizeMatched")
+                                or response.get("filled_size")
+                                or response.get("filledSize") or 0)
                 tx_hashes = (response.get("transactionsHashes", [])
                              or response.get("transactionHashes", []))
 
                 filled = False
                 fill_qty = 0.0
                 if status == "matched" or tx_hashes:
-                    filled = True
                     fill_qty = float(size_matched) if size_matched else 0.0
-                    # If CLOB said "matched" but gave no size_matched, poll to confirm
+                    # If CLOB said "matched" but gave no size_matched, poll aggressively
                     if fill_qty == 0 and oid:
-                        fill_qty = self._poll_order_fill(oid, qty, timeout=5)
-                    if fill_qty == 0:
-                        # CLOB said matched — trust it, assume full fill
-                        fill_qty = qty
-                        _write_jsonl({"event_type":"FILL_QTY_ASSUMED",
+                        # Log the raw response so we can see what fields the CLOB returns
+                        _write_jsonl({"event_type":"MATCHED_NO_SIZE",
+                                     "order_id": oid,
+                                     "raw_keys": list(response.keys()),
+                                     "raw_status": status,
+                                     "raw_size_matched": response.get("size_matched"),
+                                     "raw_sizeMatched": response.get("sizeMatched"),
+                                     "requested_qty": qty})
+                        fill_qty = self._poll_order_fill(oid, qty, timeout=15)
+                    filled = fill_qty > 0
+                    if not filled:
+                        # CLOB said matched but couldn't confirm qty after 15s —
+                        # return unfilled so lifecycle recovery can track it down
+                        _write_jsonl({"event_type":"FILL_UNCONFIRMED",
                                      "order_id": oid, "status": status,
                                      "requested_qty": qty,
-                                     "note": "CLOB said matched but size_matched missing; assuming full fill"})
+                                     "note": "CLOB said matched but size_matched never populated after 15s poll"})
                 elif status == "live" and oid:
                     # Poll briefly to see if it filled
                     fill_qty = self._poll_order_fill(oid, qty, timeout=3)
@@ -551,7 +562,7 @@ class PolymarketClient:
 
     def _poll_order_fill(self, order_id: str, expected_qty: float,
                          timeout: int = 5) -> float:
-        """Poll CLOB briefly for GTC order fill. Returns filled qty (0.0 if not confirmed)."""
+        """Poll CLOB for order fill confirmation. Returns filled qty (0.0 if not confirmed)."""
         start = time.time()
         while time.time() - start < timeout:
             try:
@@ -559,7 +570,11 @@ class PolymarketClient:
                 if order and isinstance(order, dict):
                     status = order.get("status", "").lower()
                     if status in ("matched", "filled"):
-                        sm = order.get("size_matched")
+                        # Check multiple fields the CLOB might use for fill qty
+                        sm = (order.get("size_matched")
+                              or order.get("sizeMatched")
+                              or order.get("filled_size")
+                              or order.get("filledSize"))
                         if sm:
                             return float(sm)
                         # status says matched but no size — keep polling
@@ -567,7 +582,7 @@ class PolymarketClient:
                         return 0.0
             except Exception:
                 pass
-            time.sleep(1)
+            time.sleep(0.5)
         return 0.0
 
     def get_order_status(self, order_id: str) -> Optional[dict]:
