@@ -457,8 +457,9 @@ class Bot:
             self._truth.skip_history_now()
         # ── LIVE_SAFE mode: monotonic process start for entry window ──
         self._process_start_mono = time.monotonic()
-        # ── LIVE_SAFE: record starting hour so we exit when it ends ──
+        # ── LIVE_SAFE: record starting hour and count windows traded ──
         self._live_safe_start_hour = utc_now().replace(minute=0, second=0, microsecond=0)
+        self._live_safe_hours_completed = 0
         # ── Wallet balance snapshot for RECONCILE_DIFF display ──
         # (Removed: _last_wallet_balances — no longer needed)
         # (Removed: _balances_empty_count / _balances_pause_entries — no longer needed)
@@ -659,26 +660,34 @@ class Bot:
                 "stop_triggered": any_stop,
                 "shadow_delta": round(shadow_delta, 4),
             })
-            # ── LIVE_SAFE: exit after the starting hour window ends ──
+            # ── LIVE_SAFE: count completed hours, exit after LIVE_SAFE_NUM_HOURS ──
             if MODE == "LIVE_SAFE" and current_hour != self._live_safe_start_hour:
-                print("\n" + "=" * 60)
-                print("  [LIVE_SAFE] Hour window ended — shutting down for log review")
-                print(f"  Started: {iso_z(self._live_safe_start_hour)}")
-                print(f"  Equity:  ${equity_now:.2f}  |  PnL: ${self._hour_net_pnl:+.2f}")
+                self._live_safe_hours_completed += 1
                 _ls_fills = len(self._truth._fills) if hasattr(self._truth, '_fills') else self._hour_trade_count
-                print(f"  Fills in current hour window:  {_ls_fills}")
-                print("=" * 60)
+                print(f"\n  [LIVE_SAFE] Hour {self._live_safe_hours_completed}/{LIVE_SAFE_NUM_HOURS} complete  |  "
+                      f"PnL: ${self._hour_net_pnl:+.2f}  |  Fills: {_ls_fills}")
                 write_jsonl({
-                    "event_type": "LIVE_SAFE_HOUR_END_EXIT",
+                    "event_type": "LIVE_SAFE_HOUR_END",
+                    "hour_num": self._live_safe_hours_completed,
+                    "total_hours": LIVE_SAFE_NUM_HOURS,
                     "start_hour": iso_z(self._live_safe_start_hour),
                     "equity": round(equity_now, 4),
                     "hour_net_pnl": round(self._hour_net_pnl, 4),
                     "fills_in_current_hour": _ls_fills,
                     "trades": self._hour_trade_count,
                 })
-                self._save_state()
-                self.running = False
-                return
+                # Update start hour to current hour for next window
+                self._live_safe_start_hour = current_hour
+                # Reset entry window so buys are allowed in the new hour
+                self._process_start_mono = time.monotonic()
+                if self._live_safe_hours_completed >= LIVE_SAFE_NUM_HOURS:
+                    print("\n" + "=" * 60)
+                    print(f"  [LIVE_SAFE] {LIVE_SAFE_NUM_HOURS} hours complete — shutting down")
+                    print(f"  Equity:  ${equity_now:.2f}  |  Total PnL: ${self.realized_pnl_usdc:+.2f}")
+                    print("=" * 60)
+                    self._save_state()
+                    self.running = False
+                    return
             # ── Reset for new hour ──
             self._hour_window = current_hour
             self.hourly_pnl_usdc = 0.0
@@ -1126,8 +1135,8 @@ class Bot:
                   f"Max order: ${LIVE_SAFE_MAX_ORDER_USD:.2f}  |  "
                   f"Max total invested: ${LIVE_SAFE_MAX_TOTAL_INVESTED_USD:.2f}  |  "
                   f"Buys disabled after window; sells always allowed")
-            print(f"  [LIVE_SAFE] Will EXIT at hour boundary "
-                  f"({iso_z(self._live_safe_start_hour)} window)\n")
+            print(f"  [LIVE_SAFE] Will run {LIVE_SAFE_NUM_HOURS} hourly windows then exit  "
+                  f"(started: {iso_z(self._live_safe_start_hour)})\n")
 
         if MODE in ("LIVE", "LIVE_SAFE", "TEST"):
             print(f"  LIVE symbol filter active: {', '.join(LIVE_ALLOWED_SYMBOLS)}")
@@ -4297,12 +4306,13 @@ class Bot:
     # PRE-8HR SAFETY: coin-specific spread limit for entries
     # -----------------------------------------------------------------
     def _coin_spread_entry_ok(self, crypto: str, spread_cents: float) -> bool:
-        """Check if spread is within coin-specific entry limit."""
+        """Check if spread is within coin-specific entry limit (inclusive)."""
         if crypto in ("BTC", "ETH"):
             limit = MAX_SPREAD_ENTRY_CENTS_BTCETH
         else:
             limit = MAX_SPREAD_ENTRY_CENTS_SOLXRP
-        if spread_cents > limit:
+        # Use small epsilon for floating point: allow spread at exactly the limit
+        if spread_cents > limit + 0.05:
             self._diag_spread_limit_blocks += 1
             return False
         return True
@@ -4427,7 +4437,7 @@ class Bot:
             for st in self.market_states.values()
             for o in ["Up", "Down"] if st.positions[o].qty >= MIN_QTY
         )
-        # ── LIVE_SAFE total invested cap ($20 default) ──
+        # ── LIVE_SAFE total invested cap ($50 default, rolling — sells free up room) ──
         if MODE == "LIVE_SAFE" and total_usd >= LIVE_SAFE_MAX_TOTAL_INVESTED_USD:
             write_jsonl({"event_type": "LIVE_SAFE_INVESTED_CAP",
                           "slug": slug, "total_invested_usd": round(total_usd, 2),
