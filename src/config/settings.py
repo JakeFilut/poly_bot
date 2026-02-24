@@ -74,7 +74,7 @@ NO_NEW_ENTRIES_SEC_TO_CLOSE = float(os.getenv("NO_NEW_ENTRIES_SEC_TO_CLOSE", "18
 # -----------------------------------------------------------------------------
 # Runtime profile — selects which subsystems are active
 # -----------------------------------------------------------------------------
-PROFILE = os.getenv("PROFILE", "F247_LIKE")    # F247_LIKE | HOURLY_SCALP_MIN | HYBRID_COPYWALLET
+PROFILE = os.getenv("PROFILE", "HYBRID_COPYWALLET")    # F247_LIKE | HOURLY_SCALP_MIN | HYBRID_COPYWALLET
 
 # HOURLY_SCALP_MIN: minimal profile for BTC/ETH IOC scalping.
 # Keeps: IOC buy/sell, fill confirmation/recovery, reservation + exposure caps,
@@ -806,8 +806,13 @@ SCALP_CONSEC_STOP_PAUSE_SEC = float(os.getenv("SCALP_CONSEC_STOP_PAUSE_SEC", "10
 SCALP_CONSEC_STOP_THRESHOLD = int(os.getenv("SCALP_CONSEC_STOP_THRESHOLD", "3"))
 
 # ── Engine budget split ──
-DIR_BUDGET_USD = float(os.getenv("DIR_BUDGET_USD", "35.0"))
-SCALP_BUDGET_USD = float(os.getenv("SCALP_BUDGET_USD", "15.0"))
+# Paper (LOG) mode: scaled up with $1000 total cap; LIVE: $35/$15
+if MODE == "LOG":
+    DIR_BUDGET_USD = float(os.getenv("DIR_BUDGET_USD", "700.0"))
+    SCALP_BUDGET_USD = float(os.getenv("SCALP_BUDGET_USD", "300.0"))
+else:
+    DIR_BUDGET_USD = float(os.getenv("DIR_BUDGET_USD", "35.0"))
+    SCALP_BUDGET_USD = float(os.getenv("SCALP_BUDGET_USD", "15.0"))
 
 # ── RUN_ONE_HOUR: exit after one hourly window ──
 RUN_ONE_HOUR = bool(os.getenv("RUN_ONE_HOUR", "False") not in ("", "0", "False", "false"))
@@ -817,12 +822,21 @@ if _IS_HYBRID:
     CRYPTOS = ["BTC", "ETH"]
     LIVE_ALLOWED_SYMBOLS = ["BTC", "ETH"]
     # Exposure: CURRENT open cost, not cumulative spend
-    MAX_TOTAL_EXPOSURE_USD = float(os.getenv("MAX_TOTAL_EXPOSURE_USD", "50.0"))
-    MAX_POSITION_USD_PER_SLUG = float(os.getenv("MAX_POSITION_USD_PER_SLUG", "25.0"))
-    MAX_OPEN_ORDERS_TOTAL_USD = float(os.getenv("MAX_OPEN_ORDERS_TOTAL_USD", "25.0"))
-    MAX_OPEN_ORDERS_PER_SLUG_USD = float(os.getenv("MAX_OPEN_ORDERS_PER_SLUG_USD", "12.5"))
-    MAX_POSITION_SHARES_PER_OUTCOME = float(os.getenv("MAX_POSITION_SHARES_PER_OUTCOME", "60"))
-    MAX_NET_IMBALANCE_SHARES = float(os.getenv("MAX_NET_IMBALANCE_SHARES", "25"))
+    # Paper (LOG) mode gets $1000 cap; LIVE modes stay at $50
+    if MODE == "LOG":
+        MAX_TOTAL_EXPOSURE_USD = float(os.getenv("MAX_TOTAL_EXPOSURE_USD", "1000.0"))
+        MAX_POSITION_USD_PER_SLUG = float(os.getenv("MAX_POSITION_USD_PER_SLUG", "500.0"))
+        MAX_OPEN_ORDERS_TOTAL_USD = float(os.getenv("MAX_OPEN_ORDERS_TOTAL_USD", "500.0"))
+        MAX_OPEN_ORDERS_PER_SLUG_USD = float(os.getenv("MAX_OPEN_ORDERS_PER_SLUG_USD", "250.0"))
+        MAX_POSITION_SHARES_PER_OUTCOME = float(os.getenv("MAX_POSITION_SHARES_PER_OUTCOME", "1200"))
+        MAX_NET_IMBALANCE_SHARES = float(os.getenv("MAX_NET_IMBALANCE_SHARES", "500"))
+    else:
+        MAX_TOTAL_EXPOSURE_USD = float(os.getenv("MAX_TOTAL_EXPOSURE_USD", "50.0"))
+        MAX_POSITION_USD_PER_SLUG = float(os.getenv("MAX_POSITION_USD_PER_SLUG", "25.0"))
+        MAX_OPEN_ORDERS_TOTAL_USD = float(os.getenv("MAX_OPEN_ORDERS_TOTAL_USD", "25.0"))
+        MAX_OPEN_ORDERS_PER_SLUG_USD = float(os.getenv("MAX_OPEN_ORDERS_PER_SLUG_USD", "12.5"))
+        MAX_POSITION_SHARES_PER_OUTCOME = float(os.getenv("MAX_POSITION_SHARES_PER_OUTCOME", "60"))
+        MAX_NET_IMBALANCE_SHARES = float(os.getenv("MAX_NET_IMBALANCE_SHARES", "25"))
     # Window: do NOT require early-window-only
     ENTRY_ONLY_EARLY_WINDOW = False
     ACTIVE_WINDOW_ONLY = True
