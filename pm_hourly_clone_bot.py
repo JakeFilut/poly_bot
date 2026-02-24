@@ -358,6 +358,9 @@ class Bot:
         self._diag_dscalp_exit_cents: List[float] = []     # profit/loss in cents
         # Entry reject tracking by gate (per-minute, reset in DIAG report)
         self._diag_entry_reject_by_gate: Dict[str, int] = {}
+        # ENTRY_BLOCKED tracing: per-slug rate-limited decision log
+        self._entry_blocked_last_ts: Dict[str, float] = {}  # slug -> last log ts
+        self._entry_blocked_rollup: Dict[str, int] = {}     # blocker_category -> count (60s window)
         # TIME_STOP deferred/soft-exit tracking
         self._diag_time_stop_defers = 0
         self._diag_time_stop_soft_exits = 0
@@ -1454,6 +1457,19 @@ class Bot:
                   f"MAX_EXPOSURE=${MAX_TOTAL_EXPOSURE_USD} "
                   f"ioc={LAST_SECONDS_IOC_ONLY:.0f}s "
                   f"cancel_all={CANCEL_ALL_BEFORE_CLOSE_SEC:.0f}s")
+        # Concurrent exposure caps (all modes)
+        print(f"  RISK LIMITS ({MODE}): max_concurrent=${MAX_CONCURRENT_EXPOSURE_USD:.0f}"
+              f"  per_slug=${MAX_EXPOSURE_USD_PER_SLUG:.0f}"
+              f"  per_order=${MAX_ORDER_USD:.0f}"
+              f"  DIR=${DIR_BUDGET_USD:.0f}  SCALP=${SCALP_BUDGET_USD:.0f}")
+        if MODE == "LOG":
+            print(f"  PAPER_LIMITS {{max_concurrent={MAX_CONCURRENT_EXPOSURE_USD:.0f},"
+                  f" per_slug={MAX_EXPOSURE_USD_PER_SLUG:.0f},"
+                  f" per_order={MAX_ORDER_USD:.0f}}}")
+        else:
+            print(f"  LIVE_LIMITS {{max_concurrent={MAX_CONCURRENT_EXPOSURE_USD:.0f},"
+                  f" per_slug={MAX_EXPOSURE_USD_PER_SLUG:.0f},"
+                  f" per_order={MAX_ORDER_USD:.0f}}}")
         self._last_balance_print = 0.0
         self._last_save_ts = time.time()
 
@@ -2607,6 +2623,8 @@ class Bot:
                   f"life(accept={_t.cursor_accepted_fills} "
                   f"drop_old={_t.cursor_dropped_old_ts} "
                   f"drop_win={_t.cursor_dropped_outside_window})")
+            # ENTRY_BLOCKED rollup (top 5 blockers in last 60s)
+            self._print_entry_blocked_rollup()
 
         # Reset per-minute counters
         self._diag_report_last_ts = now_t
@@ -2816,8 +2834,8 @@ class Bot:
         pos_str = "  ".join(pos_parts) if pos_parts else "none"
 
         exposure = self._total_exposure_usd()
-        exposure_left = max(0.0, MAX_TOTAL_EXPOSURE_USD - exposure)
-        exposure_str = f"  |  EXPOSURE ${exposure:.2f}/${MAX_TOTAL_EXPOSURE_USD:.0f}  Left: ${exposure_left:.2f}"
+        remaining_capacity = max(0.0, MAX_CONCURRENT_EXPOSURE_USD - exposure)
+        exposure_str = f"  |  EXPOSURE ${exposure:.2f}/${MAX_CONCURRENT_EXPOSURE_USD:.0f}  Left: ${remaining_capacity:.2f}"
 
         # HYBRID mode: show engine-level breakdown
         engine_str = ""
@@ -3697,6 +3715,7 @@ class Bot:
         # Inventory cap check
         if not self._inventory_cap_ok(m.slug, outcome):
             self._diag_entry_reject_by_gate["inventory_cap"] = self._diag_entry_reject_by_gate.get("inventory_cap", 0) + 1
+            self._log_entry_blocked(m.slug, m.crypto, outcome, "inventory", "INVENTORY_CAP", t_min)
             DiagReporter.gate_trace(m.slug, outcome, "inventory", "INVENTORY_CAP",
                                     t_min=t_min, delta_bps=delta_bps, exposure_total=self._total_exposure_usd(),
                                     bot=self, write_fn=write_jsonl)
@@ -3745,6 +3764,7 @@ class Bot:
         spread_cents = book.spread * 100
         if not self._coin_spread_entry_ok(m.crypto, spread_cents):
             self._diag_entry_reject_by_gate["spread_filter"] = self._diag_entry_reject_by_gate.get("spread_filter", 0) + 1
+            self._log_entry_blocked(m.slug, m.crypto, outcome, "spread", f"SPREAD_FILTER({spread_cents:.1f}c)", t_min)
             # Sampled log: only emit GATE_SPREAD_BLOCK at LOG_SPREAD_BLOCK_SAMPLER probability
             if LOG_LEVEL != "COMPACT" or random.random() < LOG_SPREAD_BLOCK_SAMPLER:
                 write_jsonl({"event_type": "GATE_SPREAD_BLOCK", "ts_ms": int(now_t * 1000),
@@ -3791,6 +3811,7 @@ class Bot:
         spot_move_ok = self._spot_move_10s_bps(m.slug) >= DSCALP_SPOT_MOVE_10S_BPS
         if not delta_ok and not spot_move_ok:
             self._diag_entry_reject_by_gate["signal"] = self._diag_entry_reject_by_gate.get("signal", 0) + 1
+            self._log_entry_blocked(m.slug, m.crypto, outcome, "signal", f"SIGNAL_TOO_WEAK(delta={abs_delta_bps:.1f})", t_min)
             DiagReporter.gate_trace(m.slug, outcome, "edge", "SIGNAL_TOO_WEAK",
                                     t_min=t_min, spread=spread_cents, delta_bps=delta_bps,
                                     exposure_total=self._total_exposure_usd(),
@@ -3844,14 +3865,14 @@ class Bot:
         if order_qty < 1:
             return
 
-        # Execution safety gate (kill-switch, drift, loss-tail, LIVE_SAFE entry window)
-        if not self._exec_safety_can_enter(m.slug):
+        # Execution safety gate (kill-switch, drift, loss-tail, exposure caps)
+        if not self._exec_safety_can_enter(m.slug, outcome, t_min):
             DiagReporter.gate_trace(m.slug, outcome, "safe", "EXEC_SAFETY_BLOCK",
                                     t_min=t_min, spread=spread_cents, delta_bps=delta_bps,
                                     exposure_total=self._total_exposure_usd(),
                                     bot=self, velocity_bps_per_min=vel, write_fn=write_jsonl)
             return
-        # LIVE_SAFE trade-size limiter
+        # LIVE_SAFE trade-size limiter (also applies MAX_ORDER_USD)
         step_usd, order_qty = self._live_safe_cap_usd(step_usd, buy_price)
         if order_qty < 1:
             return
@@ -5029,8 +5050,8 @@ class Bot:
         # Block if desync hard stop active
         if self._desync_hard_stop:
             return False
-        # Block if exposure cap hit
-        if self._total_exposure_usd() >= MAX_TOTAL_EXPOSURE_USD:
+        # Block if concurrent exposure cap hit
+        if self._total_exposure_usd() >= MAX_CONCURRENT_EXPOSURE_USD:
             return False
         return True
 
@@ -5204,11 +5225,30 @@ class Bot:
         """Cancel all open orders.
         Tries client.cancel_all_orders() batch method first, falls back to
         fetching open orders then cancelling each individually.
+        In LOG mode, clears all internal reservations (no CLOB orders to cancel).
         Returns count of successfully cancelled orders."""
         _pre_exp_cancel = self._total_exposure_usd()
         DiagReporter.order_trace("CANCELED", "", "", "CANCEL",
                                  "", 0, 0, pre_exposure=_pre_exp_cancel,
                                  engine="ALL", write_fn=write_jsonl)
+
+        # LOG mode: no real CLOB orders — just clear internal state
+        if MODE == "LOG":
+            cleared = len(self._reserved_usd)
+            cleared_usd = sum(self._reserved_usd.values())
+            for oid in list(self._reserved_usd.keys()):
+                self._release_reservation(oid)
+            _post_exp = self._total_exposure_usd()
+            write_jsonl({"event_type": "CANCEL_ALL_LOG_MODE",
+                         "reservations_cleared": cleared,
+                         "usd_released": round(cleared_usd, 2),
+                         "pre_exposure": round(_pre_exp_cancel, 2),
+                         "post_exposure": round(_post_exp, 2),
+                         "ts_ms": int(time.time() * 1000)})
+            if cleared > 0:
+                print(f"  [CANCEL_ALL] LOG mode: cleared {cleared} reservations (${cleared_usd:.2f})")
+            return cleared
+
         # Try the client's batch cancel first (handles both batch API and fallback)
         try:
             result = self.client.cancel_all_orders()
@@ -5806,17 +5846,22 @@ class Bot:
         return max(0.0, remaining)
 
     def _live_safe_cap_usd(self, order_usd: float, price: float) -> Tuple[float, float]:
-        """Apply LIVE_SAFE trade-size limiter to a BUY order.
+        """Apply trade-size limiter to a BUY order.
         Returns (capped_usd, capped_qty). If qty < CLOB minimum, returns (0, 0) to skip.
         CLOB requires: min 5 shares AND min $1 total order value.
-        In non-LIVE_SAFE modes, enforces CLOB minimum but no USD cap."""
+        All modes: cap at MAX_ORDER_USD. LIVE_SAFE: also cap at LIVE_SAFE_MAX_ORDER_USD."""
         import math as _math
         min_qty_for_usd = _math.ceil(1.01 / max(1e-9, price))
         clob_min = max(CLOB_MIN_ORDER_SIZE, min_qty_for_usd)
+        # Apply MAX_ORDER_USD cap in all modes
+        per_order_cap = MAX_ORDER_USD
+        if MODE == "LIVE_SAFE":
+            per_order_cap = min(per_order_cap, LIVE_SAFE_MAX_ORDER_USD)
         if MODE != "LIVE_SAFE":
-            qty = max(float(clob_min), order_usd / max(1e-9, price))
+            capped_usd = min(order_usd, per_order_cap)
+            qty = max(float(clob_min), capped_usd / max(1e-9, price))
             return qty * price, qty
-        capped_usd = min(order_usd, LIVE_SAFE_MAX_ORDER_USD)
+        capped_usd = min(order_usd, per_order_cap)
         capped_qty = capped_usd / max(1e-9, price)
         # Enforce Polymarket minimum (shares + $1 value)
         if capped_qty < clob_min:
@@ -5859,6 +5904,64 @@ class Bot:
         """Check if slug entries are paused by loss-tail guard. Sells always allowed."""
         pause_until = self._slug_entry_paused_until.get(slug, 0.0)
         return time.monotonic() >= pause_until
+
+    # -----------------------------------------------------------------
+    # ENTRY_BLOCKED tracing — per-slug rate-limited decision log
+    # -----------------------------------------------------------------
+    def _log_entry_blocked(self, slug: str, crypto: str, outcome: str,
+                           blocker_category: str, blocker_reason: str,
+                           t_min: float = 0.0) -> None:
+        """Emit ENTRY_BLOCKED log, rate-limited to once per 10s per slug.
+        Also accumulates the 60s rollup counters."""
+        # Always count for rollup
+        self._entry_blocked_rollup[blocker_category] = (
+            self._entry_blocked_rollup.get(blocker_category, 0) + 1)
+        # Rate-limit per-slug log to once per 10s
+        now = time.time()
+        last = self._entry_blocked_last_ts.get(slug, 0.0)
+        if now - last < 10.0:
+            return
+        self._entry_blocked_last_ts[slug] = now
+        exposure = self._total_exposure_usd()
+        open_order_usd = self._total_reserved_usd()
+        pos_cost_usd = exposure - open_order_usd
+        window_state = str(getattr(self._truth, 'window_state', 'UNKNOWN'))
+        bot_state = "SAFE_MODE" if getattr(self._truth, 'safe_mode', False) else "NORMAL"
+        if self._desync_hard_stop:
+            bot_state = "DESYNC_HARD_STOP"
+        write_jsonl({
+            "event_type": "ENTRY_BLOCKED",
+            "slug": slug, "crypto": crypto, "t_min": round(t_min, 1),
+            "window_state": window_state, "bot_state": bot_state,
+            "current_exposure_usd": round(exposure, 2),
+            "open_order_usd": round(open_order_usd, 2),
+            "pos_cost_usd": round(pos_cost_usd, 2),
+            "remaining_capacity_usd": round(max(0, MAX_CONCURRENT_EXPOSURE_USD - exposure), 2),
+            "first_blocker_category": blocker_category,
+            "first_blocker_reason": blocker_reason,
+            "ts_ms": int(now * 1000),
+        })
+        print(f"  [ENTRY_BLOCKED] {slug} {crypto} {outcome} "
+              f"cat={blocker_category} reason={blocker_reason} "
+              f"exposure=${exposure:.2f}/{MAX_CONCURRENT_EXPOSURE_USD:.0f} "
+              f"t_min={t_min:.1f}")
+
+    def _print_entry_blocked_rollup(self) -> None:
+        """Print top-5 blocker categories from last 60s, then reset."""
+        if not self._entry_blocked_rollup:
+            return
+        total = sum(self._entry_blocked_rollup.values())
+        top5 = sorted(self._entry_blocked_rollup.items(),
+                       key=lambda x: x[1], reverse=True)[:5]
+        parts = [f"{cat}={cnt}" for cat, cnt in top5]
+        print(f"  BLOCKERS_60s: total={total}  {' '.join(parts)}")
+        write_jsonl({
+            "event_type": "ENTRY_BLOCKED_ROLLUP",
+            "total": total,
+            "top5": {cat: cnt for cat, cnt in top5},
+            "ts_ms": int(time.time() * 1000),
+        })
+        self._entry_blocked_rollup.clear()
 
     # -----------------------------------------------------------------
     # PRE-8HR SAFETY: inventory cap check (block new BUYs when exceeded)
@@ -6113,25 +6216,59 @@ class Bot:
                 except Exception as diag_e:
                     print(f"  [DIAG] Failed to fetch CLOB balances: {diag_e}")
 
-            # Drift #2: resync from truth + dedup fills
-            if self._pos_drift_consecutive == 2 and POS_DRIFT_RESYNC_ENABLED and not self._pos_drift_resync_done:
-                # First dedup
+            # Drift #2: dedup fills as preparation
+            if self._pos_drift_consecutive == 2:
                 removed = self._truth.dedup_fills()
                 if removed > 0:
                     print(f"  [INVARIANT] Truth dedup removed {removed} duplicate fill(s)")
-                # Then resync
+
+            # Drift #3: SAFE MODE + cancel_all + force resync from truth
+            if (self._pos_drift_consecutive >= 3
+                    and POS_DRIFT_RESYNC_ENABLED
+                    and not self._pos_drift_resync_done):
+                # 1. Enter SAFE MODE
+                self._truth.enter_safe_mode(
+                    reason=f"position_drift_{self._pos_drift_consecutive}_consecutive",
+                    mismatches=[f"{d['slug']} {d['outcome']}: bot={d['bot_qty']} truth={d['truth_qty']}"
+                                for d in diffs])
+                print(f"  [INVARIANT] SAFE MODE entered after {self._pos_drift_consecutive} consecutive drifts")
+
+                # 2. Cancel all open orders
+                cancelled = self._cancel_all_orders()
+                print(f"  [INVARIANT] Cancelled {cancelled} orders before resync")
+
+                # 3. Force resync: overwrite bot positions from truth
+                before_snapshot = []
+                for d in diffs:
+                    before_snapshot.append({
+                        "slug": d["slug"], "outcome": d["outcome"],
+                        "bot_qty": d["bot_qty"], "truth_qty": d["truth_qty"],
+                    })
                 corrections = self._resync_positions_from_truth()
                 self._pos_drift_resync_done = True
-                if corrections:
-                    for c in corrections:
-                        print(f"  [RESYNC] {c['slug']} {c['outcome']}: "
-                              f"{c['old']} → {c['new']}")
-                    write_jsonl({
-                        "event_type": "POSITION_RESYNC_FROM_TRUTH",
-                        "corrections": corrections,
-                        "ts_ms": int(time.time() * 1000),
+
+                # 4. Log POSITION_RESYNC_APPLIED with before/after snapshot
+                resync_log = []
+                for c in corrections:
+                    resync_log.append({
+                        "slug": c["slug"], "outcome": c["outcome"],
+                        "bot_qty_before": c["old"], "truth_qty": c["new"],
+                        "delta": round(c["new"] - c["old"], 2),
                     })
-                # Reset counter: give 3 fresh checks post-resync
+                    print(f"  [RESYNC] {c['slug']} {c['outcome']}: "
+                          f"{c['old']} → {c['new']}")
+                write_jsonl({
+                    "event_type": "POSITION_RESYNC_APPLIED",
+                    "consecutive_drifts": self._pos_drift_consecutive,
+                    "corrections": resync_log,
+                    "cancelled_orders": cancelled,
+                    "safe_mode": True,
+                    "ts_ms": int(time.time() * 1000),
+                })
+                if not corrections:
+                    print(f"  [RESYNC] No corrections needed — truth and bot agree after dedup")
+
+                # Reset counter: give fresh checks post-resync
                 self._pos_drift_consecutive = 0
                 return
 
@@ -6256,45 +6393,48 @@ class Bot:
                 self._truth.enter_safe_mode(
                     f"HEDGE_MISMATCH: {slug} net_exposure={net_exposure:.1f}")
 
-    def _exec_safety_can_enter(self, slug: str) -> bool:
-        """Execution safety gate. Returns True if entry is allowed."""
+    def _exec_safety_can_enter(self, slug: str, outcome: str = "?",
+                              t_min: float = 0.0) -> bool:
+        """Execution safety gate. Returns True if entry is allowed.
+        Enforces concurrent exposure caps in ALL modes (including LOG).
+        Emits ENTRY_BLOCKED tracing when blocked."""
+        slug_st = self.market_states.get(slug)
+        crypto = slug_st.crypto if slug_st else "?"
         # Active window filter: block buys on non-current-hour tokens
         if ACTIVE_WINDOW_ONLY and STRICT_WINDOW_MODE:
             token_up, _ = self._token_for_slug_outcome(slug, "Up")
             if token_up and not self._truth.is_active_window_token(token_up):
-                write_jsonl({"event_type": "WINDOW_BUY_BLOCKED",
-                             "slug": slug, "reason": "non_active_window",
-                             "ts_ms": int(time.time() * 1000)})
-                print(f"  [TRUTH] WARN: Attempt to trade non-active window token: "
-                      f"{slug} BUY")
+                self._log_entry_blocked(slug, crypto, outcome,
+                    "global", "NON_ACTIVE_WINDOW", t_min)
                 return False
         # State machine: only ACTIVE state can place new buys
         if self._truth.window_state != WindowState.ACTIVE:
+            self._log_entry_blocked(slug, crypto, outcome,
+                "global", f"WINDOW_STATE={self._truth.window_state}", t_min)
             return False
         # Truth Capture SAFE MODE: block all new buys on desync
         if self._truth.safe_mode:
+            self._log_entry_blocked(slug, crypto, outcome,
+                "global", "SAFE_MODE", t_min)
             return False
         # Loss-tail guard (all modes)
         if not self._slug_entry_allowed(slug):
+            self._log_entry_blocked(slug, crypto, outcome,
+                "exec_safety", "LOSS_TAIL_GUARD", t_min)
             return False
-        if MODE == "LOG":
-            return True
-        # LIVE_SAFE: check entry window
-        if not self._buys_allowed():
-            return False
-        # ── Strict always-on exposure cap (all live modes) ──
-        # exposure = open position cost basis + reserved pending buys
+        # LIVE modes: check entry window + safe mode gates
+        if MODE != "LOG":
+            if not self._buys_allowed():
+                self._log_entry_blocked(slug, crypto, outcome,
+                    "exec_safety", "BUYS_NOT_ALLOWED", t_min)
+                return False
+        # ── Concurrent exposure cap (ALL modes) ──
         total_usd = self._total_exposure_usd()
-        if total_usd >= MAX_TOTAL_EXPOSURE_USD:
-            write_jsonl({"event_type": "EXPOSURE_CAP_HIT",
-                          "slug": slug,
-                          "filled_usd": round(total_usd - self._total_reserved_usd(), 2),
-                          "reserved_usd": round(self._total_reserved_usd(), 2),
-                          "total_exposure_usd": round(total_usd, 2),
-                          "cap_usd": MAX_TOTAL_EXPOSURE_USD,
-                          "ts_ms": int(time.time() * 1000)})
+        if total_usd >= MAX_CONCURRENT_EXPOSURE_USD:
+            self._log_entry_blocked(slug, crypto, outcome,
+                "global", f"CONCURRENT_EXPOSURE(${total_usd:.0f}>=${MAX_CONCURRENT_EXPOSURE_USD:.0f})", t_min)
             return False
-        slug_st = self.market_states.get(slug)
+        # ── Per-slug concurrent exposure cap (ALL modes) ──
         slug_usd = 0.0
         if slug_st:
             slug_usd = sum(
@@ -6302,12 +6442,20 @@ class Bot:
                 for o in ["Up", "Down"] if slug_st.positions[o].qty >= MIN_QTY
             )
         slug_usd += self._dscalp_invested_usd.get(slug, 0.0)
-        allowed, reason = self._exec_safety.can_enter(
-            slug, self._exec_tracker.open_order_count(), slug_usd, total_usd)
-        if not allowed:
-            write_jsonl({"event_type": "EXEC_ENTRY_BLOCKED", "slug": slug,
-                          "reason": reason, "ts_ms": int(time.time() * 1000)})
-        return allowed
+        slug_usd += self._reserved_usd_for_slug(slug)
+        if slug_usd >= MAX_EXPOSURE_USD_PER_SLUG:
+            self._log_entry_blocked(slug, crypto, outcome,
+                "inventory", f"SLUG_EXPOSURE(${slug_usd:.0f}>=${MAX_EXPOSURE_USD_PER_SLUG:.0f})", t_min)
+            return False
+        # LIVE modes: additional SafetyCaps checks
+        if MODE != "LOG":
+            allowed, reason = self._exec_safety.can_enter(
+                slug, self._exec_tracker.open_order_count(), slug_usd, total_usd)
+            if not allowed:
+                self._log_entry_blocked(slug, crypto, outcome,
+                    "exec_safety", reason, t_min)
+            return allowed
+        return True
 
     def _execute_burst_buy(self, m: MarketRef, st: MarketState, outcome: str,
                            base_clip_usd: float, ctx: dict, thr_bps: float = 0):

@@ -87,11 +87,12 @@ class ExposureTracker:
         """Check if opening a new position of additional_usd is allowed.
 
         Checks:
-        1. Total exposure + new order <= MAX_TOTAL_EXPOSURE_USD
+        1. Total exposure + new order <= MAX_CONCURRENT_EXPOSURE_USD
         2. Engine-specific budget not exceeded
         """
         current = self.total_exposure_usd()
-        if current + additional_usd > settings.MAX_TOTAL_EXPOSURE_USD:
+        cap = getattr(settings, 'MAX_CONCURRENT_EXPOSURE_USD', settings.MAX_TOTAL_EXPOSURE_USD)
+        if current + additional_usd > cap:
             return False
 
         engine_exp = self.engine_exposure_usd(engine)
@@ -104,7 +105,8 @@ class ExposureTracker:
 
     def exposure_room(self) -> float:
         """How much more USD can be deployed across all engines."""
-        return max(0.0, settings.MAX_TOTAL_EXPOSURE_USD - self.total_exposure_usd())
+        cap = getattr(settings, 'MAX_CONCURRENT_EXPOSURE_USD', settings.MAX_TOTAL_EXPOSURE_USD)
+        return max(0.0, cap - self.total_exposure_usd())
 
     def _positions_cost_usd(self) -> float:
         total = 0.0
