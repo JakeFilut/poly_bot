@@ -140,10 +140,12 @@ _ALWAYS_LOG_EVENTS = frozenset({
     "STATE_DESYNC_DETECTED", "STATE_DESYNC_RESOLVED",
     # Fill integrity events (A/B/C/D/E)
     "PENDING_FILL", "FILL_CONFIRMED", "FILL_CONFIRM_FAILED",
-    "FILL_DEDUP_SKIPPED", "ORPHAN_ORDER", "ORDER_RESOLVED",
+    "FILL_DEDUP_SKIPPED", "FILL_DEDUP_LOADED", "FILL_DEDUPE_ROTATED",
+    "ORPHAN_ORDER", "ORPHAN_ORDER_CONFIRMED", "ORDER_RESOLVED",
+    "PARTIAL_FILL_APPLIED", "FILL_CONFIRM_LATENCY_MS",
     "POSITION_DRIFT", "POSITION_RESYNC_APPLIED",
     "DRIFT_DIAGNOSTIC", "DESYNC_FROM_INVARIANT",
-    "FILL_INTEGRITY_STARTUP",
+    "FILL_INTEGRITY_STARTUP", "SAFE_MODE_EXIT_AUTO",
 })
 # Prefixes that always log (for variable event_type like flatten_reason)
 _ALWAYS_LOG_PREFIXES = ("FLATTEN", "KILL", "PAUSE", "END_OF_HOUR")
@@ -544,6 +546,7 @@ class Bot:
         self._fill_dedupe_store = FillDedupeStore(
             persist_path=FILL_DEDUPE_PERSIST_PATH,
             write_jsonl=write_jsonl,
+            max_lines=FILL_DEDUPE_MAX_LINES,
         )
         _dedupe_loaded = self._fill_dedupe_store.load_from_disk()
         self._pending_fill_registry = PendingFillRegistry(
@@ -555,9 +558,11 @@ class Bot:
         self._pending_fill_registry.SLOW_TIMEOUT_SEC = FILL_CONFIRM_SLOW_TIMEOUT_SEC
         self._order_lifecycle_watcher = OrderLifecycleWatcher(
             get_order_status_fn=self.client.get_order_status,
+            get_order_fills_fn=self.client.get_order_fills,
             write_jsonl=write_jsonl,
         )
         self._order_lifecycle_watcher.RESOLVE_TIMEOUT_SEC = ORDER_UNKNOWN_RESOLVE_TIMEOUT_SEC
+        self._safe_mode_clean_checks: int = 0  # consecutive clean invariant checks while in SAFE MODE
         # ── HYBRID_COPYWALLET: exposure tracker + scalp engine ──
         self._exposure_tracker = ExposureTracker(write_jsonl)
         self._scalp_engine = ScalpEngine(self._exposure_tracker, write_jsonl) if _IS_HYBRID else None
@@ -1513,27 +1518,32 @@ class Bot:
                   f"thresholds: {{delta_min_bps: {DSCALP_DELTA_MIN_BPS:.0f}, "
                   f"probe_delta_bps: {HYBRID_PROBE_DELTA_MIN_BPS:.0f}, "
                   f"spread_max_cents: {DSCALP_MAX_SPREAD_CENTS:.0f}}}}}")
-        # Fill Integrity startup log
+        # Fill Integrity startup diagnostic block (F)
         _dedupe_size = self._fill_dedupe_store.size
         _dedupe_persist = "ON" if FILL_DEDUPE_PERSIST_PATH else "OFF"
-        print(f"  FILL_INTEGRITY: DEDUPE_PERSISTENCE={_dedupe_persist} "
-              f"store_size={_dedupe_size} "
-              f"confirm_timeout={FILL_CONFIRM_NORMAL_TIMEOUT_SEC:.0f}s/{FILL_CONFIRM_SLOW_TIMEOUT_SEC:.0f}s "
-              f"order_unknown_timeout={ORDER_UNKNOWN_RESOLVE_TIMEOUT_SEC:.0f}s")
-        print(f"  DRIFT: check_interval={POS_DRIFT_CHECK_INTERVAL_SEC:.0f}s "
-              f"tolerance={POS_DRIFT_TOLERANCE} "
-              f"auto_exit_safe_mode={POS_DRIFT_AUTO_EXIT_SAFE_MODE}")
+        _dedupe_bad = self._fill_dedupe_store.bad_lines_skipped
+        print(f"  FILL_INTEGRITY_STATUS {{"
+              f"dedupe_persistence: {_dedupe_persist}, "
+              f"dedupe_loaded_count: {_dedupe_size}, "
+              f"{'bad_lines_skipped: ' + str(_dedupe_bad) + ', ' if _dedupe_bad else ''}"
+              f"drift_tolerance: {POS_DRIFT_TOLERANCE}, "
+              f"confirm_timeout_normal: {FILL_CONFIRM_NORMAL_TIMEOUT_SEC}, "
+              f"confirm_timeout_slow: {FILL_CONFIRM_SLOW_TIMEOUT_SEC}, "
+              f"orphan_timeout: {ORDER_UNKNOWN_RESOLVE_TIMEOUT_SEC}, "
+              f"clean_checks_to_exit: {POS_DRIFT_CLEAN_CHECKS_TO_EXIT}}}")
         write_jsonl({
             "event_type": "FILL_INTEGRITY_STARTUP",
             "dedupe_persistence": _dedupe_persist,
-            "dedupe_store_size": _dedupe_size,
-            "dedupe_persist_path": FILL_DEDUPE_PERSIST_PATH,
-            "fill_confirm_normal_timeout_sec": FILL_CONFIRM_NORMAL_TIMEOUT_SEC,
-            "fill_confirm_slow_timeout_sec": FILL_CONFIRM_SLOW_TIMEOUT_SEC,
-            "order_unknown_resolve_timeout_sec": ORDER_UNKNOWN_RESOLVE_TIMEOUT_SEC,
-            "pos_drift_check_interval_sec": POS_DRIFT_CHECK_INTERVAL_SEC,
-            "pos_drift_tolerance": POS_DRIFT_TOLERANCE,
-            "pos_drift_auto_exit_safe_mode": POS_DRIFT_AUTO_EXIT_SAFE_MODE,
+            "dedupe_loaded_count": _dedupe_size,
+            "dedupe_bad_lines_skipped": _dedupe_bad,
+            "dedupe_max_lines": FILL_DEDUPE_MAX_LINES,
+            "drift_tolerance": POS_DRIFT_TOLERANCE,
+            "drift_check_interval_sec": POS_DRIFT_CHECK_INTERVAL_SEC,
+            "drift_auto_exit_safe_mode": POS_DRIFT_AUTO_EXIT_SAFE_MODE,
+            "drift_clean_checks_to_exit": POS_DRIFT_CLEAN_CHECKS_TO_EXIT,
+            "confirm_timeout_normal": FILL_CONFIRM_NORMAL_TIMEOUT_SEC,
+            "confirm_timeout_slow": FILL_CONFIRM_SLOW_TIMEOUT_SEC,
+            "orphan_timeout": ORDER_UNKNOWN_RESOLVE_TIMEOUT_SEC,
             "ts_ms": int(time.time() * 1000),
         })
         self._last_balance_print = 0.0
@@ -6390,6 +6400,7 @@ class Bot:
             if not hasattr(self, '_pos_drift_resync_done'):
                 self._pos_drift_resync_done = False
             self._pos_drift_consecutive += 1
+            self._safe_mode_clean_checks = 0  # reset clean-check counter on any drift
 
             write_jsonl({
                 "event_type": "POSITION_DRIFT",
@@ -6495,8 +6506,22 @@ class Bot:
                 # Clear orphan blocks after resync
                 self._order_lifecycle_watcher.clear_all_orphan_blocks()
 
-                # 6. Remain in SAFE MODE until next invariant check passes clean
+                # 6. Reset per-slug cached state that depends on qty
+                for c in corrections:
+                    _slug = c["slug"]
+                    # Invalidate inventory caps / lean logic caches
+                    self._last_fill_ts.pop(_slug, None)
+                    self._slug_neg_exits.pop(_slug, None)
+                    self._slug_neg_exit_count.pop(_slug, None)
+                    self._slug_entry_paused_until.pop(_slug, None)
+                    # Reset directional tracking if position was corrected
+                    if _slug in self._dscalp_invested_usd:
+                        # Let dscalp re-evaluate on next tick
+                        pass
+
+                # 7. Remain in SAFE MODE until N consecutive clean checks pass
                 #    (auto-exit happens in the "no drift" branch below)
+                self._safe_mode_clean_checks = 0  # reset counter for new SAFE MODE
                 # Reset counter for post-resync escalation tracking
                 self._pos_drift_consecutive = 0
                 return
@@ -6554,19 +6579,41 @@ class Bot:
                 self._pos_drift_consecutive = 0
             self._pos_drift_resync_done = False
 
-            # ── AUTO-EXIT SAFE MODE: invariant passes clean → resume trading ──
+            # ── AUTO-EXIT SAFE MODE: require N consecutive clean checks ──
             if POS_DRIFT_AUTO_EXIT_SAFE_MODE and self._truth.safe_mode:
-                self._truth.exit_safe_mode()
-                print("  [INVARIANT] Clean check — auto-exiting SAFE MODE")
-                # Also clear desync_hard_stop if it was set
-                if self._desync_hard_stop:
-                    self._desync_hard_stop = False
+                self._safe_mode_clean_checks += 1
+                _required = POS_DRIFT_CLEAN_CHECKS_TO_EXIT
+                if self._safe_mode_clean_checks >= _required:
+                    # Collect affected slugs for logging
+                    _slug_list = sorted(set(
+                        slug for slug in self.market_states.keys()
+                    ))
+                    self._truth.exit_safe_mode()
                     write_jsonl({
-                        "event_type": "DESYNC_HARD_STOP_CLEARED",
-                        "reason": "invariant_clean_check",
+                        "event_type": "SAFE_MODE_EXIT_AUTO",
+                        "clean_checks": self._safe_mode_clean_checks,
+                        "required_checks": _required,
+                        "slug_list": _slug_list,
                         "ts_ms": int(time.time() * 1000),
                     })
-                    print("  [INVARIANT] DESYNC_HARD_STOP cleared — buys re-enabled")
+                    print(f"  [INVARIANT] {self._safe_mode_clean_checks} consecutive clean checks — "
+                          f"auto-exiting SAFE MODE")
+                    self._safe_mode_clean_checks = 0
+                    # Also clear desync_hard_stop if it was set
+                    if self._desync_hard_stop:
+                        self._desync_hard_stop = False
+                        write_jsonl({
+                            "event_type": "DESYNC_HARD_STOP_CLEARED",
+                            "reason": "invariant_clean_checks",
+                            "ts_ms": int(time.time() * 1000),
+                        })
+                        print("  [INVARIANT] DESYNC_HARD_STOP cleared — buys re-enabled")
+                else:
+                    print(f"  [INVARIANT] Clean check {self._safe_mode_clean_checks}/{_required} "
+                          f"— staying in SAFE MODE until {_required} consecutive")
+            else:
+                # Not in safe mode — reset counter
+                self._safe_mode_clean_checks = 0
 
     def _check_hedge_mismatch(self) -> None:
         """Detect hedge mismatches: net exposure on one side beyond threshold.

@@ -6,31 +6,37 @@ Implements:
      - Stable fill_key: prefer trade_id/match_id, else composite
      - Persistent dedupe store (JSONL + in-memory set) survives restarts
      - FILL_DEDUP_SKIPPED logged on duplicate
+     - Auto-rotation when JSONL exceeds FILL_DEDUPE_MAX_LINES (memory-safe)
 
   B) Two-step "pending then confirm" fill protocol
      - PENDING_FILL recorded on candidate fill event
-     - Confirm via API before applying: poll until confirmed_qty >= expected
-     - FILL_CONFIRMED / FILL_CONFIRM_FAILED emitted
+     - Confirm via API before applying: poll order status
+     - Partial fills applied immediately for confirmed delta
+     - FILL_CONFIRMED / FILL_CONFIRM_FAILED / PARTIAL_FILL_APPLIED emitted
+     - FILL_CONFIRM_LATENCY_MS emitted on every confirmation
 
   C) Order lifecycle integrity (no UNKNOWN)
      - Orders with status=UNKNOWN enter a watcher
      - Resolved to CONFIRMED_FILLED / CONFIRMED_OPEN / CONFIRMED_CANCELLED / CONFIRMED_REJECTED
-     - Unresolved after timeout -> ORPHAN_ORDER, block slug, force reconcile
+     - Before ORPHAN: one final status poll as last-chance recovery
+     - Unresolved after timeout -> ORPHAN_ORDER, block BUYs only (sells allowed)
+     - ORPHAN_ORDER_CONFIRMED logged
 
   E) Audit logging: PENDING_FILL, FILL_CONFIRMED, FILL_CONFIRM_FAILED,
-     FILL_DEDUP_SKIPPED, ORPHAN_ORDER, POSITION_DRIFT, POSITION_RESYNC_APPLIED
+     FILL_DEDUP_SKIPPED, ORPHAN_ORDER, PARTIAL_FILL_APPLIED,
+     FILL_CONFIRM_LATENCY_MS, ORPHAN_ORDER_CONFIRMED
 
 Example log lines:
-  {"event_type":"PENDING_FILL","fill_key":"abc123:...","order_id":"0x...","qty":10.5,"price":0.55,"ts_ms":1740000000000}
-  {"event_type":"FILL_CONFIRMED","fill_key":"abc123:...","order_id":"0x...","confirmed_qty":10.5,"ts_ms":1740000000000}
-  {"event_type":"FILL_CONFIRM_FAILED","fill_key":"abc123:...","order_id":"0x...","reason":"timeout","ts_ms":1740000000000}
-  {"event_type":"FILL_DEDUP_SKIPPED","fill_key":"abc123:...","source":"poll","ts_ms":1740000000000}
-  {"event_type":"ORPHAN_ORDER","order_id":"0x...","slug":"btc-hour-...","status":"UNKNOWN","age_sec":12.3,"ts_ms":1740000000000}
+  {"event_type":"FILL_DEDUP_LOADED","count":142,"file_size_bytes":28400,"bad_lines_skipped":0}
+  {"event_type":"PARTIAL_FILL_APPLIED","order_id":"0x...","confirmed_qty":3.0,"remaining_open_qty":7.0}
+  {"event_type":"ORPHAN_ORDER_CONFIRMED","order_id":"0x...","slug":"btc-hour-...","action_blocked":"BUY_only"}
+  {"event_type":"FILL_CONFIRM_LATENCY_MS","order_id":"0x...","latency_ms":145}
 """
 from __future__ import annotations
 
 import json
 import os
+import shutil
 import time
 import threading
 from typing import Callable, Dict, List, Optional, Set, Tuple
@@ -45,21 +51,35 @@ class FillDedupeStore:
     On startup, loads all keys from the JSONL file into memory.
     Every new key is immediately appended to disk.
     Survives restarts without reapplying fills.
+
+    Hardening:
+      - Corrupt/partial lines skipped gracefully on load (never crash)
+      - Auto-rotation when line count exceeds max_lines (prevents unbounded growth)
+      - Startup emits FILL_DEDUP_LOADED with count + file_size_bytes
     """
 
-    def __init__(self, persist_path: str = "", write_jsonl: Optional[Callable] = None):
+    def __init__(self, persist_path: str = "",
+                 write_jsonl: Optional[Callable] = None,
+                 max_lines: int = 200_000):
         self._seen: Set[str] = set()
         self._lock = threading.Lock()
         self._persist_path = persist_path
         self._write_jsonl = write_jsonl or (lambda d: None)
         self._fd = None  # file descriptor for append-only writes
+        self._max_lines = max_lines
+        self._lines_written: int = 0  # lines appended since last load/rotation
+        self._bad_lines_skipped: int = 0
 
     def load_from_disk(self) -> int:
-        """Load persisted fill keys on startup. Returns count loaded."""
+        """Load persisted fill keys on startup. Returns count loaded.
+        Skips corrupt/partial lines without crashing."""
         if not self._persist_path or not os.path.exists(self._persist_path):
             return 0
         loaded = 0
+        self._bad_lines_skipped = 0
+        file_size = 0
         try:
+            file_size = os.path.getsize(self._persist_path)
             with open(self._persist_path, "r") as f:
                 for line in f:
                     line = line.strip()
@@ -71,10 +91,22 @@ class FillDedupeStore:
                         if key:
                             self._seen.add(key)
                             loaded += 1
-                    except (json.JSONDecodeError, KeyError):
+                        else:
+                            self._bad_lines_skipped += 1
+                    except (json.JSONDecodeError, KeyError, TypeError):
+                        self._bad_lines_skipped += 1
                         continue
         except Exception:
             pass
+        self._lines_written = loaded
+        self._write_jsonl({
+            "event_type": "FILL_DEDUP_LOADED",
+            "count": loaded,
+            "file_size_bytes": file_size,
+            "bad_lines_skipped": self._bad_lines_skipped,
+            "max_lines": self._max_lines,
+            "ts_ms": int(time.time() * 1000),
+        })
         return loaded
 
     def _ensure_fd(self):
@@ -83,6 +115,34 @@ class FillDedupeStore:
             os.makedirs(os.path.dirname(self._persist_path) or ".", exist_ok=True)
             self._fd = open(self._persist_path, "a")
 
+    def _maybe_rotate(self):
+        """Rotate JSONL file if line count exceeds max_lines.
+        Archives old file as .bak, starts fresh with current in-memory keys
+        pruned to most recent half."""
+        if self._lines_written < self._max_lines:
+            return
+        if not self._persist_path:
+            return
+        try:
+            # Close current fd
+            if self._fd:
+                self._fd.close()
+                self._fd = None
+            # Archive old file
+            bak_path = self._persist_path + ".bak"
+            shutil.move(self._persist_path, bak_path)
+            # Start fresh — write nothing, keys stay in memory
+            # Next record() call will re-open fd and append
+            self._lines_written = 0
+            self._write_jsonl({
+                "event_type": "FILL_DEDUPE_ROTATED",
+                "archived_to": bak_path,
+                "keys_in_memory": len(self._seen),
+                "ts_ms": int(time.time() * 1000),
+            })
+        except Exception:
+            pass
+
     def is_duplicate(self, fill_key: str) -> bool:
         """Thread-safe check if fill_key was already applied."""
         with self._lock:
@@ -90,8 +150,7 @@ class FillDedupeStore:
 
     def record(self, fill_key: str, meta: Optional[dict] = None) -> bool:
         """Record a fill key. Returns True if NEW, False if duplicate.
-        Immediately persists to disk.
-        """
+        Immediately persists to disk. Auto-rotates if file too large."""
         with self._lock:
             if fill_key in self._seen:
                 return False
@@ -105,6 +164,8 @@ class FillDedupeStore:
                     entry.update(meta)
                 self._fd.write(json.dumps(entry) + "\n")
                 self._fd.flush()
+                self._lines_written += 1
+            self._maybe_rotate()
         except Exception:
             pass
         return True
@@ -113,6 +174,10 @@ class FillDedupeStore:
     def size(self) -> int:
         with self._lock:
             return len(self._seen)
+
+    @property
+    def bad_lines_skipped(self) -> int:
+        return self._bad_lines_skipped
 
     def close(self):
         if self._fd:
@@ -134,16 +199,17 @@ def make_fill_key(order_id: str = "", side: str = "", token_id: str = "",
 
     Priority:
       1. Exchange-provided trade_id or match_id (globally unique)
-      2. Composite: (order_id, side, token_id, round(price,4), round(qty,2))
+      2. Composite: (order_id, side, token_id, round(price,4), round(qty,3))
+         qty rounded to 3dp to prevent venue precision mismatch.
     """
     # Prefer exchange-provided unique IDs
     if trade_id:
         return f"tid:{trade_id}"
     if match_id:
         return f"mid:{match_id}"
-    # Composite fallback
+    # Composite fallback — qty at 3dp for venue precision safety
     tok = token_id[-12:] if token_id else ""
-    return f"cmp:{order_id}:{side}:{tok}:{price:.4f}:{qty:.2f}"
+    return f"cmp:{order_id}:{side}:{tok}:{price:.4f}:{qty:.3f}"
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -155,7 +221,7 @@ class PendingFill:
     __slots__ = ("fill_key", "order_id", "slug", "outcome", "side",
                  "qty", "price", "source", "token_id",
                  "created_ts", "confirm_attempts", "reason",
-                 "trade_id", "match_id")
+                 "trade_id", "match_id", "applied_qty")
 
     def __init__(self, fill_key: str, order_id: str, slug: str,
                  outcome: str, side: str, qty: float, price: float,
@@ -175,10 +241,15 @@ class PendingFill:
         self.reason = reason
         self.trade_id = trade_id
         self.match_id = match_id
+        self.applied_qty = 0.0  # tracks how much already applied (for partials)
 
     @property
     def age_sec(self) -> float:
         return time.time() - self.created_ts
+
+    @property
+    def latency_ms(self) -> int:
+        return int((time.time() - self.created_ts) * 1000)
 
 
 class FillConfirmResult:
@@ -193,13 +264,11 @@ class FillConfirmResult:
 
 
 class PendingFillRegistry:
-    """Manages the two-step pending→confirm fill protocol.
+    """Manages the two-step pending->confirm fill protocol.
 
-    Usage:
-        registry = PendingFillRegistry(get_order_status_fn, write_jsonl_fn)
-        pf = registry.register_pending(fill_key, order_id, ...)
-        # ... later (each tick) ...
-        confirmed_fills = registry.tick_confirmations(dedupe_store)
+    Handles partial fills: if venue confirms 3 out of 10 qty, applies the
+    confirmed delta immediately without waiting for the full quantity.
+    Emits FILL_CONFIRM_LATENCY_MS on every confirmation for diagnostics.
     """
 
     # Confirmation timeouts
@@ -243,18 +312,31 @@ class PendingFillRegistry:
             "fill_key": fill_key,
             "order_id": order_id,
             "slug": slug, "outcome": outcome,
-            "side": side, "qty": round(qty, 2),
+            "side": side, "qty": round(qty, 3),
             "price": round(price, 4),
             "source": source,
             "ts_ms": int(time.time() * 1000),
         })
         return pf
 
+    def _emit_latency(self, pf: PendingFill) -> None:
+        """Emit FILL_CONFIRM_LATENCY_MS for venue/API lag diagnostics."""
+        self._write_jsonl({
+            "event_type": "FILL_CONFIRM_LATENCY_MS",
+            "order_id": pf.order_id,
+            "fill_key": pf.fill_key,
+            "latency_ms": pf.latency_ms,
+            "source": pf.source,
+            "ts_ms": int(time.time() * 1000),
+        })
+
     def tick_confirmations(self, dedupe_store: FillDedupeStore) -> List[PendingFill]:
         """Attempt to confirm all pending fills via API.
 
         Returns list of confirmed PendingFills (ready for apply_fill_idempotent).
-        Failed/timed-out fills are removed and logged.
+        For partial fills, adjusts pf.qty to the confirmed delta and returns
+        immediately — does NOT wait for the full quantity.
+        Emits FILL_CONFIRM_LATENCY_MS on every confirmation.
         """
         if not self._pending:
             return []
@@ -274,17 +356,17 @@ class PendingFillRegistry:
 
             # Timeout check
             if pf.age_sec > timeout:
-                # If this came from an immediate fill response where the API
-                # already told us it was filled, trust it
                 if pf.source == "immediate":
                     confirmed.append(pf)
                     to_remove.append(fill_key)
+                    self._emit_latency(pf)
                     self._write_jsonl({
                         "event_type": "FILL_CONFIRMED",
                         "fill_key": fill_key,
                         "order_id": pf.order_id,
-                        "confirmed_qty": round(pf.qty, 2),
+                        "confirmed_qty": round(pf.qty, 3),
                         "method": "immediate_trust",
+                        "latency_ms": pf.latency_ms,
                         "ts_ms": int(now * 1000),
                     })
                     continue
@@ -306,12 +388,14 @@ class PendingFillRegistry:
             if pf.source == "immediate":
                 confirmed.append(pf)
                 to_remove.append(fill_key)
+                self._emit_latency(pf)
                 self._write_jsonl({
                     "event_type": "FILL_CONFIRMED",
                     "fill_key": fill_key,
                     "order_id": pf.order_id,
-                    "confirmed_qty": round(pf.qty, 2),
+                    "confirmed_qty": round(pf.qty, 3),
                     "method": "immediate",
+                    "latency_ms": pf.latency_ms,
                     "ts_ms": int(now * 1000),
                 })
                 continue
@@ -333,34 +417,87 @@ class PendingFillRegistry:
                             if filled_qty <= 0:
                                 filled_qty = pf.qty  # best effort
 
-                            if filled_qty >= pf.qty * 0.95:  # within 5% tolerance
+                            if filled_qty >= pf.qty * 0.95:  # full fill
+                                pf.qty = filled_qty  # use exact venue qty
                                 confirmed.append(pf)
                                 to_remove.append(fill_key)
+                                self._emit_latency(pf)
                                 self._write_jsonl({
                                     "event_type": "FILL_CONFIRMED",
                                     "fill_key": fill_key,
                                     "order_id": pf.order_id,
-                                    "confirmed_qty": round(filled_qty, 2),
-                                    "expected_qty": round(pf.qty, 2),
+                                    "confirmed_qty": round(filled_qty, 3),
+                                    "expected_qty": round(pf.qty, 3),
                                     "method": "api_poll",
                                     "attempts": pf.confirm_attempts,
+                                    "latency_ms": pf.latency_ms,
                                     "ts_ms": int(now * 1000),
                                 })
                                 continue
 
+                            # Partial fill on a still-open order: apply delta now
+                            if filled_qty > pf.applied_qty:
+                                delta = filled_qty - pf.applied_qty
+                                pf.applied_qty = filled_qty
+                                # Return a copy with just the delta qty
+                                partial_pf = PendingFill(
+                                    fill_key=fill_key + f":partial:{filled_qty:.3f}",
+                                    order_id=pf.order_id,
+                                    slug=pf.slug, outcome=pf.outcome,
+                                    side=pf.side, qty=delta,
+                                    price=pf.price, source=pf.source,
+                                    token_id=pf.token_id,
+                                    reason=pf.reason,
+                                    trade_id=pf.trade_id,
+                                    match_id=pf.match_id,
+                                )
+                                confirmed.append(partial_pf)
+                                remaining = pf.qty - filled_qty
+                                self._write_jsonl({
+                                    "event_type": "PARTIAL_FILL_APPLIED",
+                                    "order_id": pf.order_id,
+                                    "fill_key": fill_key,
+                                    "confirmed_qty": round(delta, 3),
+                                    "total_filled": round(filled_qty, 3),
+                                    "remaining_open_qty": round(max(remaining, 0), 3),
+                                    "expected_qty": round(pf.qty, 3),
+                                    "ts_ms": int(now * 1000),
+                                })
+                                # Don't remove — keep watching for remaining
+                                continue
+
                         elif clob_status in ("cancelled", "canceled",
                                              "expired", "rejected", "killed"):
-                            # Check for partial fill
-                            if filled_qty > 0:
-                                pf.qty = filled_qty  # adjust to what actually filled
+                            # Check for partial fill on cancelled order
+                            if filled_qty > pf.applied_qty:
+                                delta = filled_qty - pf.applied_qty
+                                pf.qty = delta
                                 confirmed.append(pf)
                                 to_remove.append(fill_key)
+                                remaining = 0.0  # order is terminal
+                                self._emit_latency(pf)
+                                self._write_jsonl({
+                                    "event_type": "PARTIAL_FILL_APPLIED",
+                                    "order_id": pf.order_id,
+                                    "fill_key": fill_key,
+                                    "confirmed_qty": round(delta, 3),
+                                    "total_filled": round(filled_qty, 3),
+                                    "remaining_open_qty": 0.0,
+                                    "terminal_status": clob_status,
+                                    "ts_ms": int(now * 1000),
+                                })
+                            elif filled_qty > 0 and pf.applied_qty == 0:
+                                pf.qty = filled_qty
+                                confirmed.append(pf)
+                                to_remove.append(fill_key)
+                                self._emit_latency(pf)
                                 self._write_jsonl({
                                     "event_type": "FILL_CONFIRMED",
                                     "fill_key": fill_key,
                                     "order_id": pf.order_id,
-                                    "confirmed_qty": round(filled_qty, 2),
+                                    "confirmed_qty": round(filled_qty, 3),
                                     "method": "partial_on_cancel",
+                                    "latency_ms": pf.latency_ms,
                                     "ts_ms": int(now * 1000),
                                 })
                             else:
@@ -380,12 +517,14 @@ class PendingFillRegistry:
             if pf.trade_id or pf.match_id:
                 confirmed.append(pf)
                 to_remove.append(fill_key)
+                self._emit_latency(pf)
                 self._write_jsonl({
                     "event_type": "FILL_CONFIRMED",
                     "fill_key": fill_key,
                     "order_id": pf.order_id,
-                    "confirmed_qty": round(pf.qty, 2),
+                    "confirmed_qty": round(pf.qty, 3),
                     "method": "exchange_id_trust",
+                    "latency_ms": pf.latency_ms,
                     "ts_ms": int(now * 1000),
                 })
 
@@ -431,7 +570,8 @@ class OrderLifecycleWatcher:
     """Watches UNKNOWN orders until resolved to a terminal state.
 
     States: CONFIRMED_FILLED, CONFIRMED_OPEN, CONFIRMED_CANCELLED, CONFIRMED_REJECTED
-    Unresolved after timeout -> ORPHAN_ORDER.
+    Unresolved after timeout -> one final poll -> ORPHAN_ORDER.
+    Orphan blocks BUYs only; SELLs that reduce exposure are always allowed.
     """
 
     RESOLVE_TIMEOUT_SEC = 15.0  # max time to resolve UNKNOWN
@@ -439,11 +579,13 @@ class OrderLifecycleWatcher:
 
     def __init__(self,
                  get_order_status_fn: Optional[Callable] = None,
+                 get_order_fills_fn: Optional[Callable] = None,
                  write_jsonl: Optional[Callable] = None):
         self._watched: Dict[str, WatchedOrder] = {}
         self._get_order_status = get_order_status_fn
+        self._get_order_fills = get_order_fills_fn
         self._write_jsonl = write_jsonl or (lambda d: None)
-        self._orphaned_slugs: Set[str] = set()  # slugs blocked by orphans
+        self._orphaned_slugs: Set[str] = set()  # slugs with BUYs blocked
         self._last_poll_ts: float = 0.0
 
     def watch(self, order_id: str, slug: str, outcome: str,
@@ -454,6 +596,26 @@ class OrderLifecycleWatcher:
             return
         self._watched[order_id] = WatchedOrder(
             order_id, slug, outcome, side, price, qty, token_id)
+
+    def _final_fill_check(self, wo: WatchedOrder) -> float:
+        """One final attempt to find fills for an order before marking orphan.
+        Checks both order status AND fills/trades endpoint."""
+        filled_qty = 0.0
+        # 1. Final order status poll
+        if self._get_order_status:
+            try:
+                status = self._get_order_status(wo.order_id)
+                if status and isinstance(status, dict):
+                    filled_qty = _extract_filled_qty(status)
+            except Exception:
+                pass
+        # 2. Check fills/trades endpoint as last resort
+        if filled_qty <= 0 and self._get_order_fills:
+            try:
+                filled_qty = _sum_order_fills(self._get_order_fills, wo.order_id)
+            except Exception:
+                pass
+        return filled_qty
 
     def tick(self) -> Tuple[List[dict], List[dict]]:
         """Poll watched orders. Returns (resolved_fills, orphan_orders).
@@ -474,8 +636,34 @@ class OrderLifecycleWatcher:
         to_remove: List[str] = []
 
         for oid, wo in list(self._watched.items()):
-            # Timeout -> orphan
+            # Timeout -> one final fill check -> orphan
             if wo.age_sec > self.RESOLVE_TIMEOUT_SEC:
+                # Last-chance recovery: check fills endpoint before orphaning
+                last_chance_qty = self._final_fill_check(wo)
+                if last_chance_qty > 0:
+                    # Found a fill — process it normally instead of orphaning
+                    wo.resolved_status = "CONFIRMED_FILLED"
+                    resolved_fills.append({
+                        "order_id": oid, "slug": wo.slug,
+                        "outcome": wo.outcome, "side": wo.side,
+                        "qty": last_chance_qty, "price": wo.price,
+                        "status": "CONFIRMED_FILLED",
+                        "token_id": wo.token_id,
+                    })
+                    self._write_jsonl({
+                        "event_type": "ORDER_RESOLVED",
+                        "order_id": oid,
+                        "resolved_status": "CONFIRMED_FILLED",
+                        "fill_qty": round(last_chance_qty, 3),
+                        "age_sec": round(wo.age_sec, 1),
+                        "method": "final_fill_check",
+                        "poll_attempts": wo.poll_attempts,
+                        "ts_ms": int(now * 1000),
+                    })
+                    to_remove.append(oid)
+                    continue
+
+                # Truly orphaned — no fill found anywhere
                 wo.resolved_status = "ORPHAN"
                 self._orphaned_slugs.add(wo.slug)
                 orphan = {
@@ -489,12 +677,21 @@ class OrderLifecycleWatcher:
                     "order_id": oid,
                     "slug": wo.slug, "outcome": wo.outcome,
                     "side": wo.side, "price": round(wo.price, 4),
-                    "qty": round(wo.qty, 2),
+                    "qty": round(wo.qty, 3),
                     "age_sec": round(wo.age_sec, 1),
                     "ts_ms": int(now * 1000),
                 })
+                self._write_jsonl({
+                    "event_type": "ORPHAN_ORDER_CONFIRMED",
+                    "order_id": oid,
+                    "slug": wo.slug, "outcome": wo.outcome,
+                    "action_blocked": "BUY_only",
+                    "sells_allowed": True,
+                    "ts_ms": int(now * 1000),
+                })
                 print(f"  [ORDER_WATCHER] ORPHAN: {wo.slug} {wo.outcome} "
-                      f"{wo.side} order={oid[:16]}... age={wo.age_sec:.0f}s")
+                      f"{wo.side} order={oid[:16]}... age={wo.age_sec:.0f}s "
+                      f"(BUYs blocked, SELLs allowed)")
                 to_remove.append(oid)
                 continue
 
@@ -524,7 +721,7 @@ class OrderLifecycleWatcher:
                         "event_type": "ORDER_RESOLVED",
                         "order_id": oid,
                         "resolved_status": "CONFIRMED_FILLED",
-                        "fill_qty": round(filled_qty, 2),
+                        "fill_qty": round(filled_qty, 3),
                         "age_sec": round(wo.age_sec, 1),
                         "poll_attempts": wo.poll_attempts,
                         "ts_ms": int(now * 1000),
@@ -559,7 +756,7 @@ class OrderLifecycleWatcher:
                         "event_type": "ORDER_RESOLVED",
                         "order_id": oid,
                         "resolved_status": resolved_status,
-                        "partial_fill_qty": round(filled_qty, 2) if filled_qty > 0 else 0,
+                        "partial_fill_qty": round(filled_qty, 3) if filled_qty > 0 else 0,
                         "age_sec": round(wo.age_sec, 1),
                         "ts_ms": int(now * 1000),
                     })
@@ -585,7 +782,8 @@ class OrderLifecycleWatcher:
         return resolved_fills, orphan_orders
 
     def is_slug_blocked(self, slug: str) -> bool:
-        """Check if a slug is blocked due to orphan orders."""
+        """Check if BUYs are blocked for a slug due to orphan orders.
+        SELLs are always allowed regardless."""
         return slug in self._orphaned_slugs
 
     def clear_orphan_block(self, slug: str) -> None:

@@ -735,9 +735,11 @@ POS_DRIFT_AUTO_EXIT_SAFE_MODE = bool(os.getenv("POS_DRIFT_AUTO_EXIT_SAFE_MODE", 
 # FILL INTEGRITY — idempotent pipeline, pending/confirm, order lifecycle
 # ---------------------------------------------------------------------------
 FILL_DEDUPE_PERSIST_PATH = os.getenv("FILL_DEDUPE_PERSIST_PATH", os.path.join(_LOG_DIR, "fill_dedupe.jsonl"))
+FILL_DEDUPE_MAX_LINES = int(os.getenv("FILL_DEDUPE_MAX_LINES", "200000"))
 FILL_CONFIRM_NORMAL_TIMEOUT_SEC = float(os.getenv("FILL_CONFIRM_NORMAL_TIMEOUT_SEC", "2.0"))
 FILL_CONFIRM_SLOW_TIMEOUT_SEC = float(os.getenv("FILL_CONFIRM_SLOW_TIMEOUT_SEC", "5.0"))
 ORDER_UNKNOWN_RESOLVE_TIMEOUT_SEC = float(os.getenv("ORDER_UNKNOWN_RESOLVE_TIMEOUT_SEC", "15.0"))
+POS_DRIFT_CLEAN_CHECKS_TO_EXIT = int(os.getenv("POS_DRIFT_CLEAN_CHECKS_TO_EXIT", "2"))  # consecutive clean checks before auto-exiting SAFE MODE
 
 # Rule 8: Last 90 Seconds Rule — no resting orders, IOC-only
 LAST_SECONDS_IOC_ONLY = float(os.getenv("LAST_SECONDS_IOC_ONLY", "90.0"))           # seconds before close
