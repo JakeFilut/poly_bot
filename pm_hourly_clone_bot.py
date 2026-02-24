@@ -3993,9 +3993,7 @@ class Bot:
             maker_taker=mt, decision_id=decision_id,
             client_order_id=client_oid, position_id=pos.position_id,
             notes=f"dscalp_entry vel={vel:.1f}",
-            **build_book_fields(ctx["up_book"], ctx["dn_book"],
-                                ctx.get("spot", 0), ctx.get("hour_open", 0),
-                                delta_bps, abs_delta_bps),
+            **build_book_fields(ctx["up_book"], ctx["dn_book"], outcome),
         )
 
     def _dscalp_manage_exits(self, m: MarketRef, st: MarketState, ctx: dict):
