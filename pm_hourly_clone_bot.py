@@ -1451,7 +1451,7 @@ class Bot:
                   f"depth={DEPTH_CHECK_MULTIPLIER}x "
                   f"breaker={HEDGE_FAIL_MAX_COUNT}/{HEDGE_FAIL_WINDOW_SEC:.0f}s/{HEDGE_FAIL_PAUSE_SEC:.0f}s "
                   f"loss=${MAX_LOSS_PER_HOUR_USD} "
-                  f"hourly_budget=${HOURLY_BUDGET_USD} "
+                  f"MAX_EXPOSURE=${MAX_TOTAL_EXPOSURE_USD} "
                   f"ioc={LAST_SECONDS_IOC_ONLY:.0f}s "
                   f"cancel_all={CANCEL_ALL_BEFORE_CLOSE_SEC:.0f}s")
         self._last_balance_print = 0.0
@@ -2661,11 +2661,16 @@ class Bot:
         self._gate_report_last_ts = now_t
         if not self._diag_entry_reject_by_gate:
             return
+        _invested = self._total_exposure_usd()
+        _remaining = max(0, MAX_TOTAL_EXPOSURE_USD - _invested)
         write_jsonl({
             "event_type": "GATE_REPORT",
             "ts_ms": int(now_t * 1000),
             "reject_counts": dict(self._diag_entry_reject_by_gate),
             "total_rejects": sum(self._diag_entry_reject_by_gate.values()),
+            "INVESTED_USD": round(_invested, 2),
+            "MAX_EXPOSURE_USD": MAX_TOTAL_EXPOSURE_USD,
+            "REMAINING_EXPOSURE_USD": round(_remaining, 2),
         })
 
     def _emit_snapshot_compact(self, m, ctx: dict):
@@ -3674,6 +3679,19 @@ class Bot:
         outcome = ctx["drift_dir"]
         book = up_book if outcome == "Up" else dn_book
 
+        # ── HYBRID probe mode: relaxed thresholds mid-hour ──
+        _in_probe = (HYBRID_PROBE_ENABLED and t_min > HYBRID_PROBE_START_MIN)
+
+        # HYBRID probe cooldown: limit to ~1 entry per HYBRID_PROBE_COOLDOWN_SEC per slug
+        if _in_probe:
+            _last_slug_fill = self._last_fill_ts.get(m.slug, 0.0)
+            if (now_t - _last_slug_fill) < HYBRID_PROBE_COOLDOWN_SEC:
+                _cd_left_ms = int((HYBRID_PROBE_COOLDOWN_SEC - (now_t - _last_slug_fill)) * 1000)
+                DiagReporter.gate_trace(m.slug, outcome, "cooldown", "HYBRID_PROBE_COOLDOWN",
+                                        t_min=t_min, delta_bps=delta_bps, exposure_total=self._total_exposure_usd(),
+                                        bot=self, cooldown_remaining_ms=_cd_left_ms, write_fn=write_jsonl)
+                return
+
         # ── HARD GATES (must pass ALL) ──
 
         # Inventory cap check
@@ -3698,6 +3716,11 @@ class Bot:
         _coin_edge_cents = MIN_DIRECTIONAL_EDGE_CENTS_SOLXRP if _solxrp else MIN_DIRECTIONAL_EDGE_CENTS_BTCETH
         _coin_vel_min = MIN_VEL_BPS_PER_MIN_SOLXRP if _solxrp else MIN_VEL_BPS_PER_MIN_BTCETH
         _coin_cache_max_ms = CACHE_AGE_MAX_MS_SOLXRP if _solxrp else CACHE_AGE_MAX_MS_BTCETH
+
+        # HYBRID probe: relax thresholds mid-hour for continuous entry
+        if _in_probe:
+            _coin_edge_cents = HYBRID_PROBE_EDGE_CENTS
+            _coin_vel_min = HYBRID_PROBE_VEL_MIN_BPS
 
         # Anti-stacking: per-coin cooldown between new entries after a fill
         last_fill = self._last_fill_ts.get(m.slug, 0.0)
@@ -3733,8 +3756,9 @@ class Bot:
                                     bot=self, write_fn=write_jsonl)
             return
 
-        # Spread gate (existing)
-        if book.spread * 100 > DSCALP_MAX_SPREAD_CENTS:
+        # Spread gate (existing) — use relaxed limit in probe mode
+        _eff_spread_max = HYBRID_PROBE_MAX_SPREAD_CENTS if _in_probe else DSCALP_MAX_SPREAD_CENTS
+        if book.spread * 100 > _eff_spread_max:
             self._diag_entry_reject_by_gate["spread_general"] = self._diag_entry_reject_by_gate.get("spread_general", 0) + 1
             DiagReporter.gate_trace(m.slug, outcome, "spread", "SPREAD_GENERAL",
                                     t_min=t_min, spread=book.spread*100, delta_bps=delta_bps,
@@ -3761,8 +3785,9 @@ class Bot:
                                     bot=self, edge_bps=entry_edge_cents, write_fn=write_jsonl)
             return
 
-        # ── ENTRY SIGNAL: delta >= 15bps OR spot moved >= 8bps in 10s ──
-        delta_ok = abs_delta_bps >= DSCALP_DELTA_MIN_BPS
+        # ── ENTRY SIGNAL: delta >= threshold OR spot moved >= 8bps in 10s ──
+        _eff_delta_min = HYBRID_PROBE_DELTA_MIN_BPS if _in_probe else DSCALP_DELTA_MIN_BPS
+        delta_ok = abs_delta_bps >= _eff_delta_min
         spot_move_ok = self._spot_move_10s_bps(m.slug) >= DSCALP_SPOT_MOVE_10S_BPS
         if not delta_ok and not spot_move_ok:
             self._diag_entry_reject_by_gate["signal"] = self._diag_entry_reject_by_gate.get("signal", 0) + 1
@@ -5961,11 +5986,57 @@ class Bot:
             return True
         return False
 
+    def _resync_positions_from_truth(self) -> list:
+        """Rebuild bot positions from truth. Returns list of corrections."""
+        truth_positions = self._truth.get_active_window_positions()
+        corrected = []
+        for tp in truth_positions.values():
+            slug, outcome = tp.slug, tp.outcome
+            truth_qty = round(float(tp.net_qty), 2)
+            if truth_qty < MIN_QTY:
+                truth_qty = 0.0
+            st = self.market_states.get(slug)
+            if st is None:
+                continue
+            bot_qty = round(st.positions[outcome].qty, 2)
+            if bot_qty < MIN_QTY:
+                bot_qty = 0.0
+            if abs(bot_qty - truth_qty) > POS_DRIFT_TOLERANCE:
+                old_qty = st.positions[outcome].qty
+                st.positions[outcome].qty = truth_qty
+                # Adjust cost_usdc proportionally
+                if old_qty > MIN_QTY and truth_qty > MIN_QTY:
+                    st.positions[outcome].cost_usdc = st.positions[outcome].vwap * truth_qty
+                elif truth_qty <= MIN_QTY:
+                    st.positions[outcome].qty = 0.0
+                    st.positions[outcome].cost_usdc = 0.0
+                corrected.append({"slug": slug, "outcome": outcome,
+                                  "old": round(old_qty, 2), "new": round(truth_qty, 2)})
+        # Also zero out bot positions that don't exist in truth
+        truth_keys = set()
+        for tp in truth_positions.values():
+            truth_keys.add((tp.slug, tp.outcome))
+        for slug, st in self.market_states.items():
+            for outcome in ("Up", "Down"):
+                if (slug, outcome) not in truth_keys and st.positions[outcome].qty >= MIN_QTY:
+                    old_qty = st.positions[outcome].qty
+                    if old_qty >= POS_DRIFT_TOLERANCE:
+                        st.positions[outcome].qty = 0.0
+                        st.positions[outcome].cost_usdc = 0.0
+                        corrected.append({"slug": slug, "outcome": outcome,
+                                          "old": round(old_qty, 2), "new": 0.0})
+        return corrected
+
     def _check_position_invariant(self) -> None:
         """Compare bot positions vs truth positions each tick.
-        Prints POSITION_DRIFT line if mismatch > 0.01 shares on any token.
-        If drift persists for 3 consecutive checks, trigger DESYNC_HARD_STOP.
-        Throttled to once every 10s to avoid log spam.
+        Uses POS_DRIFT_TOLERANCE (default 0.5 shares) to avoid false triggers.
+        Normalizes both sides to 2dp and MIN_QTY before comparing.
+
+        Escalation path:
+          #1: diagnostic (fetch CLOB balances)
+          #2: resync from truth (rebuild bot positions) + dedup
+          #3..#N: if drift persists for POS_DRIFT_ESCALATION_AFTER_RESYNC
+                  consecutive checks post-resync → DESYNC_HARD_STOP
         """
         now_t = time.time()
         if now_t - getattr(self, '_last_pos_invariant_ts', 0.0) < 10.0:
@@ -5973,48 +6044,51 @@ class Bot:
         self._last_pos_invariant_ts = now_t
 
         truth_positions = self._truth.get_active_window_positions()
-        # Build truth lookup: (slug, outcome) -> float(net_qty)
+        # Build truth lookup: (slug, outcome) -> float(net_qty), normalized
         truth_by_so: Dict[tuple, float] = {}
         for tp in truth_positions.values():
             key = (tp.slug, tp.outcome)
-            truth_by_so[key] = float(tp.net_qty)
+            tq = round(float(tp.net_qty), 2)
+            truth_by_so[key] = tq if tq >= MIN_QTY else 0.0
 
-        # Build bot lookup from market_states
+        # Build bot lookup from market_states, normalized
         bot_by_so: Dict[tuple, float] = {}
         for slug, st_inv in self.market_states.items():
             for outcome_inv in ("Up", "Down"):
-                q = st_inv.positions[outcome_inv].qty
+                q = round(st_inv.positions[outcome_inv].qty, 2)
                 if q >= MIN_QTY:
                     bot_by_so[(slug, outcome_inv)] = q
 
-        # Compare
+        # Compare using POS_DRIFT_TOLERANCE
         all_keys = set(truth_by_so.keys()) | set(bot_by_so.keys())
         diffs = []
         for k in sorted(all_keys):
             bq = bot_by_so.get(k, 0.0)
             tq = truth_by_so.get(k, 0.0)
-            if abs(bq - tq) > 0.01:
+            if abs(bq - tq) > POS_DRIFT_TOLERANCE:
                 diffs.append({"slug": k[0], "outcome": k[1],
                               "bot_qty": round(bq, 2), "truth_qty": round(tq, 2),
                               "delta": round(bq - tq, 2)})
         if diffs:
-            # Track consecutive drift count
             if not hasattr(self, '_pos_drift_consecutive'):
                 self._pos_drift_consecutive = 0
+            if not hasattr(self, '_pos_drift_resync_done'):
+                self._pos_drift_resync_done = False
             self._pos_drift_consecutive += 1
 
             write_jsonl({
                 "event_type": "POSITION_DRIFT",
                 "diffs": diffs,
                 "consecutive": self._pos_drift_consecutive,
+                "tolerance": POS_DRIFT_TOLERANCE,
                 "ts_ms": int(time.time() * 1000),
             })
             parts = [f"{d['slug'][-15:]} {d['outcome']}: bot={d['bot_qty']} truth={d['truth_qty']} Δ={d['delta']}"
                      for d in diffs]
             print(f"  [INVARIANT] POSITION_DRIFT #{self._pos_drift_consecutive} "
-                  f"({len(diffs)}): " + " | ".join(parts))
+                  f"(tol={POS_DRIFT_TOLERANCE}, {len(diffs)} diffs): " + " | ".join(parts))
 
-            # One-shot diagnostic: fetch CLOB balances on first drift
+            # Drift #1: one-shot diagnostic — fetch CLOB balances
             if self._pos_drift_consecutive == 1:
                 try:
                     clob_bals = self.client.get_balances()
@@ -6039,20 +6113,34 @@ class Bot:
                 except Exception as diag_e:
                     print(f"  [DIAG] Failed to fetch CLOB balances: {diag_e}")
 
-            # Auto-heal: attempt truth dedup at drift #2 before DESYNC escalation
-            if self._pos_drift_consecutive == 2:
+            # Drift #2: resync from truth + dedup fills
+            if self._pos_drift_consecutive == 2 and POS_DRIFT_RESYNC_ENABLED and not self._pos_drift_resync_done:
+                # First dedup
                 removed = self._truth.dedup_fills()
                 if removed > 0:
-                    print(f"  [INVARIANT] Truth dedup removed {removed} duplicate fill(s) "
-                          f"— re-checking next tick")
-                    # Reset consecutive counter to give the fix a chance
-                    self._pos_drift_consecutive = 0
-                    return
+                    print(f"  [INVARIANT] Truth dedup removed {removed} duplicate fill(s)")
+                # Then resync
+                corrections = self._resync_positions_from_truth()
+                self._pos_drift_resync_done = True
+                if corrections:
+                    for c in corrections:
+                        print(f"  [RESYNC] {c['slug']} {c['outcome']}: "
+                              f"{c['old']} → {c['new']}")
+                    write_jsonl({
+                        "event_type": "POSITION_RESYNC_FROM_TRUTH",
+                        "corrections": corrections,
+                        "ts_ms": int(time.time() * 1000),
+                    })
+                # Reset counter: give 3 fresh checks post-resync
+                self._pos_drift_consecutive = 0
+                return
 
-            # Escalation: 3 consecutive drifts → DESYNC_HARD_STOP
-            if self._pos_drift_consecutive >= 3 and not self._desync_hard_stop:
+            # Escalation: N consecutive checks AFTER resync → DESYNC_HARD_STOP
+            _escalation_threshold = POS_DRIFT_ESCALATION_AFTER_RESYNC
+            if (self._pos_drift_resync_done
+                    and self._pos_drift_consecutive >= _escalation_threshold
+                    and not self._desync_hard_stop):
                 self._desync_hard_stop = True
-                # Release all budget reservations
                 released_count = len(self._reserved_usd)
                 released_total = sum(self._reserved_usd.values())
                 self._reserved_usd.clear()
@@ -6061,6 +6149,7 @@ class Bot:
                     "event_type": "DESYNC_FROM_INVARIANT",
                     "source": "position_invariant",
                     "consecutive_checks": self._pos_drift_consecutive,
+                    "resync_was_attempted": True,
                     "diffs": diffs,
                     "action": "cancel_all + clear_reservations + block_buys",
                     "reservations_cleared": released_count,
@@ -6075,7 +6164,7 @@ class Bot:
                         "ts_ms": int(time.time() * 1000),
                     })
                 print(f"  *** DESYNC FROM INVARIANT *** {self._pos_drift_consecutive} "
-                      f"consecutive drifts — cancelling all orders, blocking new buys")
+                      f"consecutive drifts post-resync — cancelling all orders, blocking new buys")
                 for d in diffs:
                     sign = "+" if d["delta"] > 0 else ""
                     print(f"    {d['slug']} {d['outcome']} drift "
@@ -6086,17 +6175,18 @@ class Bot:
                           f"(${released_total:.2f})")
                 DiagReporter.safety_trace(
                     "DESYNC_ON",
-                    f"position_invariant {self._pos_drift_consecutive} consecutive drifts",
+                    f"position_invariant {self._pos_drift_consecutive} consecutive drifts post-resync",
                     drift_counter=self._pos_drift_consecutive, write_fn=write_jsonl)
                 self._cancel_all_orders()
                 self._truth.enter_safe_mode(
-                    reason=f"position_invariant_drift_{self._pos_drift_consecutive}_consecutive",
+                    reason=f"position_invariant_drift_{self._pos_drift_consecutive}_consecutive_post_resync",
                     mismatches=[f"{d['slug']} {d['outcome']}: bot={d['bot_qty']} truth={d['truth_qty']}"
                                 for d in diffs])
         else:
-            # No drift — reset consecutive counter
+            # No drift — reset consecutive counter and resync flag
             if getattr(self, '_pos_drift_consecutive', 0) > 0:
                 self._pos_drift_consecutive = 0
+            self._pos_drift_resync_done = False
 
     def _check_hedge_mismatch(self) -> None:
         """Detect hedge mismatches: net exposure on one side beyond threshold.
