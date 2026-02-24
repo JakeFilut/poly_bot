@@ -146,6 +146,8 @@ _ALWAYS_LOG_EVENTS = frozenset({
     "POSITION_DRIFT", "POSITION_RESYNC_APPLIED",
     "DRIFT_DIAGNOSTIC", "DESYNC_FROM_INVARIANT",
     "FILL_INTEGRITY_STARTUP", "SAFE_MODE_EXIT_AUTO",
+    # Entry-blocked tracing (HYBRID_HOT)
+    "ENTRY_BLOCKED", "ENTRY_BLOCKED_ROLLUP", "PAPER_TRADE_RATE",
 })
 # Prefixes that always log (for variable event_type like flatten_reason)
 _ALWAYS_LOG_PREFIXES = ("FLATTEN", "KILL", "PAUSE", "END_OF_HOUR")
@@ -373,6 +375,13 @@ class Bot:
         # ENTRY_BLOCKED tracing: per-slug rate-limited decision log
         self._entry_blocked_last_ts: Dict[str, float] = {}  # slug -> last log ts
         self._entry_blocked_rollup: Dict[str, int] = {}     # blocker_category -> count (60s window)
+        # PAPER_TRADE_RATE per-minute metrics (HYBRID_HOT)
+        self._ptr_decisions: int = 0                         # entry evaluations reaching hard gates
+        self._ptr_orders_placed: int = 0                     # orders actually submitted (entry)
+        self._ptr_fills: int = 0                             # entry fills this minute
+        self._ptr_eval_slugs: set = set()                    # unique slugs evaluated
+        self._ptr_spread_samples: List[float] = []           # spread (cents) at evaluation
+        self._ptr_edge_samples: List[float] = []             # abs_delta_bps at evaluation
         # TIME_STOP deferred/soft-exit tracking
         self._diag_time_stop_defers = 0
         self._diag_time_stop_soft_exits = 0
@@ -1507,17 +1516,25 @@ class Bot:
             print(f"  LIVE_LIMITS {{max_concurrent={MAX_CONCURRENT_EXPOSURE_USD:.0f},"
                   f" per_slug={MAX_EXPOSURE_USD_PER_SLUG:.0f},"
                   f" per_order={MAX_ORDER_USD:.0f}}}")
+        # HYBRID_HOT startup report
+        print(f"  HYBRID_HOT_STATUS {{MODE={MODE}, "
+              f"MAX_ORDER_USD={MAX_ORDER_USD:.1f}, "
+              f"ENTRY_ONLY_EARLY_WINDOW={ENTRY_ONLY_EARLY_WINDOW}, "
+              f"LOSS_TAIL_PAUSE={LOSS_TAIL_PAUSE_ENABLED}, "
+              f"SCALP_CONSEC_STOP_PAUSE={SCALP_CONSEC_STOP_PAUSE_ENABLED}}}")
         # PAPER_STRESS profile: print full config block
         if PROFILE == "PAPER_STRESS":
             print(f"  PAPER_STRESS_CONFIG {{"
                   f"max_order_usd: {MAX_ORDER_USD:.1f}, "
-                  f"exposure_caps_disabled: true, "
+                  f"exposure_caps: {MAX_CONCURRENT_EXPOSURE_USD:.0f}, "
                   f"cooldowns: {{post_fill_ms: {POST_FILL_COOLDOWN_MS:.0f}, "
                   f"dscalp_ms: {DSCALP_COOLDOWN_MS:.0f}, "
                   f"probe_sec: {HYBRID_PROBE_COOLDOWN_SEC:.0f}}}, "
-                  f"thresholds: {{delta_min_bps: {DSCALP_DELTA_MIN_BPS:.0f}, "
-                  f"probe_delta_bps: {HYBRID_PROBE_DELTA_MIN_BPS:.0f}, "
-                  f"spread_max_cents: {DSCALP_MAX_SPREAD_CENTS:.0f}}}}}")
+                  f"thresholds: {{delta_min_bps: {DSCALP_DELTA_MIN_BPS:.1f}, "
+                  f"probe_delta_bps: {HYBRID_PROBE_DELTA_MIN_BPS:.1f}, "
+                  f"spread_max_cents: {DSCALP_MAX_SPREAD_CENTS:.1f}, "
+                  f"imb_min: {IMB_MIN:.2f}, "
+                  f"vel_btceth: {MIN_VEL_BPS_PER_MIN_BTCETH:.1f}}}}}")
         # Fill Integrity startup diagnostic block (F)
         _dedupe_size = self._fill_dedupe_store.size
         _dedupe_persist = "ON" if FILL_DEDUPE_PERSIST_PATH else "OFF"
@@ -2704,6 +2721,8 @@ class Bot:
                   f"drop_win={_t.cursor_dropped_outside_window})")
             # ENTRY_BLOCKED rollup (top 5 blockers in last 60s)
             self._print_entry_blocked_rollup()
+            # PAPER_TRADE_RATE per-minute metric (HYBRID_HOT)
+            self._print_paper_trade_rate()
 
         # Reset per-minute counters
         self._diag_report_last_ts = now_t
@@ -3791,6 +3810,10 @@ class Bot:
 
         # ── HARD GATES (must pass ALL) ──
 
+        # PAPER_TRADE_RATE: count this as a decision evaluation
+        self._ptr_decisions += 1
+        self._ptr_eval_slugs.add(m.slug)
+
         # Inventory cap check
         if not self._inventory_cap_ok(m.slug, outcome):
             self._diag_entry_reject_by_gate["inventory_cap"] = self._diag_entry_reject_by_gate.get("inventory_cap", 0) + 1
@@ -3841,6 +3864,8 @@ class Bot:
 
         # Coin-specific spread gate (BTC/ETH: <=2c, SOL/XRP: <=4c)
         spread_cents = book.spread * 100
+        self._ptr_spread_samples.append(spread_cents)
+        self._ptr_edge_samples.append(abs_delta_bps)
         if not self._coin_spread_entry_ok(m.crypto, spread_cents):
             self._diag_entry_reject_by_gate["spread_filter"] = self._diag_entry_reject_by_gate.get("spread_filter", 0) + 1
             self._log_entry_blocked(m.slug, m.crypto, outcome, "spread", f"SPREAD_FILTER({spread_cents:.1f}c)", t_min)
@@ -6080,6 +6105,8 @@ class Bot:
 
     def _record_negative_exit(self, slug: str, net_pnl: float, reason: str):
         """Record a negative exit for loss-tail guard. Only tracks configured reasons."""
+        if not LOSS_TAIL_PAUSE_ENABLED:
+            return
         if reason not in LOSS_TAIL_NEGATIVE_EXIT_REASONS:
             return
         if net_pnl >= 0:
@@ -6107,6 +6134,8 @@ class Bot:
 
     def _slug_entry_allowed(self, slug: str) -> bool:
         """Check if slug entries are paused by loss-tail guard. Sells always allowed."""
+        if not LOSS_TAIL_PAUSE_ENABLED:
+            return True
         pause_until = self._slug_entry_paused_until.get(slug, 0.0)
         return time.monotonic() >= pause_until
 
@@ -6167,6 +6196,37 @@ class Bot:
             "ts_ms": int(time.time() * 1000),
         })
         self._entry_blocked_rollup.clear()
+
+    def _print_paper_trade_rate(self) -> None:
+        """Print PAPER_TRADE_RATE per-minute metric line. Only in LOG mode."""
+        if MODE != "LOG":
+            return
+        decisions = self._ptr_decisions
+        orders_placed = self._true_cost_submit_count
+        fills = self._true_cost_fill_count_min
+        unique_slugs = len(self._ptr_eval_slugs)
+        avg_spread = (sum(self._ptr_spread_samples) / len(self._ptr_spread_samples)
+                      if self._ptr_spread_samples else 0.0)
+        avg_edge = (sum(self._ptr_edge_samples) / len(self._ptr_edge_samples)
+                    if self._ptr_edge_samples else 0.0)
+        print(f"  PAPER_TRADE_RATE {{decisions={decisions}, orders_placed={orders_placed}, "
+              f"fills={fills}, unique_slugs={unique_slugs}, "
+              f"avg_spread={avg_spread:.1f}c, avg_edge_bps={avg_edge:.1f}}}")
+        write_jsonl({
+            "event_type": "PAPER_TRADE_RATE",
+            "decisions": decisions,
+            "orders_placed": orders_placed,
+            "fills": fills,
+            "unique_slugs": unique_slugs,
+            "avg_spread_cents": round(avg_spread, 2),
+            "avg_edge_bps": round(avg_edge, 2),
+            "ts_ms": int(time.time() * 1000),
+        })
+        # Reset for next minute
+        self._ptr_decisions = 0
+        self._ptr_eval_slugs.clear()
+        self._ptr_spread_samples.clear()
+        self._ptr_edge_samples.clear()
 
     # -----------------------------------------------------------------
     # PRE-8HR SAFETY: inventory cap check (block new BUYs when exceeded)

@@ -283,7 +283,7 @@ class ScalpEngine:
             self.diag_exits_stop += 1
             stops = self._consec_stops.get(state.slug, 0) + 1
             self._consec_stops[state.slug] = stops
-            if stops >= settings.SCALP_CONSEC_STOP_THRESHOLD:
+            if settings.SCALP_CONSEC_STOP_PAUSE_ENABLED and stops >= settings.SCALP_CONSEC_STOP_THRESHOLD:
                 self._slug_paused_until[state.slug] = now + settings.SCALP_CONSEC_STOP_PAUSE_SEC
                 self._write_jsonl({
                     "event_type": "SCALP_CONSEC_STOP_PAUSE",
