@@ -699,9 +699,16 @@ HEDGE_FAIL_PAUSE_SEC = float(os.getenv("HEDGE_FAIL_PAUSE_SEC", "900"))          
 # Rule 7: Max Loss Per Window — stop trading if PnL drops below threshold
 MAX_LOSS_PER_HOUR_USD = float(os.getenv("MAX_LOSS_PER_HOUR_USD", "25.0"))            # max loss per hour
 
-# Hourly budget: max dollars that can be invested per hour.
-# Sells return proceeds to the budget so net spend = buys - sell proceeds.
-HOURLY_BUDGET_USD = float(os.getenv("HOURLY_BUDGET_USD", "50.0"))
+# Hourly budget: LEGACY REPORTING ONLY — NOT used for gating.
+# Actual enforcement uses MAX_TOTAL_EXPOSURE_USD via _total_exposure_usd().
+HOURLY_BUDGET_USD = float(os.getenv("HOURLY_BUDGET_USD", "50.0"))  # reporting only
+
+# ---------------------------------------------------------------------------
+# POSITION INVARIANT — drift detection between bot state and truth
+# ---------------------------------------------------------------------------
+POS_DRIFT_TOLERANCE = float(os.getenv("POS_DRIFT_TOLERANCE", "0.5"))   # shares: ignore drift < this
+POS_DRIFT_RESYNC_ENABLED = bool(os.getenv("POS_DRIFT_RESYNC_ENABLED", "True") not in ("", "0", "False", "false"))
+POS_DRIFT_ESCALATION_AFTER_RESYNC = int(os.getenv("POS_DRIFT_ESCALATION_AFTER_RESYNC", "3"))  # consecutive checks AFTER resync before hard stop
 
 # Rule 8: Last 90 Seconds Rule — no resting orders, IOC-only
 LAST_SECONDS_IOC_ONLY = float(os.getenv("LAST_SECONDS_IOC_ONLY", "90.0"))           # seconds before close
@@ -768,6 +775,17 @@ if _IS_MIN_PROFILE:
     #   LIVE_SAFE_MAX_TOTAL_INVESTED_USD, MAX_POSITION_USD_PER_SLUG, etc.
 
 # ---------------------------------------------------------------------------
+# HYBRID probe mode defaults (overridden inside HYBRID_COPYWALLET block)
+# ---------------------------------------------------------------------------
+HYBRID_PROBE_ENABLED = False          # only active in HYBRID_COPYWALLET
+HYBRID_PROBE_START_MIN = 3.0
+HYBRID_PROBE_COOLDOWN_SEC = 60.0
+HYBRID_PROBE_DELTA_MIN_BPS = 8.0
+HYBRID_PROBE_VEL_MIN_BPS = 1.0
+HYBRID_PROBE_MAX_SPREAD_CENTS = 3.0
+HYBRID_PROBE_EDGE_CENTS = 1.5
+
+# ---------------------------------------------------------------------------
 # HYBRID_COPYWALLET profile — two engines (directional + scalp), shared exposure cap
 # ---------------------------------------------------------------------------
 _IS_HYBRID = (PROFILE == "HYBRID_COPYWALLET")
@@ -821,6 +839,17 @@ if _IS_HYBRID:
     MAX_ORDER_SUBMITS_PER_MIN = int(os.getenv("MAX_ORDER_SUBMITS_PER_MIN", "300"))
     MIN_ORDER_INTERVAL_MS = float(os.getenv("MIN_ORDER_INTERVAL_MS", "150"))
     DSCALP_COOLDOWN_MS = float(os.getenv("DSCALP_COOLDOWN_MS", "2000"))
+    # ── Continuous probe mode (minutes 3-55): relaxed gates for frequent entries ──
+    HYBRID_PROBE_ENABLED = bool(os.getenv("HYBRID_PROBE_ENABLED", "True") not in ("", "0", "False", "false"))
+    HYBRID_PROBE_START_MIN = float(os.getenv("HYBRID_PROBE_START_MIN", "3.0"))
+    HYBRID_PROBE_COOLDOWN_SEC = float(os.getenv("HYBRID_PROBE_COOLDOWN_SEC", "60.0"))  # ~1 entry/min/slug
+    HYBRID_PROBE_DELTA_MIN_BPS = float(os.getenv("HYBRID_PROBE_DELTA_MIN_BPS", "8.0"))
+    HYBRID_PROBE_VEL_MIN_BPS = float(os.getenv("HYBRID_PROBE_VEL_MIN_BPS", "1.0"))
+    HYBRID_PROBE_MAX_SPREAD_CENTS = float(os.getenv("HYBRID_PROBE_MAX_SPREAD_CENTS", "3.0"))
+    HYBRID_PROBE_EDGE_CENTS = float(os.getenv("HYBRID_PROBE_EDGE_CENTS", "1.5"))
+    # Also relax the per-coin spread gates in HYBRID
+    MAX_SPREAD_ENTRY_CENTS_BTCETH = float(os.getenv("MAX_SPREAD_ENTRY_CENTS_BTCETH", "3"))
+    MAX_SPREAD_ENTRY_CENTS_SOLXRP = float(os.getenv("MAX_SPREAD_ENTRY_CENTS_SOLXRP", "4"))
     # Disable parity/quoting/rescue/hedge
     PARITY_BUY_ENABLED = False
     PARITY_SELL_ENABLED = False
