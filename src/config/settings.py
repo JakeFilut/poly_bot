@@ -654,6 +654,7 @@ LOSS_TAIL_NEGATIVE_EXIT_REASONS = {"DERISK_MAKER", "PARITY_FLATTEN", "PARITY_REC
 LOSS_TAIL_LOOKBACK_SEC = float(os.getenv("LOSS_TAIL_LOOKBACK_SEC", "600"))                # 10 min rolling window
 LOSS_TAIL_NEG_EXIT_THRESHOLD = int(os.getenv("LOSS_TAIL_NEG_EXIT_THRESHOLD", "3"))        # X negative exits in window → pause
 LOSS_TAIL_PAUSE_SEC = float(os.getenv("LOSS_TAIL_PAUSE_SEC", "600"))                      # pause entries for 10 min
+LOSS_TAIL_PAUSE_ENABLED = bool(os.getenv("LOSS_TAIL_PAUSE_ENABLED", "True") not in ("", "0", "False", "false"))
 
 # ---------------------------------------------------------------------------
 # PER-SLUG PnL REPORT — emitted every 60s alongside TEMPO_REPORT
@@ -835,6 +836,7 @@ SCALP_IMB_SHORT_THRESHOLD = float(os.getenv("SCALP_IMB_SHORT_THRESHOLD", "0.38")
 SCALP_LOOP_INTERVAL_MS = float(os.getenv("SCALP_LOOP_INTERVAL_MS", "300"))
 SCALP_CONSEC_STOP_PAUSE_SEC = float(os.getenv("SCALP_CONSEC_STOP_PAUSE_SEC", "10.0"))
 SCALP_CONSEC_STOP_THRESHOLD = int(os.getenv("SCALP_CONSEC_STOP_THRESHOLD", "3"))
+SCALP_CONSEC_STOP_PAUSE_ENABLED = bool(os.getenv("SCALP_CONSEC_STOP_PAUSE_ENABLED", "True") not in ("", "0", "False", "false"))
 
 # ── Engine budget split ──
 # Paper (LOG) mode: no effective budget limit; LIVE: $35/$15
@@ -893,7 +895,7 @@ if _IS_HYBRID:
     DSCALP_COOLDOWN_MS = float(os.getenv("DSCALP_COOLDOWN_MS", "2000"))
     # ── Continuous probe mode (minutes 3-55): relaxed gates for frequent entries ──
     HYBRID_PROBE_ENABLED = bool(os.getenv("HYBRID_PROBE_ENABLED", "True") not in ("", "0", "False", "false"))
-    HYBRID_PROBE_START_MIN = float(os.getenv("HYBRID_PROBE_START_MIN", "3.0"))
+    HYBRID_PROBE_START_MIN = float(os.getenv("HYBRID_PROBE_START_MIN", "1.0"))   # probe all hour (was 3.0)
     HYBRID_PROBE_COOLDOWN_SEC = float(os.getenv("HYBRID_PROBE_COOLDOWN_SEC", "60.0"))  # ~1 entry/min/slug
     HYBRID_PROBE_DELTA_MIN_BPS = float(os.getenv("HYBRID_PROBE_DELTA_MIN_BPS", "8.0"))
     HYBRID_PROBE_VEL_MIN_BPS = float(os.getenv("HYBRID_PROBE_VEL_MIN_BPS", "1.0"))
@@ -931,52 +933,65 @@ if _IS_PAPER_STRESS:
         DERISK_RESCUE_TO_STRADDLE = False
         HEDGE_TICK_ESCALATION_ENABLED = False
 
-    # ── A) Exposure caps: disabled (only per-order $5 clamp) ──
-    MAX_CONCURRENT_EXPOSURE_USD = 1e9
-    MAX_EXPOSURE_USD_PER_SLUG = 1e9
-    MAX_TOTAL_EXPOSURE_USD = 1e9
-    MAX_POSITION_USD_PER_SLUG = 1e9
-    MAX_OPEN_ORDERS_TOTAL_USD = 1e9
-    MAX_OPEN_ORDERS_PER_SLUG_USD = 1e9
-    MAX_POSITION_SHARES_PER_OUTCOME = 1e9
-    MAX_NET_IMBALANCE_SHARES = 1e9
-    DIR_BUDGET_USD = 1e9
-    SCALP_BUDGET_USD = 1e9
+    # ── A) Exposure caps: high but not infinite (HYBRID_HOT) ──
+    MAX_CONCURRENT_EXPOSURE_USD = 100000
+    MAX_EXPOSURE_USD_PER_SLUG = 100000
+    MAX_TOTAL_EXPOSURE_USD = 100000
+    MAX_POSITION_USD_PER_SLUG = 100000
+    MAX_OPEN_ORDERS_TOTAL_USD = 100000
+    MAX_OPEN_ORDERS_PER_SLUG_USD = 100000
+    MAX_POSITION_SHARES_PER_OUTCOME = 100000
+    MAX_NET_IMBALANCE_SHARES = 100000
+    DIR_BUDGET_USD = 100000
+    SCALP_BUDGET_USD = 100000
     MAX_ORDER_USD = float(os.getenv("MAX_ORDER_USD", "5.0"))
 
-    # ── B) "Trade a lot" tweaks ──
+    # ── B) Disable loss-tail and scalp consec-stop pauses (HYBRID_HOT) ──
+    LOSS_TAIL_PAUSE_ENABLED = False
+    SCALP_CONSEC_STOP_PAUSE_ENABLED = False
+
+    # ── C) "Trade a lot" timing ──
     ENTRY_ONLY_EARLY_WINDOW = False
     ACTIVE_WINDOW_ONLY = True
     STRICT_WINDOW_MODE = True
     TRADE_START_MIN = 1.0
     TRADE_STOP_ADD_MIN = 58.0
 
-    # Cooldowns: aggressive
-    POST_FILL_COOLDOWN_MS = float(os.getenv("POST_FILL_COOLDOWN_MS", "200"))
-    PER_TOKEN_COOLDOWN_MS = float(os.getenv("PER_TOKEN_COOLDOWN_MS", "150"))
+    # ── D) Ultra-low cooldowns (HYBRID_HOT) ──
+    POST_FILL_COOLDOWN_MS = float(os.getenv("POST_FILL_COOLDOWN_MS", "100"))
+    PER_TOKEN_COOLDOWN_MS = float(os.getenv("PER_TOKEN_COOLDOWN_MS", "100"))
     MIN_ORDER_INTERVAL_MS = float(os.getenv("MIN_ORDER_INTERVAL_MS", "100"))
     MAX_ORDER_SUBMITS_PER_MIN = int(os.getenv("MAX_ORDER_SUBMITS_PER_MIN", "600"))
-    DSCALP_COOLDOWN_MS = float(os.getenv("DSCALP_COOLDOWN_MS", "1000"))
+    DSCALP_COOLDOWN_MS = float(os.getenv("DSCALP_COOLDOWN_MS", "800"))
+    MIN_ENTRY_INTERVAL_MS = float(os.getenv("MIN_ENTRY_INTERVAL_MS", "100"))
+    MIN_TIME_BETWEEN_NEW_ENTRIES_MS = float(os.getenv("MIN_TIME_BETWEEN_NEW_ENTRIES_MS", "500"))
 
-    # Edge thresholds: relaxed
-    DSCALP_DELTA_MIN_BPS = float(os.getenv("DSCALP_DELTA_MIN_BPS", "5.0"))
-    MIN_DIRECTIONAL_EDGE_CENTS_BTCETH = float(os.getenv("MIN_DIRECTIONAL_EDGE_CENTS_BTCETH", "1.5"))
-    MIN_DIRECTIONAL_EDGE_CENTS_SOLXRP = float(os.getenv("MIN_DIRECTIONAL_EDGE_CENTS_SOLXRP", "2.0"))
-    MIN_VEL_BPS_PER_MIN_BTCETH = float(os.getenv("MIN_VEL_BPS_PER_MIN_BTCETH", "1.0"))
-    MIN_VEL_BPS_PER_MIN_SOLXRP = float(os.getenv("MIN_VEL_BPS_PER_MIN_SOLXRP", "1.5"))
+    # ── E) Entry cooldown function override (HYBRID_HOT: 50ms) ──
+    def entry_cooldown_sec(coin: str, t_min: float) -> float:    # noqa: F811
+        return 0.05
 
-    # Probe thresholds: very relaxed for max fills
+    # ── F) Signal gates lowered 30-50% (HYBRID_HOT) ──
+    IMB_MIN = 1.05                                                                 # was 1.15
+    DSCALP_DELTA_MIN_BPS = float(os.getenv("DSCALP_DELTA_MIN_BPS", "3.0"))        # was 5.0 (-40%)
+    DSCALP_VEL_MIN_BPS_PER_MIN = float(os.getenv("DSCALP_VEL_MIN_BPS_PER_MIN", "1.5"))  # was 2.5 (-40%)
+    MIN_DIRECTIONAL_EDGE_CENTS_BTCETH = float(os.getenv("MIN_DIRECTIONAL_EDGE_CENTS_BTCETH", "1.0"))  # was 1.5 (-33%)
+    MIN_DIRECTIONAL_EDGE_CENTS_SOLXRP = float(os.getenv("MIN_DIRECTIONAL_EDGE_CENTS_SOLXRP", "1.2"))  # was 2.0 (-40%)
+    MIN_VEL_BPS_PER_MIN_BTCETH = float(os.getenv("MIN_VEL_BPS_PER_MIN_BTCETH", "0.6"))   # was 1.0 (-40%)
+    MIN_VEL_BPS_PER_MIN_SOLXRP = float(os.getenv("MIN_VEL_BPS_PER_MIN_SOLXRP", "1.0"))   # was 1.5 (-33%)
+    MIN_DELTA_VEL_BPS_PER_MIN = 0.6                                                # was 1.0 (-40%)
+
+    # ── G) Probe thresholds lowered (HYBRID_HOT) ──
     HYBRID_PROBE_ENABLED = True
-    HYBRID_PROBE_START_MIN = 1.5
-    HYBRID_PROBE_COOLDOWN_SEC = float(os.getenv("HYBRID_PROBE_COOLDOWN_SEC", "15.0"))
-    HYBRID_PROBE_DELTA_MIN_BPS = float(os.getenv("HYBRID_PROBE_DELTA_MIN_BPS", "4.0"))
-    HYBRID_PROBE_VEL_MIN_BPS = float(os.getenv("HYBRID_PROBE_VEL_MIN_BPS", "0.5"))
-    HYBRID_PROBE_MAX_SPREAD_CENTS = float(os.getenv("HYBRID_PROBE_MAX_SPREAD_CENTS", "6.0"))
-    HYBRID_PROBE_EDGE_CENTS = float(os.getenv("HYBRID_PROBE_EDGE_CENTS", "0.5"))
+    HYBRID_PROBE_START_MIN = 1.0                                                   # was 1.5
+    HYBRID_PROBE_COOLDOWN_SEC = float(os.getenv("HYBRID_PROBE_COOLDOWN_SEC", "10.0"))      # was 15.0 (-33%)
+    HYBRID_PROBE_DELTA_MIN_BPS = float(os.getenv("HYBRID_PROBE_DELTA_MIN_BPS", "2.5"))    # was 4.0 (-37%)
+    HYBRID_PROBE_VEL_MIN_BPS = float(os.getenv("HYBRID_PROBE_VEL_MIN_BPS", "0.3"))        # was 0.5 (-40%)
+    HYBRID_PROBE_MAX_SPREAD_CENTS = float(os.getenv("HYBRID_PROBE_MAX_SPREAD_CENTS", "7.0"))  # was 6.0 (+1c)
+    HYBRID_PROBE_EDGE_CENTS = float(os.getenv("HYBRID_PROBE_EDGE_CENTS", "0.3"))          # was 0.5 (-40%)
 
-    # Spread checks: relaxed
-    MAX_SPREAD_ENTRY_CENTS_BTCETH = float(os.getenv("MAX_SPREAD_ENTRY_CENTS_BTCETH", "6"))
-    MAX_SPREAD_ENTRY_CENTS_SOLXRP = float(os.getenv("MAX_SPREAD_ENTRY_CENTS_SOLXRP", "8"))
-    DSCALP_MAX_SPREAD_CENTS = float(os.getenv("DSCALP_MAX_SPREAD_CENTS", "6.0"))
+    # ── H) Spreads +1c wider (HYBRID_HOT) ──
+    MAX_SPREAD_ENTRY_CENTS_BTCETH = float(os.getenv("MAX_SPREAD_ENTRY_CENTS_BTCETH", "7"))   # was 6 (+1c)
+    MAX_SPREAD_ENTRY_CENTS_SOLXRP = float(os.getenv("MAX_SPREAD_ENTRY_CENTS_SOLXRP", "9"))   # was 8 (+1c)
+    DSCALP_MAX_SPREAD_CENTS = float(os.getenv("DSCALP_MAX_SPREAD_CENTS", "7.0"))             # was 6.0 (+1c)
     NOISY_SPREAD_BLOCK_CENTS = float(os.getenv("NOISY_SPREAD_BLOCK_CENTS", "15"))
     NOISY_SPREAD_BLOCK_VEL = float(os.getenv("NOISY_SPREAD_BLOCK_VEL", "1"))
