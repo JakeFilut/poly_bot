@@ -74,7 +74,7 @@ NO_NEW_ENTRIES_SEC_TO_CLOSE = float(os.getenv("NO_NEW_ENTRIES_SEC_TO_CLOSE", "18
 # -----------------------------------------------------------------------------
 # Runtime profile — selects which subsystems are active
 # -----------------------------------------------------------------------------
-PROFILE = os.getenv("PROFILE", "F247_LIKE")    # F247_LIKE | HOURLY_SCALP_MIN | HYBRID_COPYWALLET
+PROFILE = os.getenv("PROFILE", "HYBRID_COPYWALLET")    # F247_LIKE | HOURLY_SCALP_MIN | HYBRID_COPYWALLET
 
 # HOURLY_SCALP_MIN: minimal profile for BTC/ETH IOC scalping.
 # Keeps: IOC buy/sell, fill confirmation/recovery, reservation + exposure caps,
