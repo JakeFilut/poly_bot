@@ -4075,14 +4075,15 @@ class Bot:
         st.last_entry_ts = iso_z(utc_now())
 
         self.logger.log_order_fill(
-            engine="DSCALP", slug=m.slug, crypto=m.crypto,
-            hour_start_utc=ctx["hour_start_utc"], t_min=t_min,
-            outcome=outcome, side="BUY", qty=order_qty,
-            fill_price=buy_price, usdc_cost=actual_cost,
-            maker_taker=mt, decision_id=decision_id,
-            client_order_id=client_oid, position_id=pos.position_id,
-            notes=f"dscalp_entry vel={vel:.1f}",
-            **build_book_fields(ctx["up_book"], ctx["dn_book"], outcome),
+            engine="DSCALP", reason="DSCALP_ENTRY",
+            decision_id=decision_id, client_order_id=client_oid,
+            position_id=pos.position_id,
+            crypto=m.crypto, slug=m.slug, outcome=outcome,
+            side="BUY", qty=order_qty, fill_price=buy_price,
+            usdc_cost=actual_cost, maker_taker=mt,
+            vwap=pos.vwap, ctx=ctx,
+            book_fields=build_book_fields(ctx["up_book"], ctx["dn_book"], outcome),
+            extra={"t_min": round(t_min, 1), "vel": round(vel, 1)},
         )
 
     def _dscalp_manage_exits(self, m: MarketRef, st: MarketState, ctx: dict):
