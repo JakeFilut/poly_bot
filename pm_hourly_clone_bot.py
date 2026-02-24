@@ -374,7 +374,8 @@ class Bot:
         self._diag_entry_reject_by_gate: Dict[str, int] = {}
         # ENTRY_BLOCKED tracing: per-slug rate-limited decision log
         self._entry_blocked_last_ts: Dict[str, float] = {}  # slug -> last log ts
-        self._entry_blocked_rollup: Dict[str, int] = {}     # blocker_category -> count (60s window)
+        self._entry_blocked_rollup: Dict[str, int] = {}     # category:reason -> count (60s window)
+        self._entry_blocked_rollup_crypto: Dict[str, int] = {}  # crypto:category:reason -> count (60s window)
         # PAPER_TRADE_RATE per-minute metrics (HYBRID_HOT)
         self._ptr_decisions: int = 0                         # entry evaluations reaching hard gates
         self._ptr_orders_placed: int = 0                     # orders actually submitted (entry)
@@ -3817,7 +3818,9 @@ class Bot:
         # Inventory cap check
         if not self._inventory_cap_ok(m.slug, outcome):
             self._diag_entry_reject_by_gate["inventory_cap"] = self._diag_entry_reject_by_gate.get("inventory_cap", 0) + 1
-            self._log_entry_blocked(m.slug, m.crypto, outcome, "inventory", "INVENTORY_CAP", t_min)
+            self._log_entry_blocked(m.slug, m.crypto, outcome, "inventory", "INVENTORY_CAP", t_min,
+                                    extra={"spread_cents": round(book.spread * 100, 1),
+                                           "delta_bps": round(delta_bps, 1)})
             DiagReporter.gate_trace(m.slug, outcome, "inventory", "INVENTORY_CAP",
                                     t_min=t_min, delta_bps=delta_bps, exposure_total=self._total_exposure_usd(),
                                     bot=self, write_fn=write_jsonl)
@@ -3868,7 +3871,9 @@ class Bot:
         self._ptr_edge_samples.append(abs_delta_bps)
         if not self._coin_spread_entry_ok(m.crypto, spread_cents):
             self._diag_entry_reject_by_gate["spread_filter"] = self._diag_entry_reject_by_gate.get("spread_filter", 0) + 1
-            self._log_entry_blocked(m.slug, m.crypto, outcome, "spread", f"SPREAD_FILTER({spread_cents:.1f}c)", t_min)
+            self._log_entry_blocked(m.slug, m.crypto, outcome, "spread", f"SPREAD_FILTER({spread_cents:.1f}c)", t_min,
+                                    extra={"spread_cents": round(spread_cents, 1),
+                                           "delta_bps": round(delta_bps, 1)})
             # Sampled log: only emit GATE_SPREAD_BLOCK at LOG_SPREAD_BLOCK_SAMPLER probability
             if LOG_LEVEL != "COMPACT" or random.random() < LOG_SPREAD_BLOCK_SAMPLER:
                 write_jsonl({"event_type": "GATE_SPREAD_BLOCK", "ts_ms": int(now_t * 1000),
@@ -3915,7 +3920,11 @@ class Bot:
         spot_move_ok = self._spot_move_10s_bps(m.slug) >= DSCALP_SPOT_MOVE_10S_BPS
         if not delta_ok and not spot_move_ok:
             self._diag_entry_reject_by_gate["signal"] = self._diag_entry_reject_by_gate.get("signal", 0) + 1
-            self._log_entry_blocked(m.slug, m.crypto, outcome, "signal", f"SIGNAL_TOO_WEAK(delta={abs_delta_bps:.1f})", t_min)
+            self._log_entry_blocked(m.slug, m.crypto, outcome, "signal",
+                                    f"SIGNAL_TOO_WEAK(delta={abs_delta_bps:.1f})", t_min,
+                                    extra={"edge_bps": round(abs_delta_bps, 1),
+                                           "threshold_bps": round(_eff_delta_min, 1),
+                                           "spread_cents": round(spread_cents, 1)})
             DiagReporter.gate_trace(m.slug, outcome, "edge", "SIGNAL_TOO_WEAK",
                                     t_min=t_min, spread=spread_cents, delta_bps=delta_bps,
                                     exposure_total=self._total_exposure_usd(),
@@ -4010,6 +4019,10 @@ class Bot:
                       "vel": round(vel, 4),
                       "cache_age_ms": round(cache_age, 0),
                       "spread_cents": round(book.spread * 100, 2)})
+
+        # Pre-buy drift check: compare bot vs truth, resync if needed
+        if not self._prebuy_drift_check(m.slug, outcome):
+            return  # blocked by drift — do not trade while desynced
 
         # Execute buy
         _pre_exp_dir = self._total_exposure_usd()
@@ -4536,6 +4549,9 @@ class Bot:
             sm["signal_detect_ts"] = signal_detect_ts
             # Record trade direction for no-flip rule
             self._last_trade_direction[m.slug] = (outcome, time.time())
+            # Pre-buy drift check
+            if not self._prebuy_drift_check(m.slug, outcome):
+                return
             # Always buy at ask (taker) for immediate fill
             probe_price = book.ask
             probe_usd = max(MIN_ORDER_USDC, clip * PROBE_SIZE_FRAC)
@@ -5267,6 +5283,9 @@ class Bot:
 
         if action["action"] == "BUY":
             if not self._buys_allowed_scalp():
+                return
+            # Pre-buy drift check
+            if not self._prebuy_drift_check(slug, outcome):
                 return
             # In-flight guard
             if self._has_inflight_buy(token_id):
@@ -6145,12 +6164,16 @@ class Bot:
     # -----------------------------------------------------------------
     def _log_entry_blocked(self, slug: str, crypto: str, outcome: str,
                            blocker_category: str, blocker_reason: str,
-                           t_min: float = 0.0) -> None:
+                           t_min: float = 0.0, extra: dict = None) -> None:
         """Emit ENTRY_BLOCKED log, rate-limited to once per 10s per slug.
-        Also accumulates the 60s rollup counters."""
-        # Always count for rollup
-        self._entry_blocked_rollup[blocker_category] = (
-            self._entry_blocked_rollup.get(blocker_category, 0) + 1)
+        Also accumulates the 60s rollup counters (global + by-crypto)."""
+        # Always count for rollup (global + by-crypto)
+        _rkey = f"{blocker_category}:{blocker_reason}"
+        self._entry_blocked_rollup[_rkey] = (
+            self._entry_blocked_rollup.get(_rkey, 0) + 1)
+        _ckey = f"{crypto}:{_rkey}"
+        self._entry_blocked_rollup_crypto[_ckey] = (
+            self._entry_blocked_rollup_crypto.get(_ckey, 0) + 1)
         # Rate-limit per-slug log to once per 10s
         now = time.time()
         last = self._entry_blocked_last_ts.get(slug, 0.0)
@@ -6164,39 +6187,73 @@ class Bot:
         bot_state = "SAFE_MODE" if getattr(self._truth, 'safe_mode', False) else "NORMAL"
         if self._desync_hard_stop:
             bot_state = "DESYNC_HARD_STOP"
-        write_jsonl({
+        # Gather position info for the specific outcome
+        st = self.market_states.get(slug)
+        pos_qty = st.positions[outcome].qty if st and outcome in st.positions else 0.0
+        net_imbal = 0.0
+        if st:
+            net_imbal = abs(st.positions["Up"].qty - st.positions["Down"].qty)
+        event = {
             "event_type": "ENTRY_BLOCKED",
-            "slug": slug, "crypto": crypto, "t_min": round(t_min, 1),
+            "slug": slug, "crypto": crypto, "outcome": outcome,
+            "t_min": round(t_min, 1),
+            "category": blocker_category,
+            "reason": blocker_reason,
             "window_state": window_state, "bot_state": bot_state,
+            "mode": MODE, "profile": PROFILE,
+            "max_order_usd": MAX_ORDER_USD,
+            "max_position_shares_per_outcome": MAX_POSITION_SHARES_PER_OUTCOME,
+            "max_net_imbalance_shares": MAX_NET_IMBALANCE_SHARES,
+            "max_concurrent_exposure_usd": MAX_CONCURRENT_EXPOSURE_USD,
             "current_exposure_usd": round(exposure, 2),
             "open_order_usd": round(open_order_usd, 2),
             "pos_cost_usd": round(pos_cost_usd, 2),
             "remaining_capacity_usd": round(max(0, MAX_CONCURRENT_EXPOSURE_USD - exposure), 2),
-            "first_blocker_category": blocker_category,
-            "first_blocker_reason": blocker_reason,
+            "pos_qty": round(pos_qty, 2),
+            "net_imbalance": round(net_imbal, 1),
             "ts_ms": int(now * 1000),
-        })
+        }
+        if extra:
+            event.update(extra)
+        write_jsonl(event)
         print(f"  [ENTRY_BLOCKED] {slug} {crypto} {outcome} "
               f"cat={blocker_category} reason={blocker_reason} "
               f"exposure=${exposure:.2f}/{MAX_CONCURRENT_EXPOSURE_USD:.0f} "
-              f"t_min={t_min:.1f}")
+              f"t_min={t_min:.1f} mode={MODE}")
 
     def _print_entry_blocked_rollup(self) -> None:
-        """Print top-5 blocker categories from last 60s, then reset."""
+        """Print BLOCKER_ROLLUP: top-5 blockers globally + by-crypto from last 60s."""
         if not self._entry_blocked_rollup:
             return
         total = sum(self._entry_blocked_rollup.values())
         top5 = sorted(self._entry_blocked_rollup.items(),
                        key=lambda x: x[1], reverse=True)[:5]
         parts = [f"{cat}={cnt}" for cat, cnt in top5]
-        print(f"  BLOCKERS_60s: total={total}  {' '.join(parts)}")
+        # By-crypto breakdown
+        by_crypto: dict = {}
+        for ckey, cnt in self._entry_blocked_rollup_crypto.items():
+            crypto_part = ckey.split(":", 1)[0]
+            by_crypto.setdefault(crypto_part, {})
+            reason_part = ckey.split(":", 1)[1] if ":" in ckey else ckey
+            by_crypto[crypto_part][reason_part] = cnt
+        crypto_top5 = {}
+        for crypto_name, reasons in by_crypto.items():
+            crypto_top5[crypto_name] = dict(
+                sorted(reasons.items(), key=lambda x: x[1], reverse=True)[:5])
+        print(f"  BLOCKER_ROLLUP: total={total}  {' '.join(parts)}")
+        for crypto_name, reasons in crypto_top5.items():
+            c_parts = [f"{r}={c}" for r, c in reasons.items()]
+            print(f"    {crypto_name}: {' '.join(c_parts)}")
         write_jsonl({
-            "event_type": "ENTRY_BLOCKED_ROLLUP",
+            "event_type": "BLOCKER_ROLLUP",
             "total": total,
-            "top5": {cat: cnt for cat, cnt in top5},
+            "top5_global": {cat: cnt for cat, cnt in top5},
+            "by_crypto": crypto_top5,
+            "mode": MODE, "profile": PROFILE,
             "ts_ms": int(time.time() * 1000),
         })
         self._entry_blocked_rollup.clear()
+        self._entry_blocked_rollup_crypto.clear()
 
     def _print_paper_trade_rate(self) -> None:
         """Print PAPER_TRADE_RATE per-minute metric line. Only in LOG mode."""
@@ -6395,6 +6452,80 @@ class Bot:
                         corrected.append({"slug": slug, "outcome": outcome,
                                           "old": round(old_qty, 2), "new": 0.0})
         return corrected
+
+    def _prebuy_drift_check(self, slug: str, outcome: str) -> bool:
+        """Fast pre-buy invariant: compare bot qty vs truth qty for this slug/outcome.
+        If delta > POS_DRIFT_TOLERANCE:
+          - log PREBUY_POSITION_DRIFT
+          - attempt resync from truth for this slug/outcome
+          - if resync succeeds: return True (proceed with buy)
+          - if resync fails: log PREBUY_DRIFT_BLOCK, return False (block buy)
+        Returns True if OK to proceed with buy."""
+        st = self.market_states.get(slug)
+        if st is None:
+            return True
+        bot_qty = round(st.positions[outcome].qty, 2)
+        if bot_qty < MIN_QTY:
+            bot_qty = 0.0
+        # Get truth qty for this slug/outcome
+        truth_qty = 0.0
+        try:
+            truth_positions = self._truth.get_active_window_positions()
+            for tp in truth_positions.values():
+                if tp.slug == slug and tp.outcome == outcome:
+                    truth_qty = round(float(tp.net_qty), 2)
+                    if truth_qty < MIN_QTY:
+                        truth_qty = 0.0
+                    break
+        except Exception:
+            return True  # can't check, allow buy
+        delta = abs(bot_qty - truth_qty)
+        if delta <= POS_DRIFT_TOLERANCE:
+            return True  # no drift, proceed
+        # Drift detected — log and attempt resync
+        write_jsonl({
+            "event_type": "PREBUY_POSITION_DRIFT",
+            "slug": slug, "outcome": outcome,
+            "bot_qty": bot_qty, "truth_qty": truth_qty,
+            "delta": round(delta, 4),
+            "ts_ms": int(time.time() * 1000),
+        })
+        print(f"  [PREBUY_DRIFT] {slug} {outcome}: bot={bot_qty} truth={truth_qty} delta={delta:.4f}")
+        # Attempt resync for this specific slug/outcome
+        try:
+            if truth_qty > MIN_QTY:
+                old_qty = st.positions[outcome].qty
+                st.positions[outcome].qty = truth_qty
+                if old_qty > MIN_QTY and truth_qty > MIN_QTY:
+                    st.positions[outcome].cost_usdc = st.positions[outcome].vwap * truth_qty
+                write_jsonl({
+                    "event_type": "PREBUY_DRIFT_RESYNCED",
+                    "slug": slug, "outcome": outcome,
+                    "old_qty": round(old_qty, 2), "new_qty": round(truth_qty, 2),
+                    "ts_ms": int(time.time() * 1000),
+                })
+                return True  # resynced successfully, proceed with buy
+            else:
+                # Truth says 0, bot says non-zero — resync to 0
+                st.positions[outcome].qty = 0.0
+                st.positions[outcome].cost_usdc = 0.0
+                write_jsonl({
+                    "event_type": "PREBUY_DRIFT_RESYNCED",
+                    "slug": slug, "outcome": outcome,
+                    "old_qty": bot_qty, "new_qty": 0.0,
+                    "ts_ms": int(time.time() * 1000),
+                })
+                return True
+        except Exception as e:
+            write_jsonl({
+                "event_type": "PREBUY_DRIFT_BLOCK",
+                "slug": slug, "outcome": outcome,
+                "bot_qty": bot_qty, "truth_qty": truth_qty,
+                "error": str(e)[:200],
+                "ts_ms": int(time.time() * 1000),
+            })
+            print(f"  [PREBUY_DRIFT_BLOCK] {slug} {outcome}: resync failed, blocking buy")
+            return False
 
     def _check_position_invariant(self) -> None:
         """Compare bot positions vs truth positions every POS_DRIFT_CHECK_INTERVAL_SEC.
@@ -6822,6 +6953,9 @@ class Bot:
         price move 2c against, inventory cap, or hard spread limit."""
         # LIVE safety cap check
         if not self._exec_safety_can_enter(m.slug):
+            return
+        # Pre-buy drift check
+        if not self._prebuy_drift_check(m.slug, outcome):
             return
         # Inventory cap + post-fill cooldown
         if not self._inventory_cap_ok(m.slug, outcome):
@@ -8252,6 +8386,9 @@ class Bot:
                            leg_usd: float, ctx: dict, pair_id: str,
                            quote_step_usd_used: float = 0.0) -> float:
         """Buy at ask for immediate fill in quoting mode. Returns cost if filled."""
+        # Pre-buy drift check
+        if not self._prebuy_drift_check(m.slug, outcome):
+            return 0.0
         token_id = m.outcome_up_id if outcome == "Up" else m.outcome_down_id
         pos = st.positions[outcome]
         placed_ts = time.time()
@@ -8469,6 +8606,9 @@ class Bot:
                         pair_id: str = "") -> float:
         """Execute one leg of a parity buy at ask price for immediate fill.
         Returns cost (USDC) of filled order."""
+        # Pre-buy drift check
+        if not self._prebuy_drift_check(m.slug, outcome):
+            return 0.0
         token_id = m.outcome_up_id if outcome == "Up" else m.outcome_down_id
         pos = st.positions[outcome]
         placed_ts = time.time()
@@ -8742,6 +8882,7 @@ class Bot:
             return
         if not self._post_fill_cooldown_ok(m.slug):
             return
+        # Late scalp buys cheapside — direction determined below, drift check deferred
         t_min = ctx["t_min"]
         delta_bps, abs_delta_bps = ctx["delta_bps"], ctx["abs_delta_bps"]
         up_book, dn_book = ctx["up_book"], ctx["dn_book"]
@@ -8766,6 +8907,9 @@ class Bot:
                 return
         clip = self._calc_clip(m.crypto, t_min, abs_delta_bps) * 0.50
         if clip < MIN_ORDER_USDC:
+            return
+        # Pre-buy drift check
+        if not self._prebuy_drift_check(m.slug, outcome):
             return
         # LIVE_SAFE trade-size limiter
         clip, qty = self._live_safe_cap_usd(clip, book.ask)

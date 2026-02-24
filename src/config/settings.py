@@ -855,8 +855,8 @@ if _IS_HYBRID:
     CRYPTOS = ["BTC", "ETH"]
     LIVE_ALLOWED_SYMBOLS = ["BTC", "ETH"]
     # Exposure: CURRENT open cost, not cumulative spend
-    # Paper (LOG): exposure caps disabled (huge values); only per-order $5 clamp.
-    # LIVE modes stay at $50.
+    # PAPER/LOG: aggressive — per-order $5 cap ONLY, no concurrent exposure limit.
+    # LIVE modes: conservative $50 concurrent cap.
     if MODE == "LOG":
         MAX_TOTAL_EXPOSURE_USD = float(os.getenv("MAX_TOTAL_EXPOSURE_USD", "1e9"))
         MAX_CONCURRENT_EXPOSURE_USD = float(os.getenv("MAX_CONCURRENT_EXPOSURE_USD", "1e9"))
@@ -865,8 +865,9 @@ if _IS_HYBRID:
         MAX_POSITION_USD_PER_SLUG = float(os.getenv("MAX_POSITION_USD_PER_SLUG", "1e9"))
         MAX_OPEN_ORDERS_TOTAL_USD = float(os.getenv("MAX_OPEN_ORDERS_TOTAL_USD", "1e9"))
         MAX_OPEN_ORDERS_PER_SLUG_USD = float(os.getenv("MAX_OPEN_ORDERS_PER_SLUG_USD", "1e9"))
-        MAX_POSITION_SHARES_PER_OUTCOME = float(os.getenv("MAX_POSITION_SHARES_PER_OUTCOME", "1e9"))
-        MAX_NET_IMBALANCE_SHARES = float(os.getenv("MAX_NET_IMBALANCE_SHARES", "1e9"))
+        # ── PAPER/LOG: high inventory caps so we don't stall ──
+        MAX_POSITION_SHARES_PER_OUTCOME = float(os.getenv("MAX_POSITION_SHARES_PER_OUTCOME", "250"))
+        MAX_NET_IMBALANCE_SHARES = float(os.getenv("MAX_NET_IMBALANCE_SHARES", "250"))
     else:
         MAX_TOTAL_EXPOSURE_USD = float(os.getenv("MAX_TOTAL_EXPOSURE_USD", "50.0"))
         MAX_CONCURRENT_EXPOSURE_USD = float(os.getenv("MAX_CONCURRENT_EXPOSURE_USD", "50.0"))
@@ -877,23 +878,38 @@ if _IS_HYBRID:
         MAX_OPEN_ORDERS_PER_SLUG_USD = float(os.getenv("MAX_OPEN_ORDERS_PER_SLUG_USD", "12.5"))
         MAX_POSITION_SHARES_PER_OUTCOME = float(os.getenv("MAX_POSITION_SHARES_PER_OUTCOME", "60"))
         MAX_NET_IMBALANCE_SHARES = float(os.getenv("MAX_NET_IMBALANCE_SHARES", "25"))
-    # Window: do NOT require early-window-only
+    # Window: do NOT require early-window-only — BOTH LIVE and PAPER trade all hour
     ENTRY_ONLY_EARLY_WINDOW = False
     ACTIVE_WINDOW_ONLY = True
     STRICT_WINDOW_MODE = True
-    # Make mid-hour trading possible
+    # Make mid-hour trading possible — probe + scalp all hour, burst limited to early
     TRADE_START_MIN = 1.0
     TRADE_STOP_ADD_MIN = 58.0
     FLATTEN_START_MIN = float(os.getenv("FLATTEN_START_MIN", "59.0"))
     HARD_FLATTEN_MIN = float(os.getenv("HARD_FLATTEN_MIN", "59.4"))
     TRADE_HARD_STOP_MIN = 59.4
-    # Cooldowns: wallet-like fast
-    POST_FILL_COOLDOWN_MS = float(os.getenv("POST_FILL_COOLDOWN_MS", "150"))
-    PER_TOKEN_COOLDOWN_MS = float(os.getenv("PER_TOKEN_COOLDOWN_MS", "150"))
-    MAX_ORDER_SUBMITS_PER_MIN = int(os.getenv("MAX_ORDER_SUBMITS_PER_MIN", "300"))
-    MIN_ORDER_INTERVAL_MS = float(os.getenv("MIN_ORDER_INTERVAL_MS", "150"))
-    DSCALP_COOLDOWN_MS = float(os.getenv("DSCALP_COOLDOWN_MS", "2000"))
-    # ── Continuous probe mode (minutes 3-55): relaxed gates for frequent entries ──
+    # Cooldowns: mode-dependent (PAPER=aggressive, LIVE=wallet-like)
+    if MODE == "LOG":
+        POST_FILL_COOLDOWN_MS = float(os.getenv("POST_FILL_COOLDOWN_MS", "150"))
+        PER_TOKEN_COOLDOWN_MS = float(os.getenv("PER_TOKEN_COOLDOWN_MS", "150"))
+        MAX_ORDER_SUBMITS_PER_MIN = int(os.getenv("MAX_ORDER_SUBMITS_PER_MIN", "300"))
+        MIN_ORDER_INTERVAL_MS = float(os.getenv("MIN_ORDER_INTERVAL_MS", "150"))
+        DSCALP_COOLDOWN_MS = float(os.getenv("DSCALP_COOLDOWN_MS", "1500"))
+        MIN_ENTRY_INTERVAL_MS = float(os.getenv("MIN_ENTRY_INTERVAL_MS", "100"))
+        MIN_TIME_BETWEEN_NEW_ENTRIES_MS = float(os.getenv("MIN_TIME_BETWEEN_NEW_ENTRIES_MS", "800"))
+        # PAPER/LOG entry cooldown: fast re-entry
+        def entry_cooldown_sec(coin: str, t_min: float) -> float:    # noqa: F811
+            return 0.15
+    else:
+        POST_FILL_COOLDOWN_MS = float(os.getenv("POST_FILL_COOLDOWN_MS", "300"))
+        PER_TOKEN_COOLDOWN_MS = float(os.getenv("PER_TOKEN_COOLDOWN_MS", "250"))
+        MAX_ORDER_SUBMITS_PER_MIN = int(os.getenv("MAX_ORDER_SUBMITS_PER_MIN", "300"))
+        MIN_ORDER_INTERVAL_MS = float(os.getenv("MIN_ORDER_INTERVAL_MS", "200"))
+        DSCALP_COOLDOWN_MS = float(os.getenv("DSCALP_COOLDOWN_MS", "2000"))
+    # ── PAPER/LOG: larger probe fraction so clips are meaningful at $5 cap ──
+    if MODE == "LOG":
+        PROBE_SIZE_FRAC = 0.50  # probe = max($1, clip * 0.50) in paper
+    # ── Continuous probe mode (all hour): relaxed gates for frequent entries ──
     HYBRID_PROBE_ENABLED = bool(os.getenv("HYBRID_PROBE_ENABLED", "True") not in ("", "0", "False", "false"))
     HYBRID_PROBE_START_MIN = float(os.getenv("HYBRID_PROBE_START_MIN", "1.0"))   # probe all hour (was 3.0)
     HYBRID_PROBE_COOLDOWN_SEC = float(os.getenv("HYBRID_PROBE_COOLDOWN_SEC", "60.0"))  # ~1 entry/min/slug
