@@ -609,8 +609,8 @@ OM_KILL_PAUSE_SEC = float(os.getenv("OM_KILL_PAUSE_SEC", "60"))                 
 
 # Global safety caps
 OM_MAX_OPEN_ORDERS = int(os.getenv("OM_MAX_OPEN_ORDERS", "50"))                    # hard cap on tracked open orders
-OM_MAX_TOTAL_USD = float(os.getenv("OM_MAX_TOTAL_USD", "100"))                     # max total exposure across all slugs (match MAX_TOTAL_EXPOSURE_USD)
-OM_MAX_PER_SLUG_USD = float(os.getenv("OM_MAX_PER_SLUG_USD", "50"))                # max exposure per slug
+OM_MAX_TOTAL_USD = float(os.getenv("OM_MAX_TOTAL_USD", "100"))                     # placeholder — overridden after concurrent caps defined
+OM_MAX_PER_SLUG_USD = float(os.getenv("OM_MAX_PER_SLUG_USD", "50"))               # placeholder — overridden after concurrent caps defined
 
 # Sanity report
 OM_SANITY_REPORT_INTERVAL_SEC = float(os.getenv("OM_SANITY_REPORT_INTERVAL_SEC", "60"))  # report every 60s
@@ -627,6 +627,23 @@ MAX_OPEN_ORDERS_TOTAL_USD = float(os.getenv("MAX_OPEN_ORDERS_TOTAL_USD", "50.0")
 MAX_OPEN_ORDERS_PER_SLUG_USD = float(os.getenv("MAX_OPEN_ORDERS_PER_SLUG_USD", "25.0"))       # per-slug open orders cap
 CLOB_MIN_ORDER_SIZE = 5                                                                   # Polymarket CLOB minimum order size (shares)
 CLOB_MIN_ORDER_USD = 1.0                                                                   # Polymarket CLOB minimum order value ($1)
+
+# ---------------------------------------------------------------------------
+# CONCURRENT EXPOSURE CAPS — real-time (positions_cost + open_order_notional)
+# These gate ALL new BUYs. Sells always free capacity.
+# ---------------------------------------------------------------------------
+if MODE == "LOG":
+    MAX_CONCURRENT_EXPOSURE_USD = float(os.getenv("MAX_CONCURRENT_EXPOSURE_USD", "100.0"))
+    MAX_EXPOSURE_USD_PER_SLUG = float(os.getenv("MAX_EXPOSURE_USD_PER_SLUG", "1000.0"))
+    MAX_ORDER_USD = float(os.getenv("MAX_ORDER_USD", "10.0"))
+else:
+    MAX_CONCURRENT_EXPOSURE_USD = float(os.getenv("MAX_CONCURRENT_EXPOSURE_USD", "50.0"))
+    MAX_EXPOSURE_USD_PER_SLUG = float(os.getenv("MAX_EXPOSURE_USD_PER_SLUG", "25.0"))
+    MAX_ORDER_USD = float(os.getenv("MAX_ORDER_USD", "5.0"))
+
+# Sync safety caps to concurrent exposure values (defined above)
+OM_MAX_TOTAL_USD = float(os.getenv("OM_MAX_TOTAL_USD", str(MAX_CONCURRENT_EXPOSURE_USD)))
+OM_MAX_PER_SLUG_USD = float(os.getenv("OM_MAX_PER_SLUG_USD", str(MAX_EXPOSURE_USD_PER_SLUG)))
 
 # ---------------------------------------------------------------------------
 # LOSS-TAIL REDUCTION GUARD — auto-pause slugs with repeated negative exits
@@ -806,10 +823,10 @@ SCALP_CONSEC_STOP_PAUSE_SEC = float(os.getenv("SCALP_CONSEC_STOP_PAUSE_SEC", "10
 SCALP_CONSEC_STOP_THRESHOLD = int(os.getenv("SCALP_CONSEC_STOP_THRESHOLD", "3"))
 
 # ── Engine budget split ──
-# Paper (LOG) mode: scaled up with $1000 total cap; LIVE: $35/$15
+# Paper (LOG) mode: scaled up with $100 concurrent cap; LIVE: $35/$15
 if MODE == "LOG":
-    DIR_BUDGET_USD = float(os.getenv("DIR_BUDGET_USD", "700.0"))
-    SCALP_BUDGET_USD = float(os.getenv("SCALP_BUDGET_USD", "300.0"))
+    DIR_BUDGET_USD = float(os.getenv("DIR_BUDGET_USD", "70.0"))
+    SCALP_BUDGET_USD = float(os.getenv("SCALP_BUDGET_USD", "30.0"))
 else:
     DIR_BUDGET_USD = float(os.getenv("DIR_BUDGET_USD", "35.0"))
     SCALP_BUDGET_USD = float(os.getenv("SCALP_BUDGET_USD", "15.0"))
@@ -822,16 +839,22 @@ if _IS_HYBRID:
     CRYPTOS = ["BTC", "ETH"]
     LIVE_ALLOWED_SYMBOLS = ["BTC", "ETH"]
     # Exposure: CURRENT open cost, not cumulative spend
-    # Paper (LOG) mode gets $1000 cap; LIVE modes stay at $50
+    # Paper (LOG) mode gets relaxed caps; LIVE modes stay at $50
     if MODE == "LOG":
-        MAX_TOTAL_EXPOSURE_USD = float(os.getenv("MAX_TOTAL_EXPOSURE_USD", "1000.0"))
-        MAX_POSITION_USD_PER_SLUG = float(os.getenv("MAX_POSITION_USD_PER_SLUG", "500.0"))
-        MAX_OPEN_ORDERS_TOTAL_USD = float(os.getenv("MAX_OPEN_ORDERS_TOTAL_USD", "500.0"))
-        MAX_OPEN_ORDERS_PER_SLUG_USD = float(os.getenv("MAX_OPEN_ORDERS_PER_SLUG_USD", "250.0"))
+        MAX_TOTAL_EXPOSURE_USD = float(os.getenv("MAX_TOTAL_EXPOSURE_USD", "100.0"))
+        MAX_CONCURRENT_EXPOSURE_USD = float(os.getenv("MAX_CONCURRENT_EXPOSURE_USD", "100.0"))
+        MAX_EXPOSURE_USD_PER_SLUG = float(os.getenv("MAX_EXPOSURE_USD_PER_SLUG", "1000.0"))
+        MAX_ORDER_USD = float(os.getenv("MAX_ORDER_USD", "10.0"))
+        MAX_POSITION_USD_PER_SLUG = float(os.getenv("MAX_POSITION_USD_PER_SLUG", "1000.0"))
+        MAX_OPEN_ORDERS_TOTAL_USD = float(os.getenv("MAX_OPEN_ORDERS_TOTAL_USD", "100.0"))
+        MAX_OPEN_ORDERS_PER_SLUG_USD = float(os.getenv("MAX_OPEN_ORDERS_PER_SLUG_USD", "50.0"))
         MAX_POSITION_SHARES_PER_OUTCOME = float(os.getenv("MAX_POSITION_SHARES_PER_OUTCOME", "1200"))
         MAX_NET_IMBALANCE_SHARES = float(os.getenv("MAX_NET_IMBALANCE_SHARES", "500"))
     else:
         MAX_TOTAL_EXPOSURE_USD = float(os.getenv("MAX_TOTAL_EXPOSURE_USD", "50.0"))
+        MAX_CONCURRENT_EXPOSURE_USD = float(os.getenv("MAX_CONCURRENT_EXPOSURE_USD", "50.0"))
+        MAX_EXPOSURE_USD_PER_SLUG = float(os.getenv("MAX_EXPOSURE_USD_PER_SLUG", "25.0"))
+        MAX_ORDER_USD = float(os.getenv("MAX_ORDER_USD", "5.0"))
         MAX_POSITION_USD_PER_SLUG = float(os.getenv("MAX_POSITION_USD_PER_SLUG", "25.0"))
         MAX_OPEN_ORDERS_TOTAL_USD = float(os.getenv("MAX_OPEN_ORDERS_TOTAL_USD", "25.0"))
         MAX_OPEN_ORDERS_PER_SLUG_USD = float(os.getenv("MAX_OPEN_ORDERS_PER_SLUG_USD", "12.5"))

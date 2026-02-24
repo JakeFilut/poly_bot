@@ -101,6 +101,13 @@ class PolymarketClient:
             print("ERROR: POLYMARKET_PRIVATE_KEY required for LIVE mode")
             sys.exit(1)
 
+        # Startup sanity check: verify cancel_all capability
+        self._cancel_all_method = self._resolve_cancel_all_method()
+        _cancel_supported = self._cancel_all_method is not None or _settings.MODE == "LOG"
+        print(f"  CANCEL_ALL_SUPPORTED: {_cancel_supported}"
+              f"  method={self._cancel_all_method or 'internal_state_only'}"
+              f"  mode={_settings.MODE}")
+
     # ------------------------------------------------------------------ #
     # CLOB client initialisation (same pattern as src/clients)
     # ------------------------------------------------------------------ #
@@ -864,6 +871,15 @@ class PolymarketClient:
             pass
         return []
 
+    def _resolve_cancel_all_method(self) -> Optional[str]:
+        """Determine which CLOB cancel-all method is available."""
+        if not self._clob:
+            return None
+        for attr in ("cancel_all", "cancel_orders", "cancel_open_orders"):
+            if hasattr(self._clob, attr) and callable(getattr(self._clob, attr)):
+                return attr
+        return None
+
     def cancel_order(self, order_id: str) -> None:
         """Cancel a single order by id."""
         if _settings.MODE == "LOG":
@@ -878,10 +894,15 @@ class PolymarketClient:
     def cancel_all_orders(self) -> int:
         """Cancel all open orders via CLOB batch cancel or one-by-one fallback.
 
+        In LOG mode, returns 0 (no CLOB orders exist) but the caller is
+        responsible for clearing internal state (reservations, trackers).
+
         Returns count of orders cancelled (best-effort).
         """
         if _settings.MODE == "LOG":
-            return 0
+            _write_jsonl({"event_type": "CANCEL_ALL_LOG_MODE",
+                          "ts_ms": int(time.time() * 1000)})
+            return 0  # no real CLOB orders, caller clears internal state
         if not self._clob:
             return 0
 
