@@ -1,14 +1,22 @@
 """
 DiagReporter — structured runtime diagnostic dump for DIAG_MODE.
 
-Emits one structured JSON block every DIAG_INTERVAL_SEC to console + file.
+Emits flat key=value diagnostics every DIAG_INTERVAL_SEC to console + file.
 Covers: clock/window, safety, exposure, orders, positions, signals, invariants.
+
+Output formats (all gated by DIAG_MODE=1):
+  [DIAG]   — 10-second snapshot (flat key=value, per-slug sub-blocks)
+  [GATE]   — entry rejection trace (multi-line, FIRST blocking gate only)
+  [ORDER]  — order/fill events (multi-line)
+  [SAFETY] — safe mode / desync transitions (multi-line)
+  [BUG]    — exposure invariant violations
 
 Usage from bot:
     reporter = DiagReporter(bot)
     reporter.tick()              # call from main loop — rate-limited internally
-    reporter.gate_trace(...)     # call at each entry rejection point
-    reporter.order_trace(...)    # call at order/fill events
+    DiagReporter.gate_trace(...)     # call at each entry rejection point
+    DiagReporter.order_trace(...)    # call at order/fill events
+    DiagReporter.safety_trace(...)   # call at safety state transitions
 """
 from __future__ import annotations
 
@@ -494,70 +502,76 @@ class DiagReporter:
     # ──────────────────────────────────────────────────────────────────
 
     def _emit(self, snapshot: dict) -> None:
-        """Print to console (pretty) and append to diag_state.jsonl."""
-        # Console: pretty-print
-        print("\n  ╔═══════════════════════ DIAG SNAPSHOT ═══════════════════════╗")
-
+        """Print [DIAG] flat key=value block and append JSON to diag_state.jsonl."""
         clk = snapshot["clock"]
-        print(f"  ║ CLOCK: t_min={clk['t_min']}  state={clk['state']}  "
-              f"close_in={clk['seconds_to_close']:.0f}s  "
-              f"close_imminent={clk['close_imminent']}  flatten={clk['flatten_phase']}")
-        for s in clk["active_slugs"]:
-            print(f"  ║   {s['crypto']}: {s['slug'][:40]}  active={s['window_active']}")
-
         saf = snapshot["safety"]
-        print(f"  ║ SAFETY: truth_safe={saf['truth_safe_mode']}"
-              f"  ledger_safe={saf['ledger_safe_mode']}"
-              f"  desync={saf['desync_hard_stop']}"
-              f"  kill={saf['exec_kill_switch']}"
-              f"  hedge_cb={saf['hedge_circuit_breaker']}")
-        print(f"  ║ GATES: buys_common={saf['buys_allowed_common']}"
-              f"  buys_dir={saf['buys_allowed_dir']}"
-              f"  buys_scalp={saf['buys_allowed_scalp']}"
-              f"  top_blocker={saf['top_blocker']}")
-
         exp = snapshot["exposure"]
-        print(f"  ║ EXPOSURE: positions=${exp['exposure_positions_usd']}"
-              f"  orders=${exp['exposure_open_orders_usd']}"
-              f"  TOTAL=${exp['exposure_total_usd']}/{exp['MAX_TOTAL_EXPOSURE_USD']}"
-              f"  LEFT=${exp['remaining_exposure_capacity']}")
-        print(f"  ║ BUDGET: cash=${exp['cash']}  equity=${exp['equity']}"
-              f"  hour_spend=${exp['hour_spend_cumulative_usd']}"
-              f"  DIR=${exp['engine_dir_usd']}  SCALP=${exp['engine_scalp_usd']}")
-        for slug, info in exp.get("per_slug", {}).items():
-            crypto = slug.split("-")[0][:3].upper()
-            parts = []
-            for o in ("Up", "Down"):
-                if o in info:
-                    parts.append(f"{o}:{info[o]['qty']}@{info[o]['vwap']}")
-            print(f"  ║   {crypto}: ${info['position_usd']}  {' '.join(parts)}")
-
         ords = snapshot["orders"]
-        print(f"  ║ ORDERS: open={ords['open_orders_count']}"
-              f"  open_usd=${ords['open_orders_total_usd']}"
-              f"  reserved=${ords['reserved_usd']}"
-              f"  watchers={ords['watchers_count']}")
-        for w in ords.get("watchers", [])[:5]:
-            print(f"  ║   {w['slug'][:20]} {w['outcome']} {w['side']}"
-                  f"  qty={w['qty']}@{w['price']}  age={w['age_sec']}s"
-                  f"  pending={w['pending_confirmation']}")
-
         pos = snapshot["positions"]
-        print(f"  ║ POSITIONS: drift_count={pos['drift_count']}"
-              f"  last_reconcile={pos['last_reconcile']}"
-              f"  dedup_size={pos['applied_fills_size']}")
-        for c in pos.get("comparisons", []):
-            drift_tag = " [DRIFT]" if abs(c["delta_qty"]) > 0.5 else ""
-            print(f"  ║   {c['slug'][:25]} {c['outcome']}: bot={c['bot_qty']}  truth={c['truth_qty']}  delta={c['delta_qty']}{drift_tag}")
-
         sigs = snapshot.get("signals", {}).get("signals", [])
-        for sig in sigs:
-            ok_tag = "OK" if sig["signal_ok"] else f"BLOCKED({sig['blocker']})"
-            print(f"  ║ SIGNAL {sig['crypto']}: delta={sig['delta_bps']}bps  z={sig['z']}"
-                  f"  vel={sig['velocity_bps_per_min']}  spread_up={sig['spread_up_cents']}c"
-                  f"  spread_dn={sig['spread_dn_cents']}c  side={sig['chosen_side']}  {ok_tag}")
 
-        print(f"  ╚═══════════════════════════════════════════════════════════╝\n")
+        # Build flat key=value output matching spec section 2
+        lines = ["[DIAG]"]
+        lines.append(f"now_utc={clk['now_utc']}")
+        lines.append(f"hour_start_utc={clk['hour_start_utc']}")
+        lines.append(f"hour_end_utc={clk['hour_end_utc']}")
+        lines.append(f"t_min={clk['t_min']}")
+        # Map state to spec values: IDLE/ACTIVE/SETTLEMENT/FLATTEN
+        state = clk['state']
+        if clk.get('flatten_phase'):
+            state = "FLATTEN"
+        lines.append(f"state={state}")
+        lines.append(f"close_imminent={str(clk['close_imminent']).lower()}")
+        lines.append(f"safe_mode={str(saf['truth_safe_mode']).lower()}")
+        lines.append(f"desync_hard_stop={str(saf['desync_hard_stop']).lower()}")
+        lines.append(f"cash={exp['cash']}")
+        lines.append(f"equity={exp['equity']}")
+        lines.append(f"exposure_positions_usd={exp['exposure_positions_usd']}")
+        lines.append(f"exposure_open_orders_usd={exp['exposure_open_orders_usd']}")
+        lines.append(f"exposure_total_usd={exp['exposure_total_usd']}")
+        lines.append(f"MAX_TOTAL_EXPOSURE_USD={exp['MAX_TOTAL_EXPOSURE_USD']}")
+        lines.append(f"hour_spend_cumulative_usd={exp['hour_spend_cumulative_usd']}")
+        lines.append(f"remaining_exposure_capacity={exp['remaining_exposure_capacity']}")
+        lines.append(f"open_orders_total_usd={ords['open_orders_total_usd']}")
+        lines.append(f"open_orders_count={ords['open_orders_count']}")
+
+        # Per-slug sub-blocks: merge position comparisons + signal data
+        sig_by_slug = {s["slug"]: s for s in sigs}
+        pos_by_slug: Dict[str, dict] = {}
+        for c in pos.get("comparisons", []):
+            slug = c["slug"]
+            if slug not in pos_by_slug:
+                pos_by_slug[slug] = {}
+            pos_by_slug[slug][c["outcome"]] = c
+
+        all_slugs = set()
+        for s in clk.get("active_slugs", []):
+            all_slugs.add(s["slug"])
+        for c in pos.get("comparisons", []):
+            all_slugs.add(c["slug"])
+
+        for slug in sorted(all_slugs):
+            pc = pos_by_slug.get(slug, {})
+            sig = sig_by_slug.get(slug, {})
+            bot_up = pc.get("Up", {}).get("bot_qty", 0.0)
+            bot_dn = pc.get("Down", {}).get("bot_qty", 0.0)
+            truth_up = pc.get("Up", {}).get("truth_qty", 0.0)
+            truth_dn = pc.get("Down", {}).get("truth_qty", 0.0)
+            drift = abs(bot_up - truth_up) > 0.5 or abs(bot_dn - truth_dn) > 0.5
+            spread = sig.get("spread_up_cents", 0.0)
+            edge = sig.get("delta_bps", 0.0)
+            vel = sig.get("velocity_bps_per_min", 0.0)
+            lines.append(f"  slug={slug}")
+            lines.append(f"  bot_qty_up={bot_up}")
+            lines.append(f"  bot_qty_down={bot_dn}")
+            lines.append(f"  truth_qty_up={truth_up}")
+            lines.append(f"  truth_qty_down={truth_dn}")
+            lines.append(f"  drift_detected={str(drift).lower()}")
+            lines.append(f"  spread_cents={spread}")
+            lines.append(f"  computed_edge_bps={edge}")
+            lines.append(f"  velocity_bps_per_min={vel}")
+
+        print("\n".join(lines))
 
         # File: append one JSON line
         try:
@@ -608,23 +622,74 @@ class DiagReporter:
     def gate_trace(slug: str, side: str, stage: str, reason: str,
                    t_min: float = 0.0, spread: float = 0.0,
                    delta_bps: float = 0.0, exposure_total: float = 0.0,
+                   bot: Any = None, velocity_bps_per_min: float = 0.0,
+                   cooldown_remaining_ms: int = 0, edge_bps: float = 0.0,
                    write_fn=None) -> None:
-        """Emit one-line gate trace. Called at FIRST blocking gate only."""
+        """Emit multi-line [GATE] trace. Called at FIRST blocking gate only."""
         if not settings.DIAG_MODE:
             return
-        line = (f"  [GATE] slug={slug}  side={side}  allow=false"
-                f"  stage={stage}  reason={reason}"
-                f"  key_metrics={{t_min:{t_min:.1f}, spread:{spread:.1f}c,"
-                f" delta_bps:{delta_bps:.1f}, exposure_total:{exposure_total:.1f}}}")
-        print(line)
+
+        # Normalize side to UP/DOWN
+        side_norm = side.upper() if side else ""
+
+        # Enrich from bot if available
+        safe_mode = False
+        desync_hard_stop = False
+        positions_cost = 0.0
+        reserved_open_orders = 0.0
+        max_exp = settings.MAX_TOTAL_EXPOSURE_USD
+        open_orders_count = 0
+
+        if bot is not None:
+            if hasattr(bot, '_truth'):
+                safe_mode = bot._truth.safe_mode
+            desync_hard_stop = getattr(bot, '_desync_hard_stop', False)
+            for _slug, _st in bot.market_states.items():
+                for _outcome in ("Up", "Down"):
+                    _pos = _st.positions[_outcome]
+                    if _pos.qty >= 0.001:
+                        positions_cost += abs(_pos.qty) * _pos.vwap
+            reserved_open_orders = bot._total_reserved_usd() if hasattr(bot, '_total_reserved_usd') else 0.0
+            if hasattr(bot, '_exec_tracker'):
+                open_orders_count = len(bot._exec_tracker.get_tracked_orders())
+
+        lines = [
+            "[GATE]",
+            f"slug={slug}",
+            f"side={side_norm}",
+            f"block_stage={stage}",
+            f"block_reason={reason}",
+            f"t_min={t_min:.2f}",
+            f"safe_mode={str(safe_mode).lower()}",
+            f"desync_hard_stop={str(desync_hard_stop).lower()}",
+            f"exposure_total={exposure_total:.2f}",
+            f"positions_cost={positions_cost:.2f}",
+            f"reserved_open_orders={reserved_open_orders:.2f}",
+            f"MAX_TOTAL_EXPOSURE_USD={max_exp:.2f}",
+            f"spread_cents={spread:.2f}",
+            f"edge_bps={edge_bps:.2f}",
+            f"velocity_bps_per_min={velocity_bps_per_min:.2f}",
+            f"cooldown_remaining_ms={int(cooldown_remaining_ms)}",
+            f"open_orders_count={open_orders_count}",
+        ]
+        print("\n".join(lines))
+
         evt = {
             "event_type": "GATE_TRACE",
-            "slug": slug, "side": side,
-            "stage": stage, "reason": reason,
+            "slug": slug, "side": side_norm,
+            "block_stage": stage, "block_reason": reason,
             "t_min": round(t_min, 2),
+            "safe_mode": safe_mode,
+            "desync_hard_stop": desync_hard_stop,
+            "exposure_total": round(exposure_total, 2),
+            "positions_cost": round(positions_cost, 2),
+            "reserved_open_orders": round(reserved_open_orders, 2),
+            "MAX_TOTAL_EXPOSURE_USD": max_exp,
             "spread_cents": round(spread, 2),
-            "delta_bps": round(delta_bps, 2),
-            "exposure_total_usd": round(exposure_total, 2),
+            "edge_bps": round(edge_bps, 2),
+            "velocity_bps_per_min": round(velocity_bps_per_min, 2),
+            "cooldown_remaining_ms": int(cooldown_remaining_ms),
+            "open_orders_count": open_orders_count,
             "ts_ms": _ts_ms(),
         }
         if write_fn:
@@ -638,33 +703,66 @@ class DiagReporter:
     def order_trace(event_type: str, slug: str, outcome: str, side: str,
                     order_id: str, price: float, qty: float,
                     pre_exposure: float = 0.0, post_exposure: float = 0.0,
-                    pre_qty: float = 0.0, post_qty: float = 0.0,
-                    engine: str = "", dedupe_key: str = "",
-                    write_fn=None) -> None:
-        """Emit one-line order trace with pre/post exposure."""
+                    bot_qty_after: float = 0.0, truth_qty_after: float = 0.0,
+                    engine: str = "", write_fn=None) -> None:
+        """Emit multi-line [ORDER] trace at order/fill events."""
         if not settings.DIAG_MODE:
             return
         notional = round(price * qty, 2)
+        lines = [
+            "[ORDER]",
+            f"event_type={event_type}",
+            f"engine={engine}",
+            f"slug={slug}",
+            f"outcome={outcome}",
+            f"side={side}",
+            f"qty={qty:.2f}",
+            f"price={price:.4f}",
+            f"notional_usd={notional:.2f}",
+            f"pre_exposure_total={pre_exposure:.2f}",
+            f"post_exposure_total={post_exposure:.2f}",
+            f"bot_qty_after={bot_qty_after:.2f}",
+            f"truth_qty_after={truth_qty_after:.2f}",
+        ]
+        print("\n".join(lines))
         evt = {
             "event_type": "ORDER_TRACE",
-            "ts_utc": _iso(datetime.now(timezone.utc)),
             "action": event_type,
-            "slug": slug, "outcome": outcome, "side": side,
-            "order_id": order_id[:16] if order_id else "",
-            "price": round(price, 4),
-            "qty": round(qty, 2),
-            "notional_usd": notional,
             "engine": engine,
+            "slug": slug, "outcome": outcome, "side": side,
+            "qty": round(qty, 2), "price": round(price, 4),
+            "notional_usd": notional,
             "pre_exposure_total": round(pre_exposure, 2),
             "post_exposure_total": round(post_exposure, 2),
-            "pre_qty": round(pre_qty, 2),
-            "post_qty": round(post_qty, 2),
-            "dedupe_key": dedupe_key,
+            "bot_qty_after": round(bot_qty_after, 2),
+            "truth_qty_after": round(truth_qty_after, 2),
             "ts_ms": _ts_ms(),
         }
-        print(f"  [ORDER] {event_type} {slug[:20]} {outcome} {side}"
-              f"  qty={qty:.1f}@{price:.3f}  ${notional}"
-              f"  exp=${pre_exposure:.1f}->${post_exposure:.1f}"
-              f"  eng={engine}")
+        if write_fn:
+            write_fn(evt)
+
+    # ──────────────────────────────────────────────────────────────────
+    # 4) SAFETY TRACE — call at safe mode / desync transitions
+    # ──────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def safety_trace(event: str, reason: str, drift_counter: int = 0,
+                     write_fn=None) -> None:
+        """Emit multi-line [SAFETY] trace at safety state transitions."""
+        if not settings.DIAG_MODE:
+            return
+        lines = [
+            "[SAFETY]",
+            f"event={event}",
+            f"reason={reason}",
+            f"drift_counter={drift_counter}",
+        ]
+        print("\n".join(lines))
+        evt = {
+            "event_type": "SAFETY_TRACE",
+            "event": event, "reason": reason,
+            "drift_counter": drift_counter,
+            "ts_ms": _ts_ms(),
+        }
         if write_fn:
             write_fn(evt)

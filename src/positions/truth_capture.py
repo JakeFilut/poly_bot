@@ -1574,6 +1574,14 @@ class TruthCapture:
         })
         print(f"  [TRUTH] *** SAFE MODE: {reason} ***")
         print(f"  [TRUTH]     No new buys. Sells that reduce exposure allowed.")
+        try:
+            from src.execution.diag_reporter import DiagReporter
+            DiagReporter.safety_trace(
+                "SAFE_MODE_ON", reason,
+                drift_counter=getattr(self, 'desync_count', 0),
+                write_fn=self._write_jsonl)
+        except Exception:
+            pass
 
     def exit_safe_mode(self) -> None:
         if self._safe_mode:
@@ -1583,6 +1591,14 @@ class TruthCapture:
             self._write_jsonl({
                 "event_type": "TRUTH_SAFE_MODE_EXIT", "ts_ms": _ts_ms()})
             print("  [TRUTH] SAFE MODE resolved — trading allowed")
+            try:
+                from src.execution.diag_reporter import DiagReporter
+                DiagReporter.safety_trace(
+                    "SAFE_MODE_OFF", "resolved — no mismatches",
+                    drift_counter=getattr(self, 'desync_count', 0),
+                    write_fn=self._write_jsonl)
+            except Exception:
+                pass
 
     # ══════════════════════════════════════════════════════════════════
     #  MAIN TICK — call from bot main loop every iteration
