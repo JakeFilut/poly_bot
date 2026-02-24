@@ -44,6 +44,13 @@ LOG_SNAPSHOT_EVERY_N_SEC = float(os.getenv("LOG_SNAPSHOT_EVERY_N_SEC", "60"))   
 LOG_SPREAD_BLOCK_SAMPLER = float(os.getenv("LOG_SPREAD_BLOCK_SAMPLER", "0.02")) # 2% sampling for GATE_SPREAD_BLOCK
 CONSOLE_LEVEL = os.getenv("CONSOLE_LEVEL", "QUIET").upper()                     # NORMAL | QUIET
 
+# ---------------------------------------------------------------------------
+# DIAG_MODE — structured runtime snapshot for external consumption (ChatGPT etc)
+# ---------------------------------------------------------------------------
+DIAG_MODE = bool(os.getenv("DIAG_MODE", "False") not in ("", "0", "False", "false"))
+DIAG_INTERVAL_SEC = float(os.getenv("DIAG_INTERVAL_SEC", "10"))
+DIAG_FILE = os.getenv("DIAG_FILE", os.path.join(_LOG_DIR, "diag_state.jsonl"))
+
 # Markets / coins
 CRYPTOS = ["BTC", "ETH", "SOL", "XRP"]
 ENABLE_XRP = bool(os.getenv("ENABLE_XRP", "False") not in ("", "0", "False", "false"))   # default OFF
@@ -67,7 +74,7 @@ NO_NEW_ENTRIES_SEC_TO_CLOSE = float(os.getenv("NO_NEW_ENTRIES_SEC_TO_CLOSE", "18
 # -----------------------------------------------------------------------------
 # Runtime profile — selects which subsystems are active
 # -----------------------------------------------------------------------------
-PROFILE = os.getenv("PROFILE", "F247_LIKE")    # F247_LIKE | HOURLY_SCALP_MIN
+PROFILE = os.getenv("PROFILE", "F247_LIKE")    # F247_LIKE | HOURLY_SCALP_MIN | HYBRID_COPYWALLET
 
 # HOURLY_SCALP_MIN: minimal profile for BTC/ETH IOC scalping.
 # Keeps: IOC buy/sell, fill confirmation/recovery, reservation + exposure caps,
@@ -616,6 +623,8 @@ LIVE_SAFE_NUM_HOURS = int(os.getenv("LIVE_SAFE_NUM_HOURS", "3"))                
 LIVE_SAFE_MAX_ORDER_USD = float(os.getenv("LIVE_SAFE_MAX_ORDER_USD", "5.00"))             # max buy order size in LIVE_SAFE
 LIVE_SAFE_MAX_TOTAL_INVESTED_USD = float(os.getenv("LIVE_SAFE_MAX_TOTAL_INVESTED_USD", "100.0")) # legacy alias — use MAX_TOTAL_EXPOSURE_USD
 MAX_TOTAL_EXPOSURE_USD = float(os.getenv("MAX_TOTAL_EXPOSURE_USD", "100.0"))                   # strict always-on exposure cap (positions + reserved)
+MAX_OPEN_ORDERS_TOTAL_USD = float(os.getenv("MAX_OPEN_ORDERS_TOTAL_USD", "50.0"))             # open orders cap (default for non-hybrid)
+MAX_OPEN_ORDERS_PER_SLUG_USD = float(os.getenv("MAX_OPEN_ORDERS_PER_SLUG_USD", "25.0"))       # per-slug open orders cap
 CLOB_MIN_ORDER_SIZE = 5                                                                   # Polymarket CLOB minimum order size (shares)
 CLOB_MIN_ORDER_USD = 1.0                                                                   # Polymarket CLOB minimum order value ($1)
 
@@ -757,3 +766,68 @@ if _IS_MIN_PROFILE:
     #   IOC_ENTRY_ENABLED, BUDGET_RESERVE_ENABLED, ONE_INFLIGHT_PER_TOKEN,
     #   TOKEN_ATTEMPT_MAX_PER_MIN, FLATTEN_START_MIN, HARD_FLATTEN_MIN,
     #   LIVE_SAFE_MAX_TOTAL_INVESTED_USD, MAX_POSITION_USD_PER_SLUG, etc.
+
+# ---------------------------------------------------------------------------
+# HYBRID_COPYWALLET profile — two engines (directional + scalp), shared exposure cap
+# ---------------------------------------------------------------------------
+_IS_HYBRID = (PROFILE == "HYBRID_COPYWALLET")
+
+# ── Scalp engine constants (only used when HYBRID_COPYWALLET) ──
+SCALP_ENABLED = _IS_HYBRID
+SCALP_MIN_SPREAD_CENTS = float(os.getenv("SCALP_MIN_SPREAD_CENTS", "2.0"))
+SCALP_MIN_EDGE_CENTS = float(os.getenv("SCALP_MIN_EDGE_CENTS", "1.0"))
+SCALP_TAKE_PROFIT_CENTS = float(os.getenv("SCALP_TAKE_PROFIT_CENTS", "2.0"))
+SCALP_STOP_LOSS_CENTS = float(os.getenv("SCALP_STOP_LOSS_CENTS", "2.0"))
+SCALP_MAX_HOLD_SEC = float(os.getenv("SCALP_MAX_HOLD_SEC", "60.0"))
+SCALP_SIZE_USD = float(os.getenv("SCALP_SIZE_USD", "1.50"))
+SCALP_MAX_CONCURRENT_PER_SLUG = int(os.getenv("SCALP_MAX_CONCURRENT_PER_SLUG", "1"))
+SCALP_IMB_LONG_THRESHOLD = float(os.getenv("SCALP_IMB_LONG_THRESHOLD", "0.62"))
+SCALP_IMB_SHORT_THRESHOLD = float(os.getenv("SCALP_IMB_SHORT_THRESHOLD", "0.38"))
+SCALP_LOOP_INTERVAL_MS = float(os.getenv("SCALP_LOOP_INTERVAL_MS", "300"))
+SCALP_CONSEC_STOP_PAUSE_SEC = float(os.getenv("SCALP_CONSEC_STOP_PAUSE_SEC", "10.0"))
+SCALP_CONSEC_STOP_THRESHOLD = int(os.getenv("SCALP_CONSEC_STOP_THRESHOLD", "3"))
+
+# ── Engine budget split ──
+DIR_BUDGET_USD = float(os.getenv("DIR_BUDGET_USD", "35.0"))
+SCALP_BUDGET_USD = float(os.getenv("SCALP_BUDGET_USD", "15.0"))
+
+# ── RUN_ONE_HOUR: exit after one hourly window ──
+RUN_ONE_HOUR = bool(os.getenv("RUN_ONE_HOUR", "False") not in ("", "0", "False", "false"))
+
+if _IS_HYBRID:
+    # Symbols
+    CRYPTOS = ["BTC", "ETH"]
+    LIVE_ALLOWED_SYMBOLS = ["BTC", "ETH"]
+    # Exposure: CURRENT open cost, not cumulative spend
+    MAX_TOTAL_EXPOSURE_USD = float(os.getenv("MAX_TOTAL_EXPOSURE_USD", "50.0"))
+    MAX_POSITION_USD_PER_SLUG = float(os.getenv("MAX_POSITION_USD_PER_SLUG", "25.0"))
+    MAX_OPEN_ORDERS_TOTAL_USD = float(os.getenv("MAX_OPEN_ORDERS_TOTAL_USD", "25.0"))
+    MAX_OPEN_ORDERS_PER_SLUG_USD = float(os.getenv("MAX_OPEN_ORDERS_PER_SLUG_USD", "12.5"))
+    MAX_POSITION_SHARES_PER_OUTCOME = float(os.getenv("MAX_POSITION_SHARES_PER_OUTCOME", "60"))
+    MAX_NET_IMBALANCE_SHARES = float(os.getenv("MAX_NET_IMBALANCE_SHARES", "25"))
+    # Window: do NOT require early-window-only
+    ENTRY_ONLY_EARLY_WINDOW = False
+    ACTIVE_WINDOW_ONLY = True
+    STRICT_WINDOW_MODE = True
+    # Make mid-hour trading possible
+    TRADE_START_MIN = 1.0
+    TRADE_STOP_ADD_MIN = 58.0
+    FLATTEN_START_MIN = float(os.getenv("FLATTEN_START_MIN", "59.0"))
+    HARD_FLATTEN_MIN = float(os.getenv("HARD_FLATTEN_MIN", "59.4"))
+    TRADE_HARD_STOP_MIN = 59.4
+    # Cooldowns: wallet-like fast
+    POST_FILL_COOLDOWN_MS = float(os.getenv("POST_FILL_COOLDOWN_MS", "150"))
+    PER_TOKEN_COOLDOWN_MS = float(os.getenv("PER_TOKEN_COOLDOWN_MS", "150"))
+    MAX_ORDER_SUBMITS_PER_MIN = int(os.getenv("MAX_ORDER_SUBMITS_PER_MIN", "300"))
+    MIN_ORDER_INTERVAL_MS = float(os.getenv("MIN_ORDER_INTERVAL_MS", "150"))
+    DSCALP_COOLDOWN_MS = float(os.getenv("DSCALP_COOLDOWN_MS", "2000"))
+    # Disable parity/quoting/rescue/hedge
+    PARITY_BUY_ENABLED = False
+    PARITY_SELL_ENABLED = False
+    PARITY_QUOTE_ENABLED = False
+    DERISK_RESCUE_TO_STRADDLE = False
+    HEDGE_TICK_ESCALATION_ENABLED = False
+    ENABLE_XRP = False
+    XRP_PARITY_QUOTE_ENABLED = False
+    XRP_PARITY_BUY_ENABLED = False
+    CORR_SCALE_ENABLED = False

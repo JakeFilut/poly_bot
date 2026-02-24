@@ -875,6 +875,54 @@ class PolymarketClient:
         except Exception as e:
             _write_jsonl({"event_type":"CANCEL_ERROR", "order_id": order_id, "err": str(e)[:120]})
 
+    def cancel_all_orders(self) -> int:
+        """Cancel all open orders via CLOB batch cancel or one-by-one fallback.
+
+        Returns count of orders cancelled (best-effort).
+        """
+        if _settings.MODE == "LOG":
+            return 0
+        if not self._clob:
+            return 0
+
+        # Try CLOB batch cancel_all first
+        try:
+            if hasattr(self._clob, "cancel_all"):
+                self._clob.cancel_all()
+                _write_jsonl({"event_type": "CANCEL_ALL_BATCH_OK",
+                              "ts_ms": int(time.time() * 1000)})
+                return -1  # unknown count, but succeeded
+        except Exception as e:
+            _write_jsonl({"event_type": "CANCEL_ALL_BATCH_FAIL",
+                          "err": str(e)[:200],
+                          "ts_ms": int(time.time() * 1000)})
+
+        # Fallback: fetch open orders and cancel each
+        cancelled = 0
+        try:
+            open_orders = self.get_open_orders()
+        except Exception as e:
+            _write_jsonl({"event_type": "CANCEL_ALL_FETCH_FAIL",
+                          "err": str(e)[:200],
+                          "ts_ms": int(time.time() * 1000)})
+            return 0
+
+        for o in open_orders:
+            oid = o.get("id") or o.get("orderID") or o.get("order_id", "")
+            if not oid:
+                continue
+            try:
+                self._clob.cancel(oid)
+                cancelled += 1
+            except Exception:
+                pass
+
+        _write_jsonl({"event_type": "CANCEL_ALL_FALLBACK_OK",
+                      "cancelled": cancelled,
+                      "total_open": len(open_orders),
+                      "ts_ms": int(time.time() * 1000)})
+        return cancelled
+
     def get_open_orders(self) -> List[dict]:
         """Return currently open/live orders."""
         if not self._clob:
