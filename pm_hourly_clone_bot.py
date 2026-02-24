@@ -84,6 +84,10 @@ from src.execution.fills_ledger import FillsLedger
 from src.execution.exposure_tracker import ExposureTracker
 from src.execution.scalp_engine import ScalpEngine
 from src.execution.diag_reporter import DiagReporter
+from src.execution.fill_integrity import (
+    FillDedupeStore, PendingFillRegistry, OrderLifecycleWatcher,
+    make_fill_key,
+)
 from src.positions.truth_capture import TruthCapture, WindowState
 from src.feeds.polymarket import PolymarketClient, set_jsonl_writer
 
@@ -134,6 +138,12 @@ _ALWAYS_LOG_EVENTS = frozenset({
     "RECONCILE_START", "RECONCILE_DONE", "RECONCILE_CORRECTIONS",
     "RECONCILE_TRIGGERED", "RECONCILE_ERROR",
     "STATE_DESYNC_DETECTED", "STATE_DESYNC_RESOLVED",
+    # Fill integrity events (A/B/C/D/E)
+    "PENDING_FILL", "FILL_CONFIRMED", "FILL_CONFIRM_FAILED",
+    "FILL_DEDUP_SKIPPED", "ORPHAN_ORDER", "ORDER_RESOLVED",
+    "POSITION_DRIFT", "POSITION_RESYNC_APPLIED",
+    "DRIFT_DIAGNOSTIC", "DESYNC_FROM_INVARIANT",
+    "FILL_INTEGRITY_STARTUP",
 })
 # Prefixes that always log (for variable event_type like flatten_reason)
 _ALWAYS_LOG_PREFIXES = ("FLATTEN", "KILL", "PAUSE", "END_OF_HOUR")
@@ -529,7 +539,25 @@ class Bot:
         self._sell_error_until: Dict[str, float] = {}          # (slug|outcome) -> monotonic ts cooldown expires
         self._sell_allowance_retried = False                    # True after one re-approval attempt
         # ── Fill dedup: prevents double-apply when same fill arrives via ws + poll + lifecycle ──
-        self._applied_fills: set = set()  # {(order_id, side, round(qty,2))}
+        self._applied_fills: set = set()  # {(order_id, side, round(qty,2))} -- legacy
+        # ── Fill Integrity: persistent dedupe + pending/confirm + order lifecycle watcher ──
+        self._fill_dedupe_store = FillDedupeStore(
+            persist_path=FILL_DEDUPE_PERSIST_PATH,
+            write_jsonl=write_jsonl,
+        )
+        _dedupe_loaded = self._fill_dedupe_store.load_from_disk()
+        self._pending_fill_registry = PendingFillRegistry(
+            get_order_status_fn=self.client.get_order_status,
+            get_order_fills_fn=self.client.get_order_fills,
+            write_jsonl=write_jsonl,
+        )
+        self._pending_fill_registry.NORMAL_TIMEOUT_SEC = FILL_CONFIRM_NORMAL_TIMEOUT_SEC
+        self._pending_fill_registry.SLOW_TIMEOUT_SEC = FILL_CONFIRM_SLOW_TIMEOUT_SEC
+        self._order_lifecycle_watcher = OrderLifecycleWatcher(
+            get_order_status_fn=self.client.get_order_status,
+            write_jsonl=write_jsonl,
+        )
+        self._order_lifecycle_watcher.RESOLVE_TIMEOUT_SEC = ORDER_UNKNOWN_RESOLVE_TIMEOUT_SEC
         # ── HYBRID_COPYWALLET: exposure tracker + scalp engine ──
         self._exposure_tracker = ExposureTracker(write_jsonl)
         self._scalp_engine = ScalpEngine(self._exposure_tracker, write_jsonl) if _IS_HYBRID else None
@@ -1485,6 +1513,29 @@ class Bot:
                   f"thresholds: {{delta_min_bps: {DSCALP_DELTA_MIN_BPS:.0f}, "
                   f"probe_delta_bps: {HYBRID_PROBE_DELTA_MIN_BPS:.0f}, "
                   f"spread_max_cents: {DSCALP_MAX_SPREAD_CENTS:.0f}}}}}")
+        # Fill Integrity startup log
+        _dedupe_size = self._fill_dedupe_store.size
+        _dedupe_persist = "ON" if FILL_DEDUPE_PERSIST_PATH else "OFF"
+        print(f"  FILL_INTEGRITY: DEDUPE_PERSISTENCE={_dedupe_persist} "
+              f"store_size={_dedupe_size} "
+              f"confirm_timeout={FILL_CONFIRM_NORMAL_TIMEOUT_SEC:.0f}s/{FILL_CONFIRM_SLOW_TIMEOUT_SEC:.0f}s "
+              f"order_unknown_timeout={ORDER_UNKNOWN_RESOLVE_TIMEOUT_SEC:.0f}s")
+        print(f"  DRIFT: check_interval={POS_DRIFT_CHECK_INTERVAL_SEC:.0f}s "
+              f"tolerance={POS_DRIFT_TOLERANCE} "
+              f"auto_exit_safe_mode={POS_DRIFT_AUTO_EXIT_SAFE_MODE}")
+        write_jsonl({
+            "event_type": "FILL_INTEGRITY_STARTUP",
+            "dedupe_persistence": _dedupe_persist,
+            "dedupe_store_size": _dedupe_size,
+            "dedupe_persist_path": FILL_DEDUPE_PERSIST_PATH,
+            "fill_confirm_normal_timeout_sec": FILL_CONFIRM_NORMAL_TIMEOUT_SEC,
+            "fill_confirm_slow_timeout_sec": FILL_CONFIRM_SLOW_TIMEOUT_SEC,
+            "order_unknown_resolve_timeout_sec": ORDER_UNKNOWN_RESOLVE_TIMEOUT_SEC,
+            "pos_drift_check_interval_sec": POS_DRIFT_CHECK_INTERVAL_SEC,
+            "pos_drift_tolerance": POS_DRIFT_TOLERANCE,
+            "pos_drift_auto_exit_safe_mode": POS_DRIFT_AUTO_EXIT_SAFE_MODE,
+            "ts_ms": int(time.time() * 1000),
+        })
         self._last_balance_print = 0.0
         self._last_save_ts = time.time()
 
@@ -1675,6 +1726,9 @@ class Bot:
                         self._get_token_to_slug_outcome())
                     self._exec_safety.set_drift_paused(
                         self._exec_drift.is_drifted())
+
+                    # Fill Integrity: confirm pending fills + resolve UNKNOWN orders
+                    self._tick_fill_integrity()
 
                     # Truth Capture: poll order watchers, wallet scan, reconcile
                     _truth_active_tids = set(self._get_token_to_slug_outcome().keys())
@@ -4610,6 +4664,76 @@ class Bot:
         """Build {token_id: (slug, outcome)} for TruthCapture meta resolution."""
         return self._get_token_to_slug_outcome()
 
+    # ── Fill Integrity: pending confirm + order lifecycle watcher ticks ──
+
+    def _tick_fill_integrity(self) -> None:
+        """Run fill integrity subsystem ticks: confirm pending fills,
+        resolve UNKNOWN orders, apply any confirmed fills."""
+        # 1. Tick pending fill confirmations
+        confirmed = self._pending_fill_registry.tick_confirmations(
+            self._fill_dedupe_store)
+        for pf in confirmed:
+            self.apply_fill_idempotent(
+                slug=pf.slug, outcome=pf.outcome, side=pf.side,
+                fill_qty=pf.qty, fill_price=pf.price,
+                order_id=pf.order_id, reason=pf.reason or "CONFIRMED",
+                source=pf.source, trade_id=pf.trade_id,
+                match_id=pf.match_id,
+            )
+
+        # 2. Tick order lifecycle watcher (resolve UNKNOWN orders)
+        resolved_fills, orphan_orders = self._order_lifecycle_watcher.tick()
+        for rf in resolved_fills:
+            self.apply_fill_idempotent(
+                slug=rf["slug"], outcome=rf["outcome"], side=rf["side"],
+                fill_qty=rf["qty"], fill_price=rf["price"],
+                order_id=rf["order_id"],
+                reason="ORDER_WATCHER_RESOLVED",
+                source="order_watcher",
+            )
+        # Orphan orders: force reconcile on affected slugs
+        for orphan in orphan_orders:
+            slug = orphan["slug"]
+            # Force a position invariant check on next cycle
+            self._last_pos_invariant_ts = 0.0
+
+    def _register_fill_pending_confirm(self, slug: str, outcome: str,
+                                        side: str, qty: float, price: float,
+                                        order_id: str = "", source: str = "immediate",
+                                        reason: str = "",
+                                        trade_id: str = "", match_id: str = "") -> None:
+        """Register a candidate fill in the pending/confirm pipeline.
+        For immediate fills (API confirmed), this confirms instantly.
+        For recovered/poll fills, polls API until confirmed."""
+        token_id = ""
+        for mk in self._cached_markets:
+            if mk.slug == slug:
+                token_id = mk.outcome_up_id if outcome == "Up" else mk.outcome_down_id
+                break
+        fill_key = make_fill_key(
+            order_id=order_id, side=side, token_id=token_id,
+            price=price, qty=qty,
+            trade_id=trade_id, match_id=match_id,
+        )
+        # Skip if already in persistent store
+        if self._fill_dedupe_store.is_duplicate(fill_key):
+            return
+        self._pending_fill_registry.register_pending(
+            fill_key=fill_key, order_id=order_id,
+            slug=slug, outcome=outcome, side=side,
+            qty=qty, price=price, source=source,
+            token_id=token_id, reason=reason,
+            trade_id=trade_id, match_id=match_id,
+        )
+
+    def _watch_unknown_order(self, order_id: str, slug: str, outcome: str,
+                              side: str, price: float, qty: float,
+                              token_id: str = "") -> None:
+        """Register an order with status=UNKNOWN for lifecycle resolution."""
+        self._order_lifecycle_watcher.watch(
+            order_id=order_id, slug=slug, outcome=outcome,
+            side=side, price=price, qty=qty, token_id=token_id)
+
     def _token_for_slug_outcome(self, slug: str, outcome: str) -> Tuple[str, str]:
         """Return (token_id, market_id) for a slug+outcome from cached markets."""
         for m in self._cached_markets:
@@ -5444,15 +5568,73 @@ class Bot:
         """Record an order attempt for the per-token breaker."""
         self._token_attempt_ts.setdefault(token_id, []).append(time.time())
 
-    # ── Unified apply_fill — single entry point for all fill sources ──
+    # ── Unified apply_fill — single idempotent entry point for all fill sources ──
+
+    def apply_fill_idempotent(self, slug: str, outcome: str, side: str,
+                              fill_qty: float, fill_price: float,
+                              order_id: str = "", reason: str = "",
+                              source: str = "immediate",
+                              skip_truth: bool = False,
+                              trade_id: str = "", match_id: str = "") -> float:
+        """Idempotent fill application — ALL fills go through this ONE function.
+
+        Regardless of origin (ws/poll/recovered/manual), every fill enters here.
+        Uses persistent FillDedupeStore (JSONL + in-memory) so restarts don't reapply.
+
+        Returns: PnL for SELL fills, 0.0 for BUY fills, 0.0 if deduped.
+        """
+        # ── Generate stable fill_key for persistent dedupe ──
+        token_id_for_key = ""
+        for mk in self._cached_markets:
+            if mk.slug == slug:
+                token_id_for_key = mk.outcome_up_id if outcome == "Up" else mk.outcome_down_id
+                break
+        fill_key = make_fill_key(
+            order_id=order_id, side=side, token_id=token_id_for_key,
+            price=fill_price, qty=fill_qty,
+            trade_id=trade_id, match_id=match_id,
+        )
+
+        # ── Persistent dedupe: skip if fill_key already applied ──
+        if not self._fill_dedupe_store.record(fill_key, meta={
+            "slug": slug, "outcome": outcome, "side": side,
+            "order_id": order_id, "source": source,
+        }):
+            write_jsonl({
+                "event_type": "FILL_DEDUP_SKIPPED",
+                "fill_key": fill_key,
+                "source": source,
+                "slug": slug, "outcome": outcome,
+                "side": side, "order_id": order_id,
+                "qty": round(fill_qty, 2),
+                "ts_ms": int(time.time() * 1000),
+            })
+            return 0.0
+
+        # Also record in legacy in-memory set for backward compat
+        if order_id:
+            self._applied_fills.add((order_id, side, round(fill_qty, 2)))
+
+        return self._apply_fill_inner(slug, outcome, side, fill_qty, fill_price,
+                                      order_id, reason, source, skip_truth)
 
     def _apply_fill(self, slug: str, outcome: str, side: str,
                     fill_qty: float, fill_price: float,
                     order_id: str = "", reason: str = "",
                     source: str = "immediate",
                     skip_truth: bool = False) -> float:
-        """Unified fill application — used by immediate fills, poll recovery,
-        and lifecycle watcher.
+        """Backward-compat wrapper — delegates to apply_fill_idempotent."""
+        return self.apply_fill_idempotent(
+            slug, outcome, side, fill_qty, fill_price,
+            order_id=order_id, reason=reason, source=source,
+            skip_truth=skip_truth)
+
+    def _apply_fill_inner(self, slug: str, outcome: str, side: str,
+                          fill_qty: float, fill_price: float,
+                          order_id: str = "", reason: str = "",
+                          source: str = "immediate",
+                          skip_truth: bool = False) -> float:
+        """Internal fill application after dedup check passed.
 
         Updates:
           - positions (qty, vwap, cost_usdc)
@@ -5464,20 +5646,6 @@ class Bot:
 
         Returns: PnL for SELL fills, 0.0 for BUY fills.
         """
-        # ── Dedup: prevent double-apply from ws + poll + lifecycle ──
-        if order_id:
-            dedup_key = (order_id, side, round(fill_qty, 2))
-            if dedup_key in self._applied_fills:
-                write_jsonl({
-                    "event_type": "FILL_APPLY_DEDUP",
-                    "source": source,
-                    "slug": slug, "outcome": outcome,
-                    "side": side, "order_id": order_id,
-                    "qty": round(fill_qty, 2),
-                    "ts_ms": int(time.time() * 1000),
-                })
-                return 0.0
-            self._applied_fills.add(dedup_key)
 
         st = self.market_states.get(slug)
         if not st:
@@ -5732,6 +5900,9 @@ class Bot:
                                     trim_qty, "FLATTEN_TRIM_WIDE",
                                     token_id=token_id,
                                     pending_confirmation=True)
+                                self._watch_unknown_order(
+                                    oid, slug, outcome, "SELL", sell_price,
+                                    trim_qty, token_id=token_id)
                         # If killed — do nothing, wait for next tick
                     else:
                         # Paper mode
@@ -5829,6 +6000,9 @@ class Bot:
                                 remaining_qty, "HARD_FLATTEN",
                                 token_id=token_id,
                                 pending_confirmation=True)
+                            self._watch_unknown_order(
+                                oid, slug, outcome, "SELL", sell_price,
+                                remaining_qty, token_id=token_id)
                         remaining_qty = 0.0  # assume it went through
                         break
 
@@ -6152,18 +6326,31 @@ class Bot:
         return corrected
 
     def _check_position_invariant(self) -> None:
-        """Compare bot positions vs truth positions each tick.
-        Uses POS_DRIFT_TOLERANCE (default 0.5 shares) to avoid false triggers.
-        Normalizes both sides to 2dp and MIN_QTY before comparing.
+        """Compare bot positions vs truth positions every POS_DRIFT_CHECK_INTERVAL_SEC.
 
-        Escalation path:
-          #1: diagnostic (fetch CLOB balances)
-          #2: resync from truth (rebuild bot positions) + dedup
-          #3..#N: if drift persists for POS_DRIFT_ESCALATION_AFTER_RESYNC
-                  consecutive checks post-resync → DESYNC_HARD_STOP
+        Uses POS_DRIFT_TOLERANCE (default 0.01 shares) — any drift > threshold
+        increments per-slug drift counter.
+
+        Escalation path (per-slug):
+          Drift #1: diagnostic (fetch CLOB balances for comparison)
+          Drift #2: cancel open orders for that slug
+          Drift #3: SAFE MODE + cancel all + resync from truth + log POSITION_RESYNC_APPLIED
+                    Remain in SAFE MODE until next invariant check passes CLEAN,
+                    then auto-exit SAFE MODE.
+          Drift #N (post-resync): if POS_DRIFT_ESCALATION_AFTER_RESYNC consecutive
+                    checks still drift → DESYNC_HARD_STOP
+
+        Auto-exit SAFE MODE: when invariant passes clean (no diffs), automatically
+        exit safe mode so trading resumes.
         """
         now_t = time.time()
-        if now_t - getattr(self, '_last_pos_invariant_ts', 0.0) < 10.0:
+        _check_interval = getattr(self, '_pos_drift_check_interval',
+                                  POS_DRIFT_CHECK_INTERVAL_SEC if hasattr(__builtins__, '__import__') else 10.0)
+        try:
+            _check_interval = POS_DRIFT_CHECK_INTERVAL_SEC
+        except NameError:
+            _check_interval = 10.0
+        if now_t - getattr(self, '_last_pos_invariant_ts', 0.0) < _check_interval:
             return
         self._last_pos_invariant_ts = now_t
 
@@ -6183,9 +6370,10 @@ class Bot:
                 if q >= MIN_QTY:
                     bot_by_so[(slug, outcome_inv)] = q
 
-        # Compare using POS_DRIFT_TOLERANCE
+        # Compare using POS_DRIFT_TOLERANCE (default 0.01 shares)
         all_keys = set(truth_by_so.keys()) | set(bot_by_so.keys())
         diffs = []
+        drifted_slugs: set = set()
         for k in sorted(all_keys):
             bq = bot_by_so.get(k, 0.0)
             tq = truth_by_so.get(k, 0.0)
@@ -6193,7 +6381,10 @@ class Bot:
                 diffs.append({"slug": k[0], "outcome": k[1],
                               "bot_qty": round(bq, 2), "truth_qty": round(tq, 2),
                               "delta": round(bq - tq, 2)})
+                drifted_slugs.add(k[0])
+
         if diffs:
+            # Initialize drift tracking state
             if not hasattr(self, '_pos_drift_consecutive'):
                 self._pos_drift_consecutive = 0
             if not hasattr(self, '_pos_drift_resync_done'):
@@ -6205,6 +6396,7 @@ class Bot:
                 "diffs": diffs,
                 "consecutive": self._pos_drift_consecutive,
                 "tolerance": POS_DRIFT_TOLERANCE,
+                "drifted_slugs": sorted(drifted_slugs),
                 "ts_ms": int(time.time() * 1000),
             })
             parts = [f"{d['slug'][-15:]} {d['outcome']}: bot={d['bot_qty']} truth={d['truth_qty']} Δ={d['delta']}"
@@ -6212,7 +6404,7 @@ class Bot:
             print(f"  [INVARIANT] POSITION_DRIFT #{self._pos_drift_consecutive} "
                   f"(tol={POS_DRIFT_TOLERANCE}, {len(diffs)} diffs): " + " | ".join(parts))
 
-            # Drift #1: one-shot diagnostic — fetch CLOB balances
+            # ── Drift #1: diagnostic — fetch CLOB balances ──
             if self._pos_drift_consecutive == 1:
                 try:
                     clob_bals = self.client.get_balances()
@@ -6237,13 +6429,27 @@ class Bot:
                 except Exception as diag_e:
                     print(f"  [DIAG] Failed to fetch CLOB balances: {diag_e}")
 
-            # Drift #2: dedup fills as preparation
+            # ── Drift #2: cancel open orders for drifted slugs + dedup ──
             if self._pos_drift_consecutive == 2:
                 removed = self._truth.dedup_fills()
                 if removed > 0:
                     print(f"  [INVARIANT] Truth dedup removed {removed} duplicate fill(s)")
+                # Cancel open orders only for drifted slugs
+                for slug in drifted_slugs:
+                    cancelled_slug = 0
+                    for oid, tracked in list(self._exec_tracker.get_tracked_orders().items()):
+                        if tracked.slug == slug:
+                            try:
+                                self.client.cancel_order(oid)
+                                self._exec_tracker.on_cancel(oid)
+                                self._release_reservation(oid)
+                                cancelled_slug += 1
+                            except Exception:
+                                pass
+                    if cancelled_slug > 0:
+                        print(f"  [INVARIANT] Cancelled {cancelled_slug} orders for drifted slug {slug[-15:]}")
 
-            # Drift #3: SAFE MODE + cancel_all + force resync from truth
+            # ── Drift #3: SAFE MODE + cancel_all + force resync from truth ──
             if (self._pos_drift_consecutive >= 3
                     and POS_DRIFT_RESYNC_ENABLED
                     and not self._pos_drift_resync_done):
@@ -6254,21 +6460,18 @@ class Bot:
                                 for d in diffs])
                 print(f"  [INVARIANT] SAFE MODE entered after {self._pos_drift_consecutive} consecutive drifts")
 
-                # 2. Cancel all open orders
+                # 2. Cancel all open orders successfully
                 cancelled = self._cancel_all_orders()
                 print(f"  [INVARIANT] Cancelled {cancelled} orders before resync")
 
-                # 3. Force resync: overwrite bot positions from truth
-                before_snapshot = []
-                for d in diffs:
-                    before_snapshot.append({
-                        "slug": d["slug"], "outcome": d["outcome"],
-                        "bot_qty": d["bot_qty"], "truth_qty": d["truth_qty"],
-                    })
+                # 3. Fetch truth positions again (fresh read)
+                truth_positions = self._truth.get_active_window_positions()
+
+                # 4. OVERWRITE bot positions for affected slug/outcome from truth
                 corrections = self._resync_positions_from_truth()
                 self._pos_drift_resync_done = True
 
-                # 4. Log POSITION_RESYNC_APPLIED with before/after snapshot
+                # 5. Log POSITION_RESYNC_APPLIED with before/after and delta
                 resync_log = []
                 for c in corrections:
                     resync_log.append({
@@ -6289,11 +6492,16 @@ class Bot:
                 if not corrections:
                     print(f"  [RESYNC] No corrections needed — truth and bot agree after dedup")
 
-                # Reset counter: give fresh checks post-resync
+                # Clear orphan blocks after resync
+                self._order_lifecycle_watcher.clear_all_orphan_blocks()
+
+                # 6. Remain in SAFE MODE until next invariant check passes clean
+                #    (auto-exit happens in the "no drift" branch below)
+                # Reset counter for post-resync escalation tracking
                 self._pos_drift_consecutive = 0
                 return
 
-            # Escalation: N consecutive checks AFTER resync → DESYNC_HARD_STOP
+            # ── Escalation: N consecutive checks AFTER resync → DESYNC_HARD_STOP ──
             _escalation_threshold = POS_DRIFT_ESCALATION_AFTER_RESYNC
             if (self._pos_drift_resync_done
                     and self._pos_drift_consecutive >= _escalation_threshold
@@ -6341,10 +6549,24 @@ class Bot:
                     mismatches=[f"{d['slug']} {d['outcome']}: bot={d['bot_qty']} truth={d['truth_qty']}"
                                 for d in diffs])
         else:
-            # No drift — reset consecutive counter and resync flag
+            # ── No drift — reset counter, clear resync flag ──
             if getattr(self, '_pos_drift_consecutive', 0) > 0:
                 self._pos_drift_consecutive = 0
             self._pos_drift_resync_done = False
+
+            # ── AUTO-EXIT SAFE MODE: invariant passes clean → resume trading ──
+            if POS_DRIFT_AUTO_EXIT_SAFE_MODE and self._truth.safe_mode:
+                self._truth.exit_safe_mode()
+                print("  [INVARIANT] Clean check — auto-exiting SAFE MODE")
+                # Also clear desync_hard_stop if it was set
+                if self._desync_hard_stop:
+                    self._desync_hard_stop = False
+                    write_jsonl({
+                        "event_type": "DESYNC_HARD_STOP_CLEARED",
+                        "reason": "invariant_clean_check",
+                        "ts_ms": int(time.time() * 1000),
+                    })
+                    print("  [INVARIANT] DESYNC_HARD_STOP cleared — buys re-enabled")
 
     def _check_hedge_mismatch(self) -> None:
         """Detect hedge mismatches: net exposure on one side beyond threshold.
@@ -6421,6 +6643,11 @@ class Bot:
         Emits ENTRY_BLOCKED tracing when blocked."""
         slug_st = self.market_states.get(slug)
         crypto = slug_st.crypto if slug_st else "?"
+        # Block slugs with unresolved ORPHAN orders
+        if self._order_lifecycle_watcher.is_slug_blocked(slug):
+            self._log_entry_blocked(slug, crypto, outcome,
+                "global", "ORPHAN_ORDER_PENDING", t_min)
+            return False
         # Active window filter: block buys on non-current-hour tokens
         if ACTIVE_WINDOW_ONLY and STRICT_WINDOW_MODE:
             token_up, _ = self._token_for_slug_outcome(slug, "Up")
@@ -6725,6 +6952,10 @@ class Bot:
                     # Set a long-hold timestamp so _has_inflight_buy blocks for
                     # the full reservation timeout, not just the 350ms cooldown.
                     self._inflight_buy_ts[token_id] = time.time() + RESERVATION_STUCK_TIMEOUT_SEC
+                    # Register with order lifecycle watcher (no UNKNOWN left unresolved)
+                    self._watch_unknown_order(
+                        oid, m.slug, outcome, "BUY", order_price, this_qty,
+                        token_id=token_id)
                     write_jsonl({"event_type": "BUY_PENDING_CONFIRMATION",
                                  "slug": m.slug, "outcome": outcome,
                                  "order_id": oid, "status": fill.get("status"),
@@ -9286,6 +9517,10 @@ class Bot:
         self._exec_tracker.on_submit(
             oid, m.slug, outcome, "SELL", price, qty, reason,
             token_id=token_id, pending_confirmation=is_pending)
+        # Register UNKNOWN orders with lifecycle watcher
+        if is_pending and oid:
+            self._watch_unknown_order(
+                oid, m.slug, outcome, "SELL", price, qty, token_id=token_id)
         self._truth_watch_after_place(fill_result, m, outcome, "SELL", qty, price)
         self._exec_safety.record_slug_submit(m.slug)
         if fill_state is True:
@@ -9295,6 +9530,14 @@ class Bot:
             self._exec_tracker.on_fill(oid, actual_qty,
                                        fill_price=actual_price,
                                        token_id=token_id)
+            # Record in persistent dedupe store
+            _sell_fill_key = make_fill_key(
+                order_id=oid, side="SELL", token_id=token_id,
+                price=actual_price, qty=actual_qty)
+            self._fill_dedupe_store.record(_sell_fill_key, meta={
+                "slug": m.slug, "outcome": outcome, "side": "SELL",
+                "order_id": oid, "source": "do_sell_immediate",
+            })
             self._record_fill_ts(m.slug)  # post-fill cooldown
             # True cost: count fill only after confirmed fill
             self._true_cost_fill_count += 1

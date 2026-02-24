@@ -725,9 +725,19 @@ HOURLY_BUDGET_USD = float(os.getenv("HOURLY_BUDGET_USD", "50.0"))  # reporting o
 # ---------------------------------------------------------------------------
 # POSITION INVARIANT — drift detection between bot state and truth
 # ---------------------------------------------------------------------------
-POS_DRIFT_TOLERANCE = float(os.getenv("POS_DRIFT_TOLERANCE", "0.5"))   # shares: ignore drift < this
+POS_DRIFT_TOLERANCE = float(os.getenv("POS_DRIFT_TOLERANCE", "0.01"))  # shares: drift > 0.01 triggers counter
 POS_DRIFT_RESYNC_ENABLED = bool(os.getenv("POS_DRIFT_RESYNC_ENABLED", "True") not in ("", "0", "False", "false"))
 POS_DRIFT_ESCALATION_AFTER_RESYNC = int(os.getenv("POS_DRIFT_ESCALATION_AFTER_RESYNC", "3"))  # consecutive checks AFTER resync before hard stop
+POS_DRIFT_CHECK_INTERVAL_SEC = float(os.getenv("POS_DRIFT_CHECK_INTERVAL_SEC", "10"))  # invariant check every 10s
+POS_DRIFT_AUTO_EXIT_SAFE_MODE = bool(os.getenv("POS_DRIFT_AUTO_EXIT_SAFE_MODE", "True") not in ("", "0", "False", "false"))
+
+# ---------------------------------------------------------------------------
+# FILL INTEGRITY — idempotent pipeline, pending/confirm, order lifecycle
+# ---------------------------------------------------------------------------
+FILL_DEDUPE_PERSIST_PATH = os.getenv("FILL_DEDUPE_PERSIST_PATH", os.path.join(_LOG_DIR, "fill_dedupe.jsonl"))
+FILL_CONFIRM_NORMAL_TIMEOUT_SEC = float(os.getenv("FILL_CONFIRM_NORMAL_TIMEOUT_SEC", "2.0"))
+FILL_CONFIRM_SLOW_TIMEOUT_SEC = float(os.getenv("FILL_CONFIRM_SLOW_TIMEOUT_SEC", "5.0"))
+ORDER_UNKNOWN_RESOLVE_TIMEOUT_SEC = float(os.getenv("ORDER_UNKNOWN_RESOLVE_TIMEOUT_SEC", "15.0"))
 
 # Rule 8: Last 90 Seconds Rule — no resting orders, IOC-only
 LAST_SECONDS_IOC_ONLY = float(os.getenv("LAST_SECONDS_IOC_ONLY", "90.0"))           # seconds before close
