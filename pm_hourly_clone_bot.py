@@ -1458,18 +1458,33 @@ class Bot:
                   f"ioc={LAST_SECONDS_IOC_ONLY:.0f}s "
                   f"cancel_all={CANCEL_ALL_BEFORE_CLOSE_SEC:.0f}s")
         # Concurrent exposure caps (all modes)
-        print(f"  RISK LIMITS ({MODE}): max_concurrent=${MAX_CONCURRENT_EXPOSURE_USD:.0f}"
-              f"  per_slug=${MAX_EXPOSURE_USD_PER_SLUG:.0f}"
-              f"  per_order=${MAX_ORDER_USD:.0f}"
-              f"  DIR=${DIR_BUDGET_USD:.0f}  SCALP=${SCALP_BUDGET_USD:.0f}")
+        _caps_disabled = MAX_CONCURRENT_EXPOSURE_USD >= 1e8
+        if _caps_disabled:
+            print(f"  RISK LIMITS ({MODE}): exposure_caps=DISABLED"
+                  f"  per_order=${MAX_ORDER_USD:.0f}")
+        else:
+            print(f"  RISK LIMITS ({MODE}): max_concurrent=${MAX_CONCURRENT_EXPOSURE_USD:.0f}"
+                  f"  per_slug=${MAX_EXPOSURE_USD_PER_SLUG:.0f}"
+                  f"  per_order=${MAX_ORDER_USD:.0f}"
+                  f"  DIR=${DIR_BUDGET_USD:.0f}  SCALP=${SCALP_BUDGET_USD:.0f}")
         if MODE == "LOG":
-            print(f"  PAPER_LIMITS {{max_concurrent={MAX_CONCURRENT_EXPOSURE_USD:.0f},"
-                  f" per_slug={MAX_EXPOSURE_USD_PER_SLUG:.0f},"
-                  f" per_order={MAX_ORDER_USD:.0f}}}")
+            print(f"  PAPER_LIMITS {{max_order_usd={MAX_ORDER_USD:.0f},"
+                  f" exposure_caps_disabled={_caps_disabled}}}")
         else:
             print(f"  LIVE_LIMITS {{max_concurrent={MAX_CONCURRENT_EXPOSURE_USD:.0f},"
                   f" per_slug={MAX_EXPOSURE_USD_PER_SLUG:.0f},"
                   f" per_order={MAX_ORDER_USD:.0f}}}")
+        # PAPER_STRESS profile: print full config block
+        if PROFILE == "PAPER_STRESS":
+            print(f"  PAPER_STRESS_CONFIG {{"
+                  f"max_order_usd: {MAX_ORDER_USD:.1f}, "
+                  f"exposure_caps_disabled: true, "
+                  f"cooldowns: {{post_fill_ms: {POST_FILL_COOLDOWN_MS:.0f}, "
+                  f"dscalp_ms: {DSCALP_COOLDOWN_MS:.0f}, "
+                  f"probe_sec: {HYBRID_PROBE_COOLDOWN_SEC:.0f}}}, "
+                  f"thresholds: {{delta_min_bps: {DSCALP_DELTA_MIN_BPS:.0f}, "
+                  f"probe_delta_bps: {HYBRID_PROBE_DELTA_MIN_BPS:.0f}, "
+                  f"spread_max_cents: {DSCALP_MAX_SPREAD_CENTS:.0f}}}}}")
         self._last_balance_print = 0.0
         self._last_save_ts = time.time()
 
@@ -5860,7 +5875,15 @@ class Bot:
         if MODE != "LIVE_SAFE":
             capped_usd = min(order_usd, per_order_cap)
             qty = max(float(clob_min), capped_usd / max(1e-9, price))
-            return qty * price, qty
+            final_usd = qty * price
+            # PAPER order sizing log
+            if MODE == "LOG" and capped_usd < order_usd:
+                write_jsonl({"event_type": "ORDER_SIZED_PAPER",
+                             "requested_usd": round(order_usd, 2),
+                             "capped_usd": round(capped_usd, 2),
+                             "price": round(price, 4), "qty": round(qty, 1),
+                             "ts_ms": int(time.time() * 1000)})
+            return final_usd, qty
         capped_usd = min(order_usd, per_order_cap)
         capped_qty = capped_usd / max(1e-9, price)
         # Enforce Polymarket minimum (shares + $1 value)
@@ -9439,15 +9462,57 @@ def _select_mode() -> str:
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Polymarket hourly bot")
+    parser.add_argument("--profile", type=str, default=None,
+                        help="Override PROFILE (e.g. PAPER_STRESS, HYBRID_COPYWALLET)")
+    parser.add_argument("--run-seconds", type=int, default=None,
+                        help="Auto-exit after N seconds (e.g. 3600 for 1 hour)")
+    args = parser.parse_args()
+
     global MODE
+    import src.config.settings as _settings_mod
+
+    # Apply --profile override before mode selection
+    if args.profile:
+        os.environ["PROFILE"] = args.profile
+        _settings_mod.PROFILE = args.profile
+        _settings_mod._IS_PAPER_STRESS = (args.profile == "PAPER_STRESS")
+        if args.profile == "PAPER_STRESS":
+            # PAPER_STRESS forces LOG mode
+            os.environ["MODE"] = "LOG"
+            _settings_mod.MODE = "LOG"
+            # Reload settings to apply PAPER_STRESS overrides
+            import importlib
+            importlib.reload(_settings_mod)
+            # Re-apply wildcard import
+            for attr in dir(_settings_mod):
+                if not attr.startswith("_"):
+                    globals()[attr] = getattr(_settings_mod, attr)
+
     MODE = _select_mode()
     # Patch module-level MODE so all code sees the updated value
-    import src.config.settings as _settings_mod
     _settings_mod.MODE = MODE
     if MODE not in ("LOG", "LIVE_SAFE", "LIVE"):
         print("MODE must be LOG, LIVE_SAFE, or LIVE")
         sys.exit(1)
-    print(f"\n  [MODE] Starting in {MODE} mode\n")
+    profile = _settings_mod.PROFILE
+    print(f"\n  [MODE] Starting in {MODE} mode  profile={profile}\n")
+
+    # Apply --run-seconds as a timer
+    _run_seconds = args.run_seconds
+    if _run_seconds:
+        print(f"  [TIMER] Auto-exit after {_run_seconds}s")
+        def _timer_exit():
+            import threading
+            def _shutdown():
+                print(f"\n  [TIMER] {_run_seconds}s elapsed — shutting down")
+                os._exit(0)
+            t = threading.Timer(_run_seconds, _shutdown)
+            t.daemon = True
+            t.start()
+        _timer_exit()
+
     bot = Bot()
     bot.run()
 if __name__ == "__main__":

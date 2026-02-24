@@ -74,7 +74,8 @@ NO_NEW_ENTRIES_SEC_TO_CLOSE = float(os.getenv("NO_NEW_ENTRIES_SEC_TO_CLOSE", "18
 # -----------------------------------------------------------------------------
 # Runtime profile — selects which subsystems are active
 # -----------------------------------------------------------------------------
-PROFILE = os.getenv("PROFILE", "HYBRID_COPYWALLET")    # F247_LIKE | HOURLY_SCALP_MIN | HYBRID_COPYWALLET
+PROFILE = os.getenv("PROFILE", "HYBRID_COPYWALLET")    # F247_LIKE | HOURLY_SCALP_MIN | HYBRID_COPYWALLET | PAPER_STRESS
+_IS_PAPER_STRESS = (PROFILE == "PAPER_STRESS")
 
 # HOURLY_SCALP_MIN: minimal profile for BTC/ETH IOC scalping.
 # Keeps: IOC buy/sell, fill confirmation/recovery, reservation + exposure caps,
@@ -631,11 +632,12 @@ CLOB_MIN_ORDER_USD = 1.0                                                        
 # ---------------------------------------------------------------------------
 # CONCURRENT EXPOSURE CAPS — real-time (positions_cost + open_order_notional)
 # These gate ALL new BUYs. Sells always free capacity.
+# PAPER/LOG: exposure caps disabled (huge values), only per-order $5 clamp.
 # ---------------------------------------------------------------------------
 if MODE == "LOG":
-    MAX_CONCURRENT_EXPOSURE_USD = float(os.getenv("MAX_CONCURRENT_EXPOSURE_USD", "100.0"))
-    MAX_EXPOSURE_USD_PER_SLUG = float(os.getenv("MAX_EXPOSURE_USD_PER_SLUG", "1000.0"))
-    MAX_ORDER_USD = float(os.getenv("MAX_ORDER_USD", "10.0"))
+    MAX_CONCURRENT_EXPOSURE_USD = float(os.getenv("MAX_CONCURRENT_EXPOSURE_USD", "1e9"))
+    MAX_EXPOSURE_USD_PER_SLUG = float(os.getenv("MAX_EXPOSURE_USD_PER_SLUG", "1e9"))
+    MAX_ORDER_USD = float(os.getenv("MAX_ORDER_USD", "5.0"))
 else:
     MAX_CONCURRENT_EXPOSURE_USD = float(os.getenv("MAX_CONCURRENT_EXPOSURE_USD", "50.0"))
     MAX_EXPOSURE_USD_PER_SLUG = float(os.getenv("MAX_EXPOSURE_USD_PER_SLUG", "25.0"))
@@ -805,7 +807,7 @@ HYBRID_PROBE_EDGE_CENTS = 1.5
 # ---------------------------------------------------------------------------
 # HYBRID_COPYWALLET profile — two engines (directional + scalp), shared exposure cap
 # ---------------------------------------------------------------------------
-_IS_HYBRID = (PROFILE == "HYBRID_COPYWALLET")
+_IS_HYBRID = (PROFILE in ("HYBRID_COPYWALLET", "PAPER_STRESS"))
 
 # ── Scalp engine constants (only used when HYBRID_COPYWALLET) ──
 SCALP_ENABLED = _IS_HYBRID
@@ -823,10 +825,10 @@ SCALP_CONSEC_STOP_PAUSE_SEC = float(os.getenv("SCALP_CONSEC_STOP_PAUSE_SEC", "10
 SCALP_CONSEC_STOP_THRESHOLD = int(os.getenv("SCALP_CONSEC_STOP_THRESHOLD", "3"))
 
 # ── Engine budget split ──
-# Paper (LOG) mode: scaled up with $100 concurrent cap; LIVE: $35/$15
+# Paper (LOG) mode: no effective budget limit; LIVE: $35/$15
 if MODE == "LOG":
-    DIR_BUDGET_USD = float(os.getenv("DIR_BUDGET_USD", "70.0"))
-    SCALP_BUDGET_USD = float(os.getenv("SCALP_BUDGET_USD", "30.0"))
+    DIR_BUDGET_USD = float(os.getenv("DIR_BUDGET_USD", "1e9"))
+    SCALP_BUDGET_USD = float(os.getenv("SCALP_BUDGET_USD", "1e9"))
 else:
     DIR_BUDGET_USD = float(os.getenv("DIR_BUDGET_USD", "35.0"))
     SCALP_BUDGET_USD = float(os.getenv("SCALP_BUDGET_USD", "15.0"))
@@ -839,17 +841,18 @@ if _IS_HYBRID:
     CRYPTOS = ["BTC", "ETH"]
     LIVE_ALLOWED_SYMBOLS = ["BTC", "ETH"]
     # Exposure: CURRENT open cost, not cumulative spend
-    # Paper (LOG) mode gets relaxed caps; LIVE modes stay at $50
+    # Paper (LOG): exposure caps disabled (huge values); only per-order $5 clamp.
+    # LIVE modes stay at $50.
     if MODE == "LOG":
-        MAX_TOTAL_EXPOSURE_USD = float(os.getenv("MAX_TOTAL_EXPOSURE_USD", "100.0"))
-        MAX_CONCURRENT_EXPOSURE_USD = float(os.getenv("MAX_CONCURRENT_EXPOSURE_USD", "100.0"))
-        MAX_EXPOSURE_USD_PER_SLUG = float(os.getenv("MAX_EXPOSURE_USD_PER_SLUG", "1000.0"))
-        MAX_ORDER_USD = float(os.getenv("MAX_ORDER_USD", "10.0"))
-        MAX_POSITION_USD_PER_SLUG = float(os.getenv("MAX_POSITION_USD_PER_SLUG", "1000.0"))
-        MAX_OPEN_ORDERS_TOTAL_USD = float(os.getenv("MAX_OPEN_ORDERS_TOTAL_USD", "100.0"))
-        MAX_OPEN_ORDERS_PER_SLUG_USD = float(os.getenv("MAX_OPEN_ORDERS_PER_SLUG_USD", "50.0"))
-        MAX_POSITION_SHARES_PER_OUTCOME = float(os.getenv("MAX_POSITION_SHARES_PER_OUTCOME", "1200"))
-        MAX_NET_IMBALANCE_SHARES = float(os.getenv("MAX_NET_IMBALANCE_SHARES", "500"))
+        MAX_TOTAL_EXPOSURE_USD = float(os.getenv("MAX_TOTAL_EXPOSURE_USD", "1e9"))
+        MAX_CONCURRENT_EXPOSURE_USD = float(os.getenv("MAX_CONCURRENT_EXPOSURE_USD", "1e9"))
+        MAX_EXPOSURE_USD_PER_SLUG = float(os.getenv("MAX_EXPOSURE_USD_PER_SLUG", "1e9"))
+        MAX_ORDER_USD = float(os.getenv("MAX_ORDER_USD", "5.0"))
+        MAX_POSITION_USD_PER_SLUG = float(os.getenv("MAX_POSITION_USD_PER_SLUG", "1e9"))
+        MAX_OPEN_ORDERS_TOTAL_USD = float(os.getenv("MAX_OPEN_ORDERS_TOTAL_USD", "1e9"))
+        MAX_OPEN_ORDERS_PER_SLUG_USD = float(os.getenv("MAX_OPEN_ORDERS_PER_SLUG_USD", "1e9"))
+        MAX_POSITION_SHARES_PER_OUTCOME = float(os.getenv("MAX_POSITION_SHARES_PER_OUTCOME", "1e9"))
+        MAX_NET_IMBALANCE_SHARES = float(os.getenv("MAX_NET_IMBALANCE_SHARES", "1e9"))
     else:
         MAX_TOTAL_EXPOSURE_USD = float(os.getenv("MAX_TOTAL_EXPOSURE_USD", "50.0"))
         MAX_CONCURRENT_EXPOSURE_USD = float(os.getenv("MAX_CONCURRENT_EXPOSURE_USD", "50.0"))
@@ -897,3 +900,71 @@ if _IS_HYBRID:
     XRP_PARITY_QUOTE_ENABLED = False
     XRP_PARITY_BUY_ENABLED = False
     CORR_SCALE_ENABLED = False
+
+# =============================================================================
+# PAPER_STRESS profile — maximum trade frequency, $5 per-order cap only
+# Inherits HYBRID_COPYWALLET base, then overrides for aggressive paper trading.
+# Activated by PROFILE=PAPER_STRESS (implies MODE=LOG).
+# =============================================================================
+if _IS_PAPER_STRESS:
+    # Force LOG mode (paper only)
+    MODE = "LOG"
+    # Inherit HYBRID base (BTC/ETH, no parity, etc.)
+    if not _IS_HYBRID:
+        CRYPTOS = ["BTC", "ETH"]
+        LIVE_ALLOWED_SYMBOLS = ["BTC", "ETH"]
+        PARITY_BUY_ENABLED = False
+        PARITY_SELL_ENABLED = False
+        PARITY_QUOTE_ENABLED = False
+        DERISK_RESCUE_TO_STRADDLE = False
+        HEDGE_TICK_ESCALATION_ENABLED = False
+
+    # ── A) Exposure caps: disabled (only per-order $5 clamp) ──
+    MAX_CONCURRENT_EXPOSURE_USD = 1e9
+    MAX_EXPOSURE_USD_PER_SLUG = 1e9
+    MAX_TOTAL_EXPOSURE_USD = 1e9
+    MAX_POSITION_USD_PER_SLUG = 1e9
+    MAX_OPEN_ORDERS_TOTAL_USD = 1e9
+    MAX_OPEN_ORDERS_PER_SLUG_USD = 1e9
+    MAX_POSITION_SHARES_PER_OUTCOME = 1e9
+    MAX_NET_IMBALANCE_SHARES = 1e9
+    DIR_BUDGET_USD = 1e9
+    SCALP_BUDGET_USD = 1e9
+    MAX_ORDER_USD = float(os.getenv("MAX_ORDER_USD", "5.0"))
+
+    # ── B) "Trade a lot" tweaks ──
+    ENTRY_ONLY_EARLY_WINDOW = False
+    ACTIVE_WINDOW_ONLY = True
+    STRICT_WINDOW_MODE = True
+    TRADE_START_MIN = 1.0
+    TRADE_STOP_ADD_MIN = 58.0
+
+    # Cooldowns: aggressive
+    POST_FILL_COOLDOWN_MS = float(os.getenv("POST_FILL_COOLDOWN_MS", "200"))
+    PER_TOKEN_COOLDOWN_MS = float(os.getenv("PER_TOKEN_COOLDOWN_MS", "150"))
+    MIN_ORDER_INTERVAL_MS = float(os.getenv("MIN_ORDER_INTERVAL_MS", "100"))
+    MAX_ORDER_SUBMITS_PER_MIN = int(os.getenv("MAX_ORDER_SUBMITS_PER_MIN", "600"))
+    DSCALP_COOLDOWN_MS = float(os.getenv("DSCALP_COOLDOWN_MS", "1000"))
+
+    # Edge thresholds: relaxed
+    DSCALP_DELTA_MIN_BPS = float(os.getenv("DSCALP_DELTA_MIN_BPS", "5.0"))
+    MIN_DIRECTIONAL_EDGE_CENTS_BTCETH = float(os.getenv("MIN_DIRECTIONAL_EDGE_CENTS_BTCETH", "1.5"))
+    MIN_DIRECTIONAL_EDGE_CENTS_SOLXRP = float(os.getenv("MIN_DIRECTIONAL_EDGE_CENTS_SOLXRP", "2.0"))
+    MIN_VEL_BPS_PER_MIN_BTCETH = float(os.getenv("MIN_VEL_BPS_PER_MIN_BTCETH", "1.0"))
+    MIN_VEL_BPS_PER_MIN_SOLXRP = float(os.getenv("MIN_VEL_BPS_PER_MIN_SOLXRP", "1.5"))
+
+    # Probe thresholds: very relaxed for max fills
+    HYBRID_PROBE_ENABLED = True
+    HYBRID_PROBE_START_MIN = 1.5
+    HYBRID_PROBE_COOLDOWN_SEC = float(os.getenv("HYBRID_PROBE_COOLDOWN_SEC", "15.0"))
+    HYBRID_PROBE_DELTA_MIN_BPS = float(os.getenv("HYBRID_PROBE_DELTA_MIN_BPS", "4.0"))
+    HYBRID_PROBE_VEL_MIN_BPS = float(os.getenv("HYBRID_PROBE_VEL_MIN_BPS", "0.5"))
+    HYBRID_PROBE_MAX_SPREAD_CENTS = float(os.getenv("HYBRID_PROBE_MAX_SPREAD_CENTS", "6.0"))
+    HYBRID_PROBE_EDGE_CENTS = float(os.getenv("HYBRID_PROBE_EDGE_CENTS", "0.5"))
+
+    # Spread checks: relaxed
+    MAX_SPREAD_ENTRY_CENTS_BTCETH = float(os.getenv("MAX_SPREAD_ENTRY_CENTS_BTCETH", "6"))
+    MAX_SPREAD_ENTRY_CENTS_SOLXRP = float(os.getenv("MAX_SPREAD_ENTRY_CENTS_SOLXRP", "8"))
+    DSCALP_MAX_SPREAD_CENTS = float(os.getenv("DSCALP_MAX_SPREAD_CENTS", "6.0"))
+    NOISY_SPREAD_BLOCK_CENTS = float(os.getenv("NOISY_SPREAD_BLOCK_CENTS", "15"))
+    NOISY_SPREAD_BLOCK_VEL = float(os.getenv("NOISY_SPREAD_BLOCK_VEL", "1"))
