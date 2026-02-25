@@ -455,7 +455,7 @@ def resolve_token_id(conn: sqlite3.Connection, slug: str, outcome: str) -> Optio
     for out_label, tid in outcome_map.items():
         try:
             conn.execute(
-                "INSERT OR REPLACE INTO slug_tokens (slug, outcome, token_id, resolved_ts) "
+                "INSERT OR REPLACE INTO slug_tokens (slug, outcome, token_id, updated_epoch) "
                 "VALUES (?, ?, ?, ?)",
                 (slug, out_label, tid, now_ts),
             )
@@ -476,6 +476,17 @@ def resolve_token_id(conn: sqlite3.Connection, slug: str, outcome: str) -> Optio
         write_jsonl({"event_type": "TOKEN_ID_MISSING", "slug": slug,
                      "outcome": outcome, "reason": "outcome_not_in_gamma"})
     return resolved
+
+
+def preload_token_cache(conn: sqlite3.Connection):
+    """Load all slug_tokens rows into _token_cache at startup and log stats."""
+    cur = conn.execute("SELECT slug, outcome, token_id FROM slug_tokens")
+    rows = cur.fetchall()
+    for slug, outcome, tid in rows:
+        _token_cache[(slug, outcome)] = tid
+    write_jsonl({"event_type": "TOKEN_RESOLVER", "action": "startup_preload",
+                 "cache_size": len(_token_cache), "db_rows": len(rows)})
+    print(f"  Token resolver: preloaded {len(rows)} rows from slug_tokens")
 
 
 # -------------------- SQLite --------------------
@@ -501,6 +512,7 @@ def db_init(conn: sqlite3.Connection):
         usdcSize TEXT,
         token_id TEXT,
         order_id TEXT,
+        match_id TEXT,
         crypto TEXT,
         binanceSpot TEXT,
         hour_ms INTEGER,
@@ -547,7 +559,7 @@ def db_init(conn: sqlite3.Connection):
         slug TEXT NOT NULL,
         outcome TEXT NOT NULL,
         token_id TEXT NOT NULL,
-        resolved_ts INTEGER,
+        updated_epoch INTEGER,
         PRIMARY KEY (slug, outcome)
     );
     """)
@@ -561,16 +573,16 @@ def db_insert_trade(conn: sqlite3.Connection, row: dict) -> bool:
         conn.execute("""
         INSERT INTO trades (
             txHash, timestamp_epoch, timestamp_iso, slug, title, outcome, side, size, price, usdcSize,
-            token_id, order_id,
+            token_id, order_id, match_id,
             crypto, binanceSpot, hour_ms, hourOpen, hourClose,
             bestBid, bestAsk, spread, mid, microprice, imbalance_topN, bid_depth_topN, ask_depth_topN,
             bid_depth_total, ask_depth_total, bidsJson, asksJson, bookTs, bookHash,
             crossing_estimate, trade_vs_mid, trade_vs_micro
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             row["txHash"], row["timestamp_epoch"], row["timestamp_iso"], row["slug"], row["title"],
             row["outcome"], row["side"], row["size"], row["price"], row["usdcSize"],
-            row["token_id"], row["order_id"],
+            row["token_id"], row["order_id"], row["match_id"],
             row["crypto"], row["binanceSpot"], row["hour_ms"], row["hourOpen"], row["hourClose"],
             row["bestBid"], row["bestAsk"], row["spread"], row["mid"], row["microprice"], row["imbalance_topN"],
             row["bid_depth_topN"], row["ask_depth_topN"], row["bid_depth_total"], row["ask_depth_total"],
@@ -857,6 +869,7 @@ def write_fingerprint(conn: sqlite3.Connection, path: str, window_sec: int = 60)
 def main():
     conn = db_connect(DB_PATH)
     db_init(conn)
+    preload_token_cache(conn)
 
     start_ts = epoch_sec()
     last_seen_ts = start_ts
@@ -868,7 +881,7 @@ def main():
 
     raw_header = [
         "timestamp_iso", "timestamp_epoch", "slug", "title", "outcome", "side",
-        "size", "price", "usdcSize", "txHash", "token_id", "order_id",
+        "size", "price", "usdcSize", "txHash", "token_id", "order_id", "match_id",
         "crypto", "binanceSpot", "hour_ms", "hourOpen", "hourClose",
         "bestBid", "bestAsk", "spread", "mid", "microprice",
         "imbalance_topN", "bid_depth_topN", "ask_depth_topN",
@@ -938,10 +951,17 @@ def main():
                         usdc_size = 0
                 token_id = safe_get(t, ["token_id", "tokenId", "asset_id", "assetId"])
                 order_id = safe_get(t, ["order_id", "orderId"])
+                match_id = safe_get(t, ["match_id", "matchId", "tradeId", "trade_id"])
 
                 # Resolve token_id via slug+outcome if the Activity API didn't provide it
                 if not token_id and slug and outcome:
                     token_id = resolve_token_id(conn, slug, outcome)
+
+                if not token_id:
+                    write_jsonl({"event_type": "TOKEN_ID_MISSING",
+                                 "slug": slug, "outcome": outcome,
+                                 "title": title, "txHash": tx,
+                                 "reason": "unresolved_after_all_tiers"})
 
                 crypto = detect_crypto(slug, title)
                 spot = ""
@@ -989,6 +1009,7 @@ def main():
                     "txHash": tx,
                     "token_id": (str(token_id) if token_id is not None else ""),
                     "order_id": (str(order_id) if order_id is not None else ""),
+                    "match_id": (str(match_id) if match_id is not None else ""),
                     "crypto": crypto,
                     "binanceSpot": spot,
                     "hour_ms": hour_ms_val,
@@ -1051,6 +1072,7 @@ def main():
                         "price": clean_number(price),
                         "usdc": clean_number(usdc_size),
                         "txHash": tx,
+                        "token_id": (str(token_id) if token_id else ""),
                         "crossing": crossing,
                         "spread": snap.spread, "mid": snap.mid,
                         "binance_spot": spot, "hour_open": hour_open,
