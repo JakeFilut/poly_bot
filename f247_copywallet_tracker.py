@@ -229,6 +229,14 @@ SESSION = make_session()
 # -------------------- Token ID resolver cache --------------------
 _token_cache: Dict[Tuple[str, str], str] = {}   # (slug, outcome) -> token_id
 
+# Outcome normalization: Activity API says "Up"/"Down", Gamma may say "Yes"/"No"
+_OUTCOME_ALIASES: Dict[str, List[str]] = {
+    "Up": ["Up", "Yes"],
+    "Down": ["Down", "No"],
+    "Yes": ["Yes", "Up"],
+    "No": ["No", "Down"],
+}
+
 # -------------------- Binance caching --------------------
 _spot_cache: Dict[str, Tuple[float, str]] = {}
 _hour_open_cache: Dict[Tuple[str, int], str] = {}
@@ -315,6 +323,16 @@ class BookSnap:
     asks_json: str = ""
     book_ts: str = ""
     book_hash: str = ""
+    suspect: str = ""          # "SUSPECT" if spread > 0.20 or extreme bid/ask
+
+
+def _is_book_suspect(bb: Optional[float], ba: Optional[float], spread_f: Optional[float]) -> bool:
+    """Detect pathological books: spread > 0.20 or bid<=0.02 and ask>=0.98."""
+    if spread_f is not None and spread_f > 0.20:
+        return True
+    if bb is not None and ba is not None and bb <= 0.02 and ba >= 0.98:
+        return True
+    return False
 
 
 _book_cache: Dict[str, Tuple[float, BookSnap]] = {}
@@ -376,6 +394,16 @@ def fetch_orderbook(token_id: str) -> Optional[BookSnap]:
             mid = clean_number(mid_val)
             micro_val = _microprice(bb, ba, bid_sz1, ask_sz1)
             micro = clean_number(micro_val)
+        # Suspect detection
+        spread_f = ffloat(spread)
+        suspect = "SUSPECT" if _is_book_suspect(bb, ba, spread_f) else ""
+        if suspect:
+            write_jsonl({"event_type": "BOOK_SUSPECT", "token_id": token_id,
+                         "best_bid": best_bid, "best_ask": best_ask,
+                         "spread": spread,
+                         "bids_top3": json.dumps(bids[:3], separators=(",", ":")),
+                         "asks_top3": json.dumps(asks[:3], separators=(",", ":"))})
+
         bid_depth_top = _levels_depth(bids, ORDERBOOK_DEPTH_LEVELS)
         ask_depth_top = _levels_depth(asks, ORDERBOOK_DEPTH_LEVELS)
         bid_depth_tot = _levels_depth(bids, ORDERBOOK_TOTAL_DEPTH_LEVELS)
@@ -398,6 +426,7 @@ def fetch_orderbook(token_id: str) -> Optional[BookSnap]:
             asks_json=json.dumps(asks[:ORDERBOOK_DEPTH_LEVELS], separators=(",", ":")),
             book_ts=str(data.get("timestamp", "")),
             book_hash=str(data.get("hash", "")),
+            suspect=suspect,
         )
         _book_cache[token_id] = (now, snap)
         return snap
@@ -406,68 +435,136 @@ def fetch_orderbook(token_id: str) -> Optional[BookSnap]:
 
 
 # -------------------- Token ID resolver --------------------
+def _normalize_outcome_label(label: str) -> str:
+    """Normalize Gamma outcome labels: Yes->Up, No->Down, passthrough others."""
+    u = label.strip().upper()
+    if "UP" in u or "YES" in u:
+        return "Up"
+    if "DOWN" in u or "NO" in u:
+        return "Down"
+    return label
+
+
 def _fetch_gamma_slug_tokens(slug: str) -> Dict[str, str]:
-    """Fetch event by slug from Gamma API, return {outcome_label: token_id}."""
+    """Fetch event by slug from Gamma API, return {normalized_outcome: clob_token_id}.
+
+    Tries the path-parameter endpoint first, then query-parameter fallback.
+    Normalizes outcome labels (Yes->Up, No->Down) so activity API outcomes match.
+    """
+    result: Dict[str, str] = {}
+    event = None
+
+    # Try path-parameter endpoint (what the main bot uses)
     url = f"{GAMMA_API_BASE}/events/slug/{slug}"
     try:
         r = SESSION.get(url, timeout=10)
-        if r.status_code != 200:
-            return {}
-        event = r.json()
-        market_list = event.get("markets", [])
-        if not isinstance(market_list, list) or not market_list:
-            market_list = [event]
-        market = market_list[0]
+        if r.status_code == 200:
+            event = r.json()
+    except Exception:
+        pass
 
+    # Fallback: query-parameter endpoint
+    if event is None:
+        try:
+            r = SESSION.get(f"{GAMMA_API_BASE}/events", params={"slug": slug}, timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, list) and data:
+                    event = data[0]
+        except Exception:
+            pass
+
+    if event is None:
+        write_jsonl({"event_type": "GAMMA_FETCH_FAILED", "slug": slug})
+        return {}
+
+    market_list = event.get("markets", [])
+    if not isinstance(market_list, list) or not market_list:
+        market_list = [event]
+
+    # Iterate all markets in the event (usually just 1 for hourly crypto)
+    for market in market_list:
         outcomes_raw = market.get("outcomes")
         tokens_raw = market.get("clobTokenIds")
         outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else (outcomes_raw or [])
         tokens = json.loads(tokens_raw) if isinstance(tokens_raw, str) else (tokens_raw or [])
 
-        result: Dict[str, str] = {}
         for i, out in enumerate(outcomes):
-            if i < len(tokens):
-                result[str(out)] = str(tokens[i])
-        return result
-    except Exception:
-        return {}
+            if i >= len(tokens):
+                continue
+            raw_label = str(out)
+            tid = str(tokens[i])
+            # Store under the normalized label (Up/Down)
+            norm = _normalize_outcome_label(raw_label)
+            result[norm] = tid
+            # Also store under the raw label if different
+            if raw_label != norm:
+                result[raw_label] = tid
+
+    write_jsonl({"event_type": "GAMMA_FETCH_OK", "slug": slug,
+                 "outcomes": list(result.keys()),
+                 "market_count": len(market_list)})
+    return result
+
+
+def _cache_lookup_with_aliases(slug: str, outcome: str) -> Optional[str]:
+    """Look up token in memory cache, trying outcome aliases (Up↔Yes, Down↔No)."""
+    direct = _token_cache.get((slug, outcome))
+    if direct:
+        return direct
+    for alias in _OUTCOME_ALIASES.get(outcome, []):
+        hit = _token_cache.get((slug, alias))
+        if hit:
+            # Populate the primary key too so future lookups are instant
+            _token_cache[(slug, outcome)] = hit
+            return hit
+    return None
 
 
 def resolve_token_id(conn: sqlite3.Connection, slug: str, outcome: str) -> Optional[str]:
-    """Resolve token_id for slug+outcome.  3-tier: memory cache → SQLite → Gamma API."""
+    """Resolve token_id for slug+outcome.  3-tier: memory cache → SQLite → Gamma API.
+    Tries outcome aliases (Up↔Yes, Down↔No) at each tier.
+    """
     if not slug or not outcome:
         return None
 
-    key = (slug, outcome)
-
-    # --- tier 1: in-memory cache ---
-    cached = _token_cache.get(key)
+    # --- tier 1: in-memory cache (with aliases) ---
+    cached = _cache_lookup_with_aliases(slug, outcome)
     if cached:
+        write_jsonl({"event_type": "TOKEN_RESOLUTION", "slug": slug,
+                     "outcome": outcome, "resolved_token_id": cached,
+                     "source": "cache", "cache_hit": True})
         return cached
 
-    # --- tier 2: SQLite lookup ---
-    cur = conn.execute(
-        "SELECT token_id FROM slug_tokens WHERE slug = ? AND outcome = ?",
-        (slug, outcome),
-    )
-    row = cur.fetchone()
-    if row:
-        tid = row[0]
-        _token_cache[key] = tid
-        write_jsonl({"event_type": "TOKEN_RESOLVER", "source": "sqlite",
-                     "slug": slug, "outcome": outcome, "token_id": tid})
-        return tid
+    # --- tier 2: SQLite lookup (try outcome + aliases) ---
+    aliases = [outcome] + [a for a in _OUTCOME_ALIASES.get(outcome, []) if a != outcome]
+    for alias in aliases:
+        cur = conn.execute(
+            "SELECT token_id FROM slug_tokens WHERE slug = ? AND outcome = ?",
+            (slug, alias),
+        )
+        row = cur.fetchone()
+        if row:
+            tid = row[0]
+            _token_cache[(slug, outcome)] = tid
+            _token_cache[(slug, alias)] = tid
+            write_jsonl({"event_type": "TOKEN_RESOLUTION", "slug": slug,
+                         "outcome": outcome, "resolved_token_id": tid,
+                         "source": "sqlite", "cache_hit": False,
+                         "matched_alias": alias})
+            return tid
 
     # --- tier 3: Gamma API ---
-    write_jsonl({"event_type": "TOKEN_RESOLVER", "source": "gamma_api",
-                 "slug": slug, "outcome": outcome, "status": "fetching"})
+    write_jsonl({"event_type": "TOKEN_RESOLUTION", "slug": slug,
+                 "outcome": outcome, "source": "gamma_api",
+                 "cache_hit": False, "status": "fetching"})
     outcome_map = _fetch_gamma_slug_tokens(slug)
     if not outcome_map:
         write_jsonl({"event_type": "TOKEN_ID_MISSING", "slug": slug,
                      "outcome": outcome, "reason": "gamma_api_empty"})
         return None
 
-    # Persist ALL outcomes for this slug in one shot
+    # Persist ALL outcomes for this slug
     now_ts = epoch_sec()
     for out_label, tid in outcome_map.items():
         try:
@@ -481,17 +578,16 @@ def resolve_token_id(conn: sqlite3.Connection, slug: str, outcome: str) -> Optio
         _token_cache[(slug, out_label)] = tid
     conn.commit()
 
-    write_jsonl({"event_type": "TOKEN_RESOLVED_SLUG", "slug": slug,
-                 "outcomes": list(outcome_map.keys()),
-                 "token_count": len(outcome_map)})
-
-    resolved = _token_cache.get(key)
+    # Now try cache again (with aliases)
+    resolved = _cache_lookup_with_aliases(slug, outcome)
     if resolved:
-        write_jsonl({"event_type": "TOKEN_ID_FILLED", "slug": slug,
-                     "outcome": outcome, "token_id": resolved})
+        write_jsonl({"event_type": "TOKEN_RESOLUTION", "slug": slug,
+                     "outcome": outcome, "resolved_token_id": resolved,
+                     "source": "gamma_api", "cache_hit": False})
     else:
         write_jsonl({"event_type": "TOKEN_ID_MISSING", "slug": slug,
-                     "outcome": outcome, "reason": "outcome_not_in_gamma"})
+                     "outcome": outcome, "reason": "outcome_not_in_gamma",
+                     "gamma_outcomes": list(outcome_map.keys())})
     return resolved
 
 
@@ -553,6 +649,7 @@ def db_init(conn: sqlite3.Connection):
         crossing_estimate TEXT,
         trade_vs_mid TEXT,
         trade_vs_micro TEXT,
+        book_suspect TEXT,
         spread_percentile_60s TEXT,
         spread_mean_60s TEXT,
         spread_std_60s TEXT,
@@ -593,6 +690,7 @@ def db_init(conn: sqlite3.Connection):
     # Migrations: add columns if missing (existing DBs)
     _migrate_cols = [
         ("erc1155_token_id", "TEXT DEFAULT ''"),
+        ("book_suspect", "TEXT DEFAULT ''"),
         ("spread_percentile_60s", "TEXT DEFAULT ''"),
         ("spread_mean_60s", "TEXT DEFAULT ''"),
         ("spread_std_60s", "TEXT DEFAULT ''"),
@@ -618,10 +716,10 @@ def db_insert_trade(conn: sqlite3.Connection, row: dict) -> bool:
             crypto, binanceSpot, hour_ms, hourOpen, hourClose,
             bestBid, bestAsk, spread, mid, microprice, imbalance_topN, bid_depth_topN, ask_depth_topN,
             bid_depth_total, ask_depth_total, bidsJson, asksJson, bookTs, bookHash,
-            crossing_estimate, trade_vs_mid, trade_vs_micro,
+            crossing_estimate, trade_vs_mid, trade_vs_micro, book_suspect,
             spread_percentile_60s, spread_mean_60s, spread_std_60s,
             net_shares_after, avg_cost_after, realized_pnl_cumulative
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             row["txHash"], row["timestamp_epoch"], row["timestamp_iso"], row["slug"], row["title"],
             row["outcome"], row["side"], row["size"], row["price"], row["usdcSize"],
@@ -630,7 +728,7 @@ def db_insert_trade(conn: sqlite3.Connection, row: dict) -> bool:
             row["bestBid"], row["bestAsk"], row["spread"], row["mid"], row["microprice"], row["imbalance_topN"],
             row["bid_depth_topN"], row["ask_depth_topN"], row["bid_depth_total"], row["ask_depth_total"],
             row["bidsJson"], row["asksJson"], row["bookTs"], row["bookHash"],
-            row["crossing_estimate"], row["trade_vs_mid"], row["trade_vs_micro"],
+            row["crossing_estimate"], row["trade_vs_mid"], row["trade_vs_micro"], row.get("book_suspect", ""),
             row.get("spread_percentile_60s", ""), row.get("spread_mean_60s", ""), row.get("spread_std_60s", ""),
             row.get("net_shares_after", ""), row.get("avg_cost_after", ""), row.get("realized_pnl_cumulative", ""),
         ))
@@ -1210,7 +1308,7 @@ def main():
         "imbalance_topN", "bid_depth_topN", "ask_depth_topN",
         "bid_depth_total", "ask_depth_total",
         "bidsJson", "asksJson", "bookTs", "bookHash",
-        "crossing_estimate", "trade_vs_mid", "trade_vs_micro",
+        "crossing_estimate", "trade_vs_mid", "trade_vs_micro", "book_suspect",
         "spread_percentile_60s", "spread_mean_60s", "spread_std_60s",
         "net_shares_after", "avg_cost_after", "realized_pnl_cumulative",
     ]
@@ -1333,10 +1431,10 @@ def main():
                 if px is not None and microf is not None:
                     trade_vs_micro = clean_number(px - microf)
 
-                # Layer 1: Spread percentile tracking
+                # Layer 1: Spread percentile tracking (skip suspect books)
                 spread_stats = {"spread_percentile_60s": "", "spread_mean_60s": "", "spread_std_60s": ""}
                 spread_f = ffloat(snap.spread)
-                if spread_f is not None and token_id:
+                if spread_f is not None and token_id and not snap.suspect:
                     spread_tracker_record(str(token_id), ts_int, spread_f)
                     spread_stats = spread_tracker_stats(str(token_id), spread_f)
 
@@ -1384,6 +1482,7 @@ def main():
                     "crossing_estimate": crossing,
                     "trade_vs_mid": trade_vs_mid,
                     "trade_vs_micro": trade_vs_micro,
+                    "book_suspect": snap.suspect,
                     "spread_percentile_60s": spread_stats["spread_percentile_60s"],
                     "spread_mean_60s": spread_stats["spread_mean_60s"],
                     "spread_std_60s": spread_stats["spread_std_60s"],
@@ -1403,8 +1502,8 @@ def main():
                     except Exception:
                         pass
 
-                    # Schedule markouts
-                    if token_id:
+                    # Schedule markouts (only with non-suspect books)
+                    if token_id and not snap.suspect:
                         db_add_markout_jobs(
                             conn=conn, txHash=tx, token_id=str(token_id),
                             t0_epoch=ts_int, mid_t0=snap.mid,
@@ -1434,6 +1533,7 @@ def main():
                         "erc1155_token_id": str(erc1155_token_id),
                         "crossing": crossing,
                         "spread": snap.spread, "mid": snap.mid,
+                        "book_suspect": snap.suspect,
                         "binance_spot": spot, "hour_open": hour_open,
                         "spread_pct_60s": spread_stats["spread_percentile_60s"],
                         "net_shares": inv_fields["net_shares_after"],
@@ -1457,20 +1557,31 @@ def main():
                     bn_tag = f" [{crypto} spot={spot} O={hour_open}]" if crypto else ""
                     inv_tag = f" inv={inv_fields['net_shares_after']}" if inv_fields["net_shares_after"] else ""
                     spr_pct_tag = f" sprP={spread_stats['spread_percentile_60s']}%" if spread_stats["spread_percentile_60s"] else ""
+                    suspect_tag = " !!SUSPECT_BOOK!!" if snap.suspect else ""
                     print(
                         f"  F247{bn_tag}{ob_tag}: {iso} {slug} {outcome} {side} "
                         f"sz={row['size']} px={row['price']} usdc={row['usdcSize']} "
                         f"{crossing} dMid={trade_vs_mid} dMicro={trade_vs_micro}"
-                        f"{spr_pct_tag}{inv_tag}"
+                        f"{spr_pct_tag}{inv_tag}{suspect_tag}"
                     )
 
             # ---- markout processing ----
             due_jobs = db_fetch_due_markouts(conn, epoch_sec(), MARKOUT_MAX_PER_TICK)
-            for (markout_id, txHash, token_id, t0_epoch, horizon_sec,
+            for (markout_id, txHash, tok_mk, t0_epoch, horizon_sec,
                  due_epoch, mid_t0, spread_t0, bin_t0) in due_jobs:
-                snap1 = fetch_orderbook(str(token_id))
+                snap1 = fetch_orderbook(str(tok_mk))
                 if snap1 is None:
                     snap1 = BookSnap()
+                # Only mark done if we have valid t1 data and t0 was valid
+                mid_t0_f = ffloat(mid_t0)
+                mid_t1_f = ffloat(snap1.mid)
+                if mid_t1_f is None or snap1.suspect:
+                    # Skip: bad book at t1, will retry next tick
+                    continue
+                if mid_t0_f is None:
+                    # t0 was bad, mark done but don't pollute stats
+                    db_set_markout_done(conn, markout_id, "", "", "")
+                    continue
                 db_set_markout_done(conn, markout_id, snap1.mid, snap1.spread, "")
 
             # ---- backfill hourClose ----
