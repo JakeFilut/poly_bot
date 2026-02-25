@@ -39,7 +39,9 @@ import math
 import sqlite3
 import signal
 import hashlib
+import statistics
 import requests
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional, Dict, Tuple, List, Any
@@ -60,6 +62,8 @@ OUT_CSV = os.path.join(LOG_DIR, "f247_copywallet_fills_enriched.csv")
 MARKOUTS_CSV = os.path.join(LOG_DIR, "f247_copywallet_markouts.csv")
 MINUTE_ROLLUP_CSV = os.path.join(LOG_DIR, "f247_copywallet_minute_rollup.csv")
 FINGERPRINT_CSV = os.path.join(LOG_DIR, "f247_copywallet_fingerprint.csv")
+INVENTORY_CSV = os.path.join(LOG_DIR, "f247_copywallet_inventory_snapshot.csv")
+MARKOUT_STATS_CSV = os.path.join(LOG_DIR, "f247_copywallet_markout_stats.csv")
 JSONL_LOG = os.path.join(LOG_DIR, "f247_copywallet_events.jsonl")
 
 POLL_SECONDS = 1.0
@@ -74,6 +78,15 @@ EXPORT_EVERY_SECONDS = 120
 BACKFILL_EVERY_SECONDS = 30
 ROLLUP_EVERY_SECONDS = 60
 FINGERPRINT_EVERY_SECONDS = 60
+INVENTORY_EVERY_SECONDS = 60
+MARKOUT_STATS_EVERY_SECONDS = 60
+BEHAVIOR_SUMMARY_EVERY_SECONDS = 60
+
+# Spread percentile
+SPREAD_WINDOW_SEC = 60
+
+# Markout stats rolling window
+MARKOUT_STATS_WINDOW = 200
 
 # Binance
 BINANCE_SPOT_TTL_SEC = 1.0
@@ -539,7 +552,13 @@ def db_init(conn: sqlite3.Connection):
         bookHash TEXT,
         crossing_estimate TEXT,
         trade_vs_mid TEXT,
-        trade_vs_micro TEXT
+        trade_vs_micro TEXT,
+        spread_percentile_60s TEXT,
+        spread_mean_60s TEXT,
+        spread_std_60s TEXT,
+        net_shares_after TEXT,
+        avg_cost_after TEXT,
+        realized_pnl_cumulative TEXT
     );
     """)
     conn.execute("""
@@ -571,11 +590,21 @@ def db_init(conn: sqlite3.Connection):
     conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_time ON trades(timestamp_epoch);")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_markouts_due ON markouts(done, due_epoch);")
 
-    # Migration: add erc1155_token_id column if missing (existing DBs)
-    try:
-        conn.execute("SELECT erc1155_token_id FROM trades LIMIT 1")
-    except sqlite3.OperationalError:
-        conn.execute("ALTER TABLE trades ADD COLUMN erc1155_token_id TEXT DEFAULT ''")
+    # Migrations: add columns if missing (existing DBs)
+    _migrate_cols = [
+        ("erc1155_token_id", "TEXT DEFAULT ''"),
+        ("spread_percentile_60s", "TEXT DEFAULT ''"),
+        ("spread_mean_60s", "TEXT DEFAULT ''"),
+        ("spread_std_60s", "TEXT DEFAULT ''"),
+        ("net_shares_after", "TEXT DEFAULT ''"),
+        ("avg_cost_after", "TEXT DEFAULT ''"),
+        ("realized_pnl_cumulative", "TEXT DEFAULT ''"),
+    ]
+    for col_name, col_type in _migrate_cols:
+        try:
+            conn.execute(f"SELECT {col_name} FROM trades LIMIT 1")
+        except sqlite3.OperationalError:
+            conn.execute(f"ALTER TABLE trades ADD COLUMN {col_name} {col_type}")
 
     conn.commit()
 
@@ -589,8 +618,10 @@ def db_insert_trade(conn: sqlite3.Connection, row: dict) -> bool:
             crypto, binanceSpot, hour_ms, hourOpen, hourClose,
             bestBid, bestAsk, spread, mid, microprice, imbalance_topN, bid_depth_topN, ask_depth_topN,
             bid_depth_total, ask_depth_total, bidsJson, asksJson, bookTs, bookHash,
-            crossing_estimate, trade_vs_mid, trade_vs_micro
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            crossing_estimate, trade_vs_mid, trade_vs_micro,
+            spread_percentile_60s, spread_mean_60s, spread_std_60s,
+            net_shares_after, avg_cost_after, realized_pnl_cumulative
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             row["txHash"], row["timestamp_epoch"], row["timestamp_iso"], row["slug"], row["title"],
             row["outcome"], row["side"], row["size"], row["price"], row["usdcSize"],
@@ -600,6 +631,8 @@ def db_insert_trade(conn: sqlite3.Connection, row: dict) -> bool:
             row["bid_depth_topN"], row["ask_depth_topN"], row["bid_depth_total"], row["ask_depth_total"],
             row["bidsJson"], row["asksJson"], row["bookTs"], row["bookHash"],
             row["crossing_estimate"], row["trade_vs_mid"], row["trade_vs_micro"],
+            row.get("spread_percentile_60s", ""), row.get("spread_mean_60s", ""), row.get("spread_std_60s", ""),
+            row.get("net_shares_after", ""), row.get("avg_cost_after", ""), row.get("realized_pnl_cumulative", ""),
         ))
         conn.commit()
         return True
@@ -877,6 +910,284 @@ def write_fingerprint(conn: sqlite3.Connection, path: str, window_sec: int = 60)
         ])
 
 
+# -------------------- Layer 1: Spread Percentile Tracking --------------------
+_spread_window: Dict[str, deque] = {}   # token_id -> deque of (epoch_sec, spread_float)
+
+
+def spread_tracker_record(token_id: str, ts_epoch: int, spread_val: float):
+    """Record a spread observation and evict entries older than SPREAD_WINDOW_SEC."""
+    if not token_id:
+        return
+    dq = _spread_window.get(token_id)
+    if dq is None:
+        dq = deque()
+        _spread_window[token_id] = dq
+    dq.append((ts_epoch, spread_val))
+    cutoff = ts_epoch - SPREAD_WINDOW_SEC
+    while dq and dq[0][0] < cutoff:
+        dq.popleft()
+
+
+def spread_tracker_stats(token_id: str, current_spread: float) -> Dict[str, str]:
+    """Compute percentile/mean/std of current_spread within the rolling 60s window."""
+    result = {"spread_percentile_60s": "", "spread_mean_60s": "", "spread_std_60s": ""}
+    dq = _spread_window.get(token_id)
+    if not dq or len(dq) < 2:
+        return result
+    spreads = [s for _, s in dq]
+    n = len(spreads)
+    mean = sum(spreads) / n
+    result["spread_mean_60s"] = clean_number(mean)
+    if n >= 2:
+        std = statistics.stdev(spreads)
+        result["spread_std_60s"] = clean_number(std)
+    # Percentile rank: fraction of window spreads <= current_spread
+    rank = sum(1 for s in spreads if s <= current_spread)
+    pct = rank / n * 100.0
+    result["spread_percentile_60s"] = clean_number(pct)
+    return result
+
+
+# -------------------- Layer 2: Inventory Tracking --------------------
+_inventory: Dict[Tuple[str, str], dict] = {}   # (slug, outcome) -> {net_shares, avg_cost, realized_pnl, trade_count}
+
+
+def inventory_update(slug: str, outcome: str, side: str, size_f: float, price_f: float) -> Dict[str, str]:
+    """Update inventory for (slug, outcome) and return post-trade snapshot fields."""
+    key = (slug, outcome)
+    inv = _inventory.get(key)
+    if inv is None:
+        inv = {"net_shares": 0.0, "avg_cost": 0.0, "realized_pnl": 0.0, "trade_count": 0}
+        _inventory[key] = inv
+    inv["trade_count"] += 1
+    if side == "BUY":
+        old_shares = inv["net_shares"]
+        old_cost = inv["avg_cost"]
+        new_shares = old_shares + size_f
+        if new_shares > 0:
+            inv["avg_cost"] = (old_cost * old_shares + price_f * size_f) / new_shares
+        inv["net_shares"] = new_shares
+    elif side == "SELL":
+        if size_f > 0 and inv["net_shares"] > 0:
+            inv["realized_pnl"] += size_f * (price_f - inv["avg_cost"])
+        inv["net_shares"] -= size_f
+        if inv["net_shares"] <= 0:
+            inv["net_shares"] = 0.0
+            inv["avg_cost"] = 0.0
+    return {
+        "net_shares_after": clean_number(inv["net_shares"]),
+        "avg_cost_after": clean_number(inv["avg_cost"]),
+        "realized_pnl_cumulative": clean_number(inv["realized_pnl"]),
+    }
+
+
+def write_inventory_snapshot(path: str):
+    """Write current inventory state for all tracked (slug, outcome) pairs."""
+    if not _inventory:
+        return
+    header = ["ts_iso", "slug", "outcome", "net_shares", "avg_cost",
+              "realized_pnl", "trade_count"]
+    tmp = path + ".tmp"
+    now_iso = ts_to_iso(epoch_sec())
+    with open(tmp, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(header)
+        for (slug, outcome), inv in sorted(_inventory.items()):
+            w.writerow([
+                now_iso, slug, outcome,
+                clean_number(inv["net_shares"]),
+                clean_number(inv["avg_cost"]),
+                clean_number(inv["realized_pnl"]),
+                inv["trade_count"],
+            ])
+    os.replace(tmp, path)
+
+
+# -------------------- Layer 3: Markout Performance Analysis --------------------
+def compute_markout_stats(conn: sqlite3.Connection, window: int = MARKOUT_STATS_WINDOW) -> Dict[int, dict]:
+    """Compute rolling markout stats from the last `window` completed markouts per horizon."""
+    result: Dict[int, dict] = {}
+    for h in MARKOUT_HORIZONS_SEC:
+        cur = conn.execute("""
+            SELECT m.horizon_sec, m.mid_t0, m.mid_t1, m.spread_t0, t.side
+            FROM markouts m
+            LEFT JOIN trades t ON m.txHash = t.txHash
+            WHERE m.done = 1 AND m.horizon_sec = ?
+              AND m.mid_t0 IS NOT NULL AND m.mid_t0 != ''
+              AND m.mid_t1 IS NOT NULL AND m.mid_t1 != ''
+            ORDER BY m.t0_epoch DESC
+            LIMIT ?
+        """, (h, window))
+        rows = cur.fetchall()
+        if not rows:
+            result[h] = {"count": 0}
+            continue
+        markouts_buy = []
+        markouts_sell = []
+        all_markouts = []
+        for _, mid0_s, mid1_s, _, side in rows:
+            m0 = ffloat(mid0_s)
+            m1 = ffloat(mid1_s)
+            if m0 is None or m1 is None:
+                continue
+            delta = m1 - m0
+            s = (side or "").upper()
+            # For BUY, positive markout = price went up (good)
+            # For SELL, positive markout = price went down (good), so negate
+            signed = delta if s == "BUY" else -delta
+            all_markouts.append(signed)
+            if s == "BUY":
+                markouts_buy.append(signed)
+            elif s == "SELL":
+                markouts_sell.append(signed)
+        if not all_markouts:
+            result[h] = {"count": 0}
+            continue
+        n = len(all_markouts)
+        avg = sum(all_markouts) / n
+        med = statistics.median(all_markouts)
+        pct_pos = sum(1 for m in all_markouts if m > 0) / n * 100.0
+        avg_buy = (sum(markouts_buy) / len(markouts_buy)) if markouts_buy else None
+        avg_sell = (sum(markouts_sell) / len(markouts_sell)) if markouts_sell else None
+        result[h] = {
+            "count": n,
+            "avg_markout": avg,
+            "median_markout": med,
+            "pct_positive": pct_pos,
+            "avg_markout_buy": avg_buy,
+            "avg_markout_sell": avg_sell,
+        }
+    return result
+
+
+def write_markout_stats(conn: sqlite3.Connection, path: str):
+    """Write rolling markout performance stats CSV."""
+    stats = compute_markout_stats(conn)
+    if not stats:
+        return
+    header = ["ts_iso", "horizon_sec", "count", "avg_markout", "median_markout",
+              "pct_positive", "avg_markout_buy", "avg_markout_sell", "edge_decay_ratio"]
+    # Compute edge_decay_ratio = avg_markout_10s / avg_markout_2s
+    avg_2 = stats.get(2, {}).get("avg_markout")
+    avg_10 = stats.get(10, {}).get("avg_markout")
+    edge_decay = ""
+    if avg_2 is not None and avg_2 != 0 and avg_10 is not None:
+        edge_decay = clean_number(avg_10 / avg_2)
+    tmp = path + ".tmp"
+    now_iso = ts_to_iso(epoch_sec())
+    with open(tmp, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(header)
+        for h in MARKOUT_HORIZONS_SEC:
+            s = stats.get(h, {})
+            if s.get("count", 0) == 0:
+                w.writerow([now_iso, h, 0, "", "", "", "", "", ""])
+                continue
+            w.writerow([
+                now_iso, h, s["count"],
+                clean_number(s["avg_markout"]),
+                clean_number(s["median_markout"]),
+                clean_number(s["pct_positive"]),
+                clean_number(s["avg_markout_buy"]) if s["avg_markout_buy"] is not None else "",
+                clean_number(s["avg_markout_sell"]) if s["avg_markout_sell"] is not None else "",
+                edge_decay if h == 10 else "",
+            ])
+    os.replace(tmp, path)
+
+
+# -------------------- Layer 4: Behavior Summary --------------------
+def print_behavior_summary(conn: sqlite3.Connection):
+    """Print a 60-second behavior summary to console + JSONL."""
+    since = epoch_sec() - 60
+    cur = conn.execute("""
+        SELECT side, spread, bestBid, bestAsk, price,
+               spread_percentile_60s, net_shares_after, slug, outcome
+        FROM trades
+        WHERE timestamp_epoch >= ?
+        ORDER BY timestamp_epoch ASC
+    """, (since,))
+    rows = cur.fetchall()
+    if not rows:
+        return
+    n = len(rows)
+    buys = 0
+    sells = 0
+    pcts = []
+    cross = 0
+    cross_den = 0
+    for side, sp, bb, ba, px, pct60, net_sh, slug, outcome in rows:
+        s = (side or "").upper()
+        if s == "BUY":
+            buys += 1
+        elif s == "SELL":
+            sells += 1
+        pf = ffloat(pct60)
+        if pf is not None:
+            pcts.append(pf)
+        pxf = ffloat(px)
+        bbf = ffloat(bb)
+        baf = ffloat(ba)
+        if pxf is not None and (bbf is not None or baf is not None):
+            cross_den += 1
+            if s == "BUY" and baf is not None and pxf >= baf:
+                cross += 1
+            elif s == "SELL" and bbf is not None and pxf <= bbf:
+                cross += 1
+    avg_pct = (sum(pcts) / len(pcts)) if pcts else None
+    cross_pct = (cross / cross_den * 100.0) if cross_den else None
+
+    # Avg markout 2s from completed markouts in last 60s
+    cur2 = conn.execute("""
+        SELECT m.mid_t0, m.mid_t1, t.side
+        FROM markouts m
+        LEFT JOIN trades t ON m.txHash = t.txHash
+        WHERE m.done = 1 AND m.horizon_sec = 2
+          AND m.t0_epoch >= ?
+          AND m.mid_t0 IS NOT NULL AND m.mid_t0 != ''
+          AND m.mid_t1 IS NOT NULL AND m.mid_t1 != ''
+    """, (since,))
+    mk_rows = cur2.fetchall()
+    markout_2s_vals = []
+    for mid0_s, mid1_s, side in mk_rows:
+        m0 = ffloat(mid0_s)
+        m1 = ffloat(mid1_s)
+        if m0 is not None and m1 is not None:
+            delta = m1 - m0
+            s = (side or "").upper()
+            markout_2s_vals.append(delta if s == "BUY" else -delta)
+    avg_mk2 = (sum(markout_2s_vals) / len(markout_2s_vals)) if markout_2s_vals else None
+
+    # Top 3 inventory exposures by abs(net_shares)
+    top_inv = sorted(_inventory.items(), key=lambda x: abs(x[1]["net_shares"]), reverse=True)[:3]
+    inv_strs = []
+    for (sl, out), inv in top_inv:
+        if inv["net_shares"] != 0:
+            inv_strs.append(f"{sl[:20]}:{out}={inv['net_shares']:.1f}")
+
+    summary = {
+        "event_type": "BEHAVIOR_SUMMARY",
+        "trades_last_60s": n,
+        "buys": buys,
+        "sells": sells,
+        "avg_spread_percentile": clean_number(avg_pct) if avg_pct is not None else "",
+        "aggressive_cross_pct": clean_number(cross_pct) if cross_pct is not None else "",
+        "avg_markout_2s": clean_number(avg_mk2) if avg_mk2 is not None else "",
+        "top_inventory": inv_strs,
+    }
+    write_jsonl(summary)
+
+    # Console
+    mk2_str = f"{avg_mk2:+.4f}" if avg_mk2 is not None else "N/A"
+    pct_str = f"{avg_pct:.1f}%" if avg_pct is not None else "N/A"
+    cross_str = f"{cross_pct:.1f}%" if cross_pct is not None else "N/A"
+    inv_display = " | ".join(inv_strs) if inv_strs else "flat"
+    print(
+        f"  [BEHAVIOR 60s] trades={n} B={buys} S={sells} "
+        f"spr_pct={pct_str} cross={cross_str} mk2={mk2_str} "
+        f"inv=[{inv_display}]"
+    )
+
+
 # -------------------- main --------------------
 def main():
     conn = db_connect(DB_PATH)
@@ -900,6 +1211,8 @@ def main():
         "bid_depth_total", "ask_depth_total",
         "bidsJson", "asksJson", "bookTs", "bookHash",
         "crossing_estimate", "trade_vs_mid", "trade_vs_micro",
+        "spread_percentile_60s", "spread_mean_60s", "spread_std_60s",
+        "net_shares_after", "avg_cost_after", "realized_pnl_cumulative",
     ]
     init_csv(RAW_CSV, raw_header)
 
@@ -930,6 +1243,9 @@ def main():
     last_export = 0.0
     last_roll = 0.0
     last_fp = 0.0
+    last_inv = 0.0
+    last_mk_stats = 0.0
+    last_behavior = 0.0
 
     while not STOP:
         try:
@@ -1017,6 +1333,20 @@ def main():
                 if px is not None and microf is not None:
                     trade_vs_micro = clean_number(px - microf)
 
+                # Layer 1: Spread percentile tracking
+                spread_stats = {"spread_percentile_60s": "", "spread_mean_60s": "", "spread_std_60s": ""}
+                spread_f = ffloat(snap.spread)
+                if spread_f is not None and token_id:
+                    spread_tracker_record(str(token_id), ts_int, spread_f)
+                    spread_stats = spread_tracker_stats(str(token_id), spread_f)
+
+                # Layer 2: Inventory tracking
+                inv_fields = {"net_shares_after": "", "avg_cost_after": "", "realized_pnl_cumulative": ""}
+                size_f = ffloat(size)
+                price_f = ffloat(price)
+                if slug and outcome and size_f is not None and price_f is not None and side in ("BUY", "SELL"):
+                    inv_fields = inventory_update(slug, outcome, side, size_f, price_f)
+
                 row = {
                     "timestamp_iso": iso,
                     "timestamp_epoch": str(ts_int),
@@ -1054,6 +1384,12 @@ def main():
                     "crossing_estimate": crossing,
                     "trade_vs_mid": trade_vs_mid,
                     "trade_vs_micro": trade_vs_micro,
+                    "spread_percentile_60s": spread_stats["spread_percentile_60s"],
+                    "spread_mean_60s": spread_stats["spread_mean_60s"],
+                    "spread_std_60s": spread_stats["spread_std_60s"],
+                    "net_shares_after": inv_fields["net_shares_after"],
+                    "avg_cost_after": inv_fields["avg_cost_after"],
+                    "realized_pnl_cumulative": inv_fields["realized_pnl_cumulative"],
                 }
 
                 inserted = db_insert_trade(conn, row)
@@ -1099,6 +1435,10 @@ def main():
                         "crossing": crossing,
                         "spread": snap.spread, "mid": snap.mid,
                         "binance_spot": spot, "hour_open": hour_open,
+                        "spread_pct_60s": spread_stats["spread_percentile_60s"],
+                        "net_shares": inv_fields["net_shares_after"],
+                        "avg_cost": inv_fields["avg_cost_after"],
+                        "realized_pnl": inv_fields["realized_pnl_cumulative"],
                         "raw_activity": {
                             k: v for k, v in t.items()
                             if k in ("token_id", "tokenId", "asset_id", "assetId",
@@ -1115,10 +1455,13 @@ def main():
                                   f"spr={row['spread']} micro={row['microprice']} "
                                   f"imb={row['imbalance_topN']})")
                     bn_tag = f" [{crypto} spot={spot} O={hour_open}]" if crypto else ""
+                    inv_tag = f" inv={inv_fields['net_shares_after']}" if inv_fields["net_shares_after"] else ""
+                    spr_pct_tag = f" sprP={spread_stats['spread_percentile_60s']}%" if spread_stats["spread_percentile_60s"] else ""
                     print(
                         f"  F247{bn_tag}{ob_tag}: {iso} {slug} {outcome} {side} "
                         f"sz={row['size']} px={row['price']} usdc={row['usdcSize']} "
                         f"{crossing} dMid={trade_vs_mid} dMicro={trade_vs_micro}"
+                        f"{spr_pct_tag}{inv_tag}"
                     )
 
             # ---- markout processing ----
@@ -1157,6 +1500,21 @@ def main():
             if now - last_fp >= FINGERPRINT_EVERY_SECONDS:
                 last_fp = now
                 write_fingerprint(conn, FINGERPRINT_CSV, window_sec=60)
+
+            # ---- inventory snapshot ----
+            if now - last_inv >= INVENTORY_EVERY_SECONDS:
+                last_inv = now
+                write_inventory_snapshot(INVENTORY_CSV)
+
+            # ---- markout stats ----
+            if now - last_mk_stats >= MARKOUT_STATS_EVERY_SECONDS:
+                last_mk_stats = now
+                write_markout_stats(conn, MARKOUT_STATS_CSV)
+
+            # ---- behavior summary ----
+            if now - last_behavior >= BEHAVIOR_SUMMARY_EVERY_SECONDS:
+                last_behavior = now
+                print_behavior_summary(conn)
 
             time.sleep(POLL_SECONDS)
 
