@@ -333,10 +333,14 @@ def fetch_orderbook(token_id: str) -> Optional[BookSnap]:
     try:
         r = SESSION.get(CLOB_BOOK, params={"token_id": token_id}, timeout=5)
         if r.status_code != 200:
+            write_jsonl({"event_type": "BOOK_FETCH_RETRY",
+                         "token_id": token_id, "status": r.status_code})
             r = SESSION.get(CLOB_BOOK, params={"asset_id": token_id}, timeout=5)
         r.raise_for_status()
         data = r.json()
         if not isinstance(data, dict):
+            write_jsonl({"event_type": "BOOK_FETCH_BAD_RESPONSE",
+                         "token_id": token_id, "type": str(type(data).__name__)})
             return None
         bids = data.get("bids") or []
         asks = data.get("asks") or []
@@ -511,6 +515,7 @@ def db_init(conn: sqlite3.Connection):
         price TEXT,
         usdcSize TEXT,
         token_id TEXT,
+        erc1155_token_id TEXT,
         order_id TEXT,
         match_id TEXT,
         crypto TEXT,
@@ -565,6 +570,13 @@ def db_init(conn: sqlite3.Connection):
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_time ON trades(timestamp_epoch);")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_markouts_due ON markouts(done, due_epoch);")
+
+    # Migration: add erc1155_token_id column if missing (existing DBs)
+    try:
+        conn.execute("SELECT erc1155_token_id FROM trades LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE trades ADD COLUMN erc1155_token_id TEXT DEFAULT ''")
+
     conn.commit()
 
 
@@ -573,16 +585,16 @@ def db_insert_trade(conn: sqlite3.Connection, row: dict) -> bool:
         conn.execute("""
         INSERT INTO trades (
             txHash, timestamp_epoch, timestamp_iso, slug, title, outcome, side, size, price, usdcSize,
-            token_id, order_id, match_id,
+            token_id, erc1155_token_id, order_id, match_id,
             crypto, binanceSpot, hour_ms, hourOpen, hourClose,
             bestBid, bestAsk, spread, mid, microprice, imbalance_topN, bid_depth_topN, ask_depth_topN,
             bid_depth_total, ask_depth_total, bidsJson, asksJson, bookTs, bookHash,
             crossing_estimate, trade_vs_mid, trade_vs_micro
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             row["txHash"], row["timestamp_epoch"], row["timestamp_iso"], row["slug"], row["title"],
             row["outcome"], row["side"], row["size"], row["price"], row["usdcSize"],
-            row["token_id"], row["order_id"], row["match_id"],
+            row["token_id"], row["erc1155_token_id"], row["order_id"], row["match_id"],
             row["crypto"], row["binanceSpot"], row["hour_ms"], row["hourOpen"], row["hourClose"],
             row["bestBid"], row["bestAsk"], row["spread"], row["mid"], row["microprice"], row["imbalance_topN"],
             row["bid_depth_topN"], row["ask_depth_topN"], row["bid_depth_total"], row["ask_depth_total"],
@@ -881,7 +893,7 @@ def main():
 
     raw_header = [
         "timestamp_iso", "timestamp_epoch", "slug", "title", "outcome", "side",
-        "size", "price", "usdcSize", "txHash", "token_id", "order_id", "match_id",
+        "size", "price", "usdcSize", "txHash", "token_id", "erc1155_token_id", "order_id", "match_id",
         "crypto", "binanceSpot", "hour_ms", "hourOpen", "hourClose",
         "bestBid", "bestAsk", "spread", "mid", "microprice",
         "imbalance_topN", "bid_depth_topN", "ask_depth_topN",
@@ -949,18 +961,22 @@ def main():
                         usdc_size = float(size) * float(price)
                     except Exception:
                         usdc_size = 0
-                token_id = safe_get(t, ["token_id", "tokenId", "asset_id", "assetId"])
+                # Activity API returns the on-chain ERC1155 ID — NOT the CLOB token ID.
+                # We always resolve the CLOB token_id via Gamma (slug+outcome).
+                erc1155_token_id = safe_get(t, ["token_id", "tokenId", "asset_id", "assetId"]) or ""
                 order_id = safe_get(t, ["order_id", "orderId"])
                 match_id = safe_get(t, ["match_id", "matchId", "tradeId", "trade_id"])
 
-                # Resolve token_id via slug+outcome if the Activity API didn't provide it
-                if not token_id and slug and outcome:
+                # Always resolve CLOB token_id via Gamma (slug+outcome)
+                token_id = None
+                if slug and outcome:
                     token_id = resolve_token_id(conn, slug, outcome)
 
                 if not token_id:
                     write_jsonl({"event_type": "TOKEN_ID_MISSING",
                                  "slug": slug, "outcome": outcome,
                                  "title": title, "txHash": tx,
+                                 "erc1155_token_id": str(erc1155_token_id),
                                  "reason": "unresolved_after_all_tiers"})
 
                 crypto = detect_crypto(slug, title)
@@ -976,6 +992,11 @@ def main():
                 snap = fetch_orderbook(str(token_id)) if token_id else None
                 if snap is None:
                     snap = BookSnap()
+                    if token_id:
+                        write_jsonl({"event_type": "BOOK_EMPTY",
+                                     "token_id": str(token_id),
+                                     "slug": slug, "outcome": outcome,
+                                     "txHash": tx})
 
                 # Derived diagnostics
                 crossing = ""
@@ -1008,6 +1029,7 @@ def main():
                     "usdcSize": clean_number(usdc_size),
                     "txHash": tx,
                     "token_id": (str(token_id) if token_id is not None else ""),
+                    "erc1155_token_id": str(erc1155_token_id),
                     "order_id": (str(order_id) if order_id is not None else ""),
                     "match_id": (str(match_id) if match_id is not None else ""),
                     "crypto": crypto,
@@ -1064,7 +1086,7 @@ def main():
                                 "mid_t1": "", "spread_t1": "", "binance_t1": "",
                             })
 
-                    # JSONL event
+                    # JSONL event (enriched + raw Activity fields for debugging)
                     write_jsonl({
                         "event_type": "F247_TRADE",
                         "slug": slug, "crypto": crypto, "outcome": outcome,
@@ -1073,9 +1095,17 @@ def main():
                         "usdc": clean_number(usdc_size),
                         "txHash": tx,
                         "token_id": (str(token_id) if token_id else ""),
+                        "erc1155_token_id": str(erc1155_token_id),
                         "crossing": crossing,
                         "spread": snap.spread, "mid": snap.mid,
                         "binance_spot": spot, "hour_open": hour_open,
+                        "raw_activity": {
+                            k: v for k, v in t.items()
+                            if k in ("token_id", "tokenId", "asset_id", "assetId",
+                                     "conditionId", "marketSlug", "slug", "outcome",
+                                     "side", "size", "price", "usdcSize",
+                                     "transactionHash", "timestamp")
+                        },
                     })
 
                     # Console
