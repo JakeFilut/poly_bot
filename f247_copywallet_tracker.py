@@ -373,8 +373,12 @@ def fetch_orderbook(token_id: str) -> Optional[BookSnap]:
             write_jsonl({"event_type": "BOOK_FETCH_BAD_RESPONSE",
                          "token_id": token_id, "type": str(type(data).__name__)})
             return None
-        bids = data.get("bids") or []
-        asks = data.get("asks") or []
+        raw_bids = data.get("bids") or []
+        raw_asks = data.get("asks") or []
+        # CRITICAL: CLOB API returns unsorted levels — sort properly.
+        # Bids: highest price first (DESC). Asks: lowest price first (ASC).
+        bids = sorted(raw_bids, key=lambda l: float(l.get("price", 0)), reverse=True)
+        asks = sorted(raw_asks, key=lambda l: float(l.get("price", 0)))
         best_bid = str(bids[0]["price"]) if bids else ""
         best_ask = str(asks[0]["price"]) if asks else ""
         bb = ffloat(best_bid)
@@ -655,7 +659,14 @@ def db_init(conn: sqlite3.Connection):
         spread_std_60s TEXT,
         net_shares_after TEXT,
         avg_cost_after TEXT,
-        realized_pnl_cumulative TEXT
+        realized_pnl_cumulative TEXT,
+        trade_id TEXT,
+        market_id TEXT,
+        event_id TEXT,
+        outcome_id TEXT,
+        taker_maker TEXT,
+        fee TEXT,
+        trade_status TEXT
     );
     """)
     conn.execute("""
@@ -717,6 +728,13 @@ def db_init(conn: sqlite3.Connection):
         ("net_shares_after", "TEXT DEFAULT ''"),
         ("avg_cost_after", "TEXT DEFAULT ''"),
         ("realized_pnl_cumulative", "TEXT DEFAULT ''"),
+        ("trade_id", "TEXT DEFAULT ''"),
+        ("market_id", "TEXT DEFAULT ''"),
+        ("event_id", "TEXT DEFAULT ''"),
+        ("outcome_id", "TEXT DEFAULT ''"),
+        ("taker_maker", "TEXT DEFAULT ''"),
+        ("fee", "TEXT DEFAULT ''"),
+        ("trade_status", "TEXT DEFAULT ''"),
     ]
     for col_name, col_type in _migrate_cols:
         try:
@@ -738,8 +756,9 @@ def db_insert_trade(conn: sqlite3.Connection, row: dict) -> bool:
             bid_depth_total, ask_depth_total, bidsJson, asksJson, bookTs, bookHash,
             crossing_estimate, trade_vs_mid, trade_vs_micro, book_suspect,
             spread_percentile_60s, spread_mean_60s, spread_std_60s,
-            net_shares_after, avg_cost_after, realized_pnl_cumulative
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            net_shares_after, avg_cost_after, realized_pnl_cumulative,
+            trade_id, market_id, event_id, outcome_id, taker_maker, fee, trade_status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             row["txHash"], row["timestamp_epoch"], row["timestamp_iso"], row["slug"], row["title"],
             row["outcome"], row["side"], row["size"], row["price"], row["usdcSize"],
@@ -751,6 +770,9 @@ def db_insert_trade(conn: sqlite3.Connection, row: dict) -> bool:
             row["crossing_estimate"], row["trade_vs_mid"], row["trade_vs_micro"], row.get("book_suspect", ""),
             row.get("spread_percentile_60s", ""), row.get("spread_mean_60s", ""), row.get("spread_std_60s", ""),
             row.get("net_shares_after", ""), row.get("avg_cost_after", ""), row.get("realized_pnl_cumulative", ""),
+            row.get("trade_id", ""), row.get("market_id", ""), row.get("event_id", ""),
+            row.get("outcome_id", ""), row.get("taker_maker", ""), row.get("fee", ""),
+            row.get("trade_status", ""),
         ))
         conn.commit()
         return True
@@ -1391,6 +1413,7 @@ def main():
         "crossing_estimate", "trade_vs_mid", "trade_vs_micro", "book_suspect",
         "spread_percentile_60s", "spread_mean_60s", "spread_std_60s",
         "net_shares_after", "avg_cost_after", "realized_pnl_cumulative",
+        "trade_id", "market_id", "event_id", "outcome_id", "taker_maker", "fee", "trade_status",
     ]
     init_csv(RAW_CSV, raw_header)
 
@@ -1412,9 +1435,32 @@ def main():
     print(f"  JSONL: {JSONL_LOG}")
     print()
 
+    # Log orderbook sorting fix
+    write_jsonl({"event_type": "ORDERBOOK_SORTING_FIX_ENABLED", "value": True,
+                 "description": "bids sorted DESC, asks sorted ASC before computing best/spread/depth"})
+    print("  ORDERBOOK_SORTING_FIX_ENABLED=True")
+
     # Probe Binance connectivity
     btc_probe = binance_spot_price("BTC")
     print(f"  Binance probe: BTC/USDT={btc_probe or 'N/A'}")
+
+    # Startup orderbook sanity check: probe up to 3 cached token_ids
+    _sanity_tokens = list(_token_cache.values())[:3]
+    if _sanity_tokens:
+        print("  Orderbook sanity check:")
+        for _st_tid in _sanity_tokens:
+            _st_snap = fetch_orderbook(_st_tid)
+            if _st_snap:
+                print(f"    token={_st_tid[:20]}... bb={_st_snap.best_bid} ba={_st_snap.best_ask} "
+                      f"spr={_st_snap.spread} suspect={_st_snap.suspect or 'no'}")
+                write_jsonl({"event_type": "ORDERBOOK_SANITY_CHECK",
+                             "token_id": _st_tid, "best_bid": _st_snap.best_bid,
+                             "best_ask": _st_snap.best_ask, "spread": _st_snap.spread,
+                             "suspect": _st_snap.suspect})
+            else:
+                print(f"    token={_st_tid[:20]}... FAILED (no data)")
+    else:
+        print("  Orderbook sanity check: no cached tokens yet, will verify on first trade")
     print("  Ctrl+C to stop.\n")
 
     last_backfill = 0.0
@@ -1425,6 +1471,7 @@ def main():
     last_mk_stats = 0.0
     last_behavior = 0.0
     last_coverage = 0.0
+    _activity_fields_warned = False
 
     while not STOP:
         try:
@@ -1461,6 +1508,15 @@ def main():
                 erc1155_token_id = safe_get(t, ["token_id", "tokenId", "asset_id", "assetId"]) or ""
                 order_id = safe_get(t, ["order_id", "orderId"])
                 match_id = safe_get(t, ["match_id", "matchId", "tradeId", "trade_id"])
+
+                # Best-effort extra fields from the activity payload
+                trade_id = safe_get(t, ["id", "trade_id", "tradeId"]) or ""
+                market_id = safe_get(t, ["market", "marketId", "market_id", "conditionId"]) or ""
+                event_id = safe_get(t, ["event", "eventId", "event_id"]) or ""
+                outcome_id = safe_get(t, ["outcomeIndex", "outcome_id", "outcomeId"]) or ""
+                taker_maker = safe_get(t, ["type", "maker_address", "taker", "maker"]) or ""
+                fee_val = safe_get(t, ["fee", "feeAmount", "fees"]) or ""
+                trade_status = safe_get(t, ["status", "settlement", "settled"]) or ""
 
                 # Always resolve CLOB token_id via Gamma (slug+outcome)
                 token_id = None
@@ -1571,6 +1627,13 @@ def main():
                     "net_shares_after": inv_fields["net_shares_after"],
                     "avg_cost_after": inv_fields["avg_cost_after"],
                     "realized_pnl_cumulative": inv_fields["realized_pnl_cumulative"],
+                    "trade_id": str(trade_id),
+                    "market_id": str(market_id),
+                    "event_id": str(event_id),
+                    "outcome_id": str(outcome_id),
+                    "taker_maker": str(taker_maker),
+                    "fee": str(fee_val),
+                    "trade_status": str(trade_status),
                 }
 
                 inserted = db_insert_trade(conn, row)
@@ -1591,14 +1654,21 @@ def main():
                     if snap.best_bid and not snap.suspect:
                         coverage_increment("book_ok")
 
-                    # Schedule markouts (only with non-suspect books)
-                    if token_id and not snap.suspect:
+                    # Schedule markouts for every trade with a resolved token_id
+                    if token_id:
                         db_add_markout_jobs(
                             conn=conn, txHash=tx, token_id=str(token_id),
                             t0_epoch=ts_int, mid_t0=snap.mid,
                             spread_t0=snap.spread, binance_t0=spot,
                         )
                         coverage_increment("markouts_created")
+                        write_jsonl({"event_type": "MARKOUT_JOB_CREATED",
+                                     "txHash": tx,
+                                     "clob_token_id": str(token_id),
+                                     "horizons": MARKOUT_HORIZONS_SEC,
+                                     "mid_t0": snap.mid,
+                                     "spread_t0": snap.spread,
+                                     "book_suspect": snap.suspect})
                         for h in MARKOUT_HORIZONS_SEC:
                             due = ts_int + h
                             markout_id = sha1_short(f"{tx}:{h}")
@@ -1634,9 +1704,29 @@ def main():
                             if k in ("token_id", "tokenId", "asset_id", "assetId",
                                      "conditionId", "marketSlug", "slug", "outcome",
                                      "side", "size", "price", "usdcSize",
-                                     "transactionHash", "timestamp")
+                                     "transactionHash", "timestamp",
+                                     "id", "trade_id", "tradeId",
+                                     "market", "marketId", "market_id",
+                                     "event", "eventId", "event_id",
+                                     "outcomeIndex", "outcome_id", "outcomeId",
+                                     "type", "maker_address", "taker", "maker",
+                                     "fee", "feeAmount", "fees",
+                                     "status", "settlement", "settled")
                         },
                     })
+
+                    # One-time warning about missing activity fields
+                    if not _activity_fields_warned:
+                        _activity_fields_warned = True
+                        _want = {"id": "trade_id", "market": "market_id",
+                                 "event": "event_id", "outcomeIndex": "outcome_id",
+                                 "fee": "fee", "status": "trade_status"}
+                        _missing = [v for k, v in _want.items() if k not in t]
+                        if _missing:
+                            write_jsonl({"event_type": "ACTIVITY_MISSING_FIELDS",
+                                         "missing": _missing,
+                                         "available_keys": sorted(t.keys())})
+                            print(f"  [warn] Activity API missing fields: {_missing}")
 
                     # Console
                     ob_tag = ""
@@ -1680,8 +1770,17 @@ def main():
                 if mid_t0_f is None:
                     # t0 was bad, mark done but don't pollute stats
                     db_set_markout_done(conn, markout_id, "", "", "")
+                    write_jsonl({"event_type": "MARKOUT_DONE",
+                                 "markout_id": markout_id, "horizon_sec": horizon_sec,
+                                 "status": "t0_invalid"})
                     continue
                 db_set_markout_done(conn, markout_id, snap1.mid, snap1.spread, "")
+                write_jsonl({"event_type": "MARKOUT_DONE",
+                             "markout_id": markout_id, "txHash": txHash,
+                             "horizon_sec": horizon_sec,
+                             "mid_t0": mid_t0, "mid_t1": snap1.mid,
+                             "spread_t0": spread_t0, "spread_t1": snap1.spread,
+                             "status": "ok"})
 
             # ---- backfill hourClose ----
             now = time.time()
