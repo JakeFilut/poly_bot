@@ -95,6 +95,7 @@ HTTP_BACKOFF_SEC = 6
 # =======================================================
 POLYMARKET_ACTIVITY = "https://data-api.polymarket.com/activity"
 CLOB_BOOK = "https://clob.polymarket.com/book"
+GAMMA_API_BASE = "https://gamma-api.polymarket.com"
 BINANCE_BASE = "https://data-api.binance.vision"
 BINANCE_SPOT = f"{BINANCE_BASE}/api/v3/ticker/price"
 BINANCE_KLINES = f"{BINANCE_BASE}/api/v3/klines"
@@ -211,6 +212,9 @@ def make_session() -> requests.Session:
 
 SESSION = make_session()
 
+
+# -------------------- Token ID resolver cache --------------------
+_token_cache: Dict[Tuple[str, str], str] = {}   # (slug, outcome) -> token_id
 
 # -------------------- Binance caching --------------------
 _spot_cache: Dict[str, Tuple[float, str]] = {}
@@ -384,6 +388,96 @@ def fetch_orderbook(token_id: str) -> Optional[BookSnap]:
         return None
 
 
+# -------------------- Token ID resolver --------------------
+def _fetch_gamma_slug_tokens(slug: str) -> Dict[str, str]:
+    """Fetch event by slug from Gamma API, return {outcome_label: token_id}."""
+    url = f"{GAMMA_API_BASE}/events/slug/{slug}"
+    try:
+        r = SESSION.get(url, timeout=10)
+        if r.status_code != 200:
+            return {}
+        event = r.json()
+        market_list = event.get("markets", [])
+        if not isinstance(market_list, list) or not market_list:
+            market_list = [event]
+        market = market_list[0]
+
+        outcomes_raw = market.get("outcomes")
+        tokens_raw = market.get("clobTokenIds")
+        outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else (outcomes_raw or [])
+        tokens = json.loads(tokens_raw) if isinstance(tokens_raw, str) else (tokens_raw or [])
+
+        result: Dict[str, str] = {}
+        for i, out in enumerate(outcomes):
+            if i < len(tokens):
+                result[str(out)] = str(tokens[i])
+        return result
+    except Exception:
+        return {}
+
+
+def resolve_token_id(conn: sqlite3.Connection, slug: str, outcome: str) -> Optional[str]:
+    """Resolve token_id for slug+outcome.  3-tier: memory cache → SQLite → Gamma API."""
+    if not slug or not outcome:
+        return None
+
+    key = (slug, outcome)
+
+    # --- tier 1: in-memory cache ---
+    cached = _token_cache.get(key)
+    if cached:
+        return cached
+
+    # --- tier 2: SQLite lookup ---
+    cur = conn.execute(
+        "SELECT token_id FROM slug_tokens WHERE slug = ? AND outcome = ?",
+        (slug, outcome),
+    )
+    row = cur.fetchone()
+    if row:
+        tid = row[0]
+        _token_cache[key] = tid
+        write_jsonl({"event_type": "TOKEN_RESOLVER", "source": "sqlite",
+                     "slug": slug, "outcome": outcome, "token_id": tid})
+        return tid
+
+    # --- tier 3: Gamma API ---
+    write_jsonl({"event_type": "TOKEN_RESOLVER", "source": "gamma_api",
+                 "slug": slug, "outcome": outcome, "status": "fetching"})
+    outcome_map = _fetch_gamma_slug_tokens(slug)
+    if not outcome_map:
+        write_jsonl({"event_type": "TOKEN_ID_MISSING", "slug": slug,
+                     "outcome": outcome, "reason": "gamma_api_empty"})
+        return None
+
+    # Persist ALL outcomes for this slug in one shot
+    now_ts = epoch_sec()
+    for out_label, tid in outcome_map.items():
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO slug_tokens (slug, outcome, token_id, resolved_ts) "
+                "VALUES (?, ?, ?, ?)",
+                (slug, out_label, tid, now_ts),
+            )
+        except Exception:
+            pass
+        _token_cache[(slug, out_label)] = tid
+    conn.commit()
+
+    write_jsonl({"event_type": "TOKEN_RESOLVED_SLUG", "slug": slug,
+                 "outcomes": list(outcome_map.keys()),
+                 "token_count": len(outcome_map)})
+
+    resolved = _token_cache.get(key)
+    if resolved:
+        write_jsonl({"event_type": "TOKEN_ID_FILLED", "slug": slug,
+                     "outcome": outcome, "token_id": resolved})
+    else:
+        write_jsonl({"event_type": "TOKEN_ID_MISSING", "slug": slug,
+                     "outcome": outcome, "reason": "outcome_not_in_gamma"})
+    return resolved
+
+
 # -------------------- SQLite --------------------
 def db_connect(path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(path)
@@ -446,6 +540,15 @@ def db_init(conn: sqlite3.Connection):
         mid_t1 TEXT,
         spread_t1 TEXT,
         binance_t1 TEXT
+    );
+    """)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS slug_tokens (
+        slug TEXT NOT NULL,
+        outcome TEXT NOT NULL,
+        token_id TEXT NOT NULL,
+        resolved_ts INTEGER,
+        PRIMARY KEY (slug, outcome)
     );
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_time ON trades(timestamp_epoch);")
@@ -835,6 +938,10 @@ def main():
                         usdc_size = 0
                 token_id = safe_get(t, ["token_id", "tokenId", "asset_id", "assetId"])
                 order_id = safe_get(t, ["order_id", "orderId"])
+
+                # Resolve token_id via slug+outcome if the Activity API didn't provide it
+                if not token_id and slug and outcome:
+                    token_id = resolve_token_id(conn, slug, outcome)
 
                 crypto = detect_crypto(slug, title)
                 spot = ""
