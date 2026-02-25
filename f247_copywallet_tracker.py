@@ -101,6 +101,7 @@ ORDERBOOK_TOTAL_DEPTH_LEVELS = 25
 # Markouts
 MARKOUT_HORIZONS_SEC = [2, 10, 30, 60]
 MARKOUT_MAX_PER_TICK = 10
+MARKOUT_MAX_AGE_SEC = 300  # Abandon unresolved markouts after 5 minutes
 
 # Backoff
 HTTP_BACKOFF_SEC = 6
@@ -364,10 +365,9 @@ def fetch_orderbook(token_id: str) -> Optional[BookSnap]:
     try:
         r = SESSION.get(CLOB_BOOK, params={"token_id": token_id}, timeout=5)
         if r.status_code != 200:
-            write_jsonl({"event_type": "BOOK_FETCH_RETRY",
+            write_jsonl({"event_type": "BOOK_FETCH_FAIL",
                          "token_id": token_id, "status": r.status_code})
-            r = SESSION.get(CLOB_BOOK, params={"asset_id": token_id}, timeout=5)
-        r.raise_for_status()
+            return None
         data = r.json()
         if not isinstance(data, dict):
             write_jsonl({"event_type": "BOOK_FETCH_BAD_RESPONSE",
@@ -560,7 +560,7 @@ def resolve_token_id(conn: sqlite3.Connection, slug: str, outcome: str) -> Optio
                  "cache_hit": False, "status": "fetching"})
     outcome_map = _fetch_gamma_slug_tokens(slug)
     if not outcome_map:
-        write_jsonl({"event_type": "TOKEN_ID_MISSING", "slug": slug,
+        write_jsonl({"event_type": "TOKEN_RESOLUTION_FAILED", "slug": slug,
                      "outcome": outcome, "reason": "gamma_api_empty"})
         return None
 
@@ -585,7 +585,7 @@ def resolve_token_id(conn: sqlite3.Connection, slug: str, outcome: str) -> Optio
                      "outcome": outcome, "resolved_token_id": resolved,
                      "source": "gamma_api", "cache_hit": False})
     else:
-        write_jsonl({"event_type": "TOKEN_ID_MISSING", "slug": slug,
+        write_jsonl({"event_type": "TOKEN_RESOLUTION_FAILED", "slug": slug,
                      "outcome": outcome, "reason": "outcome_not_in_gamma",
                      "gamma_outcomes": list(outcome_map.keys())})
     return resolved
@@ -623,7 +623,7 @@ def db_init(conn: sqlite3.Connection):
         size TEXT,
         price TEXT,
         usdcSize TEXT,
-        token_id TEXT,
+        clob_token_id TEXT,
         erc1155_token_id TEXT,
         order_id TEXT,
         match_id TEXT,
@@ -662,7 +662,7 @@ def db_init(conn: sqlite3.Connection):
     CREATE TABLE IF NOT EXISTS markouts (
         markout_id TEXT PRIMARY KEY,
         txHash TEXT,
-        token_id TEXT,
+        clob_token_id TEXT,
         t0_epoch INTEGER,
         horizon_sec INTEGER,
         due_epoch INTEGER,
@@ -686,6 +686,26 @@ def db_init(conn: sqlite3.Connection):
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_time ON trades(timestamp_epoch);")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_markouts_due ON markouts(done, due_epoch);")
+
+    # Migrations: rename token_id → clob_token_id in trades table
+    try:
+        conn.execute("SELECT clob_token_id FROM trades LIMIT 1")
+    except sqlite3.OperationalError:
+        try:
+            conn.execute("ALTER TABLE trades RENAME COLUMN token_id TO clob_token_id")
+        except Exception:
+            conn.execute("ALTER TABLE trades ADD COLUMN clob_token_id TEXT DEFAULT ''")
+            conn.execute("UPDATE trades SET clob_token_id = token_id WHERE token_id IS NOT NULL AND token_id != ''")
+
+    # Migrations: rename token_id → clob_token_id in markouts table
+    try:
+        conn.execute("SELECT clob_token_id FROM markouts LIMIT 1")
+    except sqlite3.OperationalError:
+        try:
+            conn.execute("ALTER TABLE markouts RENAME COLUMN token_id TO clob_token_id")
+        except Exception:
+            conn.execute("ALTER TABLE markouts ADD COLUMN clob_token_id TEXT DEFAULT ''")
+            conn.execute("UPDATE markouts SET clob_token_id = token_id WHERE token_id IS NOT NULL AND token_id != ''")
 
     # Migrations: add columns if missing (existing DBs)
     _migrate_cols = [
@@ -712,7 +732,7 @@ def db_insert_trade(conn: sqlite3.Connection, row: dict) -> bool:
         conn.execute("""
         INSERT INTO trades (
             txHash, timestamp_epoch, timestamp_iso, slug, title, outcome, side, size, price, usdcSize,
-            token_id, erc1155_token_id, order_id, match_id,
+            clob_token_id, erc1155_token_id, order_id, match_id,
             crypto, binanceSpot, hour_ms, hourOpen, hourClose,
             bestBid, bestAsk, spread, mid, microprice, imbalance_topN, bid_depth_topN, ask_depth_topN,
             bid_depth_total, ask_depth_total, bidsJson, asksJson, bookTs, bookHash,
@@ -723,7 +743,7 @@ def db_insert_trade(conn: sqlite3.Connection, row: dict) -> bool:
         """, (
             row["txHash"], row["timestamp_epoch"], row["timestamp_iso"], row["slug"], row["title"],
             row["outcome"], row["side"], row["size"], row["price"], row["usdcSize"],
-            row["token_id"], row["erc1155_token_id"], row["order_id"], row["match_id"],
+            row["clob_token_id"], row["erc1155_token_id"], row["order_id"], row["match_id"],
             row["crypto"], row["binanceSpot"], row["hour_ms"], row["hourOpen"], row["hourClose"],
             row["bestBid"], row["bestAsk"], row["spread"], row["mid"], row["microprice"], row["imbalance_topN"],
             row["bid_depth_topN"], row["ask_depth_topN"], row["bid_depth_total"], row["ask_depth_total"],
@@ -781,7 +801,7 @@ def db_add_markout_jobs(conn: sqlite3.Connection, txHash: str, token_id: str, t0
         try:
             conn.execute("""
                 INSERT INTO markouts (
-                    markout_id, txHash, token_id, t0_epoch, horizon_sec, due_epoch,
+                    markout_id, txHash, clob_token_id, t0_epoch, horizon_sec, due_epoch,
                     mid_t0, spread_t0, binance_t0
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (markout_id, txHash, token_id, t0_epoch, h, due, mid_t0, spread_t0, binance_t0))
@@ -792,7 +812,7 @@ def db_add_markout_jobs(conn: sqlite3.Connection, txHash: str, token_id: str, t0
 
 def db_fetch_due_markouts(conn: sqlite3.Connection, now_epoch: int, limit: int) -> List[tuple]:
     cur = conn.execute("""
-        SELECT markout_id, txHash, token_id, t0_epoch, horizon_sec, due_epoch, mid_t0, spread_t0, binance_t0
+        SELECT markout_id, txHash, clob_token_id, t0_epoch, horizon_sec, due_epoch, mid_t0, spread_t0, binance_t0
         FROM markouts
         WHERE done = 0 AND due_epoch <= ?
         ORDER BY due_epoch ASC
@@ -883,7 +903,8 @@ def fetch_new_trades_since(wallet: str, start_ts: int, last_seen_ts: int) -> Tup
 # -------------------- rollups --------------------
 def write_minute_rollup(conn: sqlite3.Connection, path: str, since_epoch: int):
     cur = conn.execute("""
-        SELECT timestamp_epoch, side, price, usdcSize, bestBid, bestAsk, spread, microprice
+        SELECT timestamp_epoch, side, price, usdcSize, bestBid, bestAsk, spread, microprice,
+               clob_token_id, book_suspect
         FROM trades
         WHERE timestamp_epoch >= ?
         ORDER BY timestamp_epoch ASC
@@ -891,12 +912,33 @@ def write_minute_rollup(conn: sqlite3.Connection, path: str, since_epoch: int):
     rows = cur.fetchall()
     if not rows:
         return
+
+    # Build set of txHashes that have markout jobs
+    tx_with_markouts: set = set()
+    cur2 = conn.execute("""
+        SELECT DISTINCT txHash FROM markouts
+        WHERE t0_epoch >= ?
+    """, (since_epoch,))
+    for (txh,) in cur2.fetchall():
+        tx_with_markouts.add(txh)
+
+    # We also need txHash to check markout coverage — re-query with txHash
+    cur3 = conn.execute("""
+        SELECT timestamp_epoch, side, price, usdcSize, bestBid, bestAsk, spread, microprice,
+               clob_token_id, book_suspect, txHash
+        FROM trades
+        WHERE timestamp_epoch >= ?
+        ORDER BY timestamp_epoch ASC
+    """, (since_epoch,))
+    rows = cur3.fetchall()
+
     buckets: Dict[int, dict] = {}
-    for ts, side, px, usdc, bb, ba, sp, micro in rows:
+    for ts, side, px, usdc, bb, ba, sp, micro, ctid, bsuspect, txh in rows:
         m = minute_bucket(int(ts))
         b = buckets.setdefault(m, {
             "trades": 0, "buys": 0, "sells": 0, "usdc_total": 0.0,
-            "spreads": [], "micros": [], "cross": 0, "cross_den": 0
+            "spreads": [], "micros": [], "cross": 0, "cross_den": 0,
+            "with_clob_token": 0, "with_book": 0, "with_markouts": 0,
         })
         b["trades"] += 1
         s = (side or "").upper()
@@ -904,6 +946,13 @@ def write_minute_rollup(conn: sqlite3.Connection, path: str, since_epoch: int):
             b["buys"] += 1
         elif s == "SELL":
             b["sells"] += 1
+        # Coverage columns
+        if ctid not in (None, ""):
+            b["with_clob_token"] += 1
+        if bb not in (None, "") and bsuspect in (None, "", None):
+            b["with_book"] += 1
+        if txh in tx_with_markouts:
+            b["with_markouts"] += 1
         try:
             b["usdc_total"] += float(usdc or 0)
         except Exception:
@@ -931,7 +980,8 @@ def write_minute_rollup(conn: sqlite3.Connection, path: str, since_epoch: int):
         except Exception:
             pass
     header = ["minute_epoch", "minute_iso", "trades", "buys", "sells",
-              "usdc_total", "avg_spread", "avg_microprice", "aggressive_cross_pct"]
+              "usdc_total", "avg_spread", "avg_microprice", "aggressive_cross_pct",
+              "trades_with_clob_token", "trades_with_book", "trades_with_markouts"]
     tmp = path + ".tmp"
     with open(tmp, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
@@ -948,6 +998,7 @@ def write_minute_rollup(conn: sqlite3.Connection, path: str, since_epoch: int):
                 (f"{avg_sp:.6f}" if avg_sp != "" else ""),
                 (f"{avg_micro:.6f}" if avg_micro != "" else ""),
                 (f"{cross_pct:.2f}" if cross_pct != "" else ""),
+                b["with_clob_token"], b["with_book"], b["with_markouts"],
             ])
     os.replace(tmp, path)
 
@@ -1286,6 +1337,35 @@ def print_behavior_summary(conn: sqlite3.Connection):
     )
 
 
+# -------------------- DATA_COVERAGE periodic warning --------------------
+_coverage_counters = {"trades": 0, "clob_resolved": 0, "book_ok": 0, "markouts_created": 0}
+
+
+def coverage_increment(field: str, count: int = 1):
+    """Increment a coverage counter."""
+    _coverage_counters[field] = _coverage_counters.get(field, 0) + count
+
+
+def print_data_coverage():
+    """Print DATA_COVERAGE summary for last period, then reset counters."""
+    c = _coverage_counters
+    msg = (f"  DATA_COVERAGE last60s: trades={c['trades']} "
+           f"clob_resolved={c['clob_resolved']} "
+           f"book_ok={c['book_ok']} "
+           f"markouts_created={c['markouts_created']}")
+    print(msg)
+    write_jsonl({
+        "event_type": "DATA_COVERAGE",
+        "trades": c["trades"],
+        "clob_resolved": c["clob_resolved"],
+        "book_ok": c["book_ok"],
+        "markouts_created": c["markouts_created"],
+    })
+    # Reset
+    for k in _coverage_counters:
+        _coverage_counters[k] = 0
+
+
 # -------------------- main --------------------
 def main():
     conn = db_connect(DB_PATH)
@@ -1302,7 +1382,7 @@ def main():
 
     raw_header = [
         "timestamp_iso", "timestamp_epoch", "slug", "title", "outcome", "side",
-        "size", "price", "usdcSize", "txHash", "token_id", "erc1155_token_id", "order_id", "match_id",
+        "size", "price", "usdcSize", "txHash", "clob_token_id", "erc1155_token_id", "order_id", "match_id",
         "crypto", "binanceSpot", "hour_ms", "hourOpen", "hourClose",
         "bestBid", "bestAsk", "spread", "mid", "microprice",
         "imbalance_topN", "bid_depth_topN", "ask_depth_topN",
@@ -1315,7 +1395,7 @@ def main():
     init_csv(RAW_CSV, raw_header)
 
     mark_header = [
-        "markout_id", "txHash", "token_id", "t0_epoch", "horizon_sec", "due_epoch",
+        "markout_id", "txHash", "clob_token_id", "t0_epoch", "horizon_sec", "due_epoch",
         "mid_t0", "spread_t0", "binance_t0", "mid_t1", "spread_t1", "binance_t1",
     ]
     init_csv(MARKOUTS_CSV, mark_header)
@@ -1344,6 +1424,7 @@ def main():
     last_inv = 0.0
     last_mk_stats = 0.0
     last_behavior = 0.0
+    last_coverage = 0.0
 
     while not STOP:
         try:
@@ -1387,10 +1468,11 @@ def main():
                     token_id = resolve_token_id(conn, slug, outcome)
 
                 if not token_id:
-                    write_jsonl({"event_type": "TOKEN_ID_MISSING",
+                    write_jsonl({"event_type": "TOKEN_RESOLUTION_FAILED",
                                  "slug": slug, "outcome": outcome,
                                  "title": title, "txHash": tx,
                                  "erc1155_token_id": str(erc1155_token_id),
+                                 "source_field_used": "slug+outcome",
                                  "reason": "unresolved_after_all_tiers"})
 
                 crypto = detect_crypto(slug, title)
@@ -1456,7 +1538,7 @@ def main():
                     "price": clean_number(price),
                     "usdcSize": clean_number(usdc_size),
                     "txHash": tx,
-                    "token_id": (str(token_id) if token_id is not None else ""),
+                    "clob_token_id": (str(token_id) if token_id is not None else ""),
                     "erc1155_token_id": str(erc1155_token_id),
                     "order_id": (str(order_id) if order_id is not None else ""),
                     "match_id": (str(match_id) if match_id is not None else ""),
@@ -1502,6 +1584,13 @@ def main():
                     except Exception:
                         pass
 
+                    # DATA_COVERAGE counters
+                    coverage_increment("trades")
+                    if token_id:
+                        coverage_increment("clob_resolved")
+                    if snap.best_bid and not snap.suspect:
+                        coverage_increment("book_ok")
+
                     # Schedule markouts (only with non-suspect books)
                     if token_id and not snap.suspect:
                         db_add_markout_jobs(
@@ -1509,12 +1598,13 @@ def main():
                             t0_epoch=ts_int, mid_t0=snap.mid,
                             spread_t0=snap.spread, binance_t0=spot,
                         )
+                        coverage_increment("markouts_created")
                         for h in MARKOUT_HORIZONS_SEC:
                             due = ts_int + h
                             markout_id = sha1_short(f"{tx}:{h}")
                             append_row_csv(MARKOUTS_CSV, mark_header, {
                                 "markout_id": markout_id, "txHash": tx,
-                                "token_id": str(token_id),
+                                "clob_token_id": str(token_id),
                                 "t0_epoch": str(ts_int), "horizon_sec": str(h),
                                 "due_epoch": str(due), "mid_t0": snap.mid,
                                 "spread_t0": snap.spread, "binance_t0": spot,
@@ -1529,7 +1619,7 @@ def main():
                         "price": clean_number(price),
                         "usdc": clean_number(usdc_size),
                         "txHash": tx,
-                        "token_id": (str(token_id) if token_id else ""),
+                        "clob_token_id": (str(token_id) if token_id else ""),
                         "erc1155_token_id": str(erc1155_token_id),
                         "crossing": crossing,
                         "spread": snap.spread, "mid": snap.mid,
@@ -1566,9 +1656,18 @@ def main():
                     )
 
             # ---- markout processing ----
-            due_jobs = db_fetch_due_markouts(conn, epoch_sec(), MARKOUT_MAX_PER_TICK)
+            now_epoch = epoch_sec()
+            due_jobs = db_fetch_due_markouts(conn, now_epoch, MARKOUT_MAX_PER_TICK)
             for (markout_id, txHash, tok_mk, t0_epoch, horizon_sec,
                  due_epoch, mid_t0, spread_t0, bin_t0) in due_jobs:
+                # Abandon markouts that are too old (stuck retrying)
+                age = now_epoch - int(due_epoch)
+                if age > MARKOUT_MAX_AGE_SEC:
+                    write_jsonl({"event_type": "MARKOUT_ABANDONED",
+                                 "markout_id": markout_id, "txHash": txHash,
+                                 "horizon_sec": horizon_sec, "age_sec": age})
+                    db_set_markout_done(conn, markout_id, "", "", "")
+                    continue
                 snap1 = fetch_orderbook(str(tok_mk))
                 if snap1 is None:
                     snap1 = BookSnap()
@@ -1626,6 +1725,11 @@ def main():
             if now - last_behavior >= BEHAVIOR_SUMMARY_EVERY_SECONDS:
                 last_behavior = now
                 print_behavior_summary(conn)
+
+            # ---- data coverage warning ----
+            if now - last_coverage >= 60:
+                last_coverage = now
+                print_data_coverage()
 
             time.sleep(POLL_SECONDS)
 
