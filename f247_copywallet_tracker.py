@@ -110,6 +110,7 @@ HTTP_BACKOFF_SEC = 6
 # =======================================================
 POLYMARKET_ACTIVITY = "https://data-api.polymarket.com/activity"
 CLOB_BOOK = "https://clob.polymarket.com/book"
+CLOB_PRICE = "https://clob.polymarket.com/price"
 GAMMA_API_BASE = "https://gamma-api.polymarket.com"
 BINANCE_BASE = "https://data-api.binance.vision"
 BINANCE_SPOT = f"{BINANCE_BASE}/api/v3/ticker/price"
@@ -437,6 +438,28 @@ def fetch_orderbook(token_id: str) -> Optional[BookSnap]:
         return snap
     except Exception:
         return None
+
+
+def fetch_clob_midprice(token_id: str) -> Optional[Tuple[str, str]]:
+    """Fallback: use CLOB /price endpoint when /book is suspect.
+    Returns (buy_price, sell_price) or None.
+    The /price endpoint reportedly returns correct live data even when
+    /book serves stale snapshots (Polymarket known issue #180).
+    """
+    if not token_id:
+        return None
+    try:
+        buy_r = SESSION.get(CLOB_PRICE, params={
+            "token_id": token_id, "side": "BUY"}, timeout=5)
+        sell_r = SESSION.get(CLOB_PRICE, params={
+            "token_id": token_id, "side": "SELL"}, timeout=5)
+        if buy_r.status_code == 200 and sell_r.status_code == 200:
+            buy_px = str(buy_r.json().get("price", ""))
+            sell_px = str(sell_r.json().get("price", ""))
+            return (buy_px, sell_px)
+    except Exception:
+        pass
+    return None
 
 
 # -------------------- Token ID resolver --------------------
@@ -1566,7 +1589,8 @@ def main():
     print(f"  Binance probe: BTC/USDT={btc_probe or 'N/A'}")
 
     # Startup orderbook sanity check: probe up to 3 cached token_ids
-    # Also cross-reference against the most recent trade price for each
+    # Cross-reference against the most recent trade price for each.
+    # Uses /price fallback when /book is suspect.
     _sanity_items = list(_token_cache.items())[:6]  # (slug,outcome)->tid
     _sanity_done = set()
     if _sanity_items:
@@ -1581,6 +1605,19 @@ def main():
                 "SELECT price FROM trades WHERE clob_token_id = ? ORDER BY timestamp_epoch DESC LIMIT 1",
                 (_st_tid,)).fetchone()
             _last_px = _last_px_row[0] if _last_px_row else None
+            _fallback_used = False
+            if _st_snap and _st_snap.suspect:
+                # Try /price fallback
+                _pp = fetch_clob_midprice(_st_tid)
+                if _pp:
+                    _bp, _sp = _pp
+                    _bpf, _spf = ffloat(_bp), ffloat(_sp)
+                    if _bpf is not None and _spf is not None and _bpf > 0.02 and _spf < 0.98:
+                        _st_snap = BookSnap(
+                            best_bid=clean_number(_spf), best_ask=clean_number(_bpf),
+                            spread=clean_number(_bpf - _spf),
+                            mid=clean_number((_bpf + _spf) / 2.0), suspect="")
+                        _fallback_used = True
             if _st_snap:
                 _bb_s = ffloat(_st_snap.best_bid)
                 _ba_s = ffloat(_st_snap.best_ask)
@@ -1590,15 +1627,17 @@ def main():
                     _dist_s = min(abs(_px_s - _bb_s), abs(_px_s - _ba_s))
                     if _dist_s > 0.05:
                         _verdict = f"MISMATCH(dist={_dist_s:.3f})"
+                _src_tag = " [/price fallback]" if _fallback_used else ""
                 print(f"    {_s_slug}:{_s_out} tid={_st_tid[:16]}... "
                       f"bb={_st_snap.best_bid} ba={_st_snap.best_ask} spr={_st_snap.spread} "
-                      f"last_px={_last_px or 'N/A'} -> {_verdict}")
+                      f"last_px={_last_px or 'N/A'} -> {_verdict}{_src_tag}")
                 write_jsonl({"event_type": "ORDERBOOK_SANITY_CHECK",
                              "slug": _s_slug, "outcome": _s_out,
                              "token_id": _st_tid, "best_bid": _st_snap.best_bid,
                              "best_ask": _st_snap.best_ask, "spread": _st_snap.spread,
                              "last_trade_price": _last_px or "",
-                             "suspect": _st_snap.suspect, "verdict": _verdict})
+                             "suspect": _st_snap.suspect, "verdict": _verdict,
+                             "price_fallback": _fallback_used})
             else:
                 print(f"    {_s_slug}:{_s_out} tid={_st_tid[:16]}... FAILED (no data)")
     else:
@@ -1646,11 +1685,15 @@ def main():
                         usdc_size = float(size) * float(price)
                     except Exception:
                         usdc_size = 0
-                # Activity API returns the on-chain ERC1155 ID — NOT the CLOB token ID.
-                # We always resolve the CLOB token_id via Gamma (slug+outcome).
-                erc1155_token_id = safe_get(t, ["token_id", "tokenId", "asset_id", "assetId"]) or ""
+                # Activity API returns the CLOB token ID as the "asset" field.
+                # This IS the same value as the clobTokenId from Gamma.
+                # We extract it here for cross-validation against Gamma resolution.
+                asset_token_id = safe_get(t, ["asset", "asset_id", "assetId",
+                                              "token_id", "tokenId"]) or ""
+                erc1155_token_id = str(asset_token_id)
                 order_id = safe_get(t, ["order_id", "orderId"])
                 match_id = safe_get(t, ["match_id", "matchId", "tradeId", "trade_id"])
+                condition_id = safe_get(t, ["conditionId", "condition_id"]) or ""
 
                 # Best-effort extra fields from the activity payload
                 trade_id = safe_get(t, ["id", "trade_id", "tradeId"]) or ""
@@ -1668,16 +1711,51 @@ def main():
                         fee_rate_bps_val = clean_number(_fee_f / _usdc_f * 10000)
                 trade_status = safe_get(t, ["status", "settlement", "settled"]) or ""
 
-                # Always resolve CLOB token_id via Gamma (slug+outcome)
-                token_id = None
+                # Resolve CLOB token_id for this trade.
+                # Priority: activity "asset" field (ground truth from the trade) > Gamma.
+                # The Activity API "asset" field IS the clobTokenId.
+                gamma_token_id = None
                 if slug and outcome:
-                    token_id = resolve_token_id(conn, slug, outcome)
+                    gamma_token_id = resolve_token_id(conn, slug, outcome)
+
+                token_id = None
+                token_source = ""
+                if asset_token_id and len(str(asset_token_id)) > 10:
+                    # Activity API gave us the clobTokenId directly
+                    token_id = str(asset_token_id)
+                    token_source = "activity_asset"
+                    # Cross-validate against Gamma
+                    if gamma_token_id and gamma_token_id != token_id:
+                        write_jsonl({
+                            "event_type": "TOKEN_CROSS_VALIDATION_MISMATCH",
+                            "slug": slug, "outcome": outcome,
+                            "asset_token": token_id,
+                            "gamma_token": gamma_token_id,
+                            "using": "activity_asset",
+                            "txHash": tx,
+                        })
+                        # Also seed Gamma cache with the activity-sourced token
+                        # so future trades for this (slug, outcome) use it
+                        _token_cache[(slug, outcome)] = token_id
+                        try:
+                            conn.execute(
+                                "INSERT OR REPLACE INTO slug_tokens "
+                                "(slug, outcome, token_id, updated_epoch) "
+                                "VALUES (?, ?, ?, ?)",
+                                (slug, outcome, token_id, epoch_sec()))
+                            conn.commit()
+                        except Exception:
+                            pass
+                elif gamma_token_id:
+                    token_id = gamma_token_id
+                    token_source = "gamma"
 
                 if not token_id:
                     write_jsonl({"event_type": "TOKEN_RESOLUTION_FAILED",
                                  "slug": slug, "outcome": outcome,
                                  "title": title, "txHash": tx,
-                                 "erc1155_token_id": str(erc1155_token_id),
+                                 "asset_token_id": str(asset_token_id),
+                                 "condition_id": condition_id,
                                  "source_field_used": "slug+outcome",
                                  "reason": "unresolved_after_all_tiers"})
 
@@ -1700,7 +1778,40 @@ def main():
                                      "slug": slug, "outcome": outcome,
                                      "txHash": tx})
 
-                # BOOK_ID_MISMATCH: verify the book is plausibly for this trade
+                # ---- /price fallback when /book is suspect (known Polymarket issue) ----
+                # The /book endpoint sometimes returns stale snapshots with bb=0.01/ba=0.99
+                # while /price returns the correct live price.
+                if snap.suspect and token_id:
+                    price_pair = fetch_clob_midprice(str(token_id))
+                    if price_pair:
+                        _buy_px, _sell_px = price_pair
+                        _bp = ffloat(_buy_px)
+                        _sp = ffloat(_sell_px)
+                        if _bp is not None and _sp is not None and _bp > 0.02 and _sp < 0.98:
+                            # /price gave us sane data — synthesize a BookSnap
+                            _fbb = _sp  # sell price = best bid
+                            _fba = _bp  # buy price = best ask
+                            _fspread = clean_number(_fba - _fbb)
+                            _fmid = clean_number((_fba + _fbb) / 2.0)
+                            snap = BookSnap(
+                                best_bid=clean_number(_fbb),
+                                best_ask=clean_number(_fba),
+                                spread=_fspread,
+                                mid=_fmid,
+                                microprice=_fmid,
+                                suspect="",
+                            )
+                            write_jsonl({
+                                "event_type": "BOOK_PRICE_FALLBACK_USED",
+                                "token_id": str(token_id),
+                                "slug": slug, "outcome": outcome,
+                                "buy_price": _buy_px, "sell_price": _sell_px,
+                                "synth_bb": snap.best_bid,
+                                "synth_ba": snap.best_ask,
+                                "txHash": tx,
+                            })
+
+                # ---- BOOK_ID_MISMATCH: verify the book is plausibly for this trade ----
                 _px_check = ffloat(price)
                 _bb_check = ffloat(snap.best_bid)
                 _ba_check = ffloat(snap.best_ask)
@@ -1708,6 +1819,13 @@ def main():
                         and not snap.suspect):
                     _dist = min(abs(_px_check - _bb_check), abs(_px_check - _ba_check))
                     if _dist > 0.05:
+                        # Check if the complementary outcome (1-price) would be closer.
+                        # In a binary market, if we accidentally have the "No" token book
+                        # for a "Yes" trade, best_bid ≈ 1-trade_price.
+                        _compl_dist = min(
+                            abs(_px_check - (1.0 - _bb_check)),
+                            abs(_px_check - (1.0 - _ba_check)))
+                        _compl_flag = _compl_dist < 0.05
                         write_jsonl({
                             "event_type": "BOOK_ID_MISMATCH",
                             "slug": slug, "outcome": outcome,
@@ -1715,13 +1833,19 @@ def main():
                             "bestBid": snap.best_bid, "bestAsk": snap.best_ask,
                             "mid": snap.mid,
                             "token_id_used": str(token_id),
-                            "erc1155_token_id": str(erc1155_token_id),
+                            "token_source": token_source,
+                            "asset_token_id": str(asset_token_id),
+                            "gamma_token_id": str(gamma_token_id) if gamma_token_id else "",
+                            "condition_id": condition_id,
                             "txHash": tx,
                             "distance": clean_number(_dist),
+                            "complementary_match": _compl_flag,
+                            "complementary_distance": clean_number(_compl_dist),
                         })
                         print(f"  !! BOOK_ID_MISMATCH slug={slug} out={outcome} "
                               f"px={clean_number(price)} bb={snap.best_bid} ba={snap.best_ask} "
-                              f"dist={_dist:.3f} tid={str(token_id)[:16]}...")
+                              f"dist={_dist:.3f} compl={'YES' if _compl_flag else 'no'} "
+                              f"src={token_source} tid={str(token_id)[:16]}...")
 
                 # Derived diagnostics
                 crossing = ""
@@ -1880,7 +2004,9 @@ def main():
                         "usdc": clean_number(usdc_size),
                         "txHash": tx,
                         "clob_token_id": (str(token_id) if token_id else ""),
-                        "erc1155_token_id": str(erc1155_token_id),
+                        "token_source": token_source,
+                        "asset_token_id": str(asset_token_id),
+                        "condition_id": condition_id,
                         "crossing": crossing,
                         "spread": snap.spread, "mid": snap.mid,
                         "book_suspect": snap.suspect,
@@ -1891,31 +2017,41 @@ def main():
                         "realized_pnl": inv_fields["realized_pnl_cumulative"],
                         "raw_activity": {
                             k: v for k, v in t.items()
-                            if k in ("token_id", "tokenId", "asset_id", "assetId",
-                                     "conditionId", "marketSlug", "slug", "outcome",
+                            if k in ("asset", "token_id", "tokenId", "asset_id", "assetId",
+                                     "conditionId", "condition_id",
+                                     "marketSlug", "slug", "outcome",
                                      "side", "size", "price", "usdcSize",
                                      "transactionHash", "timestamp",
                                      "id", "trade_id", "tradeId",
                                      "market", "marketId", "market_id",
-                                     "event", "eventId", "event_id",
+                                     "event", "eventId", "event_id", "eventSlug",
                                      "outcomeIndex", "outcome_id", "outcomeId",
                                      "type", "maker_address", "taker", "maker",
-                                     "fee", "feeAmount", "fees",
-                                     "status", "settlement", "settled")
+                                     "fee", "feeAmount", "fees", "feeRateBps",
+                                     "status", "settlement", "settled",
+                                     "proxyWallet", "title")
                         },
                     })
 
-                    # One-time warning about missing activity fields
+                    # One-time: dump all activity keys + warn about missing fields
                     if not _activity_fields_warned:
                         _activity_fields_warned = True
-                        _want = {"id": "trade_id", "market": "market_id",
-                                 "event": "event_id", "outcomeIndex": "outcome_id",
-                                 "fee": "fee", "status": "trade_status"}
+                        # Always log available keys for forensics
+                        _all_keys = sorted(t.keys())
+                        write_jsonl({"event_type": "ACTIVITY_SCHEMA_DUMP",
+                                     "available_keys": _all_keys,
+                                     "sample_txHash": tx})
+                        print(f"  [info] Activity API keys: {_all_keys}")
+                        _want = {"id": "trade_id", "asset": "asset_token",
+                                 "conditionId": "condition_id",
+                                 "fee": "fee", "feeRateBps": "fee_rate_bps",
+                                 "outcomeIndex": "outcome_id",
+                                 "status": "trade_status"}
                         _missing = [v for k, v in _want.items() if k not in t]
                         if _missing:
                             write_jsonl({"event_type": "ACTIVITY_MISSING_FIELDS",
                                          "missing": _missing,
-                                         "available_keys": sorted(t.keys())})
+                                         "available_keys": _all_keys})
                             print(f"  [warn] Activity API missing fields: {_missing}")
 
                     # Console
