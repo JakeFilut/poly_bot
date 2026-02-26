@@ -64,6 +64,7 @@ MINUTE_ROLLUP_CSV = os.path.join(LOG_DIR, "f247_copywallet_minute_rollup.csv")
 FINGERPRINT_CSV = os.path.join(LOG_DIR, "f247_copywallet_fingerprint.csv")
 INVENTORY_CSV = os.path.join(LOG_DIR, "f247_copywallet_inventory_snapshot.csv")
 MARKOUT_STATS_CSV = os.path.join(LOG_DIR, "f247_copywallet_markout_stats.csv")
+ENTRY_MODEL_CSV = os.path.join(LOG_DIR, "f247_copywallet_entry_model.csv")
 JSONL_LOG = os.path.join(LOG_DIR, "f247_copywallet_events.jsonl")
 
 POLL_SECONDS = 1.0
@@ -666,7 +667,11 @@ def db_init(conn: sqlite3.Connection):
         outcome_id TEXT,
         taker_maker TEXT,
         fee TEXT,
-        trade_status TEXT
+        fee_rate_bps TEXT,
+        trade_status TEXT,
+        inv_net_shares_before TEXT,
+        inv_avg_cost_before TEXT,
+        time_since_last_trade TEXT
     );
     """)
     conn.execute("""
@@ -683,7 +688,10 @@ def db_init(conn: sqlite3.Connection):
         binance_t0 TEXT,
         mid_t1 TEXT,
         spread_t1 TEXT,
-        binance_t1 TEXT
+        binance_t1 TEXT,
+        trade_price TEXT,
+        side TEXT,
+        markout_pnl_per_share TEXT
     );
     """)
     conn.execute("""
@@ -734,13 +742,29 @@ def db_init(conn: sqlite3.Connection):
         ("outcome_id", "TEXT DEFAULT ''"),
         ("taker_maker", "TEXT DEFAULT ''"),
         ("fee", "TEXT DEFAULT ''"),
+        ("fee_rate_bps", "TEXT DEFAULT ''"),
         ("trade_status", "TEXT DEFAULT ''"),
+        ("inv_net_shares_before", "TEXT DEFAULT ''"),
+        ("inv_avg_cost_before", "TEXT DEFAULT ''"),
+        ("time_since_last_trade", "TEXT DEFAULT ''"),
     ]
     for col_name, col_type in _migrate_cols:
         try:
             conn.execute(f"SELECT {col_name} FROM trades LIMIT 1")
         except sqlite3.OperationalError:
             conn.execute(f"ALTER TABLE trades ADD COLUMN {col_name} {col_type}")
+
+    # Migrations for markouts table: add new columns
+    _markout_migrate = [
+        ("trade_price", "TEXT DEFAULT ''"),
+        ("side", "TEXT DEFAULT ''"),
+        ("markout_pnl_per_share", "TEXT DEFAULT ''"),
+    ]
+    for col_name, col_type in _markout_migrate:
+        try:
+            conn.execute(f"SELECT {col_name} FROM markouts LIMIT 1")
+        except sqlite3.OperationalError:
+            conn.execute(f"ALTER TABLE markouts ADD COLUMN {col_name} {col_type}")
 
     conn.commit()
 
@@ -757,8 +781,9 @@ def db_insert_trade(conn: sqlite3.Connection, row: dict) -> bool:
             crossing_estimate, trade_vs_mid, trade_vs_micro, book_suspect,
             spread_percentile_60s, spread_mean_60s, spread_std_60s,
             net_shares_after, avg_cost_after, realized_pnl_cumulative,
-            trade_id, market_id, event_id, outcome_id, taker_maker, fee, trade_status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            trade_id, market_id, event_id, outcome_id, taker_maker, fee, fee_rate_bps, trade_status,
+            inv_net_shares_before, inv_avg_cost_before, time_since_last_trade
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             row["txHash"], row["timestamp_epoch"], row["timestamp_iso"], row["slug"], row["title"],
             row["outcome"], row["side"], row["size"], row["price"], row["usdcSize"],
@@ -772,7 +797,9 @@ def db_insert_trade(conn: sqlite3.Connection, row: dict) -> bool:
             row.get("net_shares_after", ""), row.get("avg_cost_after", ""), row.get("realized_pnl_cumulative", ""),
             row.get("trade_id", ""), row.get("market_id", ""), row.get("event_id", ""),
             row.get("outcome_id", ""), row.get("taker_maker", ""), row.get("fee", ""),
-            row.get("trade_status", ""),
+            row.get("fee_rate_bps", ""), row.get("trade_status", ""),
+            row.get("inv_net_shares_before", ""), row.get("inv_avg_cost_before", ""),
+            row.get("time_since_last_trade", ""),
         ))
         conn.commit()
         return True
@@ -816,7 +843,8 @@ def db_set_hour_close(conn: sqlite3.Connection, crypto: str, hour_ms: int, close
 
 
 def db_add_markout_jobs(conn: sqlite3.Connection, txHash: str, token_id: str, t0_epoch: int,
-                        mid_t0: str, spread_t0: str, binance_t0: str):
+                        mid_t0: str, spread_t0: str, binance_t0: str,
+                        trade_price: str = "", side: str = ""):
     for h in MARKOUT_HORIZONS_SEC:
         due = t0_epoch + h
         markout_id = sha1_short(f"{txHash}:{h}")
@@ -824,9 +852,10 @@ def db_add_markout_jobs(conn: sqlite3.Connection, txHash: str, token_id: str, t0
             conn.execute("""
                 INSERT INTO markouts (
                     markout_id, txHash, clob_token_id, t0_epoch, horizon_sec, due_epoch,
-                    mid_t0, spread_t0, binance_t0
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (markout_id, txHash, token_id, t0_epoch, h, due, mid_t0, spread_t0, binance_t0))
+                    mid_t0, spread_t0, binance_t0, trade_price, side
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (markout_id, txHash, token_id, t0_epoch, h, due,
+                  mid_t0, spread_t0, binance_t0, trade_price, side))
         except sqlite3.IntegrityError:
             pass
     conn.commit()
@@ -834,7 +863,8 @@ def db_add_markout_jobs(conn: sqlite3.Connection, txHash: str, token_id: str, t0
 
 def db_fetch_due_markouts(conn: sqlite3.Connection, now_epoch: int, limit: int) -> List[tuple]:
     cur = conn.execute("""
-        SELECT markout_id, txHash, clob_token_id, t0_epoch, horizon_sec, due_epoch, mid_t0, spread_t0, binance_t0
+        SELECT markout_id, txHash, clob_token_id, t0_epoch, horizon_sec, due_epoch,
+               mid_t0, spread_t0, binance_t0, trade_price, side
         FROM markouts
         WHERE done = 0 AND due_epoch <= ?
         ORDER BY due_epoch ASC
@@ -843,12 +873,13 @@ def db_fetch_due_markouts(conn: sqlite3.Connection, now_epoch: int, limit: int) 
     return cur.fetchall()
 
 
-def db_set_markout_done(conn: sqlite3.Connection, markout_id: str, mid_t1: str, spread_t1: str, binance_t1: str):
+def db_set_markout_done(conn: sqlite3.Connection, markout_id: str, mid_t1: str, spread_t1: str,
+                        binance_t1: str, markout_pnl_per_share: str = ""):
     conn.execute("""
         UPDATE markouts
-        SET done = 1, mid_t1 = ?, spread_t1 = ?, binance_t1 = ?
+        SET done = 1, mid_t1 = ?, spread_t1 = ?, binance_t1 = ?, markout_pnl_per_share = ?
         WHERE markout_id = ?
-    """, (mid_t1, spread_t1, binance_t1, markout_id))
+    """, (mid_t1, spread_t1, binance_t1, markout_pnl_per_share, markout_id))
     conn.commit()
 
 
@@ -1121,6 +1152,33 @@ def spread_tracker_stats(token_id: str, current_spread: float) -> Dict[str, str]
 
 # -------------------- Layer 2: Inventory Tracking --------------------
 _inventory: Dict[Tuple[str, str], dict] = {}   # (slug, outcome) -> {net_shares, avg_cost, realized_pnl, trade_count}
+_last_trade_ts: Dict[str, int] = {}   # clob_token_id -> epoch_sec of last trade
+
+
+def inventory_get_before(slug: str, outcome: str) -> Dict[str, str]:
+    """Return pre-trade inventory snapshot for wallet_entry_model."""
+    key = (slug, outcome)
+    inv = _inventory.get(key)
+    if inv is None:
+        return {"inv_net_shares_before": "0", "inv_avg_cost_before": "0"}
+    return {
+        "inv_net_shares_before": clean_number(inv["net_shares"]),
+        "inv_avg_cost_before": clean_number(inv["avg_cost"]),
+    }
+
+
+def get_time_since_last_trade(token_id: str, current_ts: int) -> str:
+    """Return seconds since last trade on this token_id, or '' if first trade."""
+    last = _last_trade_ts.get(token_id)
+    if last is None:
+        return ""
+    return str(current_ts - last)
+
+
+def record_trade_ts(token_id: str, ts: int):
+    """Record the timestamp of a trade on a token."""
+    if token_id:
+        _last_trade_ts[token_id] = ts
 
 
 def inventory_update(slug: str, outcome: str, side: str, size_f: float, price_f: float) -> Dict[str, str]:
@@ -1262,6 +1320,67 @@ def write_markout_stats(conn: sqlite3.Connection, path: str):
                 clean_number(s["avg_markout_buy"]) if s["avg_markout_buy"] is not None else "",
                 clean_number(s["avg_markout_sell"]) if s["avg_markout_sell"] is not None else "",
                 edge_decay if h == 10 else "",
+            ])
+    os.replace(tmp, path)
+
+
+# -------------------- wallet_entry_model.csv --------------------
+ENTRY_MODEL_EVERY_SECONDS = 120
+
+_ENTRY_MODEL_HEADER = [
+    "txHash", "timestamp_iso", "slug", "outcome", "side", "size",
+    "trade_price", "bestBid", "bestAsk", "spread", "mid", "microprice",
+    "imbalance_topN", "bid_depth_topN", "ask_depth_topN",
+    "spread_percentile_60s", "spread_mean_60s", "spread_std_60s",
+    "inv_net_shares_before", "inv_avg_cost_before",
+    "time_since_last_trade",
+    "crossing_estimate", "fee_rate_bps",
+    "markout_pnl_2s", "markout_pnl_10s", "markout_pnl_30s", "markout_pnl_60s",
+]
+
+
+def write_wallet_entry_model(conn: sqlite3.Connection, path: str):
+    """Produce wallet_entry_model.csv: one row per trade with all features + markout PnL.
+
+    Joins trades with completed markouts to produce the dataset needed for
+    fitting a statistical entry rule.
+    """
+    cur = conn.execute("""
+        SELECT t.txHash, t.timestamp_iso, t.slug, t.outcome, t.side, t.size,
+               t.price, t.bestBid, t.bestAsk, t.spread, t.mid, t.microprice,
+               t.imbalance_topN, t.bid_depth_topN, t.ask_depth_topN,
+               t.spread_percentile_60s, t.spread_mean_60s, t.spread_std_60s,
+               t.inv_net_shares_before, t.inv_avg_cost_before,
+               t.time_since_last_trade,
+               t.crossing_estimate, t.fee_rate_bps
+        FROM trades t
+        ORDER BY t.timestamp_epoch ASC
+    """)
+    trades = cur.fetchall()
+    if not trades:
+        return
+
+    # Pre-fetch all completed markout PnLs, indexed by (txHash, horizon)
+    mk_cur = conn.execute("""
+        SELECT txHash, horizon_sec, markout_pnl_per_share
+        FROM markouts
+        WHERE done = 1 AND markout_pnl_per_share IS NOT NULL AND markout_pnl_per_share != ''
+    """)
+    mk_map: Dict[Tuple[str, int], str] = {}
+    for mk_tx, mk_h, mk_pnl in mk_cur.fetchall():
+        mk_map[(mk_tx, int(mk_h))] = mk_pnl
+
+    tmp = path + ".tmp"
+    with open(tmp, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(_ENTRY_MODEL_HEADER)
+        for row in trades:
+            tx = row[0]
+            w.writerow(list(row) + [
+                mk_map.get((tx, 2), ""),
+                mk_map.get((tx, 10), ""),
+                mk_map.get((tx, 30), ""),
+                mk_map.get((tx, 60), ""),
             ])
     os.replace(tmp, path)
 
@@ -1413,13 +1532,15 @@ def main():
         "crossing_estimate", "trade_vs_mid", "trade_vs_micro", "book_suspect",
         "spread_percentile_60s", "spread_mean_60s", "spread_std_60s",
         "net_shares_after", "avg_cost_after", "realized_pnl_cumulative",
-        "trade_id", "market_id", "event_id", "outcome_id", "taker_maker", "fee", "trade_status",
+        "trade_id", "market_id", "event_id", "outcome_id", "taker_maker", "fee", "fee_rate_bps", "trade_status",
+        "inv_net_shares_before", "inv_avg_cost_before", "time_since_last_trade",
     ]
     init_csv(RAW_CSV, raw_header)
 
     mark_header = [
         "markout_id", "txHash", "clob_token_id", "t0_epoch", "horizon_sec", "due_epoch",
         "mid_t0", "spread_t0", "binance_t0", "mid_t1", "spread_t1", "binance_t1",
+        "trade_price", "side", "markout_pnl_per_share",
     ]
     init_csv(MARKOUTS_CSV, mark_header)
 
@@ -1445,20 +1566,41 @@ def main():
     print(f"  Binance probe: BTC/USDT={btc_probe or 'N/A'}")
 
     # Startup orderbook sanity check: probe up to 3 cached token_ids
-    _sanity_tokens = list(_token_cache.values())[:3]
-    if _sanity_tokens:
-        print("  Orderbook sanity check:")
-        for _st_tid in _sanity_tokens:
+    # Also cross-reference against the most recent trade price for each
+    _sanity_items = list(_token_cache.items())[:6]  # (slug,outcome)->tid
+    _sanity_done = set()
+    if _sanity_items:
+        print("  Orderbook sanity check (book vs last trade price):")
+        for (_s_slug, _s_out), _st_tid in _sanity_items:
+            if _st_tid in _sanity_done or len(_sanity_done) >= 3:
+                continue
+            _sanity_done.add(_st_tid)
             _st_snap = fetch_orderbook(_st_tid)
+            # Get last known trade price for this token from DB
+            _last_px_row = conn.execute(
+                "SELECT price FROM trades WHERE clob_token_id = ? ORDER BY timestamp_epoch DESC LIMIT 1",
+                (_st_tid,)).fetchone()
+            _last_px = _last_px_row[0] if _last_px_row else None
             if _st_snap:
-                print(f"    token={_st_tid[:20]}... bb={_st_snap.best_bid} ba={_st_snap.best_ask} "
-                      f"spr={_st_snap.spread} suspect={_st_snap.suspect or 'no'}")
+                _bb_s = ffloat(_st_snap.best_bid)
+                _ba_s = ffloat(_st_snap.best_ask)
+                _px_s = ffloat(_last_px)
+                _verdict = "ok"
+                if _px_s is not None and _bb_s is not None and _ba_s is not None:
+                    _dist_s = min(abs(_px_s - _bb_s), abs(_px_s - _ba_s))
+                    if _dist_s > 0.05:
+                        _verdict = f"MISMATCH(dist={_dist_s:.3f})"
+                print(f"    {_s_slug}:{_s_out} tid={_st_tid[:16]}... "
+                      f"bb={_st_snap.best_bid} ba={_st_snap.best_ask} spr={_st_snap.spread} "
+                      f"last_px={_last_px or 'N/A'} -> {_verdict}")
                 write_jsonl({"event_type": "ORDERBOOK_SANITY_CHECK",
+                             "slug": _s_slug, "outcome": _s_out,
                              "token_id": _st_tid, "best_bid": _st_snap.best_bid,
                              "best_ask": _st_snap.best_ask, "spread": _st_snap.spread,
-                             "suspect": _st_snap.suspect})
+                             "last_trade_price": _last_px or "",
+                             "suspect": _st_snap.suspect, "verdict": _verdict})
             else:
-                print(f"    token={_st_tid[:20]}... FAILED (no data)")
+                print(f"    {_s_slug}:{_s_out} tid={_st_tid[:16]}... FAILED (no data)")
     else:
         print("  Orderbook sanity check: no cached tokens yet, will verify on first trade")
     print("  Ctrl+C to stop.\n")
@@ -1471,6 +1613,7 @@ def main():
     last_mk_stats = 0.0
     last_behavior = 0.0
     last_coverage = 0.0
+    last_entry_model = 0.0
     _activity_fields_warned = False
 
     while not STOP:
@@ -1516,6 +1659,13 @@ def main():
                 outcome_id = safe_get(t, ["outcomeIndex", "outcome_id", "outcomeId"]) or ""
                 taker_maker = safe_get(t, ["type", "maker_address", "taker", "maker"]) or ""
                 fee_val = safe_get(t, ["fee", "feeAmount", "fees"]) or ""
+                fee_rate_bps_val = safe_get(t, ["feeRateBps", "fee_rate_bps", "feeRate"]) or ""
+                # Compute fee_rate_bps from fee/usdcSize if not provided directly
+                if not fee_rate_bps_val:
+                    _fee_f = ffloat(fee_val)
+                    _usdc_f = ffloat(usdc_size)
+                    if _fee_f is not None and _usdc_f is not None and _usdc_f > 0:
+                        fee_rate_bps_val = clean_number(_fee_f / _usdc_f * 10000)
                 trade_status = safe_get(t, ["status", "settlement", "settled"]) or ""
 
                 # Always resolve CLOB token_id via Gamma (slug+outcome)
@@ -1550,6 +1700,29 @@ def main():
                                      "slug": slug, "outcome": outcome,
                                      "txHash": tx})
 
+                # BOOK_ID_MISMATCH: verify the book is plausibly for this trade
+                _px_check = ffloat(price)
+                _bb_check = ffloat(snap.best_bid)
+                _ba_check = ffloat(snap.best_ask)
+                if (_px_check is not None and _bb_check is not None and _ba_check is not None
+                        and not snap.suspect):
+                    _dist = min(abs(_px_check - _bb_check), abs(_px_check - _ba_check))
+                    if _dist > 0.05:
+                        write_jsonl({
+                            "event_type": "BOOK_ID_MISMATCH",
+                            "slug": slug, "outcome": outcome,
+                            "trade_price": clean_number(price),
+                            "bestBid": snap.best_bid, "bestAsk": snap.best_ask,
+                            "mid": snap.mid,
+                            "token_id_used": str(token_id),
+                            "erc1155_token_id": str(erc1155_token_id),
+                            "txHash": tx,
+                            "distance": clean_number(_dist),
+                        })
+                        print(f"  !! BOOK_ID_MISMATCH slug={slug} out={outcome} "
+                              f"px={clean_number(price)} bb={snap.best_bid} ba={snap.best_ask} "
+                              f"dist={_dist:.3f} tid={str(token_id)[:16]}...")
+
                 # Derived diagnostics
                 crossing = ""
                 trade_vs_mid = ""
@@ -1576,12 +1749,22 @@ def main():
                     spread_tracker_record(str(token_id), ts_int, spread_f)
                     spread_stats = spread_tracker_stats(str(token_id), spread_f)
 
-                # Layer 2: Inventory tracking
+                # Capture pre-trade state for wallet_entry_model
+                inv_before = inventory_get_before(slug, outcome) if slug and outcome else {
+                    "inv_net_shares_before": "", "inv_avg_cost_before": ""}
+                time_since_last = get_time_since_last_trade(
+                    str(token_id), ts_int) if token_id else ""
+
+                # Layer 2: Inventory tracking (mutates state — must be after inv_before)
                 inv_fields = {"net_shares_after": "", "avg_cost_after": "", "realized_pnl_cumulative": ""}
                 size_f = ffloat(size)
                 price_f = ffloat(price)
                 if slug and outcome and size_f is not None and price_f is not None and side in ("BUY", "SELL"):
                     inv_fields = inventory_update(slug, outcome, side, size_f, price_f)
+
+                # Record trade timestamp (must be after time_since_last capture)
+                if token_id:
+                    record_trade_ts(str(token_id), ts_int)
 
                 row = {
                     "timestamp_iso": iso,
@@ -1633,7 +1816,11 @@ def main():
                     "outcome_id": str(outcome_id),
                     "taker_maker": str(taker_maker),
                     "fee": str(fee_val),
+                    "fee_rate_bps": str(fee_rate_bps_val),
                     "trade_status": str(trade_status),
+                    "inv_net_shares_before": inv_before["inv_net_shares_before"],
+                    "inv_avg_cost_before": inv_before["inv_avg_cost_before"],
+                    "time_since_last_trade": str(time_since_last),
                 }
 
                 inserted = db_insert_trade(conn, row)
@@ -1660,6 +1847,7 @@ def main():
                             conn=conn, txHash=tx, token_id=str(token_id),
                             t0_epoch=ts_int, mid_t0=snap.mid,
                             spread_t0=snap.spread, binance_t0=spot,
+                            trade_price=clean_number(price), side=side,
                         )
                         coverage_increment("markouts_created")
                         write_jsonl({"event_type": "MARKOUT_JOB_CREATED",
@@ -1679,6 +1867,8 @@ def main():
                                 "due_epoch": str(due), "mid_t0": snap.mid,
                                 "spread_t0": snap.spread, "binance_t0": spot,
                                 "mid_t1": "", "spread_t1": "", "binance_t1": "",
+                                "trade_price": clean_number(price), "side": side,
+                                "markout_pnl_per_share": "",
                             })
 
                     # JSONL event (enriched + raw Activity fields for debugging)
@@ -1749,7 +1939,8 @@ def main():
             now_epoch = epoch_sec()
             due_jobs = db_fetch_due_markouts(conn, now_epoch, MARKOUT_MAX_PER_TICK)
             for (markout_id, txHash, tok_mk, t0_epoch, horizon_sec,
-                 due_epoch, mid_t0, spread_t0, bin_t0) in due_jobs:
+                 due_epoch, mid_t0, spread_t0, bin_t0,
+                 mk_trade_price, mk_side) in due_jobs:
                 # Abandon markouts that are too old (stuck retrying)
                 age = now_epoch - int(due_epoch)
                 if age > MARKOUT_MAX_AGE_SEC:
@@ -1774,12 +1965,27 @@ def main():
                                  "markout_id": markout_id, "horizon_sec": horizon_sec,
                                  "status": "t0_invalid"})
                     continue
-                db_set_markout_done(conn, markout_id, snap1.mid, snap1.spread, "")
+                # Direction-aware markout PnL per share
+                # BUY: profit if mid goes up -> (mid_t1 - trade_px)
+                # SELL: profit if mid goes down -> (trade_px - mid_t1)
+                mk_pnl = ""
+                _mk_px_f = ffloat(mk_trade_price)
+                _mk_side = (mk_side or "").upper()
+                if _mk_px_f is not None and mid_t1_f is not None:
+                    if _mk_side == "BUY":
+                        mk_pnl = clean_number(mid_t1_f - _mk_px_f)
+                    elif _mk_side == "SELL":
+                        mk_pnl = clean_number(_mk_px_f - mid_t1_f)
+                db_set_markout_done(conn, markout_id, snap1.mid, snap1.spread, "",
+                                    markout_pnl_per_share=mk_pnl)
                 write_jsonl({"event_type": "MARKOUT_DONE",
                              "markout_id": markout_id, "txHash": txHash,
                              "horizon_sec": horizon_sec,
                              "mid_t0": mid_t0, "mid_t1": snap1.mid,
                              "spread_t0": spread_t0, "spread_t1": snap1.spread,
+                             "trade_price": mk_trade_price or "",
+                             "side": _mk_side,
+                             "markout_pnl_per_share": mk_pnl,
                              "status": "ok"})
 
             # ---- backfill hourClose ----
@@ -1820,6 +2026,11 @@ def main():
                 last_mk_stats = now
                 write_markout_stats(conn, MARKOUT_STATS_CSV)
 
+            # ---- wallet entry model ----
+            if now - last_entry_model >= ENTRY_MODEL_EVERY_SECONDS:
+                last_entry_model = now
+                write_wallet_entry_model(conn, ENTRY_MODEL_CSV)
+
             # ---- behavior summary ----
             if now - last_behavior >= BEHAVIOR_SUMMARY_EVERY_SECONDS:
                 last_behavior = now
@@ -1845,7 +2056,8 @@ def main():
                  "total_usdc": round(total_usdc, 4)})
     try:
         db_export_csv(conn, OUT_CSV)
-        print(f"  [export] final wrote {OUT_CSV}")
+        write_wallet_entry_model(conn, ENTRY_MODEL_CSV)
+        print(f"  [export] final wrote {OUT_CSV} + {ENTRY_MODEL_CSV}")
     finally:
         if _jsonl_fh:
             _jsonl_fh.close()
