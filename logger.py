@@ -40,6 +40,12 @@ class Logger:
         self._api_errors = 0
         self._dry_run_orders = 0
 
+        # Hourly fill tracking
+        self._hourly_buy_fills = 0
+        self._hourly_sell_fills = 0
+        self._hourly_gross_buy_usd = 0.0
+        self._hourly_gross_sell_usd = 0.0
+
     # ------------------------------------------------------------------
     # Core emit
     # ------------------------------------------------------------------
@@ -77,11 +83,26 @@ class Logger:
 
     def fill(self, **kw):
         self._fill_count += 1
+        self._track_hourly_fill(kw)
         self.log("FILL", **kw)
 
     def dry_fill(self, **kw):
         self._fill_count += 1
+        self._track_hourly_fill(kw)
         self.log("DRY_FILL", **kw)
+
+    def _track_hourly_fill(self, kw: dict) -> None:
+        """Accumulate per-hour fill counts and volumes."""
+        side = kw.get("side", "")
+        qty = kw.get("qty", 0) or kw.get("qty_shares", 0)
+        price = kw.get("price", 0)
+        usd = qty * price if qty and price else kw.get("usd", 0)
+        if side == "BUY":
+            self._hourly_buy_fills += 1
+            self._hourly_gross_buy_usd += usd
+        elif side == "SELL":
+            self._hourly_sell_fills += 1
+            self._hourly_gross_sell_usd += usd
 
     def inventory(self, **kw):
         self.log("INVENTORY", **kw)
@@ -148,6 +169,27 @@ class Logger:
         self._api_errors = 0
         self._dry_run_orders = 0
         return True
+
+    # ------------------------------------------------------------------
+    # Hourly PnL
+    # ------------------------------------------------------------------
+    def hourly_pnl(self, **kw) -> None:
+        """Emit an HOURLY_PNL event at each hour boundary."""
+        self.log("HOURLY_PNL", **kw)
+
+    def get_and_reset_hourly_fills(self) -> dict:
+        """Return accumulated hourly fill stats and reset counters."""
+        stats = {
+            "total_buy_fills": self._hourly_buy_fills,
+            "total_sell_fills": self._hourly_sell_fills,
+            "gross_buy_usd": round(self._hourly_gross_buy_usd, 4),
+            "gross_sell_usd": round(self._hourly_gross_sell_usd, 4),
+        }
+        self._hourly_buy_fills = 0
+        self._hourly_sell_fills = 0
+        self._hourly_gross_buy_usd = 0.0
+        self._hourly_gross_sell_usd = 0.0
+        return stats
 
     # ------------------------------------------------------------------
     # Startup dump

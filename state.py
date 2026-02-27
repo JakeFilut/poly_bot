@@ -214,15 +214,21 @@ class StateManager:
         return inv
 
     def apply_sell_fill(self, slug: str, outcome: str, qty: float,
-                        sell_price: float = 0.0) -> InventoryEntry | None:
+                        sell_price: float = 0.0,
+                        fee_bps: float = 0.0) -> InventoryEntry | None:
         key = (slug, outcome)
         inv = self.inventory.get(key)
         if inv is None:
             return None
-        # Compute realized PnL: (sell_price - avg_cost) * qty
+        # Compute realized PnL: (sell_price - avg_cost) * qty minus fees
         if sell_price > 0 and inv.avg_cost > 0:
-            realized = (sell_price - inv.avg_cost) * qty
-            self.realized_pnl += realized
+            raw_realized = (sell_price - inv.avg_cost) * qty
+            if fee_bps > 0:
+                # Deduct round-trip fee: sell-side + proportional buy-side
+                fee_rate = fee_bps / 10_000.0
+                fee = fee_rate * qty * (sell_price + inv.avg_cost)
+                raw_realized -= fee
+            self.realized_pnl += raw_realized
         inv.apply_sell(qty)
         if inv.shares <= 0:
             self._delete_inventory(slug, outcome)

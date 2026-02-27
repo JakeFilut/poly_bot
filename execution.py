@@ -310,6 +310,7 @@ class ExecutionEngine:
             inv = self.state.apply_sell_fill(
                 order.slug, order.outcome, order.size,
                 sell_price=order.price,
+                fee_bps=self.cfg.SIM_FEE_BPS,
             )
             self.log.dry_fill(
                 slug=order.slug, outcome=order.outcome,
@@ -546,7 +547,9 @@ class ExecutionEngine:
                     avg_cost=inv.avg_cost, total_shares=inv.shares,
                 )
             elif side == "SELL":
-                inv = self.state.apply_sell_fill(slug, outcome, qty, sell_price=price)
+                inv = self.state.apply_sell_fill(slug, outcome, qty,
+                                                sell_price=price,
+                                                fee_bps=self.cfg.SIM_FEE_BPS)
                 self.log.fill(
                     order_id=order_id, slug=slug, outcome=outcome,
                     side="SELL", qty=qty, price=price,
