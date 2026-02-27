@@ -95,7 +95,7 @@ class RiskManager:
         )
         self._cooldown_until = time.time() + wait
         self.log.risk(
-            event="error_cooldown_triggered",
+            trigger="error_cooldown_triggered",
             consecutive=self._consecutive_errors,
             cooldown_sec=wait,
         )

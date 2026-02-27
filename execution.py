@@ -253,12 +253,11 @@ class ExecutionEngine:
         elif self.cfg.MODE == "DRY_RUN" and self.cfg.DRY_RUN_FILL_MODE == "none":
             # Log-only: track order but do NOT mutate inventory
             self.log.info(
-                "dry_run_no_fill",
+                "DRY_RUN_FILL_MODE=none; order tracked but no inventory mutation",
                 order_id=order.order_id,
                 slug=action.slug,
                 outcome=action.outcome,
                 side=action.action,
-                msg="DRY_RUN_FILL_MODE=none; order tracked but no inventory mutation",
             )
 
     def _simulate_fill(self, order: OpenOrder, action: TradeAction) -> None:
