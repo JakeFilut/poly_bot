@@ -41,7 +41,7 @@ import signal
 import hashlib
 import statistics
 import requests
-from collections import deque
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional, Dict, Tuple, List, Any
@@ -65,6 +65,7 @@ FINGERPRINT_CSV = os.path.join(LOG_DIR, "f247_copywallet_fingerprint.csv")
 INVENTORY_CSV = os.path.join(LOG_DIR, "f247_copywallet_inventory_snapshot.csv")
 MARKOUT_STATS_CSV = os.path.join(LOG_DIR, "f247_copywallet_markout_stats.csv")
 ENTRY_MODEL_CSV = os.path.join(LOG_DIR, "f247_copywallet_entry_model.csv")
+BOOK_TAPE_CSV = os.path.join(LOG_DIR, "f247_copywallet_book_tape.csv")
 JSONL_LOG = os.path.join(LOG_DIR, "f247_copywallet_events.jsonl")
 
 POLL_SECONDS = 1.0
@@ -89,6 +90,14 @@ SPREAD_WINDOW_SEC = 60
 # Markout stats rolling window
 MARKOUT_STATS_WINDOW = 200
 
+# Polymarket fee schedule (public)
+TAKER_FEE_BPS = 2.0
+MAKER_FEE_BPS = 0.0
+
+# Book tape: continuous 1Hz orderbook recording
+BOOK_TAPE_ENABLED = True
+BOOK_TAPE_MAX_TOKENS = 10
+
 # Binance
 BINANCE_SPOT_TTL_SEC = 1.0
 BINANCE_CLOSE_READY_BUFFER_MS = 5_000
@@ -111,6 +120,7 @@ HTTP_BACKOFF_SEC = 6
 POLYMARKET_ACTIVITY = "https://data-api.polymarket.com/activity"
 CLOB_BOOK = "https://clob.polymarket.com/book"
 CLOB_PRICE = "https://clob.polymarket.com/price"
+CLOB_LIVE_ACTIVITY = "https://clob.polymarket.com/live-activity/events/"
 GAMMA_API_BASE = "https://gamma-api.polymarket.com"
 BINANCE_BASE = "https://data-api.binance.vision"
 BINANCE_SPOT = f"{BINANCE_BASE}/api/v3/ticker/price"
@@ -460,6 +470,127 @@ def fetch_clob_midprice(token_id: str) -> Optional[Tuple[str, str]]:
     except Exception:
         pass
     return None
+
+
+# -------------------- Execution enrichment (taker/maker + fee) --------------------
+def fetch_clob_trade_info(condition_id: str, tx_hash: str = "",
+                          match_id: str = "") -> Optional[dict]:
+    """Query CLOB live-activity endpoint for trade details.
+
+    Returns dict with taker_maker, fee, fee_rate_bps, or None on failure.
+    """
+    if not condition_id:
+        return None
+    try:
+        url = f"{CLOB_LIVE_ACTIVITY}{condition_id}"
+        r = SESSION.get(url, params={"limit": 50}, timeout=10)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        if not isinstance(data, list):
+            return None
+        for event in data:
+            event_tx = (event.get("transactionHash", "")
+                        or event.get("txHash", ""))
+            event_match = (event.get("matchId", "")
+                           or event.get("match_id", ""))
+            if ((tx_hash and event_tx == tx_hash)
+                    or (match_id and event_match == match_id)):
+                tm_raw = (event.get("matchType", "")
+                          or event.get("type", "")
+                          or event.get("tradeType", ""))
+                fee_raw = (event.get("fee", "")
+                           or event.get("feeAmount", ""))
+                fbps_raw = (event.get("feeRateBps", "")
+                            or event.get("fee_rate_bps", ""))
+                return {
+                    "taker_maker": str(tm_raw).upper() if tm_raw else "",
+                    "fee": str(fee_raw) if fee_raw else "",
+                    "fee_rate_bps": str(fbps_raw) if fbps_raw else "",
+                }
+        return None
+    except Exception:
+        return None
+
+
+def infer_execution_fields(side: str, price_f: float,
+                           bb_f: float, ba_f: float,
+                           usdc_f: float) -> dict:
+    """Infer taker/maker + fee from orderbook position.
+
+    Polymarket fee schedule: taker ~2 bps, maker 0 bps.
+    """
+    if side == "BUY":
+        is_taker = price_f >= ba_f - 1e-6
+    elif side == "SELL":
+        is_taker = price_f <= bb_f + 1e-6
+    else:
+        return {"taker_maker": "", "fee": "", "fee_rate_bps": ""}
+    tm = "TAKER" if is_taker else "MAKER"
+    fee_bps = TAKER_FEE_BPS if is_taker else MAKER_FEE_BPS
+    fee_usdc = usdc_f * fee_bps / 10000.0 if usdc_f else 0.0
+    return {
+        "taker_maker": tm,
+        "fee": clean_number(fee_usdc),
+        "fee_rate_bps": clean_number(fee_bps),
+    }
+
+
+# -------------------- Book tape: continuous 1Hz recording --------------------
+_active_tokens: Dict[str, dict] = {}   # token_id -> {slug, outcome, last_trade_ts}
+
+_BOOK_TAPE_HEADER = [
+    "timestamp_iso", "timestamp_epoch", "token_id", "slug", "outcome",
+    "bestBid", "bestAsk", "spread", "mid", "microprice",
+    "imbalance_topN", "bid_depth_topN", "ask_depth_topN",
+    "spread_percentile_60s",
+]
+
+
+def register_active_token(token_id: str, slug: str, outcome: str, ts: int):
+    """Register a token_id for book tape recording."""
+    if not token_id:
+        return
+    _active_tokens[token_id] = {
+        "slug": slug, "outcome": outcome, "last_trade_ts": ts}
+    if len(_active_tokens) > BOOK_TAPE_MAX_TOKENS:
+        oldest = min(_active_tokens,
+                     key=lambda k: _active_tokens[k]["last_trade_ts"])
+        del _active_tokens[oldest]
+
+
+def write_book_tape_tick():
+    """Record one book tape row per active token_id (called every ~1s)."""
+    if not BOOK_TAPE_ENABLED or not _active_tokens:
+        return
+    now_epoch = epoch_sec()
+    now_iso = ts_to_iso(now_epoch)
+    for token_id, info in list(_active_tokens.items()):
+        snap = fetch_orderbook(token_id)
+        if snap is None or snap.suspect:
+            continue
+        spread_f = ffloat(snap.spread)
+        sp_stats: Dict[str, str] = {}
+        if spread_f is not None:
+            spread_tracker_record(token_id, now_epoch, spread_f)
+            sp_stats = spread_tracker_stats(token_id, spread_f)
+        append_row_csv(BOOK_TAPE_CSV, _BOOK_TAPE_HEADER, {
+            "timestamp_iso": now_iso,
+            "timestamp_epoch": str(now_epoch),
+            "token_id": token_id,
+            "slug": info["slug"],
+            "outcome": info["outcome"],
+            "bestBid": snap.best_bid,
+            "bestAsk": snap.best_ask,
+            "spread": snap.spread,
+            "mid": snap.mid,
+            "microprice": snap.microprice,
+            "imbalance_topN": snap.imbalance_topN,
+            "bid_depth_topN": snap.bid_depth_topN,
+            "ask_depth_topN": snap.ask_depth_topN,
+            "spread_percentile_60s": sp_stats.get(
+                "spread_percentile_60s", ""),
+        })
 
 
 # -------------------- Token ID resolver --------------------
@@ -1358,7 +1489,10 @@ _ENTRY_MODEL_HEADER = [
     "inv_net_shares_before", "inv_avg_cost_before",
     "time_since_last_trade",
     "crossing_estimate", "fee_rate_bps",
+    "taker_maker", "fee_usdc",
     "markout_pnl_2s", "markout_pnl_10s", "markout_pnl_30s", "markout_pnl_60s",
+    # Exit modeling columns
+    "time_to_next_sell_sec", "realized_pnl_roundtrip", "inventory_action",
 ]
 
 
@@ -1367,6 +1501,11 @@ def write_wallet_entry_model(conn: sqlite3.Connection, path: str):
 
     Joins trades with completed markouts to produce the dataset needed for
     fitting a statistical entry rule.
+
+    Exit modeling columns:
+      - time_to_next_sell_sec: for BUY rows, seconds until next SELL on same (slug, outcome)
+      - realized_pnl_roundtrip: for SELL rows, FIFO PnL for the shares sold
+      - inventory_action: OPEN (buy), REDUCE (partial sell), CLOSE (full close), FLIP (sell with no inventory)
     """
     cur = conn.execute("""
         SELECT t.txHash, t.timestamp_iso, t.slug, t.outcome, t.side, t.size,
@@ -1375,7 +1514,9 @@ def write_wallet_entry_model(conn: sqlite3.Connection, path: str):
                t.spread_percentile_60s, t.spread_mean_60s, t.spread_std_60s,
                t.inv_net_shares_before, t.inv_avg_cost_before,
                t.time_since_last_trade,
-               t.crossing_estimate, t.fee_rate_bps
+               t.crossing_estimate, t.fee_rate_bps,
+               t.taker_maker, t.fee,
+               t.timestamp_epoch
         FROM trades t
         ORDER BY t.timestamp_epoch ASC
     """)
@@ -1393,17 +1534,88 @@ def write_wallet_entry_model(conn: sqlite3.Connection, path: str):
     for mk_tx, mk_h, mk_pnl in mk_cur.fetchall():
         mk_map[(mk_tx, int(mk_h))] = mk_pnl
 
+    # ---- Exit modeling: group trades by (slug, outcome) ----
+    position_trades: Dict[Tuple[str, str], List[dict]] = defaultdict(list)
+    for i, row in enumerate(trades):
+        slug_r = row[2] or ""
+        outcome_r = row[3] or ""
+        side_r = (row[4] or "").upper()
+        position_trades[(slug_r, outcome_r)].append({
+            "idx": i,
+            "ts": int(row[25] or 0),
+            "side": side_r,
+            "size": ffloat(row[5]) or 0.0,
+            "price": ffloat(row[6]) or 0.0,
+        })
+
+    exit_cols: Dict[int, dict] = {}   # row index -> exit model fields
+    for (_slug_k, _out_k), tlist in position_trades.items():
+        fifo_queue: List[List[float]] = []   # [[remaining_size, buy_price], ...]
+        for ti in tlist:
+            idx = ti["idx"]
+            if ti["side"] == "BUY":
+                # Find time_to_next_sell on same (slug, outcome)
+                time_to_sell = ""
+                for tj in tlist:
+                    if tj["ts"] > ti["ts"] and tj["side"] == "SELL":
+                        time_to_sell = str(tj["ts"] - ti["ts"])
+                        break
+                fifo_queue.append([ti["size"], ti["price"]])
+                exit_cols[idx] = {
+                    "time_to_next_sell_sec": time_to_sell,
+                    "realized_pnl_roundtrip": "",
+                    "inventory_action": "OPEN",
+                }
+            elif ti["side"] == "SELL":
+                total_before = sum(q[0] for q in fifo_queue)
+                sell_size = ti["size"]
+                if total_before <= 1e-9:
+                    action = "FLIP"
+                elif sell_size >= total_before - 1e-9:
+                    action = "CLOSE"
+                else:
+                    action = "REDUCE"
+                # FIFO PnL
+                pnl = 0.0
+                remaining = sell_size
+                while remaining > 1e-9 and fifo_queue:
+                    avail = fifo_queue[0][0]
+                    buy_px = fifo_queue[0][1]
+                    matched = min(remaining, avail)
+                    pnl += matched * (ti["price"] - buy_px)
+                    fifo_queue[0][0] -= matched
+                    remaining -= matched
+                    if fifo_queue[0][0] < 1e-9:
+                        fifo_queue.pop(0)
+                exit_cols[idx] = {
+                    "time_to_next_sell_sec": "",
+                    "realized_pnl_roundtrip": clean_number(pnl) if sell_size > 0 else "",
+                    "inventory_action": action,
+                }
+            else:
+                exit_cols[idx] = {
+                    "time_to_next_sell_sec": "",
+                    "realized_pnl_roundtrip": "",
+                    "inventory_action": "",
+                }
+
     tmp = path + ".tmp"
     with open(tmp, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(_ENTRY_MODEL_HEADER)
-        for row in trades:
+        for i, row in enumerate(trades):
             tx = row[0]
-            w.writerow(list(row) + [
+            # Columns 0-24 are the base query fields (25 = timestamp_epoch, skip)
+            base = list(row[:25])
+            ec = exit_cols.get(i, {})
+            w.writerow(base + [
                 mk_map.get((tx, 2), ""),
                 mk_map.get((tx, 10), ""),
                 mk_map.get((tx, 30), ""),
                 mk_map.get((tx, 60), ""),
+                ec.get("time_to_next_sell_sec", ""),
+                ec.get("realized_pnl_roundtrip", ""),
+                ec.get("inventory_action", ""),
             ])
     os.replace(tmp, path)
 
@@ -1566,6 +1778,7 @@ def main():
         "trade_price", "side", "markout_pnl_per_share",
     ]
     init_csv(MARKOUTS_CSV, mark_header)
+    init_csv(BOOK_TAPE_CSV, _BOOK_TAPE_HEADER)
 
     write_jsonl({"event_type": "TRACKER_START", "wallet": WALLET,
                  "start_ts": start_ts, "start_iso": ts_to_iso(start_ts)})
@@ -1577,7 +1790,26 @@ def main():
     print(f"  DB: {DB_PATH}")
     print(f"  RAW CSV: {RAW_CSV}")
     print(f"  JSONL: {JSONL_LOG}")
+    print(f"  Book tape: {BOOK_TAPE_CSV}")
     print()
+
+    # Log execution enrichment + book tape features
+    write_jsonl({"event_type": "FEATURE_ENABLED",
+                 "feature": "execution_enrichment",
+                 "description": "3-tier taker/maker+fee: activity->CLOB->book_inferred",
+                 "taker_fee_bps": TAKER_FEE_BPS,
+                 "maker_fee_bps": MAKER_FEE_BPS})
+    write_jsonl({"event_type": "FEATURE_ENABLED",
+                 "feature": "book_tape",
+                 "description": "1Hz continuous orderbook recording for active tokens",
+                 "max_tokens": BOOK_TAPE_MAX_TOKENS,
+                 "csv_path": BOOK_TAPE_CSV})
+    write_jsonl({"event_type": "FEATURE_ENABLED",
+                 "feature": "exit_modeling",
+                 "description": "time_to_next_sell, realized_pnl_roundtrip, inventory_action in entry_model.csv"})
+    print("  EXECUTION_ENRICHMENT=True (activity->CLOB->book_inferred)")
+    print("  BOOK_TAPE=True (1Hz, max_tokens=%d)" % BOOK_TAPE_MAX_TOKENS)
+    print("  EXIT_MODELING=True (entry_model.csv: time_to_sell, roundtrip_pnl, inv_action)")
 
     # Log orderbook sorting fix
     write_jsonl({"event_type": "ORDERBOOK_SORTING_FIX_ENABLED", "value": True,
@@ -1866,6 +2098,42 @@ def main():
                 if px is not None and microf is not None:
                     trade_vs_micro = clean_number(px - microf)
 
+                # ---- Execution enrichment: taker/maker + fee fallback ----
+                enrich_source = "activity" if taker_maker else ""
+                if not taker_maker and condition_id:
+                    clob_info = fetch_clob_trade_info(
+                        condition_id, tx_hash=tx,
+                        match_id=str(match_id or ""))
+                    if clob_info and clob_info.get("taker_maker"):
+                        taker_maker = clob_info["taker_maker"]
+                        if not fee_val:
+                            fee_val = clob_info.get("fee", "")
+                        if not fee_rate_bps_val:
+                            fee_rate_bps_val = clob_info.get(
+                                "fee_rate_bps", "")
+                        enrich_source = "clob_live_activity"
+                if not taker_maker:
+                    _usdc_enrich = ffloat(usdc_size)
+                    if (px is not None and bbf is not None
+                            and baf is not None):
+                        inferred = infer_execution_fields(
+                            side, px, bbf, baf,
+                            _usdc_enrich or 0.0)
+                        taker_maker = inferred["taker_maker"]
+                        if not fee_val:
+                            fee_val = inferred["fee"]
+                        if not fee_rate_bps_val:
+                            fee_rate_bps_val = inferred["fee_rate_bps"]
+                        enrich_source = "book_inferred"
+                write_jsonl({
+                    "event_type": "EXECUTION_ENRICH_RESULT",
+                    "txHash": tx,
+                    "taker_maker": str(taker_maker),
+                    "fee": str(fee_val),
+                    "fee_rate_bps": str(fee_rate_bps_val),
+                    "source": enrich_source,
+                })
+
                 # Layer 1: Spread percentile tracking (skip suspect books)
                 spread_stats = {"spread_percentile_60s": "", "spread_mean_60s": "", "spread_std_60s": ""}
                 spread_f = ffloat(snap.spread)
@@ -1889,6 +2157,8 @@ def main():
                 # Record trade timestamp (must be after time_since_last capture)
                 if token_id:
                     record_trade_ts(str(token_id), ts_int)
+                    # Register for book tape continuous recording
+                    register_active_token(str(token_id), slug, outcome, ts_int)
 
                 row = {
                     "timestamp_iso": iso,
@@ -2176,6 +2446,9 @@ def main():
             if now - last_coverage >= 60:
                 last_coverage = now
                 print_data_coverage()
+
+            # ---- book tape: continuous 1Hz recording ----
+            write_book_tape_tick()
 
             time.sleep(POLL_SECONDS)
 
