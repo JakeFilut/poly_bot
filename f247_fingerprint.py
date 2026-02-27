@@ -27,6 +27,7 @@ import csv
 import io
 import json
 import math
+import os
 import sys
 from collections import Counter, defaultdict
 from typing import Any, Dict, List, TextIO, Tuple
@@ -560,8 +561,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--csv",
-        default="f247_fingerprint.csv",
-        help="Output CSV path (default: f247_fingerprint.csv)",
+        default="/home/ubuntu/github/logs/poly_bot/f247_fingerprint.csv",
+        help="Output CSV path (default: /home/ubuntu/github/logs/poly_bot/f247_fingerprint.csv)",
     )
     args = parser.parse_args()
 
@@ -584,6 +585,7 @@ def main() -> None:
     top_slugs = compute_top_slugs(records)
 
     # Output
+    os.makedirs(os.path.dirname(args.csv), exist_ok=True)
     write_csv(args.csv, cadence, cross_rate, direction_ret, clip_dist, top_slugs)
     print_summary(cadence, cross_rate, direction_ret, clip_dist, top_slugs,
                   total_records=len(records))
