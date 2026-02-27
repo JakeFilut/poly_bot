@@ -6,6 +6,7 @@ Keeps up to MAX_ACTIVE_SLUGS tracked, preferring liquid + actively traded ones.
 """
 from __future__ import annotations
 
+import json
 import re
 import time
 from dataclasses import dataclass, field
@@ -14,6 +15,20 @@ from typing import Dict, List, Optional, Tuple
 from config import Config
 from logger import Logger
 from polymarket_api import PolymarketAPI
+
+# Asset ticker → lowercase names used in questions/slugs
+_ASSET_NAMES: Dict[str, List[str]] = {
+    "BTC": ["bitcoin", "btc"],
+    "ETH": ["ethereum", "eth"],
+    "SOL": ["solana", "sol"],
+    "XRP": ["xrp", "ripple"],
+}
+
+# Pre-compiled pattern: matches "up or down", "up-or-down", "up/down", "updown"
+_UP_DOWN_RE = re.compile(
+    r"up[\s_/-]*(?:or[\s_/-]+)?down|updown",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -32,6 +47,8 @@ class TokenPair:
 
 class MarketUniverse:
     """Discovers and ranks slugs for trading."""
+
+    CRYPTO_TAG_ID = 21  # Polymarket tag_id for Crypto
 
     def __init__(self, cfg: Config, api: PolymarketAPI, logger: Logger):
         self.cfg = cfg
@@ -52,27 +69,66 @@ class MarketUniverse:
     def refresh(self) -> int:
         """Refresh universe from Gamma API.  Returns count of active pairs.
 
-        Stability rules:
-          - If an asset fetch fails, keep existing pairs for that asset
-            (don't drop slugs due to transient API errors).
-          - Only remove slugs that are genuinely absent from a successful fetch.
-          - Preserve slugs we hold inventory on, even if they fall out of top N.
+        Fetches all active crypto markets once (tag_id=21), then filters
+        client-side per asset for "up or down" patterns.
+        If the fetch fails, the current universe is preserved.
         """
         discovered: List[TokenPair] = []
-        failed_assets: set = set()
 
-        for asset in self.cfg.ASSETS:
-            try:
-                markets = self.api.get_markets(asset)
-                pairs = self._parse_markets(asset, markets)
+        try:
+            raw_markets = self.api.get_markets(tag_id=self.CRYPTO_TAG_ID)
+
+            # --- DEBUG: log request details ---
+            self.log.info(
+                "universe_debug_fetch",
+                url=f"{self.cfg.GAMMA_API_URL}/markets",
+                params={
+                    "tag_id": self.CRYPTO_TAG_ID,
+                    "closed": "false",
+                    "active": "true",
+                    "limit": 200,
+                    "order": "volume24hr",
+                    "ascending": "false",
+                },
+                http_status=200,
+                raw_count=len(raw_markets),
+            )
+
+            # --- DEBUG: sample titles/slugs and schema ---
+            if raw_markets:
+                self.log.info(
+                    "universe_debug_samples",
+                    sample_titles=[
+                        (m.get("question", "") or m.get("title", ""))[:80]
+                        for m in raw_markets[:10]
+                    ],
+                    sample_slugs=[
+                        m.get("slug", "")[:60] for m in raw_markets[:10]
+                    ],
+                )
+                first = raw_markets[0]
+                self.log.info(
+                    "universe_debug_schema",
+                    first_obj_keys=sorted(first.keys())[:20],
+                    has_tokens="tokens" in first,
+                    has_clobTokenIds="clobTokenIds" in first,
+                    has_outcomes="outcomes" in first,
+                    clobTokenIds_type=type(first.get("clobTokenIds")).__name__,
+                    outcomes_type=type(first.get("outcomes")).__name__,
+                )
+            else:
+                self.log.warn(
+                    "universe_debug_empty_response",
+                )
+
+            # --- Filter per asset ---
+            for asset in self.cfg.ASSETS:
+                pairs = self._parse_markets(asset, raw_markets)
                 discovered.extend(pairs)
-            except Exception as e:
-                self.log.api_error(fn="universe_refresh", asset=asset, error=str(e))
-                failed_assets.add(asset)
 
-        # If ALL fetches failed, keep current universe entirely
-        if len(failed_assets) == len(self.cfg.ASSETS):
-            self.log.warn("universe_refresh_all_failed; keeping current universe")
+        except Exception as e:
+            self.log.api_error(fn="universe_refresh", error=str(e))
+            self.log.warn("universe_refresh_failed; keeping current universe")
             self._last_refresh = time.time()
             return len(self.pairs)
 
@@ -88,13 +144,6 @@ class MarketUniverse:
             new_lookup[pair.up_token_id] = (pair.slug, "Up")
             new_lookup[pair.down_token_id] = (pair.slug, "Down")
 
-        # Preserve existing pairs for assets whose fetch failed
-        for slug, existing_pair in self.pairs.items():
-            if existing_pair.asset in failed_assets and slug not in new_pairs:
-                new_pairs[slug] = existing_pair
-                new_lookup[existing_pair.up_token_id] = (slug, "Up")
-                new_lookup[existing_pair.down_token_id] = (slug, "Down")
-
         added = set(new_pairs) - set(self.pairs)
         removed = set(self.pairs) - set(new_pairs)
 
@@ -108,40 +157,67 @@ class MarketUniverse:
             active=len(self.pairs),
             added=len(added),
             removed=len(removed),
-            failed_assets=list(failed_assets) if failed_assets else None,
             assets={a: sum(1 for p in self.pairs.values() if p.asset == a)
                     for a in self.cfg.ASSETS},
         )
         return len(self.pairs)
 
     def _parse_markets(self, asset: str, markets: list) -> List[TokenPair]:
-        """Parse Gamma API response into TokenPair objects."""
+        """Parse Gamma API response into TokenPair objects for a given asset."""
         pairs = []
+        n_total = len(markets)
+        n_up_down = 0
+        n_accepting = 0
+        n_has_tokens = 0
+
         for m in markets:
-            # Accept various response formats
             slug = m.get("slug", "") or m.get("question_id", "") or ""
-            condition_id = m.get("condition_id", "") or m.get("conditionId", "") or ""
+            condition_id = (m.get("condition_id", "") or
+                           m.get("conditionId", "") or "")
 
-            # Look for "Up or Down" in title/question
-            title = (m.get("question", "") or m.get("title", "")).lower()
-            if not self._is_up_down_market(title, asset):
+            # --- Filter 1: "Up or Down" match (check question AND slug) ---
+            question = m.get("question", "") or m.get("title", "") or ""
+            if not self._is_up_down_market(question, slug, asset):
                 continue
+            n_up_down += 1
 
-            # Extract token IDs for Up and Down outcomes
+            # --- Filter 2: tradability ---
+            accepting = m.get("acceptingOrders", True)
+            enable_ob = m.get("enableOrderBook", True)
+            if not accepting or not enable_ob:
+                continue
+            n_accepting += 1
+
+            # --- Extract token IDs ---
             tokens = m.get("tokens", [])
-            if not tokens and m.get("clobTokenIds"):
-                # Alternative format
-                clob_ids = m.get("clobTokenIds", [])
-                outcomes = m.get("outcomes", [])
+
+            # Gamma API returns clobTokenIds and outcomes as stringified JSON
+            if not tokens:
+                clob_ids = _parse_stringified(m.get("clobTokenIds", []))
+                outcomes = _parse_stringified(m.get("outcomes", []))
+
                 if len(clob_ids) >= 2 and len(outcomes) >= 2:
                     tokens = [
                         {"token_id": clob_ids[i], "outcome": outcomes[i]}
-                        for i in range(len(clob_ids))
+                        for i in range(min(len(clob_ids), len(outcomes)))
                     ]
 
             up_id, down_id = self._extract_outcome_tokens(tokens)
             if not up_id or not down_id:
+                # DEBUG: log why token extraction failed
+                if n_up_down <= 3:  # only log first few to avoid spam
+                    self.log.info(
+                        "universe_debug_token_fail",
+                        asset=asset,
+                        slug=slug[:60],
+                        raw_clobTokenIds_type=type(
+                            m.get("clobTokenIds")).__name__,
+                        raw_outcomes_type=type(m.get("outcomes")).__name__,
+                        tokens_len=len(tokens),
+                        sample_token=tokens[0] if tokens else None,
+                    )
                 continue
+            n_has_tokens += 1
 
             volume = float(m.get("volume", 0) or m.get("volume24hr", 0) or 0)
 
@@ -151,30 +227,34 @@ class MarketUniverse:
                 condition_id=condition_id,
                 up_token_id=up_id,
                 down_token_id=down_id,
-                description=m.get("question", ""),
+                description=question,
                 volume_24h=volume,
             ))
+
+        # --- DEBUG: per-asset filter funnel ---
+        self.log.info(
+            "universe_debug_filter",
+            asset=asset,
+            total_markets=n_total,
+            after_up_down_match=n_up_down,
+            after_accepting_orders=n_accepting,
+            after_has_token_ids=n_has_tokens,
+            final_pairs=len(pairs),
+            sample_slugs=[p.slug[:60] for p in pairs[:5]],
+        )
         return pairs
 
-    def _is_up_down_market(self, title: str, asset: str) -> bool:
-        """Check if market title matches 'X up or down' pattern."""
-        asset_lower = asset.lower()
-        # Match patterns like "Will Bitcoin go up or down", "BTC up or down", etc.
-        patterns = [
-            rf"{asset_lower}.*(?:up|down)",
-            rf"(?:bitcoin|ethereum|solana|xrp|ripple).*(?:up|down)",
-        ]
-        asset_names = {
-            "BTC": "bitcoin", "ETH": "ethereum",
-            "SOL": "solana", "XRP": "xrp",
-        }
-        full_name = asset_names.get(asset, asset_lower)
-        patterns.append(rf"{full_name}.*(?:up|down)")
+    def _is_up_down_market(self, question: str, slug: str, asset: str) -> bool:
+        """Check if market question or slug matches 'X up or down' for asset."""
+        names = _ASSET_NAMES.get(asset, [asset.lower()])
+        text = f"{question} {slug}".lower()
 
-        for pattern in patterns:
-            if re.search(pattern, title):
-                return True
-        return False
+        # Must contain an up-or-down pattern
+        if not _UP_DOWN_RE.search(text):
+            return False
+
+        # Must reference the specific asset
+        return any(name in text for name in names)
 
     def _extract_outcome_tokens(self, tokens: list) -> Tuple[str, str]:
         """Extract (up_token_id, down_token_id) from token list."""
@@ -182,7 +262,7 @@ class MarketUniverse:
         down_id = ""
         for t in tokens:
             outcome = (t.get("outcome", "") or "").lower()
-            token_id = t.get("token_id", "") or t.get("tokenId", "") or ""
+            token_id = (t.get("token_id", "") or t.get("tokenId", "") or "")
             if not token_id:
                 continue
             if outcome in ("up", "yes"):
@@ -215,3 +295,20 @@ class MarketUniverse:
     def asset_for_slug(self, slug: str) -> str | None:
         pair = self.pairs.get(slug)
         return pair.asset if pair else None
+
+
+# ------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------
+def _parse_stringified(value) -> list:
+    """Parse a value that may be a stringified JSON list or already a list."""
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, list):
+                return parsed
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return []

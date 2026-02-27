@@ -97,13 +97,19 @@ class PolymarketAPI:
     # ------------------------------------------------------------------
     # Market data (works in both modes)
     # ------------------------------------------------------------------
-    def get_markets(self, asset: str, active_only: bool = True) -> List[dict]:
-        """Fetch markets for a crypto asset from Gamma API."""
+    def get_markets(self, tag_id: int = 21, active_only: bool = True) -> List[dict]:
+        """Fetch markets from Gamma API by tag_id (default 21 = Crypto)."""
         retry = _retry(self.cfg.RETRY_MAX, self.cfg.RETRY_BACKOFF_BASE, self.log)
 
         @retry
         def _fetch():
-            params = {"tag": asset, "closed": "false", "limit": 100}
+            params = {
+                "tag_id": tag_id,
+                "closed": "false",
+                "limit": 200,
+                "order": "volume24hr",
+                "ascending": "false",
+            }
             if active_only:
                 params["active"] = "true"
             resp = requests.get(
