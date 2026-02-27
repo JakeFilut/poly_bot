@@ -12,6 +12,7 @@ Responsibilities:
 """
 from __future__ import annotations
 
+import random
 import time
 import uuid
 from collections import deque
@@ -19,7 +20,7 @@ from typing import Deque, Dict, List, Optional, Tuple
 
 from config import Config
 from logger import Logger
-from polymarket_api import PolymarketAPI
+from polymarket_api import BookSnapshot, PolymarketAPI
 from state import OpenOrder, StateManager
 from strategy import TradeAction
 
@@ -46,6 +47,12 @@ class ExecutionEngine:
 
         # Fills cursor for incremental polling
         self._last_fill_ts: float = time.time() - 300  # start 5 min ago
+
+        # Features engine reference (set externally after construction)
+        self._features = None  # type: Optional[object]
+
+        # Self-test: force-fill counter (decremented on each forced fill)
+        self._selftest_remaining: int = 0
 
     # ------------------------------------------------------------------
     # Main entry point: process a batch of actions
@@ -248,47 +255,198 @@ class ExecutionEngine:
         )
 
         # In DRY_RUN, respect fill mode setting
-        if self.cfg.MODE == "DRY_RUN" and self.cfg.DRY_RUN_FILL_MODE == "instant":
-            self._simulate_fill(order, action)
-        elif self.cfg.MODE == "DRY_RUN" and self.cfg.DRY_RUN_FILL_MODE == "none":
-            # Log-only: track order but do NOT mutate inventory
-            self.log.info(
-                "DRY_RUN_FILL_MODE=none; order tracked but no inventory mutation",
-                order_id=order.order_id,
-                slug=action.slug,
-                outcome=action.outcome,
-                side=action.action,
-            )
+        if self.cfg.MODE == "DRY_RUN":
+            if self.cfg.DRY_RUN_FILL_MODE == "instant":
+                self._simulate_fill(order, reason="instant_fill",
+                                    fill_mode="instant")
+            elif self.cfg.DRY_RUN_FILL_MODE == "probabilistic":
+                if self._selftest_remaining > 0:
+                    self._simulate_fill(order, reason="selftest_forced",
+                                        fill_mode="selftest")
+                    self._selftest_remaining -= 1
+                else:
+                    self._try_probabilistic_fill_at_placement(order)
+            elif self.cfg.DRY_RUN_FILL_MODE == "none":
+                # Log-only: track order but do NOT mutate inventory
+                self.log.info(
+                    "DRY_RUN_FILL_MODE=none; order tracked but no inventory mutation",
+                    order_id=order.order_id,
+                    slug=action.slug,
+                    outcome=action.outcome,
+                    side=action.action,
+                )
 
-    def _simulate_fill(self, order: OpenOrder, action: TradeAction) -> None:
-        """In DRY_RUN mode, immediately simulate a fill."""
-        if action.action == "BUY":
+    # ------------------------------------------------------------------
+    # DRY_RUN fill simulation
+    # ------------------------------------------------------------------
+    def _simulate_fill(self, order: OpenOrder, reason: str = "simulated",
+                       fill_mode: str = "instant") -> None:
+        """Simulate a fill in DRY_RUN mode.
+
+        Calls the SAME state pipeline as real fills:
+          - state.apply_buy_fill / apply_sell_fill  (inventory + SQLite)
+          - state.remove_order                       (open orders cleanup)
+          - per-token cooldown update
+        Emits a DRY_FILL log event with all required fields.
+        """
+        usd = round(order.size * order.price, 4)
+
+        if order.side == "BUY":
             inv = self.state.apply_buy_fill(
                 slug=order.slug, outcome=order.outcome,
                 token_id=order.token_id,
                 qty=order.size, price=order.price,
             )
-            self.log.fill(
-                order_id=order.order_id, slug=order.slug,
-                outcome=order.outcome, side="BUY",
-                qty=order.size, price=order.price,
+            self.log.dry_fill(
+                slug=order.slug, outcome=order.outcome,
+                token_id=order.token_id, side="BUY",
+                price=order.price, qty_shares=order.size, usd=usd,
+                reason=reason, fill_mode=fill_mode,
+                order_id=order.order_id,
                 avg_cost=inv.avg_cost if inv else 0,
                 total_shares=inv.shares if inv else 0,
-                simulated=True,
             )
-        elif action.action == "SELL":
-            inv = self.state.apply_sell_fill(order.slug, order.outcome, order.size,
-                                             sell_price=order.price)
-            self.log.fill(
-                order_id=order.order_id, slug=order.slug,
-                outcome=order.outcome, side="SELL",
-                qty=order.size, price=order.price,
+        elif order.side == "SELL":
+            inv = self.state.apply_sell_fill(
+                order.slug, order.outcome, order.size,
+                sell_price=order.price,
+            )
+            self.log.dry_fill(
+                slug=order.slug, outcome=order.outcome,
+                token_id=order.token_id, side="SELL",
+                price=order.price, qty_shares=order.size, usd=usd,
+                reason=reason, fill_mode=fill_mode,
+                order_id=order.order_id,
                 remaining_shares=inv.shares if inv else 0,
-                simulated=True,
+                realized_pnl=round(self.state.realized_pnl, 4),
             )
+
         # Record fill timestamp for per-token cooldown
         self._last_fill_by_token[(order.slug, order.outcome)] = time.time()
         self.state.remove_order(order.order_id)
+
+    # ------------------------------------------------------------------
+    # Probabilistic fill logic
+    # ------------------------------------------------------------------
+    def _try_probabilistic_fill_at_placement(self, order: OpenOrder) -> None:
+        """At placement time, fill crossing orders with high probability."""
+        book = self._get_book_for_order(order)
+        if book is None:
+            return
+
+        is_crossing = False
+        if order.side == "BUY" and order.price >= book.best_ask:
+            is_crossing = True
+        elif order.side == "SELL" and order.price <= book.best_bid:
+            is_crossing = True
+
+        if is_crossing:
+            prob = self._compute_fill_probability(order, book)
+            if random.random() < prob:
+                self._simulate_fill(order, reason="crossing_spread",
+                                    fill_mode="probabilistic")
+
+    def _check_probabilistic_fills(self) -> int:
+        """Check all pending DRY_RUN orders for probabilistic fills.
+
+        Called each tick from sync_fills().  Passive orders get a low but
+        non-zero chance each tick; crossing orders that survived placement
+        get a high chance.
+        """
+        count = 0
+        for order_id in list(self.state.open_orders.keys()):
+            order = self.state.open_orders.get(order_id)
+            if order is None:
+                continue
+
+            # Self-test: force-fill unconditionally
+            if self._selftest_remaining > 0:
+                self._simulate_fill(order, reason="selftest_forced",
+                                    fill_mode="selftest")
+                self._selftest_remaining -= 1
+                count += 1
+                continue
+
+            book = self._get_book_for_order(order)
+            if book is None:
+                continue
+
+            prob = self._compute_fill_probability(order, book)
+            if random.random() < prob:
+                reason = "passive_filled"
+                if order.side == "BUY" and order.price >= book.best_ask:
+                    reason = "crossing_spread"
+                elif order.side == "SELL" and order.price <= book.best_bid:
+                    reason = "crossing_spread"
+                self._simulate_fill(order, reason=reason,
+                                    fill_mode="probabilistic")
+                count += 1
+
+        return count
+
+    def _get_book_for_order(self, order: OpenOrder) -> Optional[BookSnapshot]:
+        """Get order book snapshot for an order's token.
+
+        Uses the features-engine cache (sub-second freshness) when available,
+        otherwise falls back to a direct API fetch.
+        """
+        if self._features is not None:
+            book = self._features._book_cache.get(order.token_id)
+            if book is not None:
+                return book
+        return self.api.get_orderbook(order.token_id)
+
+    def _compute_fill_probability(self, order: OpenOrder,
+                                  book: BookSnapshot) -> float:
+        """Per-tick fill probability based on order vs. book.
+
+        Crossing orders  (BUY >= best_ask, SELL <= best_bid):  0.85 – 0.95
+        Passive at touch (BUY ≈ best_bid, SELL ≈ best_ask):   0.05 – 0.25
+          - tighter spread  → higher prob
+          - imbalance favoring fill → higher prob
+        Deep passive     (away from touch):                    0.02
+        """
+        spread = book.spread
+
+        if order.side == "BUY":
+            if order.price >= book.best_ask:
+                # Crossing the spread — very high fill probability
+                return 0.90
+            elif abs(order.price - book.best_bid) < 0.005:
+                # At or near top-of-book bid — passive fill
+                base = 0.10
+                if spread <= 0.01:
+                    base = 0.20
+                elif spread <= 0.02:
+                    base = 0.14
+                # Imbalance: more ask-side size means sellers willing to cross
+                if book.bid_size > 0 and book.ask_size > 0:
+                    imbalance = book.ask_size / (book.bid_size + book.ask_size)
+                    base *= (0.5 + imbalance)
+                return min(base, 0.25)
+            else:
+                return 0.02
+
+        elif order.side == "SELL":
+            if order.price <= book.best_bid:
+                # Crossing — very high fill probability
+                return 0.90
+            elif abs(order.price - book.best_ask) < 0.005:
+                # At or near top-of-book ask — passive fill
+                base = 0.10
+                if spread <= 0.01:
+                    base = 0.20
+                elif spread <= 0.02:
+                    base = 0.14
+                # Imbalance: more bid-side size means buyers willing to cross
+                if book.bid_size > 0 and book.ask_size > 0:
+                    imbalance = book.bid_size / (book.bid_size + book.ask_size)
+                    base *= (0.5 + imbalance)
+                return min(base, 0.25)
+            else:
+                return 0.02
+
+        return 0.0
 
     # ------------------------------------------------------------------
     # Cancel expired orders
@@ -354,7 +512,9 @@ class ExecutionEngine:
     def sync_fills(self) -> int:
         """Poll for new fills and update inventory.  Returns fill count."""
         if self.cfg.MODE == "DRY_RUN":
-            return 0  # fills are simulated immediately
+            if self.cfg.DRY_RUN_FILL_MODE == "probabilistic":
+                return self._check_probabilistic_fills()
+            return 0  # instant fills handled at placement; none = no fills
 
         fills = self.api.get_fills(since_ts=self._last_fill_ts)
         count = 0
