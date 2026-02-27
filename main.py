@@ -69,6 +69,17 @@ class Bot:
         self.strategy = Strategy(self.cfg, self.state, self.log)
         self.execution = ExecutionEngine(self.cfg, self.pm_api, self.state, self.log)
 
+        # Wire features cache into execution for probabilistic book lookups
+        self.execution._features = self.features
+
+        # Self-test mode: force-fill the next N orders
+        if self.cfg.DRY_RUN_SELFTEST:
+            self.execution._selftest_remaining = self.cfg.DRY_RUN_SELFTEST_N
+            self.log.info(
+                "selftest_enabled",
+                force_fill_count=self.cfg.DRY_RUN_SELFTEST_N,
+            )
+
         # -- Shutdown flag --
         self._running = True
         self._last_state_flush = time.monotonic()

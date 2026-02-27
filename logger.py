@@ -79,6 +79,10 @@ class Logger:
         self._fill_count += 1
         self.log("FILL", **kw)
 
+    def dry_fill(self, **kw):
+        self._fill_count += 1
+        self.log("DRY_FILL", **kw)
+
     def inventory(self, **kw):
         self.log("INVENTORY", **kw)
 
