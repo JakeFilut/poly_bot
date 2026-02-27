@@ -46,6 +46,10 @@ class Logger:
         self._hourly_gross_buy_usd = 0.0
         self._hourly_gross_sell_usd = 0.0
 
+        # Rollup-period fill tracking (reset each rollup)
+        self._rollup_buy_fills = 0
+        self._rollup_sell_fills = 0
+
     # ------------------------------------------------------------------
     # Core emit
     # ------------------------------------------------------------------
@@ -92,7 +96,7 @@ class Logger:
         self.log("DRY_FILL", **kw)
 
     def _track_hourly_fill(self, kw: dict) -> None:
-        """Accumulate per-hour fill counts and volumes."""
+        """Accumulate per-hour and per-rollup fill counts and volumes."""
         side = kw.get("side", "")
         qty = kw.get("qty", 0) or kw.get("qty_shares", 0)
         price = kw.get("price", 0)
@@ -100,9 +104,11 @@ class Logger:
         if side == "BUY":
             self._hourly_buy_fills += 1
             self._hourly_gross_buy_usd += usd
+            self._rollup_buy_fills += 1
         elif side == "SELL":
             self._hourly_sell_fills += 1
             self._hourly_gross_sell_usd += usd
+            self._rollup_sell_fills += 1
 
     def inventory(self, **kw):
         self.log("INVENTORY", **kw)
@@ -132,7 +138,8 @@ class Logger:
     # ------------------------------------------------------------------
     def maybe_rollup(self, inventory_snapshot: dict | None = None,
                      unrealized_usd: float = 0.0,
-                     realized_usd: float = 0.0) -> bool:
+                     realized_usd: float = 0.0,
+                     mark_details: list[dict] | None = None) -> bool:
         """Emit a periodic rollup if interval has elapsed.  Returns True if emitted."""
         now = time.monotonic()
         if now - self._last_rollup_ts < self._rollup_sec:
@@ -143,6 +150,8 @@ class Logger:
             "period_sec": round(elapsed, 1),
             "buys": self._buy_count,
             "sells": self._sell_count,
+            "buy_fills": self._rollup_buy_fills,
+            "sell_fills": self._rollup_sell_fills,
             "skips": self._skip_count,
             "cancels": self._cancel_count,
             "fills": self._fill_count,
@@ -159,6 +168,8 @@ class Logger:
                 reverse=True,
             )[:5]
             payload["top_positions"] = {k: v for k, v in sorted_inv}
+        if mark_details:
+            payload["mark_details"] = mark_details
         self.log("ROLLUP", **payload)
         # Reset accumulators
         self._buy_count = 0
@@ -168,6 +179,8 @@ class Logger:
         self._fill_count = 0
         self._api_errors = 0
         self._dry_run_orders = 0
+        self._rollup_buy_fills = 0
+        self._rollup_sell_fills = 0
         return True
 
     # ------------------------------------------------------------------
