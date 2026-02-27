@@ -1,20 +1,10 @@
-# Polymarket Trader - Python dependencies
+# F247-style Polymarket Scalper - Dependencies
 
-# Polymarket CLOB SDK (includes web3)
+# Polymarket CLOB SDK (order signing, placement)
 py-clob-client>=0.4.0
 
-# HTTP requests
+# HTTP requests (Gamma API, Binance API, CLOB REST)
 requests>=2.31.0
-httpx>=0.24.0
 
-# CLI dependency required by httpx
-click>=8.1.0
-
-# Environment variables
+# Environment variables (optional: load .env file)
 python-dotenv>=1.0.0
-
-# Web3 for on-chain operations (balance, allowances, redemption)
-web3>=6.0.0
-
-# Timezone handling (hourly bot slug building)
-pytz>=2024.1
