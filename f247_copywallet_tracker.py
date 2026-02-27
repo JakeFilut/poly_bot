@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-F247 Copy-Wallet Trade Tracker (Start-From-Now + MAX FORENSICS)
-================================================================
+F247 Copy-Wallet Trade Tracker (Start-From-Now + MAX FORENSICS v2)
+===================================================================
 Standalone script: watches the F247 wallet on Polymarket, logs every
 new trade with full orderbook + Binance enrichment.
 
@@ -19,13 +19,27 @@ Key behaviors
   - Markouts: +2 / +10 / +30 / +60 seconds (mid/spread + optional spot)
   - Rollups: per-minute (buys/sells/usdc/spread/crossing%), 60s fingerprint
 
+MAX FORENSICS v2 additions (42 new columns per trade):
+  A) Velocity features: spread/imbalance/mid/binance deltas from 1Hz tapes
+  B) Execution style: aggressiveness classification + edge metrics
+  C) Roundtrip PnL: FIFO lot matching with holding time
+  D) Trade clustering: burstiness signals (counts, USDC in last 10s/60s)
+  E) Market selection: cross-market spread/imbalance ranks
+  F) Latency: API-to-local delay + book/binance data freshness
+
 Outputs (all inside LOG_DIR):
-  f247_copywallet_trades.db       SQLite source of truth
-  f247_copywallet_fills_raw.csv   append-only raw fills
-  f247_copywallet_fills_enriched.csv  periodic full snapshot from DB
-  f247_copywallet_markouts.csv    append-only markout registry
-  f247_copywallet_minute_rollup.csv   periodic snapshot
-  f247_copywallet_fingerprint.csv     append-only
+  f247_copywallet_trades.db              SQLite source of truth
+  f247_copywallet_fills_raw.csv          append-only raw fills (96 columns)
+  f247_copywallet_fills_enriched.csv     periodic full snapshot from DB
+  f247_copywallet_markouts.csv           append-only markout registry
+  f247_copywallet_markout_stats.csv      periodic markout stats
+  f247_copywallet_minute_rollup.csv      periodic snapshot
+  f247_copywallet_fingerprint.csv        append-only
+  f247_copywallet_inventory_snapshot.csv periodic inventory state
+  f247_copywallet_book_tape.csv          1Hz orderbook tape (append-only)
+  f247_copywallet_binance_tape.csv       1Hz Binance spot tape (append-only)
+  f247_copywallet_realized_pnl_summary.csv  periodic FIFO PnL summary
+  f247_copywallet_events.jsonl           append-only event log
 
 Run:
   python f247_copywallet_tracker.py
@@ -66,6 +80,8 @@ INVENTORY_CSV = os.path.join(LOG_DIR, "f247_copywallet_inventory_snapshot.csv")
 MARKOUT_STATS_CSV = os.path.join(LOG_DIR, "f247_copywallet_markout_stats.csv")
 ENTRY_MODEL_CSV = os.path.join(LOG_DIR, "f247_copywallet_entry_model.csv")
 BOOK_TAPE_CSV = os.path.join(LOG_DIR, "f247_copywallet_book_tape.csv")
+BINANCE_TAPE_CSV = os.path.join(LOG_DIR, "f247_copywallet_binance_tape.csv")
+REALIZED_PNL_SUMMARY_CSV = os.path.join(LOG_DIR, "f247_copywallet_realized_pnl_summary.csv")
 JSONL_LOG = os.path.join(LOG_DIR, "f247_copywallet_events.jsonl")
 
 POLL_SECONDS = 1.0
@@ -97,6 +113,15 @@ MAKER_FEE_BPS = 0.0
 # Book tape: continuous 1Hz orderbook recording
 BOOK_TAPE_ENABLED = True
 BOOK_TAPE_MAX_TOKENS = 10
+BOOK_TAPE_MEMORY_SEC = 120  # In-memory tape window for velocity lookups
+
+# Binance tape: 1Hz spot recording for velocity
+BINANCE_TAPE_MEMORY_SEC = 120  # In-memory tape window
+
+# Write cadences for new v2 features
+LATENCY_ROLLUP_EVERY_SECONDS = 60
+REALIZED_PNL_SUMMARY_EVERY_SECONDS = 120
+MARKET_RANK_EVERY_SECONDS = 10
 
 # Binance
 BINANCE_SPOT_TTL_SEC = 1.0
@@ -544,6 +569,9 @@ _BOOK_TAPE_HEADER = [
     "bestBid", "bestAsk", "spread", "mid", "microprice",
     "imbalance_topN", "bid_depth_topN", "ask_depth_topN",
     "spread_percentile_60s",
+    # v2 additions
+    "bid_depth_total", "ask_depth_total",
+    "tape_ts_epoch", "tape_source",
 ]
 
 
@@ -560,7 +588,9 @@ def register_active_token(token_id: str, slug: str, outcome: str, ts: int):
 
 
 def write_book_tape_tick():
-    """Record one book tape row per active token_id (called every ~1s)."""
+    """Record one book tape row per active token_id (called every ~1s).
+    Also stores in-memory for velocity feature lookups.
+    """
     if not BOOK_TAPE_ENABLED or not _active_tokens:
         return
     now_epoch = epoch_sec()
@@ -570,10 +600,15 @@ def write_book_tape_tick():
         if snap is None or snap.suspect:
             continue
         spread_f = ffloat(snap.spread)
+        imb_f = ffloat(snap.imbalance_topN)
+        mid_f = ffloat(snap.mid)
+        micro_f = ffloat(snap.microprice)
         sp_stats: Dict[str, str] = {}
         if spread_f is not None:
             spread_tracker_record(token_id, now_epoch, spread_f)
             sp_stats = spread_tracker_stats(token_id, spread_f)
+        # Store in-memory for velocity lookups
+        book_tape_mem_record(token_id, now_epoch, spread_f, imb_f, mid_f, micro_f)
         append_row_csv(BOOK_TAPE_CSV, _BOOK_TAPE_HEADER, {
             "timestamp_iso": now_iso,
             "timestamp_epoch": str(now_epoch),
@@ -590,6 +625,10 @@ def write_book_tape_tick():
             "ask_depth_topN": snap.ask_depth_topN,
             "spread_percentile_60s": sp_stats.get(
                 "spread_percentile_60s", ""),
+            "bid_depth_total": snap.bid_depth_total,
+            "ask_depth_total": snap.ask_depth_total,
+            "tape_ts_epoch": str(now_epoch),
+            "tape_source": "CLOB_BOOK",
         })
 
 
@@ -901,6 +940,55 @@ def db_init(conn: sqlite3.Connection):
         ("inv_net_shares_before", "TEXT DEFAULT ''"),
         ("inv_avg_cost_before", "TEXT DEFAULT ''"),
         ("time_since_last_trade", "TEXT DEFAULT ''"),
+        # === MAX FORENSICS v2 columns ===
+        # A) Velocity features
+        ("spread_prev_1s", "TEXT DEFAULT ''"),
+        ("spread_prev_5s_avg", "TEXT DEFAULT ''"),
+        ("spread_change_1s", "TEXT DEFAULT ''"),
+        ("spread_change_5s", "TEXT DEFAULT ''"),
+        ("imb_prev_1s", "TEXT DEFAULT ''"),
+        ("imb_prev_5s_avg", "TEXT DEFAULT ''"),
+        ("imb_change_1s", "TEXT DEFAULT ''"),
+        ("imb_change_5s", "TEXT DEFAULT ''"),
+        ("mid_prev_1s", "TEXT DEFAULT ''"),
+        ("mid_prev_5s_avg", "TEXT DEFAULT ''"),
+        ("mid_change_1s", "TEXT DEFAULT ''"),
+        ("mid_change_5s", "TEXT DEFAULT ''"),
+        ("mid_change_10s", "TEXT DEFAULT ''"),
+        ("micro_prev_1s", "TEXT DEFAULT ''"),
+        ("micro_change_1s", "TEXT DEFAULT ''"),
+        ("time_since_spread_p90", "TEXT DEFAULT ''"),
+        ("binance_prev_1s", "TEXT DEFAULT ''"),
+        ("binance_change_1s", "TEXT DEFAULT ''"),
+        ("binance_prev_5s", "TEXT DEFAULT ''"),
+        ("binance_change_5s", "TEXT DEFAULT ''"),
+        ("binance_prev_10s", "TEXT DEFAULT ''"),
+        ("binance_change_10s", "TEXT DEFAULT ''"),
+        # B) Execution style / aggressiveness
+        ("aggressiveness", "TEXT DEFAULT ''"),
+        ("edge_to_micro", "TEXT DEFAULT ''"),
+        ("edge_to_mid", "TEXT DEFAULT ''"),
+        ("spread_paid_est", "TEXT DEFAULT ''"),
+        ("queue_position_proxy", "TEXT DEFAULT ''"),
+        # C) Roundtrip PnL (FIFO)
+        ("realized_pnl_usdc", "TEXT DEFAULT ''"),
+        ("holding_time_sec_wavg", "TEXT DEFAULT ''"),
+        ("avg_entry_price_matched", "TEXT DEFAULT ''"),
+        # D) Trade clustering
+        ("trades_last_10s", "TEXT DEFAULT ''"),
+        ("trades_last_60s", "TEXT DEFAULT ''"),
+        ("buys_last_60s", "TEXT DEFAULT ''"),
+        ("sells_last_60s", "TEXT DEFAULT ''"),
+        ("usdc_last_60s", "TEXT DEFAULT ''"),
+        # E) Market selection
+        ("spread_rank_at_trade", "TEXT DEFAULT ''"),
+        ("imbalance_rank_at_trade", "TEXT DEFAULT ''"),
+        ("spread_percentile_60s_at_trade", "TEXT DEFAULT ''"),
+        # F) Latency
+        ("local_received_ms", "TEXT DEFAULT ''"),
+        ("api_to_local_delay_ms", "TEXT DEFAULT ''"),
+        ("book_age_ms_at_trade", "TEXT DEFAULT ''"),
+        ("binance_age_ms_at_trade", "TEXT DEFAULT ''"),
     ]
     for col_name, col_type in _migrate_cols:
         try:
@@ -923,38 +1011,39 @@ def db_init(conn: sqlite3.Connection):
     conn.commit()
 
 
+_TRADE_INSERT_COLS = [
+    "txHash", "timestamp_epoch", "timestamp_iso", "slug", "title", "outcome", "side", "size", "price", "usdcSize",
+    "clob_token_id", "erc1155_token_id", "order_id", "match_id",
+    "crypto", "binanceSpot", "hour_ms", "hourOpen", "hourClose",
+    "bestBid", "bestAsk", "spread", "mid", "microprice", "imbalance_topN", "bid_depth_topN", "ask_depth_topN",
+    "bid_depth_total", "ask_depth_total", "bidsJson", "asksJson", "bookTs", "bookHash",
+    "crossing_estimate", "trade_vs_mid", "trade_vs_micro", "book_suspect",
+    "spread_percentile_60s", "spread_mean_60s", "spread_std_60s",
+    "net_shares_after", "avg_cost_after", "realized_pnl_cumulative",
+    "trade_id", "market_id", "event_id", "outcome_id", "taker_maker", "fee", "fee_rate_bps", "trade_status",
+    "inv_net_shares_before", "inv_avg_cost_before", "time_since_last_trade",
+    # v2 columns
+    "spread_prev_1s", "spread_prev_5s_avg", "spread_change_1s", "spread_change_5s",
+    "imb_prev_1s", "imb_prev_5s_avg", "imb_change_1s", "imb_change_5s",
+    "mid_prev_1s", "mid_prev_5s_avg", "mid_change_1s", "mid_change_5s", "mid_change_10s",
+    "micro_prev_1s", "micro_change_1s",
+    "time_since_spread_p90",
+    "binance_prev_1s", "binance_change_1s", "binance_prev_5s", "binance_change_5s",
+    "binance_prev_10s", "binance_change_10s",
+    "aggressiveness", "edge_to_micro", "edge_to_mid", "spread_paid_est", "queue_position_proxy",
+    "realized_pnl_usdc", "holding_time_sec_wavg", "avg_entry_price_matched",
+    "trades_last_10s", "trades_last_60s", "buys_last_60s", "sells_last_60s", "usdc_last_60s",
+    "spread_rank_at_trade", "imbalance_rank_at_trade", "spread_percentile_60s_at_trade",
+    "local_received_ms", "api_to_local_delay_ms", "book_age_ms_at_trade", "binance_age_ms_at_trade",
+]
+
+
 def db_insert_trade(conn: sqlite3.Connection, row: dict) -> bool:
+    cols_str = ", ".join(_TRADE_INSERT_COLS)
+    placeholders = ", ".join(["?"] * len(_TRADE_INSERT_COLS))
+    vals = tuple(row.get(c, "") for c in _TRADE_INSERT_COLS)
     try:
-        conn.execute("""
-        INSERT INTO trades (
-            txHash, timestamp_epoch, timestamp_iso, slug, title, outcome, side, size, price, usdcSize,
-            clob_token_id, erc1155_token_id, order_id, match_id,
-            crypto, binanceSpot, hour_ms, hourOpen, hourClose,
-            bestBid, bestAsk, spread, mid, microprice, imbalance_topN, bid_depth_topN, ask_depth_topN,
-            bid_depth_total, ask_depth_total, bidsJson, asksJson, bookTs, bookHash,
-            crossing_estimate, trade_vs_mid, trade_vs_micro, book_suspect,
-            spread_percentile_60s, spread_mean_60s, spread_std_60s,
-            net_shares_after, avg_cost_after, realized_pnl_cumulative,
-            trade_id, market_id, event_id, outcome_id, taker_maker, fee, fee_rate_bps, trade_status,
-            inv_net_shares_before, inv_avg_cost_before, time_since_last_trade
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            row["txHash"], row["timestamp_epoch"], row["timestamp_iso"], row["slug"], row["title"],
-            row["outcome"], row["side"], row["size"], row["price"], row["usdcSize"],
-            row["clob_token_id"], row["erc1155_token_id"], row["order_id"], row["match_id"],
-            row["crypto"], row["binanceSpot"], row["hour_ms"], row["hourOpen"], row["hourClose"],
-            row["bestBid"], row["bestAsk"], row["spread"], row["mid"], row["microprice"], row["imbalance_topN"],
-            row["bid_depth_topN"], row["ask_depth_topN"], row["bid_depth_total"], row["ask_depth_total"],
-            row["bidsJson"], row["asksJson"], row["bookTs"], row["bookHash"],
-            row["crossing_estimate"], row["trade_vs_mid"], row["trade_vs_micro"], row.get("book_suspect", ""),
-            row.get("spread_percentile_60s", ""), row.get("spread_mean_60s", ""), row.get("spread_std_60s", ""),
-            row.get("net_shares_after", ""), row.get("avg_cost_after", ""), row.get("realized_pnl_cumulative", ""),
-            row.get("trade_id", ""), row.get("market_id", ""), row.get("event_id", ""),
-            row.get("outcome_id", ""), row.get("taker_maker", ""), row.get("fee", ""),
-            row.get("fee_rate_bps", ""), row.get("trade_status", ""),
-            row.get("inv_net_shares_before", ""), row.get("inv_avg_cost_before", ""),
-            row.get("time_since_last_trade", ""),
-        ))
+        conn.execute(f"INSERT INTO trades ({cols_str}) VALUES ({placeholders})", vals)
         conn.commit()
         return True
     except sqlite3.IntegrityError:
@@ -1742,6 +1831,542 @@ def print_data_coverage():
         _coverage_counters[k] = 0
 
 
+# ==================== MAX FORENSICS v2: NEW SUBSYSTEMS ====================
+
+# -------------------- Book tape in-memory (velocity lookups) --------------------
+# token_id -> deque of (t_sec, spread_f, imb_f, mid_f, micro_f)
+_book_tape_mem: Dict[str, deque] = {}
+
+
+def book_tape_mem_record(token_id: str, t_sec: int,
+                         spread_f: Optional[float], imb_f: Optional[float],
+                         mid_f: Optional[float], micro_f: Optional[float]):
+    """Store a book tape observation in memory for velocity feature lookups."""
+    if not token_id:
+        return
+    dq = _book_tape_mem.get(token_id)
+    if dq is None:
+        dq = deque()
+        _book_tape_mem[token_id] = dq
+    dq.append((t_sec, spread_f, imb_f, mid_f, micro_f))
+    cutoff = t_sec - BOOK_TAPE_MEMORY_SEC
+    while dq and dq[0][0] < cutoff:
+        dq.popleft()
+
+
+# -------------------- Binance tape in-memory --------------------
+# symbol -> deque of (t_sec, price_f)
+_binance_tape_mem: Dict[str, deque] = {}
+_active_cryptos: Dict[str, float] = {}  # symbol -> last_seen_monotonic
+
+
+def binance_tape_mem_record(symbol: str, t_sec: int, price_f: float):
+    """Store a Binance spot observation in memory."""
+    if not symbol:
+        return
+    dq = _binance_tape_mem.get(symbol)
+    if dq is None:
+        dq = deque()
+        _binance_tape_mem[symbol] = dq
+    dq.append((t_sec, price_f))
+    cutoff = t_sec - BINANCE_TAPE_MEMORY_SEC
+    while dq and dq[0][0] < cutoff:
+        dq.popleft()
+
+
+_BINANCE_TAPE_HEADER = [
+    "timestamp_iso", "timestamp_epoch", "symbol", "price", "tape_source",
+]
+
+_binance_tape_last_sec: Dict[str, int] = {}  # symbol -> last recorded epoch_sec
+
+
+def write_binance_tape_tick():
+    """Record 1Hz Binance spot prices for active crypto symbols."""
+    if not _active_cryptos:
+        return
+    now_epoch = epoch_sec()
+    now_iso = ts_to_iso(now_epoch)
+    for symbol in list(_active_cryptos.keys()):
+        # Deduplicate: at most 1 row per symbol per second
+        if _binance_tape_last_sec.get(symbol) == now_epoch:
+            continue
+        price_str = binance_spot_price(symbol)
+        price_f = ffloat(price_str)
+        if price_f is None:
+            continue
+        _binance_tape_last_sec[symbol] = now_epoch
+        binance_tape_mem_record(symbol, now_epoch, price_f)
+        append_row_csv(BINANCE_TAPE_CSV, _BINANCE_TAPE_HEADER, {
+            "timestamp_iso": now_iso,
+            "timestamp_epoch": str(now_epoch),
+            "symbol": symbol,
+            "price": price_str,
+            "tape_source": "BINANCE_SPOT",
+        })
+
+
+def register_active_crypto(symbol: str):
+    """Register a crypto symbol for Binance tape recording."""
+    if symbol:
+        _active_cryptos[symbol] = time.monotonic()
+        # Evict stale symbols (not seen in 60 min)
+        cutoff = time.monotonic() - 3600
+        stale = [s for s, t in _active_cryptos.items() if t < cutoff]
+        for s in stale:
+            del _active_cryptos[s]
+
+
+# -------------------- A) Velocity Features --------------------
+def _tape_val_at(dq: deque, t0: int, offset_sec: int, idx: int) -> Optional[float]:
+    """Get tape value at index `idx` for the latest entry at or before (t0 - offset_sec)."""
+    target = t0 - offset_sec
+    best = None
+    for entry in reversed(dq):
+        if entry[0] <= target:
+            best = entry
+            break
+    if best is None:
+        return None
+    return best[idx]
+
+
+def _tape_avg_over(dq: deque, t0: int, from_sec: int, to_sec: int, idx: int) -> Optional[float]:
+    """Average tape value at index `idx` over entries in [t0-from_sec, t0-to_sec]."""
+    lo = t0 - from_sec
+    hi = t0 - to_sec
+    vals = [e[idx] for e in dq if lo <= e[0] <= hi and e[idx] is not None]
+    return (sum(vals) / len(vals)) if vals else None
+
+
+def compute_velocity_features(token_id: str, t0: int, current_spread: Optional[float],
+                              current_imb: Optional[float], current_mid: Optional[float],
+                              current_micro: Optional[float],
+                              crypto: str) -> dict:
+    """Compute all velocity features for a trade at time t0."""
+    r: dict = {}
+
+    # --- Book tape velocities ---
+    dq = _book_tape_mem.get(token_id) if token_id else None
+    if dq and len(dq) >= 2:
+        # Spread
+        sp1 = _tape_val_at(dq, t0, 1, 1)
+        sp5avg = _tape_avg_over(dq, t0, 5, 1, 1)
+        r["spread_prev_1s"] = clean_number(sp1) if sp1 is not None else ""
+        r["spread_prev_5s_avg"] = clean_number(sp5avg) if sp5avg is not None else ""
+        r["spread_change_1s"] = clean_number(current_spread - sp1) if (current_spread is not None and sp1 is not None) else ""
+        r["spread_change_5s"] = clean_number(current_spread - sp5avg) if (current_spread is not None and sp5avg is not None) else ""
+
+        # Imbalance
+        im1 = _tape_val_at(dq, t0, 1, 2)
+        im5avg = _tape_avg_over(dq, t0, 5, 1, 2)
+        r["imb_prev_1s"] = clean_number(im1) if im1 is not None else ""
+        r["imb_prev_5s_avg"] = clean_number(im5avg) if im5avg is not None else ""
+        r["imb_change_1s"] = clean_number(current_imb - im1) if (current_imb is not None and im1 is not None) else ""
+        r["imb_change_5s"] = clean_number(current_imb - im5avg) if (current_imb is not None and im5avg is not None) else ""
+
+        # Mid
+        mid1 = _tape_val_at(dq, t0, 1, 3)
+        mid5avg = _tape_avg_over(dq, t0, 5, 1, 3)
+        mid10 = _tape_val_at(dq, t0, 10, 3)
+        r["mid_prev_1s"] = clean_number(mid1) if mid1 is not None else ""
+        r["mid_prev_5s_avg"] = clean_number(mid5avg) if mid5avg is not None else ""
+        r["mid_change_1s"] = clean_number(current_mid - mid1) if (current_mid is not None and mid1 is not None) else ""
+        r["mid_change_5s"] = clean_number(current_mid - mid5avg) if (current_mid is not None and mid5avg is not None) else ""
+        r["mid_change_10s"] = clean_number(current_mid - mid10) if (current_mid is not None and mid10 is not None) else ""
+
+        # Microprice
+        mic1 = _tape_val_at(dq, t0, 1, 4)
+        r["micro_prev_1s"] = clean_number(mic1) if mic1 is not None else ""
+        r["micro_change_1s"] = clean_number(current_micro - mic1) if (current_micro is not None and mic1 is not None) else ""
+
+        # time_since_spread_p90: seconds since spread percentile >= 90%
+        # Use spread_tracker_stats to get current percentile, scan backward for p90+
+        ts_spread_p90 = ""
+        sdq = _spread_window.get(token_id)
+        if sdq and len(sdq) >= 5:
+            spreads_sorted = sorted(s for _, s in sdq)
+            p90_threshold = spreads_sorted[int(len(spreads_sorted) * 0.9)]
+            # Scan backward through book tape for last time spread >= p90
+            for entry in reversed(dq):
+                if entry[1] is not None and entry[1] >= p90_threshold:
+                    ts_spread_p90 = str(t0 - entry[0])
+                    break
+        r["time_since_spread_p90"] = ts_spread_p90
+    else:
+        for k in ["spread_prev_1s", "spread_prev_5s_avg", "spread_change_1s", "spread_change_5s",
+                   "imb_prev_1s", "imb_prev_5s_avg", "imb_change_1s", "imb_change_5s",
+                   "mid_prev_1s", "mid_prev_5s_avg", "mid_change_1s", "mid_change_5s", "mid_change_10s",
+                   "micro_prev_1s", "micro_change_1s", "time_since_spread_p90"]:
+            r[k] = ""
+
+    # --- Binance tape velocities ---
+    bdq = _binance_tape_mem.get(crypto) if crypto else None
+    if bdq and len(bdq) >= 2:
+        # Get current binance price (latest in tape)
+        cur_bn = bdq[-1][1] if bdq else None
+        bn1 = _tape_val_at(bdq, t0, 1, 1)
+        bn5 = _tape_val_at(bdq, t0, 5, 1)
+        bn10 = _tape_val_at(bdq, t0, 10, 1)
+        r["binance_prev_1s"] = clean_number(bn1) if bn1 is not None else ""
+        r["binance_change_1s"] = clean_number(cur_bn - bn1) if (cur_bn is not None and bn1 is not None) else ""
+        r["binance_prev_5s"] = clean_number(bn5) if bn5 is not None else ""
+        r["binance_change_5s"] = clean_number(cur_bn - bn5) if (cur_bn is not None and bn5 is not None) else ""
+        r["binance_prev_10s"] = clean_number(bn10) if bn10 is not None else ""
+        r["binance_change_10s"] = clean_number(cur_bn - bn10) if (cur_bn is not None and bn10 is not None) else ""
+    else:
+        for k in ["binance_prev_1s", "binance_change_1s", "binance_prev_5s",
+                   "binance_change_5s", "binance_prev_10s", "binance_change_10s"]:
+            r[k] = ""
+
+    return r
+
+
+# -------------------- B) Aggressiveness Features --------------------
+def compute_aggressiveness(side: str, px: Optional[float],
+                           bb: Optional[float], ba: Optional[float],
+                           mid_f: Optional[float], micro_f: Optional[float]) -> dict:
+    """Compute detailed execution style / aggressiveness features."""
+    r = {"aggressiveness": "", "edge_to_micro": "", "edge_to_mid": "",
+         "spread_paid_est": "", "queue_position_proxy": ""}
+    if px is None:
+        return r
+
+    # Aggressiveness classification
+    if side == "BUY":
+        if ba is not None and px >= ba - 1e-9:
+            r["aggressiveness"] = "CROSS_ASK"
+        elif mid_f is not None and px > mid_f:
+            r["aggressiveness"] = "LIFT_INSIDE"
+        else:
+            r["aggressiveness"] = "PASSIVE_OR_BELOW_MID"
+    elif side == "SELL":
+        if bb is not None and px <= bb + 1e-9:
+            r["aggressiveness"] = "CROSS_BID"
+        elif mid_f is not None and px < mid_f:
+            r["aggressiveness"] = "HIT_INSIDE"
+        else:
+            r["aggressiveness"] = "PASSIVE_OR_ABOVE_MID"
+
+    # Edge to microprice
+    if micro_f is not None:
+        if side == "BUY":
+            r["edge_to_micro"] = clean_number(micro_f - px)
+        elif side == "SELL":
+            r["edge_to_micro"] = clean_number(px - micro_f)
+
+    # Edge to mid
+    if mid_f is not None:
+        if side == "BUY":
+            r["edge_to_mid"] = clean_number(mid_f - px)
+        elif side == "SELL":
+            r["edge_to_mid"] = clean_number(px - mid_f)
+
+    # Spread paid estimate
+    if side == "BUY" and bb is not None:
+        r["spread_paid_est"] = clean_number(max(0.0, px - bb))
+    elif side == "SELL" and ba is not None:
+        r["spread_paid_est"] = clean_number(max(0.0, ba - px))
+
+    # Queue position proxy
+    agg = r["aggressiveness"]
+    if "PASSIVE" in agg or "ABOVE" in agg or "BELOW" in agg:
+        if side == "BUY" and bb is not None and abs(px - bb) < 1e-9:
+            r["queue_position_proxy"] = "JOIN_TOP"
+        elif side == "SELL" and ba is not None and abs(px - ba) < 1e-9:
+            r["queue_position_proxy"] = "JOIN_TOP"
+        else:
+            r["queue_position_proxy"] = "DEEP"
+    else:
+        r["queue_position_proxy"] = ""
+
+    return r
+
+
+# -------------------- C) FIFO Roundtrip PnL --------------------
+# (slug, outcome) -> list of [remaining_size, buy_price, buy_ts_epoch]
+_fifo_lots: Dict[Tuple[str, str], list] = {}
+
+
+def fifo_process_trade(slug: str, outcome: str, side: str,
+                       size_f: float, price_f: float, ts_epoch: int) -> dict:
+    """Process a trade through FIFO lot matching. Returns realized PnL fields for SELL rows."""
+    r = {"realized_pnl_usdc": "", "holding_time_sec_wavg": "", "avg_entry_price_matched": ""}
+    if not slug or not outcome or size_f is None or price_f is None:
+        return r
+
+    key = (slug, outcome)
+    if key not in _fifo_lots:
+        _fifo_lots[key] = []
+    lots = _fifo_lots[key]
+
+    if side == "BUY":
+        lots.append([size_f, price_f, ts_epoch])
+        return r  # No realized PnL on buys
+
+    if side != "SELL":
+        return r
+
+    # SELL: consume lots FIFO
+    remaining = size_f
+    total_pnl = 0.0
+    weighted_hold_time = 0.0
+    total_matched = 0.0
+    weighted_entry_px = 0.0
+
+    while remaining > 1e-9 and lots:
+        avail = lots[0][0]
+        buy_px = lots[0][1]
+        buy_ts = lots[0][2]
+        matched = min(remaining, avail)
+
+        total_pnl += matched * (price_f - buy_px)
+        hold_sec = max(0, ts_epoch - buy_ts)
+        weighted_hold_time += matched * hold_sec
+        weighted_entry_px += matched * buy_px
+        total_matched += matched
+
+        lots[0][0] -= matched
+        remaining -= matched
+        if lots[0][0] < 1e-9:
+            lots.pop(0)
+
+    if total_matched > 0:
+        r["realized_pnl_usdc"] = clean_number(total_pnl)
+        r["holding_time_sec_wavg"] = clean_number(weighted_hold_time / total_matched)
+        r["avg_entry_price_matched"] = clean_number(weighted_entry_px / total_matched)
+
+    return r
+
+
+# Running realized PnL totals for summary export
+_realized_pnl_by_slug: Dict[str, float] = {}  # slug -> cumulative realized pnl
+_realized_pnl_total: float = 0.0
+
+
+def fifo_accumulate_pnl(slug: str, pnl_usdc: float):
+    """Accumulate realized PnL for summary reporting."""
+    global _realized_pnl_total
+    _realized_pnl_total += pnl_usdc
+    _realized_pnl_by_slug[slug] = _realized_pnl_by_slug.get(slug, 0.0) + pnl_usdc
+
+
+# -------------------- D) Trade Clustering / Burstiness --------------------
+# token_id -> deque of (t_sec, side_str, usdc_f)
+_trade_cluster_history: Dict[str, deque] = {}
+
+
+def cluster_record_trade(token_id: str, t_sec: int, side: str, usdc_f: float):
+    """Record a trade in the clustering history."""
+    if not token_id:
+        return
+    dq = _trade_cluster_history.get(token_id)
+    if dq is None:
+        dq = deque()
+        _trade_cluster_history[token_id] = dq
+    dq.append((t_sec, side, usdc_f))
+    # Evict entries older than 120s
+    cutoff = t_sec - 120
+    while dq and dq[0][0] < cutoff:
+        dq.popleft()
+
+
+def compute_cluster_features(token_id: str, t0: int) -> dict:
+    """Compute trade clustering features for a trade at time t0."""
+    r = {"trades_last_10s": "", "trades_last_60s": "",
+         "buys_last_60s": "", "sells_last_60s": "", "usdc_last_60s": ""}
+    if not token_id:
+        return r
+    dq = _trade_cluster_history.get(token_id)
+    if not dq:
+        r["trades_last_10s"] = "0"
+        r["trades_last_60s"] = "0"
+        r["buys_last_60s"] = "0"
+        r["sells_last_60s"] = "0"
+        r["usdc_last_60s"] = "0"
+        return r
+
+    t10 = t0 - 10
+    t60 = t0 - 60
+    cnt10 = 0
+    cnt60 = 0
+    buys60 = 0
+    sells60 = 0
+    usdc60 = 0.0
+    for ts, sd, usd in dq:
+        if ts >= t60 and ts < t0:  # Exclude current trade
+            cnt60 += 1
+            if sd == "BUY":
+                buys60 += 1
+            elif sd == "SELL":
+                sells60 += 1
+            usdc60 += usd
+            if ts >= t10:
+                cnt10 += 1
+
+    r["trades_last_10s"] = str(cnt10)
+    r["trades_last_60s"] = str(cnt60)
+    r["buys_last_60s"] = str(buys60)
+    r["sells_last_60s"] = str(sells60)
+    r["usdc_last_60s"] = clean_number(usdc60)
+    return r
+
+
+# -------------------- E) Market Selection / Ranking --------------------
+_market_ranks: Dict[str, dict] = {}  # token_id -> {spread_rank, imbalance_rank}
+_last_rank_compute: float = 0.0
+
+
+def compute_market_ranks():
+    """Compute cross-market spread and imbalance ranks for all active tokens."""
+    global _last_rank_compute
+    now = time.monotonic()
+    if now - _last_rank_compute < MARKET_RANK_EVERY_SECONDS:
+        return
+    _last_rank_compute = now
+
+    if not _active_tokens:
+        return
+
+    # Gather latest book data for each active token from book_tape_mem
+    token_data: List[Tuple[str, Optional[float], Optional[float]]] = []
+    for tid in _active_tokens:
+        dq = _book_tape_mem.get(tid)
+        if dq and len(dq) > 0:
+            latest = dq[-1]
+            token_data.append((tid, latest[1], latest[2]))  # spread, imb
+        else:
+            token_data.append((tid, None, None))
+
+    # Sort by spread (widest first) — rank 1 = widest
+    spread_sorted = sorted(
+        [(tid, sp) for tid, sp, _ in token_data if sp is not None],
+        key=lambda x: x[1], reverse=True)
+    for rank, (tid, _) in enumerate(spread_sorted, 1):
+        _market_ranks.setdefault(tid, {})["spread_rank"] = rank
+
+    # Sort by imbalance (highest first) — rank 1 = most imbalanced
+    imb_sorted = sorted(
+        [(tid, im) for tid, _, im in token_data if im is not None],
+        key=lambda x: abs(x[1] - 1.0) if x[1] is not None else 0, reverse=True)
+    for rank, (tid, _) in enumerate(imb_sorted, 1):
+        _market_ranks.setdefault(tid, {})["imbalance_rank"] = rank
+
+
+def get_market_ranks(token_id: str) -> dict:
+    """Get market ranks for a token at trade time."""
+    ranks = _market_ranks.get(token_id, {})
+    return {
+        "spread_rank_at_trade": str(ranks.get("spread_rank", "")) if ranks.get("spread_rank") else "",
+        "imbalance_rank_at_trade": str(ranks.get("imbalance_rank", "")) if ranks.get("imbalance_rank") else "",
+    }
+
+
+# -------------------- F) Latency Tracking --------------------
+_latency_window: deque = deque(maxlen=600)  # (api_delay_ms, book_age_ms, binance_age_ms)
+
+
+def latency_record(api_delay_ms: int, book_age_ms: int, binance_age_ms: int):
+    """Record a latency observation."""
+    _latency_window.append((api_delay_ms, book_age_ms, binance_age_ms))
+
+
+def compute_latency_fields(ts_int: int, book_tape_ts_epoch: Optional[int],
+                           binance_last_epoch: Optional[int]) -> dict:
+    """Compute latency fields for a single trade."""
+    local_ms = now_ms()
+    trade_ms = ts_int * 1000 if ts_int < 1_000_000_000_000 else ts_int
+    api_delay = local_ms - trade_ms
+
+    book_age = ""
+    if book_tape_ts_epoch is not None and book_tape_ts_epoch > 0:
+        book_age = str(local_ms - book_tape_ts_epoch * 1000)
+
+    binance_age = ""
+    if binance_last_epoch is not None and binance_last_epoch > 0:
+        binance_age = str(local_ms - binance_last_epoch * 1000)
+
+    # Record for rollup
+    latency_record(
+        int(api_delay),
+        int(book_age) if book_age else 0,
+        int(binance_age) if binance_age else 0,
+    )
+
+    return {
+        "local_received_ms": str(local_ms),
+        "api_to_local_delay_ms": str(int(api_delay)),
+        "book_age_ms_at_trade": str(book_age) if book_age else "",
+        "binance_age_ms_at_trade": str(binance_age) if binance_age else "",
+    }
+
+
+def _percentile(vals: List[int], pct: float) -> int:
+    """Simple percentile computation."""
+    if not vals:
+        return 0
+    s = sorted(vals)
+    idx = int(len(s) * pct / 100.0)
+    idx = min(idx, len(s) - 1)
+    return s[idx]
+
+
+def write_latency_rollup():
+    """Write LATENCY_ROLLUP event to JSONL (once per minute)."""
+    if not _latency_window:
+        return
+    api_delays = [x[0] for x in _latency_window]
+    book_ages = [x[1] for x in _latency_window if x[1] > 0]
+    binance_ages = [x[2] for x in _latency_window if x[2] > 0]
+
+    event = {
+        "event_type": "LATENCY_ROLLUP",
+        "sample_count": len(api_delays),
+        "api_to_local_delay_ms_p50": _percentile(api_delays, 50),
+        "api_to_local_delay_ms_p90": _percentile(api_delays, 90),
+        "api_to_local_delay_ms_p99": _percentile(api_delays, 99),
+        "book_age_ms_p50": _percentile(book_ages, 50) if book_ages else "",
+        "book_age_ms_p90": _percentile(book_ages, 90) if book_ages else "",
+        "book_age_ms_p99": _percentile(book_ages, 99) if book_ages else "",
+        "binance_age_ms_p50": _percentile(binance_ages, 50) if binance_ages else "",
+        "binance_age_ms_p90": _percentile(binance_ages, 90) if binance_ages else "",
+        "binance_age_ms_p99": _percentile(binance_ages, 99) if binance_ages else "",
+    }
+    write_jsonl(event)
+    print(f"  [LATENCY] api_delay p50={event['api_to_local_delay_ms_p50']}ms "
+          f"p90={event['api_to_local_delay_ms_p90']}ms "
+          f"p99={event['api_to_local_delay_ms_p99']}ms "
+          f"(n={event['sample_count']})")
+
+
+# -------------------- Realized PnL Summary Export --------------------
+def write_realized_pnl_summary(path: str):
+    """Export periodic realized PnL summary CSV."""
+    header = ["ts_iso", "window_sec", "realized_pnl_total",
+              "realized_pnl_by_symbol", "realized_pnl_by_slug_top5"]
+    now_iso = ts_to_iso(epoch_sec())
+
+    # Group by crypto symbol (from slug detection)
+    pnl_by_symbol: Dict[str, float] = {}
+    for slug_key, pnl_val in _realized_pnl_by_slug.items():
+        sym = detect_crypto(slug_key)
+        if sym:
+            pnl_by_symbol[sym] = pnl_by_symbol.get(sym, 0.0) + pnl_val
+
+    # Top 5 slugs by absolute PnL
+    top5 = sorted(_realized_pnl_by_slug.items(), key=lambda x: abs(x[1]), reverse=True)[:5]
+    top5_str = ";".join(f"{s}={clean_number(p)}" for s, p in top5)
+    symbol_str = ";".join(f"{s}={clean_number(p)}" for s, p in sorted(pnl_by_symbol.items()))
+
+    tmp = path + ".tmp"
+    with open(tmp, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(header)
+        w.writerow([now_iso, "cumulative", clean_number(_realized_pnl_total),
+                     symbol_str, top5_str])
+    os.replace(tmp, path)
+
+
 # -------------------- main --------------------
 def main():
     conn = db_connect(DB_PATH)
@@ -1769,6 +2394,25 @@ def main():
         "net_shares_after", "avg_cost_after", "realized_pnl_cumulative",
         "trade_id", "market_id", "event_id", "outcome_id", "taker_maker", "fee", "fee_rate_bps", "trade_status",
         "inv_net_shares_before", "inv_avg_cost_before", "time_since_last_trade",
+        # === MAX FORENSICS v2 columns (appended right) ===
+        # A) Velocity
+        "spread_prev_1s", "spread_prev_5s_avg", "spread_change_1s", "spread_change_5s",
+        "imb_prev_1s", "imb_prev_5s_avg", "imb_change_1s", "imb_change_5s",
+        "mid_prev_1s", "mid_prev_5s_avg", "mid_change_1s", "mid_change_5s", "mid_change_10s",
+        "micro_prev_1s", "micro_change_1s",
+        "time_since_spread_p90",
+        "binance_prev_1s", "binance_change_1s", "binance_prev_5s", "binance_change_5s",
+        "binance_prev_10s", "binance_change_10s",
+        # B) Execution style
+        "aggressiveness", "edge_to_micro", "edge_to_mid", "spread_paid_est", "queue_position_proxy",
+        # C) Roundtrip PnL
+        "realized_pnl_usdc", "holding_time_sec_wavg", "avg_entry_price_matched",
+        # D) Trade clustering
+        "trades_last_10s", "trades_last_60s", "buys_last_60s", "sells_last_60s", "usdc_last_60s",
+        # E) Market selection
+        "spread_rank_at_trade", "imbalance_rank_at_trade", "spread_percentile_60s_at_trade",
+        # F) Latency
+        "local_received_ms", "api_to_local_delay_ms", "book_age_ms_at_trade", "binance_age_ms_at_trade",
     ]
     init_csv(RAW_CSV, raw_header)
 
@@ -1779,6 +2423,7 @@ def main():
     ]
     init_csv(MARKOUTS_CSV, mark_header)
     init_csv(BOOK_TAPE_CSV, _BOOK_TAPE_HEADER)
+    init_csv(BINANCE_TAPE_CSV, _BINANCE_TAPE_HEADER)
 
     write_jsonl({"event_type": "TRACKER_START", "wallet": WALLET,
                  "start_ts": start_ts, "start_iso": ts_to_iso(start_ts)})
@@ -1791,6 +2436,8 @@ def main():
     print(f"  RAW CSV: {RAW_CSV}")
     print(f"  JSONL: {JSONL_LOG}")
     print(f"  Book tape: {BOOK_TAPE_CSV}")
+    print(f"  Binance tape: {BINANCE_TAPE_CSV}")
+    print(f"  Realized PnL summary: {REALIZED_PNL_SUMMARY_CSV}")
     print()
 
     # Log execution enrichment + book tape features
@@ -1807,9 +2454,15 @@ def main():
     write_jsonl({"event_type": "FEATURE_ENABLED",
                  "feature": "exit_modeling",
                  "description": "time_to_next_sell, realized_pnl_roundtrip, inventory_action in entry_model.csv"})
+    write_jsonl({"event_type": "FEATURE_ENABLED",
+                 "feature": "max_forensics_v2",
+                 "description": "velocity+aggressiveness+fifo_pnl+clustering+ranking+latency",
+                 "new_columns": 42,
+                 "new_files": ["binance_tape.csv", "realized_pnl_summary.csv"]})
     print("  EXECUTION_ENRICHMENT=True (activity->CLOB->book_inferred)")
     print("  BOOK_TAPE=True (1Hz, max_tokens=%d)" % BOOK_TAPE_MAX_TOKENS)
     print("  EXIT_MODELING=True (entry_model.csv: time_to_sell, roundtrip_pnl, inv_action)")
+    print("  MAX_FORENSICS_v2=True (velocity+aggressiveness+fifo+clustering+ranking+latency)")
 
     # Log orderbook sorting fix
     write_jsonl({"event_type": "ORDERBOOK_SORTING_FIX_ENABLED", "value": True,
@@ -1885,6 +2538,8 @@ def main():
     last_behavior = 0.0
     last_coverage = 0.0
     last_entry_model = 0.0
+    last_latency_rollup = 0.0
+    last_realized_pnl_summary = 0.0
     _activity_fields_warned = False
 
     while not STOP:
@@ -2160,6 +2815,55 @@ def main():
                     # Register for book tape continuous recording
                     register_active_token(str(token_id), slug, outcome, ts_int)
 
+                # Register crypto for Binance tape
+                if crypto:
+                    register_active_crypto(crypto)
+
+                # === MAX FORENSICS v2: compute all new features ===
+                # A) Velocity features
+                v2_velocity = compute_velocity_features(
+                    str(token_id) if token_id else "",
+                    ts_int,
+                    ffloat(snap.spread), ffloat(snap.imbalance_topN),
+                    midf, microf, crypto)
+
+                # B) Aggressiveness features
+                v2_aggr = compute_aggressiveness(side, px, bbf, baf, midf, microf)
+
+                # C) FIFO roundtrip PnL
+                v2_fifo = {"realized_pnl_usdc": "", "holding_time_sec_wavg": "", "avg_entry_price_matched": ""}
+                if slug and outcome and size_f is not None and price_f is not None and side in ("BUY", "SELL"):
+                    v2_fifo = fifo_process_trade(slug, outcome, side, size_f, price_f, ts_int)
+                    # Accumulate for summary
+                    _fifo_pnl_f = ffloat(v2_fifo.get("realized_pnl_usdc", ""))
+                    if _fifo_pnl_f is not None and _fifo_pnl_f != 0:
+                        fifo_accumulate_pnl(slug, _fifo_pnl_f)
+
+                # D) Trade clustering (compute BEFORE recording current trade)
+                _usdc_f_cluster = ffloat(usdc_size) or 0.0
+                v2_cluster = compute_cluster_features(str(token_id) if token_id else "", ts_int)
+                # Now record this trade for future clustering
+                if token_id:
+                    cluster_record_trade(str(token_id), ts_int, side, _usdc_f_cluster)
+
+                # E) Market selection ranks
+                v2_ranks = get_market_ranks(str(token_id) if token_id else "")
+                v2_ranks["spread_percentile_60s_at_trade"] = spread_stats.get("spread_percentile_60s", "")
+
+                # F) Latency
+                # Book tape ts: latest tape entry for this token
+                _bt_ts = None
+                _bt_dq = _book_tape_mem.get(str(token_id)) if token_id else None
+                if _bt_dq and len(_bt_dq) > 0:
+                    _bt_ts = _bt_dq[-1][0]
+                # Binance tape ts: latest for this crypto
+                _bn_ts = None
+                if crypto:
+                    _bn_dq = _binance_tape_mem.get(crypto)
+                    if _bn_dq and len(_bn_dq) > 0:
+                        _bn_ts = _bn_dq[-1][0]
+                v2_latency = compute_latency_fields(ts_int, _bt_ts, _bn_ts)
+
                 row = {
                     "timestamp_iso": iso,
                     "timestamp_epoch": str(ts_int),
@@ -2215,6 +2919,13 @@ def main():
                     "inv_net_shares_before": inv_before["inv_net_shares_before"],
                     "inv_avg_cost_before": inv_before["inv_avg_cost_before"],
                     "time_since_last_trade": str(time_since_last),
+                    # === v2 columns ===
+                    **v2_velocity,
+                    **v2_aggr,
+                    **v2_fifo,
+                    **v2_cluster,
+                    **v2_ranks,
+                    **v2_latency,
                 }
 
                 inserted = db_insert_trade(conn, row)
@@ -2449,6 +3160,22 @@ def main():
 
             # ---- book tape: continuous 1Hz recording ----
             write_book_tape_tick()
+
+            # ---- binance tape: continuous 1Hz recording ----
+            write_binance_tape_tick()
+
+            # ---- market ranking: every 10s ----
+            compute_market_ranks()
+
+            # ---- latency rollup: every 60s ----
+            if now - last_latency_rollup >= LATENCY_ROLLUP_EVERY_SECONDS:
+                last_latency_rollup = now
+                write_latency_rollup()
+
+            # ---- realized PnL summary: every 120s ----
+            if now - last_realized_pnl_summary >= REALIZED_PNL_SUMMARY_EVERY_SECONDS:
+                last_realized_pnl_summary = now
+                write_realized_pnl_summary(REALIZED_PNL_SUMMARY_CSV)
 
             time.sleep(POLL_SECONDS)
 
