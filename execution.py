@@ -97,7 +97,7 @@ class ExecutionEngine:
             )
             return
 
-        # Skip if existing order at nearly the same price (avoids churn)
+        # Cancel/replace: check existing same-side orders
         for ex_order in existing:
             if ex_order.side == action.action:
                 price_diff = abs(ex_order.price - action.price)
@@ -111,6 +111,52 @@ class ExecutionEngine:
                         threshold=self.cfg.MIN_PRICE_CHANGE_FOR_REPLACE,
                     )
                     return
+
+                # Price changed enough — cancel the stale order before replacing
+                if not self._cancel_rate_ok():
+                    self.log.decision(
+                        action="SKIP", reason="cancel_rate_limited_for_replace",
+                        slug=action.slug, outcome=action.outcome,
+                        stale_order_id=ex_order.order_id,
+                    )
+                    return
+
+                try:
+                    success = self.api.cancel_order(ex_order.order_id)
+                    now_cancel = time.time()
+                    if success:
+                        self.state.remove_order(ex_order.order_id)
+                        self.log.order_cancel(
+                            order_id=ex_order.order_id,
+                            slug=action.slug,
+                            outcome=action.outcome,
+                            reason="replace_stale_price",
+                            old_price=ex_order.price,
+                            new_price=action.price,
+                        )
+                    else:
+                        self.log.error(
+                            "cancel_for_replace_rejected",
+                            order_id=ex_order.order_id,
+                            slug=action.slug,
+                        )
+                    # Always update rate-limit trackers (even on failure,
+                    # the API call was attempted and counts toward limits)
+                    self._last_cancel_ts = now_cancel
+                    self._cancel_timestamps.append(now_cancel)
+                    self._ops_this_tick += 1
+                except Exception as e:
+                    now_cancel = time.time()
+                    self.log.error(
+                        f"cancel_for_replace_failed: {e}",
+                        order_id=ex_order.order_id,
+                        slug=action.slug,
+                    )
+                    # Rate-limit even on exception — the attempt was made
+                    self._last_cancel_ts = now_cancel
+                    self._cancel_timestamps.append(now_cancel)
+                    self._ops_this_tick += 1
+                    return  # don't place replacement if cancel errored
 
         # Prevent sell-to-open: verify inventory before selling
         if action.action == "SELL":
@@ -299,6 +345,8 @@ class ExecutionEngine:
                     f"cancel_failed: {e}",
                     order_id=order.order_id,
                 )
+                # Still record the cancel attempt for rate limiting
+                self._record_cancel()
                 self._ops_this_tick += 1
 
     # ------------------------------------------------------------------

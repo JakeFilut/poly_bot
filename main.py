@@ -17,6 +17,8 @@ See RUNBOOK section at bottom for systemd example.
 """
 from __future__ import annotations
 
+import os
+import random
 import signal
 import sys
 import time
@@ -257,6 +259,13 @@ class Bot:
 
 
 def main():
+    # Deterministic RNG for reproducible DRY_RUN auditing
+    seed_env = os.environ.get("RANDOM_SEED")
+    if seed_env is not None:
+        seed_val = int(seed_env)
+        random.seed(seed_val)
+        print(f"[INIT] RANDOM_SEED={seed_val} — deterministic RNG enabled")
+
     bot = Bot()
     bot.run()
 

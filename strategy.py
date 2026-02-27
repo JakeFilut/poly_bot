@@ -182,6 +182,9 @@ def _entry_size_usd(cfg: Config, buy_weight: float,
     # Asset multiplier
     score *= _ASSET_SIZE_MULT.get(asset, 1.0)
 
+    # Cap score so multipliers don't always push to max ladder rung
+    score = min(1.0, score)
+
     # Map score to ladder index
     ladder = cfg.CLIP_LADDER_MULTS
     idx = int(score * (len(ladder) - 1))
@@ -218,8 +221,15 @@ def _exit_actions(cfg: Config, inv: InventoryEntry, tf: TokenFeatures,
         tp_progress = min(1.0, (edge_vs_cost - cfg.TP_CENTS_MIN) /
                           max(0.001, cfg.TP_CENTS_MAX - cfg.TP_CENTS_MIN))
         base_frac = cfg.SELL_FRAC_MED + tp_progress * (cfg.SELL_FRAC_MAX - cfg.SELL_FRAC_MED)
-        frac = base_frac * max(sell_weight, 0.3)  # even outside sell window, take profit
 
+        # Cadence factor: respect cadence unless edge is very large
+        if edge_vs_cost >= 0.12:
+            cadence_factor = 1.0  # large edge — sell regardless of cadence
+        else:
+            cadence_factor = sell_weight  # no floor — cadence controls TP sells
+
+        frac = base_frac * cadence_factor
+        # Ensure at least SELL_MIN_SHARES via the clamp below (not via frac floor)
         shares = max(cfg.SELL_MIN_SHARES, round(inv.shares * frac))
         shares = min(shares, inv.shares)
         sell_price = tf.best_bid
@@ -229,7 +239,7 @@ def _exit_actions(cfg: Config, inv: InventoryEntry, tf: TokenFeatures,
             action="SELL", slug=inv.slug, outcome=inv.outcome,
             token_id=tf.token_id, price=sell_price,
             size_shares=shares, size_usd=usd,
-            reason=f"TP(edge={edge_vs_cost:.4f},frac={frac:.3f})",
+            reason=f"TP(edge={edge_vs_cost:.4f},frac={frac:.3f},cad={cadence_factor:.2f})",
             urgency=0.5 + tp_progress * 0.3,
         )
 
