@@ -23,6 +23,7 @@ import signal
 import sys
 import time
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from config import load_config
 from logger import Logger
@@ -83,6 +84,12 @@ class Bot:
         # -- Shutdown flag --
         self._running = True
         self._last_state_flush = time.monotonic()
+
+        # -- Hourly PnL tracking --
+        self._et = ZoneInfo("America/New_York")
+        self._current_hour_utc = self._get_current_hour_utc()
+        self._hourly_unrealized_start = 0.0
+        self._hourly_realized_start = 0.0
 
         # -- Register signal handlers --
         signal.signal(signal.SIGINT, self._handle_signal)
@@ -155,6 +162,10 @@ class Bot:
         """Run the main trading loop until shutdown signal."""
         self._startup_sync()
 
+        # Initialize hourly PnL baselines after state is loaded
+        self._hourly_unrealized_start = self._estimate_unrealized_conservative()
+        self._hourly_realized_start = self.state.realized_pnl
+
         self.log.info("main_loop_started", mode=self.cfg.MODE,
                       target_loop_ms=self.cfg.TARGET_LOOP_MS)
 
@@ -187,6 +198,9 @@ class Bot:
                 unrealized_usd=self._estimate_unrealized(),
                 realized_usd=self.state.realized_pnl,
             )
+
+            # Hourly PnL check
+            self._check_hourly_pnl()
 
             # Sleep to maintain target loop rate
             elapsed = time.monotonic() - loop_start
@@ -248,6 +262,90 @@ class Bot:
             if book:
                 total += inv.shares * (book.mid - inv.avg_cost)
         return total
+
+    # ------------------------------------------------------------------
+    # Conservative mark-to-market (best_bid for longs)
+    # ------------------------------------------------------------------
+    def _estimate_unrealized_conservative(self) -> float:
+        """Mark-to-market using best_bid for long inventory (conservative).
+
+        If best_bid unavailable, falls back to mid.
+        Applies SIM_FEE_BPS if configured.
+        """
+        fee_bps = self.cfg.SIM_FEE_BPS
+        fee_rate = fee_bps / 10_000.0 if fee_bps > 0 else 0.0
+        total = 0.0
+        for (slug, outcome), inv in self.state.inventory.items():
+            if inv.shares <= 0:
+                continue
+            pair = self.universe.get_pair(slug)
+            if pair is None:
+                continue
+            token_id = pair.up_token_id if outcome == "Up" else pair.down_token_id
+            book = self.features._book_cache.get(token_id)
+            if book:
+                # Conservative: mark long to best_bid, fall back to mid
+                mark = book.best_bid if book.best_bid > 0 else book.mid
+                pnl = inv.shares * (mark - inv.avg_cost)
+                if fee_rate > 0:
+                    # Deduct hypothetical round-trip fee
+                    pnl -= fee_rate * inv.shares * (mark + inv.avg_cost)
+                total += pnl
+        return total
+
+    # ------------------------------------------------------------------
+    # Hourly PnL tracking
+    # ------------------------------------------------------------------
+    def _get_current_hour_utc(self) -> datetime:
+        """Return the current hour boundary (truncated to hour)."""
+        now = datetime.now(timezone.utc)
+        return now.replace(minute=0, second=0, microsecond=0)
+
+    def _check_hourly_pnl(self) -> None:
+        """Emit HOURLY_PNL event if an hour boundary has been crossed."""
+        now_hour = self._get_current_hour_utc()
+        if now_hour <= self._current_hour_utc:
+            return
+
+        # Hour boundary crossed — compute metrics for the completed hour
+        unrealized_end = self._estimate_unrealized_conservative()
+        realized_this_hour = self.state.realized_pnl - self._hourly_realized_start
+        net_pnl = realized_this_hour + (unrealized_end - self._hourly_unrealized_start)
+
+        # Fill stats from logger
+        fill_stats = self.log.get_and_reset_hourly_fills()
+
+        # Top positions
+        inv_snap = self.state.inventory_snapshot()
+        sorted_inv = sorted(
+            inv_snap.items(),
+            key=lambda kv: kv[1].get("usd_value", 0),
+            reverse=True,
+        )[:5]
+        top_positions = [{"position": k, **v} for k, v in sorted_inv]
+
+        # Inventory notional at end
+        inv_notional = sum(v.get("usd_value", 0) for v in inv_snap.values())
+
+        # ET time for the completed hour
+        hour_et = self._current_hour_utc.astimezone(self._et)
+
+        self.log.hourly_pnl(
+            hour_start_utc=self._current_hour_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            hour_start_et=hour_et.strftime("%Y-%m-%d %H:%M ET"),
+            realized_usd=round(realized_this_hour, 4),
+            unrealized_start_usd=round(self._hourly_unrealized_start, 4),
+            unrealized_end_usd=round(unrealized_end, 4),
+            net_pnl_usd=round(net_pnl, 4),
+            inventory_notional_end_usd=round(inv_notional, 4),
+            top_positions=top_positions,
+            **fill_stats,
+        )
+
+        # Reset for next hour
+        self._current_hour_utc = now_hour
+        self._hourly_unrealized_start = unrealized_end
+        self._hourly_realized_start = self.state.realized_pnl
 
     # ------------------------------------------------------------------
     # Shutdown

@@ -146,6 +146,9 @@ class Config:
     LOG_FILE: str = "/home/ubuntu/github/logs/poly_bot/bot_log.jsonl"
     LOG_ROLLUP_SEC: int = 60
 
+    # -- Fee simulation --
+    SIM_FEE_BPS: float = 0.0  # Simulated fee in basis points (e.g., 5.0 = 5 bps = 0.05%)
+
     # -- Secrets to redact --
     _SECRETS: List[str] = field(
         default_factory=lambda: [
@@ -229,6 +232,7 @@ def load_config() -> Config:
         RETRY_BACKOFF_BASE=_env_float("RETRY_BACKOFF_BASE", 0.5),
         LOG_FILE=_env("LOG_FILE", "/home/ubuntu/github/logs/poly_bot/bot_log.jsonl"),
         LOG_ROLLUP_SEC=_env_int("LOG_ROLLUP_SEC", 60),
+        SIM_FEE_BPS=_env_float("SIM_FEE_BPS", 0.0),
     )
     _validate(cfg)
     # Ensure log/state directories exist
