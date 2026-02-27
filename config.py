@@ -123,7 +123,7 @@ class Config:
     UNIVERSE_REFRESH_SEC: int = 120
 
     # -- State persistence --
-    STATE_DB_PATH: str = "state.db"
+    STATE_DB_PATH: str = "/home/ubuntu/github/logs/poly_bot/state.db"
     STATE_FLUSH_SEC: int = 10
 
     # -- Per-token cooldown (after a fill, wait before placing another order) --
@@ -141,7 +141,7 @@ class Config:
     RETRY_BACKOFF_BASE: float = 0.5
 
     # -- Logging --
-    LOG_FILE: str = ""  # empty = stdout only
+    LOG_FILE: str = "/home/ubuntu/github/logs/poly_bot/bot_log.jsonl"
     LOG_ROLLUP_SEC: int = 60
 
     # -- Secrets to redact --
@@ -213,7 +213,7 @@ def load_config() -> Config:
         SELL_BURST3_START=_env_int("SELL_BURST3_START", 780),
         SELL_BURST3_END=_env_int("SELL_BURST3_END", 840),
         UNIVERSE_REFRESH_SEC=_env_int("UNIVERSE_REFRESH_SEC", 120),
-        STATE_DB_PATH=_env("STATE_DB_PATH", "state.db"),
+        STATE_DB_PATH=_env("STATE_DB_PATH", "/home/ubuntu/github/logs/poly_bot/state.db"),
         STATE_FLUSH_SEC=_env_int("STATE_FLUSH_SEC", 10),
         PER_TOKEN_COOLDOWN_SEC=_env_float("PER_TOKEN_COOLDOWN_SEC", 3.0),
         MIN_CANCEL_REPLACE_INTERVAL_SEC=_env_float("MIN_CANCEL_REPLACE_INTERVAL_SEC", 0.5),
@@ -223,10 +223,14 @@ def load_config() -> Config:
         ERROR_COOLDOWN_MAX_SEC=_env_float("ERROR_COOLDOWN_MAX_SEC", 60.0),
         RETRY_MAX=_env_int("RETRY_MAX", 3),
         RETRY_BACKOFF_BASE=_env_float("RETRY_BACKOFF_BASE", 0.5),
-        LOG_FILE=_env("LOG_FILE", ""),
+        LOG_FILE=_env("LOG_FILE", "/home/ubuntu/github/logs/poly_bot/bot_log.jsonl"),
         LOG_ROLLUP_SEC=_env_int("LOG_ROLLUP_SEC", 60),
     )
     _validate(cfg)
+    # Ensure log/state directories exist
+    for path in (cfg.LOG_FILE, cfg.STATE_DB_PATH):
+        if path:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
     return cfg
 
 
