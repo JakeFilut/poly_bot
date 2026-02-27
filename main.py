@@ -172,6 +172,7 @@ class Bot:
             self.log.maybe_rollup(
                 inventory_snapshot=self.state.inventory_snapshot(),
                 unrealized_usd=self._estimate_unrealized(),
+                realized_usd=self.state.realized_pnl,
             )
 
             # Sleep to maintain target loop rate

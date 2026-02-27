@@ -50,6 +50,7 @@ def _env_list_int(key: str, default: List[int]) -> List[int]:
 class Config:
     # -- Mode --
     MODE: str = ""  # DRY_RUN | LIVE
+    DRY_RUN_FILL_MODE: str = "none"  # none | probabilistic | instant
 
     # -- Polymarket credentials --
     POLYMARKET_API_KEY: str = ""
@@ -100,6 +101,11 @@ class Config:
     CLIP_UNIT_USD: float = 1.10
     CLIP_LADDER_MULTS: List[int] = field(default_factory=lambda: [1, 3, 8, 10, 12])
 
+    # -- Order precision (Polymarket rules) --
+    PRICE_MIN: float = 0.01
+    PRICE_MAX: float = 0.99
+    MIN_ORDER_SHARES: float = 1.0  # minimum shares per order
+
     # -- Aggression --
     CROSS_PROB_1C: float = 0.40  # probability of crossing at 1¢ spread
 
@@ -119,6 +125,12 @@ class Config:
     # -- State persistence --
     STATE_DB_PATH: str = "state.db"
     STATE_FLUSH_SEC: int = 10
+
+    # -- Per-token cooldown (after a fill, wait before placing another order) --
+    PER_TOKEN_COOLDOWN_SEC: float = 3.0  # seconds after fill before new order
+    MIN_CANCEL_REPLACE_INTERVAL_SEC: float = 0.5  # min time between cancel/replace ops
+    MAX_CANCEL_REPLACE_PER_SEC: int = 4  # global cap on cancel/replace ops per second
+    MIN_PRICE_CHANGE_FOR_REPLACE: float = 0.01  # 1¢ minimum price change to justify replace
 
     # -- Risk cooldown --
     ERROR_COOLDOWN_BASE_SEC: float = 2.0
@@ -161,6 +173,7 @@ def load_config() -> Config:
     """Load config from env vars, validate, return frozen Config."""
     cfg = Config(
         MODE=_env("MODE", "DRY_RUN").upper(),
+        DRY_RUN_FILL_MODE=_env("DRY_RUN_FILL_MODE", "none").lower(),
         POLYMARKET_API_KEY=_env("POLYMARKET_API_KEY", ""),
         POLYMARKET_API_SECRET=_env("POLYMARKET_API_SECRET", ""),
         POLYMARKET_API_PASSPHRASE=_env("POLYMARKET_API_PASSPHRASE", ""),
@@ -202,6 +215,10 @@ def load_config() -> Config:
         UNIVERSE_REFRESH_SEC=_env_int("UNIVERSE_REFRESH_SEC", 120),
         STATE_DB_PATH=_env("STATE_DB_PATH", "state.db"),
         STATE_FLUSH_SEC=_env_int("STATE_FLUSH_SEC", 10),
+        PER_TOKEN_COOLDOWN_SEC=_env_float("PER_TOKEN_COOLDOWN_SEC", 3.0),
+        MIN_CANCEL_REPLACE_INTERVAL_SEC=_env_float("MIN_CANCEL_REPLACE_INTERVAL_SEC", 0.5),
+        MAX_CANCEL_REPLACE_PER_SEC=_env_int("MAX_CANCEL_REPLACE_PER_SEC", 4),
+        MIN_PRICE_CHANGE_FOR_REPLACE=_env_float("MIN_PRICE_CHANGE_FOR_REPLACE", 0.01),
         ERROR_COOLDOWN_BASE_SEC=_env_float("ERROR_COOLDOWN_BASE_SEC", 2.0),
         ERROR_COOLDOWN_MAX_SEC=_env_float("ERROR_COOLDOWN_MAX_SEC", 60.0),
         RETRY_MAX=_env_int("RETRY_MAX", 3),
@@ -219,6 +236,8 @@ def _validate(cfg: Config) -> None:
 
     if cfg.MODE not in ("DRY_RUN", "LIVE"):
         errors.append(f"MODE must be DRY_RUN or LIVE, got '{cfg.MODE}'")
+    if cfg.DRY_RUN_FILL_MODE not in ("none", "probabilistic", "instant"):
+        errors.append(f"DRY_RUN_FILL_MODE must be none|probabilistic|instant, got '{cfg.DRY_RUN_FILL_MODE}'")
 
     if cfg.MODE == "LIVE":
         if not cfg.POLYMARKET_API_KEY:

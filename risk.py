@@ -31,9 +31,21 @@ class RiskManager:
     # ------------------------------------------------------------------
     # Gate functions (called by strategy)
     # ------------------------------------------------------------------
+    def _pending_buy_usd(self) -> float:
+        """Sum of USD committed to open BUY orders (not yet filled)."""
+        return sum(
+            o.price * o.size
+            for o in self.state.open_orders.values()
+            if o.side == "BUY"
+        )
+
     def allows_buy(self, slug: str, outcome: str,
                    desired_usd: float) -> Tuple[bool, str]:
-        """Check if a BUY is allowed.  Returns (ok, reason)."""
+        """Check if a BUY is allowed.  Returns (ok, reason).
+
+        Exposure = inventory cost basis + pending open buy orders.
+        Cash reserve accounts for pending buy orders too.
+        """
         now = time.time()
 
         # Cooldown check
@@ -41,11 +53,13 @@ class RiskManager:
             remaining = self._cooldown_until - now
             return False, f"error_cooldown({remaining:.1f}s)"
 
-        # Total exposure cap
-        total_exp = self.state.total_exposure_usd()
+        # Total exposure cap (includes pending open buy orders)
+        pending_usd = self._pending_buy_usd()
+        total_exp = self.state.total_exposure_usd() + pending_usd
         if total_exp + desired_usd > self.cfg.MAX_TOTAL_EXPOSURE_USD:
             self.log.risk(
                 check="total_exposure", total=total_exp,
+                pending_buy_usd=pending_usd,
                 desired=desired_usd, cap=self.cfg.MAX_TOTAL_EXPOSURE_USD,
             )
             return False, f"total_exposure({total_exp:.2f}+{desired_usd:.2f}>{self.cfg.MAX_TOTAL_EXPOSURE_USD})"
@@ -55,9 +69,10 @@ class RiskManager:
         if outcome_exp + desired_usd > self.cfg.MAX_POSITION_USD_PER_OUTCOME:
             return False, f"outcome_exposure({outcome_exp:.2f}+{desired_usd:.2f}>{self.cfg.MAX_POSITION_USD_PER_OUTCOME})"
 
-        # Cash reserve
-        if self.cash_usd - desired_usd < self.cfg.MIN_CASH_USD:
-            return False, f"cash_reserve({self.cash_usd:.2f}-{desired_usd:.2f}<{self.cfg.MIN_CASH_USD})"
+        # Cash reserve (accounts for pending buy orders)
+        available_cash = self.cash_usd - pending_usd
+        if available_cash - desired_usd < self.cfg.MIN_CASH_USD:
+            return False, f"cash_reserve({available_cash:.2f}-{desired_usd:.2f}<{self.cfg.MIN_CASH_USD})"
 
         return True, ""
 
@@ -106,9 +121,12 @@ class RiskManager:
     # Summary for logging
     # ------------------------------------------------------------------
     def snapshot(self) -> dict:
+        pending = self._pending_buy_usd()
         return {
             "cash_usd": round(self.cash_usd, 2),
             "total_exposure_usd": round(self.state.total_exposure_usd(), 2),
+            "pending_buy_usd": round(pending, 2),
+            "effective_exposure_usd": round(self.state.total_exposure_usd() + pending, 2),
             "open_orders": len(self.state.open_orders),
             "inventory_positions": len(self.state.inventory),
             "consecutive_errors": self._consecutive_errors,

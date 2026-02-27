@@ -127,6 +127,9 @@ class StateManager:
         # Used client_order_ids (idempotency guard)
         self._used_client_ids: set = set()
 
+        # Cumulative realized PnL (in-memory, for logging)
+        self.realized_pnl: float = 0.0
+
         # Load persisted data
         self._load_inventory()
         self._load_open_orders()
@@ -210,11 +213,16 @@ class StateManager:
         self._persist_inventory(inv)
         return inv
 
-    def apply_sell_fill(self, slug: str, outcome: str, qty: float) -> InventoryEntry | None:
+    def apply_sell_fill(self, slug: str, outcome: str, qty: float,
+                        sell_price: float = 0.0) -> InventoryEntry | None:
         key = (slug, outcome)
         inv = self.inventory.get(key)
         if inv is None:
             return None
+        # Compute realized PnL: (sell_price - avg_cost) * qty
+        if sell_price > 0 and inv.avg_cost > 0:
+            realized = (sell_price - inv.avg_cost) * qty
+            self.realized_pnl += realized
         inv.apply_sell(qty)
         if inv.shares <= 0:
             self._delete_inventory(slug, outcome)

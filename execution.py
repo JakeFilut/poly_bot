@@ -14,7 +14,8 @@ from __future__ import annotations
 
 import time
 import uuid
-from typing import Dict, List, Optional, Tuple
+from collections import deque
+from typing import Deque, Dict, List, Optional, Tuple
 
 from config import Config
 from logger import Logger
@@ -35,6 +36,13 @@ class ExecutionEngine:
 
         # Track ops this loop iteration (reset each tick)
         self._ops_this_tick = 0
+
+        # Per-token cooldown: (slug, outcome) -> epoch of last fill
+        self._last_fill_by_token: Dict[Tuple[str, str], float] = {}
+
+        # Cancel/replace rate limiter: sliding window of cancel timestamps
+        self._cancel_timestamps: Deque[float] = deque()
+        self._last_cancel_ts: float = 0.0
 
         # Fills cursor for incremental polling
         self._last_fill_ts: float = time.time() - 300  # start 5 min ago
@@ -66,6 +74,18 @@ class ExecutionEngine:
     def _execute_one(self, action: TradeAction) -> None:
         """Execute a single trade action."""
         token_id = action.token_id
+        now = time.time()
+
+        # Per-token cooldown: skip if recently filled on this (slug, outcome)
+        key = (action.slug, action.outcome)
+        last_fill = self._last_fill_by_token.get(key, 0.0)
+        if now - last_fill < self.cfg.PER_TOKEN_COOLDOWN_SEC:
+            self.log.decision(
+                action="SKIP", reason="per_token_cooldown",
+                slug=action.slug, outcome=action.outcome,
+                cooldown_remaining=round(self.cfg.PER_TOKEN_COOLDOWN_SEC - (now - last_fill), 2),
+            )
+            return
 
         # Check open order limit for this token
         existing = self.state.get_orders_for_token(token_id)
@@ -76,6 +96,21 @@ class ExecutionEngine:
                 existing_orders=len(existing),
             )
             return
+
+        # Skip if existing order at nearly the same price (avoids churn)
+        for ex_order in existing:
+            if ex_order.side == action.action:
+                price_diff = abs(ex_order.price - action.price)
+                if price_diff < self.cfg.MIN_PRICE_CHANGE_FOR_REPLACE:
+                    self.log.decision(
+                        action="SKIP", reason="price_unchanged_for_replace",
+                        slug=action.slug, outcome=action.outcome,
+                        existing_price=ex_order.price,
+                        desired_price=action.price,
+                        diff=round(price_diff, 4),
+                        threshold=self.cfg.MIN_PRICE_CHANGE_FOR_REPLACE,
+                    )
+                    return
 
         # Prevent sell-to-open: verify inventory before selling
         if action.action == "SELL":
@@ -88,6 +123,21 @@ class ExecutionEngine:
                     available=inv.shares if inv else 0,
                 )
                 return
+
+        # Clamp price to 2 decimals within [PRICE_MIN, PRICE_MAX]
+        action.price = round(action.price, 2)
+        action.price = max(self.cfg.PRICE_MIN, min(action.price, self.cfg.PRICE_MAX))
+
+        # Round shares down to integer; reject if below minimum
+        action.size_shares = int(action.size_shares)
+        if action.size_shares < self.cfg.MIN_ORDER_SHARES:
+            self.log.decision(
+                action="SKIP", reason="below_min_order_size",
+                slug=action.slug, outcome=action.outcome,
+                size_shares=action.size_shares,
+                min_required=self.cfg.MIN_ORDER_SHARES,
+            )
+            return
 
         # Generate idempotent client order ID
         client_id = str(uuid.uuid4())
@@ -151,9 +201,19 @@ class ExecutionEngine:
             mode=self.cfg.MODE,
         )
 
-        # In DRY_RUN, simulate immediate fill
-        if self.cfg.MODE == "DRY_RUN":
+        # In DRY_RUN, respect fill mode setting
+        if self.cfg.MODE == "DRY_RUN" and self.cfg.DRY_RUN_FILL_MODE == "instant":
             self._simulate_fill(order, action)
+        elif self.cfg.MODE == "DRY_RUN" and self.cfg.DRY_RUN_FILL_MODE == "none":
+            # Log-only: track order but do NOT mutate inventory
+            self.log.info(
+                "dry_run_no_fill",
+                order_id=order.order_id,
+                slug=action.slug,
+                outcome=action.outcome,
+                side=action.action,
+                msg="DRY_RUN_FILL_MODE=none; order tracked but no inventory mutation",
+            )
 
     def _simulate_fill(self, order: OpenOrder, action: TradeAction) -> None:
         """In DRY_RUN mode, immediately simulate a fill."""
@@ -172,7 +232,8 @@ class ExecutionEngine:
                 simulated=True,
             )
         elif action.action == "SELL":
-            inv = self.state.apply_sell_fill(order.slug, order.outcome, order.size)
+            inv = self.state.apply_sell_fill(order.slug, order.outcome, order.size,
+                                             sell_price=order.price)
             self.log.fill(
                 order_id=order.order_id, slug=order.slug,
                 outcome=order.outcome, side="SELL",
@@ -180,16 +241,45 @@ class ExecutionEngine:
                 remaining_shares=inv.shares if inv else 0,
                 simulated=True,
             )
+        # Record fill timestamp for per-token cooldown
+        self._last_fill_by_token[(order.slug, order.outcome)] = time.time()
         self.state.remove_order(order.order_id)
 
     # ------------------------------------------------------------------
     # Cancel expired orders
     # ------------------------------------------------------------------
+    def _cancel_rate_ok(self) -> bool:
+        """Check if we can perform another cancel/replace within rate limits."""
+        now = time.time()
+        # Enforce min interval between cancels
+        if now - self._last_cancel_ts < self.cfg.MIN_CANCEL_REPLACE_INTERVAL_SEC:
+            return False
+        # Enforce global cancels-per-second cap (sliding 1s window)
+        cutoff = now - 1.0
+        while self._cancel_timestamps and self._cancel_timestamps[0] < cutoff:
+            self._cancel_timestamps.popleft()
+        if len(self._cancel_timestamps) >= self.cfg.MAX_CANCEL_REPLACE_PER_SEC:
+            return False
+        return True
+
+    def _record_cancel(self) -> None:
+        """Record a cancel/replace operation for rate limiting."""
+        now = time.time()
+        self._cancel_timestamps.append(now)
+        self._last_cancel_ts = now
+
     def _cancel_expired(self) -> None:
-        """Cancel orders older than ORDER_TTL_MS."""
+        """Cancel orders older than ORDER_TTL_MS, respecting rate limits."""
         expired = self.state.get_expired_orders(self.cfg.ORDER_TTL_MS)
         for order in expired:
             if self._ops_this_tick >= self.cfg.MAX_ORDER_OPS_PER_LOOP:
+                break
+            if not self._cancel_rate_ok():
+                self.log.info(
+                    "cancel_rate_limited",
+                    order_id=order.order_id,
+                    msg="cancel/replace rate limit hit, deferring",
+                )
                 break
             try:
                 success = self.api.cancel_order(order.order_id)
@@ -202,6 +292,7 @@ class ExecutionEngine:
                         reason="TTL_expired",
                         age_ms=round((time.time() - order.created_ts) * 1000),
                     )
+                self._record_cancel()
                 self._ops_this_tick += 1
             except Exception as e:
                 self.log.error(
@@ -248,12 +339,16 @@ class ExecutionEngine:
                     avg_cost=inv.avg_cost, total_shares=inv.shares,
                 )
             elif side == "SELL":
-                inv = self.state.apply_sell_fill(slug, outcome, qty)
+                inv = self.state.apply_sell_fill(slug, outcome, qty, sell_price=price)
                 self.log.fill(
                     order_id=order_id, slug=slug, outcome=outcome,
                     side="SELL", qty=qty, price=price,
                     remaining_shares=inv.shares if inv else 0,
+                    realized_pnl=round(self.state.realized_pnl, 4),
                 )
+
+            # Record fill timestamp for per-token cooldown
+            self._last_fill_by_token[(slug, outcome)] = time.time()
 
             # Remove filled order from tracking
             self.state.remove_order(order_id)

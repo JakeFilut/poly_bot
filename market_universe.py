@@ -50,8 +50,16 @@ class MarketUniverse:
         return time.time() - self._last_refresh > self.cfg.UNIVERSE_REFRESH_SEC
 
     def refresh(self) -> int:
-        """Refresh universe from Gamma API.  Returns count of active pairs."""
+        """Refresh universe from Gamma API.  Returns count of active pairs.
+
+        Stability rules:
+          - If an asset fetch fails, keep existing pairs for that asset
+            (don't drop slugs due to transient API errors).
+          - Only remove slugs that are genuinely absent from a successful fetch.
+          - Preserve slugs we hold inventory on, even if they fall out of top N.
+        """
         discovered: List[TokenPair] = []
+        failed_assets: set = set()
 
         for asset in self.cfg.ASSETS:
             try:
@@ -60,18 +68,35 @@ class MarketUniverse:
                 discovered.extend(pairs)
             except Exception as e:
                 self.log.api_error(fn="universe_refresh", asset=asset, error=str(e))
+                failed_assets.add(asset)
+
+        # If ALL fetches failed, keep current universe entirely
+        if len(failed_assets) == len(self.cfg.ASSETS):
+            self.log.warn("universe_refresh_all_failed; keeping current universe")
+            self._last_refresh = time.time()
+            return len(self.pairs)
 
         # Rank by liquidity/volume, keep top N
         discovered.sort(key=lambda p: p.volume_24h, reverse=True)
         top = discovered[: self.cfg.MAX_ACTIVE_SLUGS]
 
-        # Update internal maps
+        # Build new maps
         new_pairs: Dict[str, TokenPair] = {}
         new_lookup: Dict[str, Tuple[str, str]] = {}
         for pair in top:
             new_pairs[pair.slug] = pair
             new_lookup[pair.up_token_id] = (pair.slug, "Up")
             new_lookup[pair.down_token_id] = (pair.slug, "Down")
+
+        # Preserve existing pairs for assets whose fetch failed
+        for slug, existing_pair in self.pairs.items():
+            if existing_pair.asset in failed_assets and slug not in new_pairs:
+                new_pairs[slug] = existing_pair
+                new_lookup[existing_pair.up_token_id] = (slug, "Up")
+                new_lookup[existing_pair.down_token_id] = (slug, "Down")
+
+        added = set(new_pairs) - set(self.pairs)
+        removed = set(self.pairs) - set(new_pairs)
 
         self.pairs = new_pairs
         self.token_lookup = new_lookup
@@ -81,6 +106,9 @@ class MarketUniverse:
             "universe_refreshed",
             total_discovered=len(discovered),
             active=len(self.pairs),
+            added=len(added),
+            removed=len(removed),
+            failed_assets=list(failed_assets) if failed_assets else None,
             assets={a: sum(1 for p in self.pairs.values() if p.asset == a)
                     for a in self.cfg.ASSETS},
         )

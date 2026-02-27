@@ -17,11 +17,14 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import List, Optional
+from zoneinfo import ZoneInfo
 
 from config import Config
 from features import SlugFeatures, TokenFeatures
 from logger import Logger
 from state import InventoryEntry, StateManager
+
+_ET = ZoneInfo("America/New_York")
 
 
 # ---------------------------------------------------------------------------
@@ -45,13 +48,19 @@ class TradeAction:
 # 9.1  Cadence Scheduler
 # ═══════════════════════════════════════════════════════════════════════════
 def _seconds_from_quarter(now_utc: datetime) -> int:
-    """Seconds elapsed since the last 15-minute boundary."""
-    total_sec = now_utc.minute * 60 + now_utc.second
+    """Seconds elapsed since the last 15-minute boundary in America/New_York.
+
+    The copied wallet's 15-minute cadence is aligned to ET clock boundaries.
+    Using UTC would cause drift and miss the real burst points.
+    Handles DST transitions automatically via zoneinfo.
+    """
+    now_et = now_utc.astimezone(_ET)
+    total_sec = now_et.minute * 60 + now_et.second
     return total_sec % 900  # 900 = 15 * 60
 
 
 def cadence_weight(cfg: Config, now_utc: datetime) -> tuple[float, float]:
-    """Return (buy_weight, sell_weight) based on 15-min cadence.
+    """Return (buy_weight, sell_weight) based on 15-min cadence in ET.
 
     buy_weight:  0.0 to 1.0 (how aggressively to buy)
     sell_weight: 0.0 to 1.0 (how aggressively to sell/shave)
