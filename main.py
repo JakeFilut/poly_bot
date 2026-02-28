@@ -91,6 +91,9 @@ class Bot:
         self._hourly_unrealized_start = 0.0
         self._hourly_realized_start = 0.0
 
+        # -- Mark-to-market cache: last valid mid per token_id --
+        self._last_valid_mid: dict[str, float] = {}
+
         # -- Register signal handlers --
         signal.signal(signal.SIGINT, self._handle_signal)
         signal.signal(signal.SIGTERM, self._handle_signal)
@@ -193,10 +196,12 @@ class Bot:
                 self._last_state_flush = now_mono
 
             # Rollup logging
+            unreal, mark_details = self._compute_unrealized_with_marks()
             self.log.maybe_rollup(
                 inventory_snapshot=self.state.inventory_snapshot(),
-                unrealized_usd=self._estimate_unrealized(),
+                unrealized_usd=unreal,
                 realized_usd=self.state.realized_pnl,
+                mark_details=mark_details,
             )
 
             # Hourly PnL check
@@ -247,51 +252,85 @@ class Bot:
                 self.cfg.MAX_TOTAL_EXPOSURE_USD * 2 - exposure
             )
 
-    def _estimate_unrealized(self) -> float:
-        """Rough unrealized P&L estimate based on last known mids."""
+    # ------------------------------------------------------------------
+    # Mark-to-market helpers
+    # ------------------------------------------------------------------
+    def _get_mark_for_token(self, token_id: str) -> tuple[float, str]:
+        """Return (mark_price, mark_source) for a token.
+
+        Hierarchy:
+          1. mid_book    – both bids & asks present → (best_bid+best_ask)/2
+          2. bid_only    – only bids present → best_bid
+          3. ask_only    – only asks present → best_ask
+          4. last_mid_cache – previous valid mid stored in _last_valid_mid
+          5. missing_zero – no data at all → 0.0  (do NOT assume 0.50)
+        """
+        book = self.features._book_cache.get(token_id)
+        if book is not None:
+            has_bids = len(book.bids) > 0
+            has_asks = len(book.asks) > 0
+            if has_bids and has_asks:
+                mid = (book.best_bid + book.best_ask) / 2
+                self._last_valid_mid[token_id] = mid
+                return mid, "mid_book"
+            if has_bids:
+                self._last_valid_mid[token_id] = book.best_bid
+                return book.best_bid, "bid_only"
+            if has_asks:
+                return book.best_ask, "ask_only"
+
+        # Fallback: last known valid mid
+        cached_mid = self._last_valid_mid.get(token_id)
+        if cached_mid is not None:
+            return cached_mid, "last_mid_cache"
+
+        # Nothing available → contribute 0
+        return 0.0, "missing_zero"
+
+    def _compute_unrealized_with_marks(self) -> tuple[float, list[dict]]:
+        """Compute total unrealized PnL and per-token mark details.
+
+        Returns (total_unrealized_usd, [mark_detail_per_position]).
+        """
+        fee_bps = self.cfg.SIM_FEE_BPS
+        fee_rate = fee_bps / 10_000.0 if fee_bps > 0 else 0.0
         total = 0.0
+        marks: list[dict] = []
+
         for (slug, outcome), inv in self.state.inventory.items():
             if inv.shares <= 0:
                 continue
-            # Use cached book mid if available
             pair = self.universe.get_pair(slug)
             if pair is None:
                 continue
             token_id = pair.up_token_id if outcome == "Up" else pair.down_token_id
-            book = self.features._book_cache.get(token_id)
-            if book:
-                total += inv.shares * (book.mid - inv.avg_cost)
+            mark, source = self._get_mark_for_token(token_id)
+            pnl = inv.shares * (mark - inv.avg_cost)
+            if fee_rate > 0 and mark > 0:
+                pnl -= fee_rate * inv.shares * (mark + inv.avg_cost)
+            total += pnl
+            marks.append({
+                "position": f"{slug}:{outcome}",
+                "shares": round(inv.shares, 2),
+                "avg_cost": round(inv.avg_cost, 4),
+                "mark": round(mark, 4),
+                "mark_source": source,
+                "unrealized": round(pnl, 4),
+            })
+
+        return total, marks
+
+    def _estimate_unrealized(self) -> float:
+        """Rough unrealized P&L estimate based on actual market prices."""
+        total, _ = self._compute_unrealized_with_marks()
         return total
 
     # ------------------------------------------------------------------
     # Conservative mark-to-market (best_bid for longs)
     # ------------------------------------------------------------------
     def _estimate_unrealized_conservative(self) -> float:
-        """Mark-to-market using best_bid for long inventory (conservative).
-
-        If best_bid unavailable, falls back to mid.
-        Applies SIM_FEE_BPS if configured.
-        """
-        fee_bps = self.cfg.SIM_FEE_BPS
-        fee_rate = fee_bps / 10_000.0 if fee_bps > 0 else 0.0
-        total = 0.0
-        for (slug, outcome), inv in self.state.inventory.items():
-            if inv.shares <= 0:
-                continue
-            pair = self.universe.get_pair(slug)
-            if pair is None:
-                continue
-            token_id = pair.up_token_id if outcome == "Up" else pair.down_token_id
-            book = self.features._book_cache.get(token_id)
-            if book:
-                # Conservative: mark long to best_bid, fall back to mid
-                mark = book.best_bid if book.best_bid > 0 else book.mid
-                pnl = inv.shares * (mark - inv.avg_cost)
-                if fee_rate > 0:
-                    # Deduct hypothetical round-trip fee
-                    pnl -= fee_rate * inv.shares * (mark + inv.avg_cost)
-                total += pnl
-        return total
+        """Mark-to-market using actual prices. Applies SIM_FEE_BPS if configured."""
+        return self._estimate_unrealized()
 
     # ------------------------------------------------------------------
     # Hourly PnL tracking
@@ -308,7 +347,7 @@ class Bot:
             return
 
         # Hour boundary crossed — compute metrics for the completed hour
-        unrealized_end = self._estimate_unrealized_conservative()
+        unrealized_end, mark_details = self._compute_unrealized_with_marks()
         realized_this_hour = self.state.realized_pnl - self._hourly_realized_start
         net_pnl = realized_this_hour + (unrealized_end - self._hourly_unrealized_start)
 
@@ -339,6 +378,7 @@ class Bot:
             net_pnl_usd=round(net_pnl, 4),
             inventory_notional_end_usd=round(inv_notional, 4),
             top_positions=top_positions,
+            mark_details=mark_details,
             **fill_stats,
         )
 
