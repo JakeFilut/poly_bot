@@ -65,6 +65,22 @@ class OpenOrder:
     created_ts: float    # epoch seconds
 
 
+@dataclass
+class ShadowOrder:
+    """A DRY_RUN limit order waiting for the market to 'touch' its price."""
+    order_id: str
+    slug: str
+    outcome: str
+    token_id: str
+    side: str            # "BUY" or "SELL"
+    price: float
+    qty: float           # shares
+    timestamp: float     # epoch seconds – when the order was placed
+    expiry_ts: float     # epoch seconds – when the order expires (timestamp + ORDER_TTL_MS/1000)
+    client_order_id: str
+    was_crossing: bool = False  # True if price crossed the spread at placement
+
+
 # ---------------------------------------------------------------------------
 # In-memory rolling tape buffers (not persisted)
 # ---------------------------------------------------------------------------
@@ -115,6 +131,7 @@ class StateManager:
         # In-memory caches (loaded from DB at init)
         self.inventory: Dict[Tuple[str, str], InventoryEntry] = {}
         self.open_orders: Dict[str, OpenOrder] = {}
+        self.shadow_orders: Dict[str, ShadowOrder] = {}
 
         # Rolling tapes (in-memory only)
         self.spread_tapes: Dict[str, RollingTape] = defaultdict(
@@ -133,6 +150,7 @@ class StateManager:
         # Load persisted data
         self._load_inventory()
         self._load_open_orders()
+        self._load_shadow_orders()
 
     # ------------------------------------------------------------------
     # Schema
@@ -161,6 +179,19 @@ class StateManager:
             );
             CREATE TABLE IF NOT EXISTS used_client_ids (
                 client_id TEXT PRIMARY KEY
+            );
+            CREATE TABLE IF NOT EXISTS shadow_orders (
+                order_id TEXT PRIMARY KEY,
+                slug TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                token_id TEXT NOT NULL,
+                side TEXT NOT NULL,
+                price REAL NOT NULL,
+                qty REAL NOT NULL,
+                timestamp REAL NOT NULL,
+                expiry_ts REAL NOT NULL,
+                client_order_id TEXT NOT NULL,
+                was_crossing INTEGER NOT NULL DEFAULT 0
             );
         """)
         self._conn.commit()
@@ -281,6 +312,45 @@ class StateManager:
 
     def is_client_id_used(self, client_id: str) -> bool:
         return client_id in self._used_client_ids
+
+    # ------------------------------------------------------------------
+    # Shadow order operations (for touch fill mode)
+    # ------------------------------------------------------------------
+    def _load_shadow_orders(self) -> None:
+        try:
+            for row in self._conn.execute(
+                "SELECT order_id, slug, outcome, token_id, side, price, qty, "
+                "timestamp, expiry_ts, client_order_id, was_crossing FROM shadow_orders"
+            ):
+                oid, slug, outcome, tid, side, price, qty, ts, exp, cid, crossing = row
+                self.shadow_orders[oid] = ShadowOrder(
+                    order_id=oid, slug=slug, outcome=outcome, token_id=tid,
+                    side=side, price=price, qty=qty, timestamp=ts,
+                    expiry_ts=exp, client_order_id=cid, was_crossing=bool(crossing),
+                )
+        except sqlite3.OperationalError:
+            # Table may not exist yet on first run with older DB
+            pass
+
+    def track_shadow_order(self, shadow: ShadowOrder) -> None:
+        self.shadow_orders[shadow.order_id] = shadow
+        self._conn.execute(
+            """INSERT OR REPLACE INTO shadow_orders
+               (order_id, slug, outcome, token_id, side, price, qty,
+                timestamp, expiry_ts, client_order_id, was_crossing)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (shadow.order_id, shadow.slug, shadow.outcome, shadow.token_id,
+             shadow.side, shadow.price, shadow.qty, shadow.timestamp,
+             shadow.expiry_ts, shadow.client_order_id, int(shadow.was_crossing)),
+        )
+        self._conn.commit()
+
+    def remove_shadow_order(self, order_id: str) -> ShadowOrder | None:
+        shadow = self.shadow_orders.pop(order_id, None)
+        if shadow is not None:
+            self._conn.execute("DELETE FROM shadow_orders WHERE order_id=?", (order_id,))
+            self._conn.commit()
+        return shadow
 
     def get_orders_for_token(self, token_id: str) -> List[OpenOrder]:
         return [o for o in self.open_orders.values() if o.token_id == token_id]

@@ -50,7 +50,7 @@ def _env_list_int(key: str, default: List[int]) -> List[int]:
 class Config:
     # -- Mode --
     MODE: str = ""  # DRY_RUN | LIVE
-    DRY_RUN_FILL_MODE: str = "none"  # none | probabilistic | instant
+    DRY_RUN_FILL_MODE: str = "none"  # none | probabilistic | instant | touch
     DRY_RUN_SELFTEST: bool = False   # Force-fill next N orders to prove pipeline
     DRY_RUN_SELFTEST_N: int = 10     # Number of orders to force-fill in selftest
 
@@ -248,8 +248,8 @@ def _validate(cfg: Config) -> None:
 
     if cfg.MODE not in ("DRY_RUN", "LIVE"):
         errors.append(f"MODE must be DRY_RUN or LIVE, got '{cfg.MODE}'")
-    if cfg.DRY_RUN_FILL_MODE not in ("none", "probabilistic", "instant"):
-        errors.append(f"DRY_RUN_FILL_MODE must be none|probabilistic|instant, got '{cfg.DRY_RUN_FILL_MODE}'")
+    if cfg.DRY_RUN_FILL_MODE not in ("none", "probabilistic", "instant", "touch"):
+        errors.append(f"DRY_RUN_FILL_MODE must be none|probabilistic|instant|touch, got '{cfg.DRY_RUN_FILL_MODE}'")
 
     if cfg.MODE == "LIVE":
         if not cfg.POLYMARKET_API_KEY:
