@@ -21,7 +21,7 @@ from typing import Deque, Dict, List, Optional, Tuple
 from config import Config
 from logger import Logger
 from polymarket_api import BookSnapshot, PolymarketAPI
-from state import OpenOrder, StateManager
+from state import OpenOrder, ShadowOrder, StateManager
 from strategy import TradeAction
 
 
@@ -53,6 +53,11 @@ class ExecutionEngine:
 
         # Self-test: force-fill counter (decremented on each forced fill)
         self._selftest_remaining: int = 0
+
+        # Shadow fill (touch mode) diagnostics
+        self._shadow_fills_this_min: int = 0
+        self._shadow_expired_this_min: int = 0
+        self._shadow_stats_ts: float = time.time()
 
     # ------------------------------------------------------------------
     # Main entry point: process a batch of actions
@@ -133,6 +138,7 @@ class ExecutionEngine:
                     now_cancel = time.time()
                     if success:
                         self.state.remove_order(ex_order.order_id)
+                        self.state.remove_shadow_order(ex_order.order_id)
                         self.log.order_cancel(
                             order_id=ex_order.order_id,
                             slug=action.slug,
@@ -266,6 +272,8 @@ class ExecutionEngine:
                     self._selftest_remaining -= 1
                 else:
                     self._try_probabilistic_fill_at_placement(order)
+            elif self.cfg.DRY_RUN_FILL_MODE == "touch":
+                self._store_shadow_order(order)
             elif self.cfg.DRY_RUN_FILL_MODE == "none":
                 # Log-only: track order but do NOT mutate inventory
                 self.log.info(
@@ -325,6 +333,123 @@ class ExecutionEngine:
         # Record fill timestamp for per-token cooldown
         self._last_fill_by_token[(order.slug, order.outcome)] = time.time()
         self.state.remove_order(order.order_id)
+
+    # ------------------------------------------------------------------
+    # Touch fill (shadow order) logic
+    # ------------------------------------------------------------------
+    def _store_shadow_order(self, order: OpenOrder) -> None:
+        """Store an order as a shadow order for touch-based fill simulation.
+
+        If the order was crossing at placement time, mark it so we can
+        allow immediate fill on the next book update.
+        """
+        book = self._get_book_for_order(order)
+        was_crossing = False
+        if book is not None:
+            if order.side == "BUY" and order.price >= book.best_ask:
+                was_crossing = True
+            elif order.side == "SELL" and order.price <= book.best_bid:
+                was_crossing = True
+
+        shadow = ShadowOrder(
+            order_id=order.order_id,
+            slug=order.slug,
+            outcome=order.outcome,
+            token_id=order.token_id,
+            side=order.side,
+            price=order.price,
+            qty=order.size,
+            timestamp=order.created_ts,
+            expiry_ts=order.created_ts + self.cfg.ORDER_TTL_MS / 1000.0,
+            client_order_id=order.client_order_id,
+            was_crossing=was_crossing,
+        )
+        self.state.track_shadow_order(shadow)
+        self.log.info(
+            "shadow_order_stored",
+            order_id=order.order_id,
+            slug=order.slug,
+            outcome=order.outcome,
+            side=order.side,
+            price=order.price,
+            qty=order.size,
+            was_crossing=was_crossing,
+        )
+
+    def _evaluate_shadow_fills(self, token_id: str,
+                               best_bid: float, best_ask: float) -> int:
+        """Evaluate all shadow orders for a given token against current book.
+
+        Touch rules:
+          BUY  fills if best_ask <= order.price OR best_bid >= order.price
+          SELL fills if best_bid >= order.price OR best_ask <= order.price
+
+        Returns number of fills triggered.
+        """
+        now = time.time()
+        fills = 0
+
+        for order_id in list(self.state.shadow_orders.keys()):
+            shadow = self.state.shadow_orders.get(order_id)
+            if shadow is None or shadow.token_id != token_id:
+                continue
+
+            # Check expiry first
+            if now >= shadow.expiry_ts:
+                self.state.remove_shadow_order(order_id)
+                # Also remove from open_orders tracking
+                self.state.remove_order(order_id)
+                self._shadow_expired_this_min += 1
+                self.log.info(
+                    "shadow_order_expired",
+                    order_id=order_id,
+                    slug=shadow.slug,
+                    outcome=shadow.outcome,
+                    side=shadow.side,
+                    price=shadow.price,
+                    age_ms=round((now - shadow.timestamp) * 1000),
+                )
+                continue
+
+            # Check touch condition
+            touched = False
+            if shadow.side == "BUY":
+                if best_ask <= shadow.price or best_bid >= shadow.price:
+                    touched = True
+            elif shadow.side == "SELL":
+                if best_bid >= shadow.price or best_ask <= shadow.price:
+                    touched = True
+
+            if touched:
+                # Reconstruct an OpenOrder to pass through the standard fill pipeline
+                open_order = self.state.open_orders.get(order_id)
+                if open_order is None:
+                    # Order may have been cancelled; clean up shadow
+                    self.state.remove_shadow_order(order_id)
+                    continue
+
+                self._simulate_fill(open_order, reason="touch_fill",
+                                    fill_mode="touch")
+                self.state.remove_shadow_order(order_id)
+                self._shadow_fills_this_min += 1
+                fills += 1
+
+        return fills
+
+    def _emit_shadow_stats(self) -> None:
+        """Emit periodic SHADOW_STATS diagnostics (every 60s)."""
+        now = time.time()
+        if now - self._shadow_stats_ts < 60.0:
+            return
+        self.log.log(
+            "SHADOW_STATS",
+            active_shadow_orders=len(self.state.shadow_orders),
+            fills_this_min=self._shadow_fills_this_min,
+            expired_this_min=self._shadow_expired_this_min,
+        )
+        self._shadow_fills_this_min = 0
+        self._shadow_expired_this_min = 0
+        self._shadow_stats_ts = now
 
     # ------------------------------------------------------------------
     # Probabilistic fill logic
@@ -450,6 +575,38 @@ class ExecutionEngine:
         return 0.0
 
     # ------------------------------------------------------------------
+    # Touch fill sync (evaluate all shadow orders against current books)
+    # ------------------------------------------------------------------
+    def _sync_touch_fills(self) -> int:
+        """Evaluate all shadow orders against current book data.
+
+        Iterates over all unique token_ids that have shadow orders,
+        fetches their current book, and evaluates touch conditions.
+        Also emits periodic SHADOW_STATS.
+        """
+        # Collect unique token_ids with shadow orders
+        token_ids = {s.token_id for s in self.state.shadow_orders.values()}
+        total_fills = 0
+
+        for token_id in token_ids:
+            book = None
+            if self._features is not None:
+                book = self._features._book_cache.get(token_id)
+            if book is None:
+                book = self.api.get_orderbook(token_id)
+            if book is None:
+                continue
+
+            fills = self._evaluate_shadow_fills(
+                token_id, book.best_bid, book.best_ask)
+            total_fills += fills
+
+        # Emit periodic diagnostics
+        self._emit_shadow_stats()
+
+        return total_fills
+
+    # ------------------------------------------------------------------
     # Cancel expired orders
     # ------------------------------------------------------------------
     def _cancel_rate_ok(self) -> bool:
@@ -489,6 +646,7 @@ class ExecutionEngine:
                 success = self.api.cancel_order(order.order_id)
                 if success:
                     self.state.remove_order(order.order_id)
+                    self.state.remove_shadow_order(order.order_id)
                     self.log.order_cancel(
                         order_id=order.order_id,
                         slug=order.slug,
@@ -515,6 +673,8 @@ class ExecutionEngine:
         if self.cfg.MODE == "DRY_RUN":
             if self.cfg.DRY_RUN_FILL_MODE == "probabilistic":
                 return self._check_probabilistic_fills()
+            if self.cfg.DRY_RUN_FILL_MODE == "touch":
+                return self._sync_touch_fills()
             return 0  # instant fills handled at placement; none = no fills
 
         fills = self.api.get_fills(since_ts=self._last_fill_ts)
@@ -588,9 +748,13 @@ class ExecutionEngine:
             try:
                 self.api.cancel_order(order_id)
                 self.state.remove_order(order_id)
+                self.state.remove_shadow_order(order_id)
                 count += 1
             except Exception:
                 pass
+        # Clear any remaining shadow orders
+        for order_id in list(self.state.shadow_orders.keys()):
+            self.state.remove_shadow_order(order_id)
         if self.cfg.MODE == "LIVE":
             self.api.cancel_all()  # belt-and-suspenders
         return count
