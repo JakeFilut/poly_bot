@@ -100,7 +100,11 @@ def _pick_buy_direction(sf: SlugFeatures, cfg: Config) -> str | None:
         # No Binance data: alternate or skip
         return None
 
-    if ret > cfg.BIN_RET30_THRESHOLD:
+    # Volatility gate: skip slow-drift periods to reduce chop bleed
+    if abs(ret) < cfg.BIN_RET30_THRESHOLD:
+        return None
+
+    if ret > 0:
         preferred = "Up"
         fallback = "Down"
     else:
@@ -126,6 +130,10 @@ def _entry_gated(tf: TokenFeatures, cfg: Config,
     """Check if entry is allowed.  Returns (allowed, reason_if_blocked)."""
     if not tf.has_book:
         return False, "no_book"
+    # Volatility filter: skip entry when Binance isn't moving
+    bin_ret_30s = abs(tf.ret_30s or 0)
+    if bin_ret_30s < cfg.VOL_MIN_RET_30S:
+        return False, f"low_vol(bin_ret_30s={bin_ret_30s:.6f}<{cfg.VOL_MIN_RET_30S})"
     if tf.spread_pctl_60s < cfg.SPREAD_PCTL_MIN:
         return False, f"spread_pctl({tf.spread_pctl_60s:.2f}<{cfg.SPREAD_PCTL_MIN})"
     if tf.spread > cfg.SPREAD_MAX_SANE:
@@ -147,6 +155,9 @@ def _entry_price(tf: TokenFeatures, cfg: Config) -> float:
     spread_cents = round(tf.spread * 100)  # integer cents
 
     if spread_cents <= 1:
+        # Weak momentum → force passive (bid-side) to reduce adverse selection
+        if abs(tf.ret_30s or 0) < cfg.VOL_MIN_RET_30S:
+            return tf.best_bid  # passive: avoid crossing in low-vol
         # Tight spread: sometimes cross
         if random.random() < cfg.CROSS_PROB_1C:
             return tf.best_ask  # cross (taker)

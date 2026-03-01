@@ -86,12 +86,16 @@ class Config:
     # -- Spread / gating --
     SPREAD_PCTL_MIN: float = 0.75
     SPREAD_MAX_SANE: float = 0.05  # 5 cents
-    BIN_RET30_THRESHOLD: float = 0.0
+    BIN_RET30_THRESHOLD: float = 0.0004
+
+    # -- Volatility filter (entry gate) --
+    VOL_MIN_RET_30S: float = 0.0004   # min |bin_ret_30s| to allow entry (0.04%)
+    VOL_MIN_RET_120S: float = 0.0006  # min |bin_ret_120s| second gate (0.06%)
 
     # -- Take-profit / stop-loss (in cents i.e. 0.06 = 6¢) --
-    TP_CENTS_MIN: float = 0.06
+    TP_CENTS_MIN: float = 0.08
     TP_CENTS_TARGET: float = 0.10
-    TP_CENTS_MAX: float = 0.16
+    TP_CENTS_MAX: float = 0.18
     SL_CENTS: float = 0.05
 
     # -- Sell sizing --
@@ -109,7 +113,7 @@ class Config:
     MIN_ORDER_SHARES: float = 1.0  # minimum shares per order
 
     # -- Aggression --
-    CROSS_PROB_1C: float = 0.40  # probability of crossing at 1¢ spread
+    CROSS_PROB_1C: float = 0.20  # probability of crossing at 1¢ spread
 
     # -- Cadence (15-min) --
     BUY_HEAVY_SEC: int = 60  # first N seconds: heavy buy
@@ -200,17 +204,19 @@ def load_config() -> Config:
         MIN_CASH_USD=_env_float("MIN_CASH_USD", 50.0),
         SPREAD_PCTL_MIN=_env_float("SPREAD_PCTL_MIN", 0.75),
         SPREAD_MAX_SANE=_env_float("SPREAD_MAX_SANE", 0.05),
-        BIN_RET30_THRESHOLD=_env_float("BIN_RET30_THRESHOLD", 0.0),
-        TP_CENTS_MIN=_env_float("TP_CENTS_MIN", 0.06),
+        BIN_RET30_THRESHOLD=_env_float("BIN_RET30_THRESHOLD", 0.0004),
+        VOL_MIN_RET_30S=_env_float("VOL_MIN_RET_30S", 0.0004),
+        VOL_MIN_RET_120S=_env_float("VOL_MIN_RET_120S", 0.0006),
+        TP_CENTS_MIN=_env_float("TP_CENTS_MIN", 0.08),
         TP_CENTS_TARGET=_env_float("TP_CENTS_TARGET", 0.10),
-        TP_CENTS_MAX=_env_float("TP_CENTS_MAX", 0.16),
+        TP_CENTS_MAX=_env_float("TP_CENTS_MAX", 0.18),
         SL_CENTS=_env_float("SL_CENTS", 0.05),
         SELL_FRAC_MED=_env_float("SELL_FRAC_MED", 0.036),
         SELL_FRAC_MAX=_env_float("SELL_FRAC_MAX", 0.15),
         SELL_MIN_SHARES=_env_float("SELL_MIN_SHARES", 5.0),
         CLIP_UNIT_USD=_env_float("CLIP_UNIT_USD", 1.10),
         CLIP_LADDER_MULTS=_env_list_int("CLIP_LADDER_MULTS", [1, 3, 8, 10, 12]),
-        CROSS_PROB_1C=_env_float("CROSS_PROB_1C", 0.40),
+        CROSS_PROB_1C=_env_float("CROSS_PROB_1C", 0.20),
         BUY_HEAVY_SEC=_env_int("BUY_HEAVY_SEC", 60),
         BUY_MED_SEC=_env_int("BUY_MED_SEC", 120),
         SELL_START_SEC=_env_int("SELL_START_SEC", 300),
