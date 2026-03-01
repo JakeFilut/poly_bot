@@ -100,7 +100,11 @@ def _pick_buy_direction(sf: SlugFeatures, cfg: Config) -> str | None:
         # No Binance data: alternate or skip
         return None
 
-    if ret > cfg.BIN_RET30_THRESHOLD:
+    # Volatility gate: skip slow-drift periods to reduce chop bleed
+    if abs(ret) < cfg.BIN_RET30_THRESHOLD:
+        return None
+
+    if ret > 0:
         preferred = "Up"
         fallback = "Down"
     else:
