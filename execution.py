@@ -288,7 +288,9 @@ class ExecutionEngine:
     # DRY_RUN fill simulation
     # ------------------------------------------------------------------
     def _simulate_fill(self, order: OpenOrder, reason: str = "simulated",
-                       fill_mode: str = "instant") -> None:
+                       fill_mode: str = "instant",
+                       trigger_bid: float | None = None,
+                       trigger_ask: float | None = None) -> None:
         """Simulate a fill in DRY_RUN mode.
 
         Calls the SAME state pipeline as real fills:
@@ -296,8 +298,18 @@ class ExecutionEngine:
           - state.remove_order                       (open orders cleanup)
           - per-token cooldown update
         Emits a DRY_FILL log event with all required fields.
+        For touch fills, trigger_bid/trigger_ask record the book prices
+        that caused the touch (for audit).
         """
         usd = round(order.size * order.price, 4)
+
+        # Extra fields for touch-mode audit
+        touch_extra = {}
+        if fill_mode == "touch":
+            if trigger_bid is not None:
+                touch_extra["trigger_bid"] = trigger_bid
+            if trigger_ask is not None:
+                touch_extra["trigger_ask"] = trigger_ask
 
         if order.side == "BUY":
             inv = self.state.apply_buy_fill(
@@ -313,6 +325,7 @@ class ExecutionEngine:
                 order_id=order.order_id,
                 avg_cost=inv.avg_cost if inv else 0,
                 total_shares=inv.shares if inv else 0,
+                **touch_extra,
             )
         elif order.side == "SELL":
             inv = self.state.apply_sell_fill(
@@ -328,6 +341,7 @@ class ExecutionEngine:
                 order_id=order.order_id,
                 remaining_shares=inv.shares if inv else 0,
                 realized_pnl=round(self.state.realized_pnl, 4),
+                **touch_extra,
             )
 
         # Record fill timestamp for per-token cooldown
@@ -429,7 +443,9 @@ class ExecutionEngine:
                     continue
 
                 self._simulate_fill(open_order, reason="touch_fill",
-                                    fill_mode="touch")
+                                    fill_mode="touch",
+                                    trigger_bid=best_bid,
+                                    trigger_ask=best_ask)
                 self.state.remove_shadow_order(order_id)
                 self._shadow_fills_this_min += 1
                 fills += 1

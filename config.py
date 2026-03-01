@@ -88,6 +88,10 @@ class Config:
     SPREAD_MAX_SANE: float = 0.05  # 5 cents
     BIN_RET30_THRESHOLD: float = 0.0004
 
+    # -- Volatility filter (entry gate) --
+    VOL_MIN_RET_30S: float = 0.0004   # min |bin_ret_30s| to allow entry (0.04%)
+    VOL_MIN_RET_120S: float = 0.0006  # min |bin_ret_120s| second gate (0.06%)
+
     # -- Take-profit / stop-loss (in cents i.e. 0.06 = 6¢) --
     TP_CENTS_MIN: float = 0.08
     TP_CENTS_TARGET: float = 0.10
@@ -201,6 +205,8 @@ def load_config() -> Config:
         SPREAD_PCTL_MIN=_env_float("SPREAD_PCTL_MIN", 0.75),
         SPREAD_MAX_SANE=_env_float("SPREAD_MAX_SANE", 0.05),
         BIN_RET30_THRESHOLD=_env_float("BIN_RET30_THRESHOLD", 0.0004),
+        VOL_MIN_RET_30S=_env_float("VOL_MIN_RET_30S", 0.0004),
+        VOL_MIN_RET_120S=_env_float("VOL_MIN_RET_120S", 0.0006),
         TP_CENTS_MIN=_env_float("TP_CENTS_MIN", 0.08),
         TP_CENTS_TARGET=_env_float("TP_CENTS_TARGET", 0.10),
         TP_CENTS_MAX=_env_float("TP_CENTS_MAX", 0.18),
