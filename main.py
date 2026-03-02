@@ -27,6 +27,7 @@ from zoneinfo import ZoneInfo
 
 from analytics import AnalyticsTracker
 from config import load_config
+from diagnostics import Diagnostics
 from logger import Logger
 from state import StateManager
 from polymarket_api import PolymarketAPI
@@ -74,6 +75,9 @@ class Bot:
         # -- Analytics tracker --
         self.analytics = AnalyticsTracker()
 
+        # -- Diagnostics (auto-generated paper-trade reports) --
+        self.diagnostics = Diagnostics(self.state)
+
         # -- LIVE risk guard (only active when MODE=LIVE) --
         self.live_risk: LiveRiskGuard | None = None
         if self.cfg.MODE == "LIVE":
@@ -91,6 +95,7 @@ class Bot:
         self.execution._features = self.features
         self.execution.analytics = self.analytics
         self.execution.live_risk = self.live_risk
+        self.execution.diagnostics = self.diagnostics
 
         # Self-test mode: force-fill the next N orders
         if self.cfg.DRY_RUN_SELFTEST:
@@ -247,6 +252,9 @@ class Bot:
 
             # Hourly PnL check
             self._check_hourly_pnl()
+
+            # Diagnostics: flush reports on ET hour boundary
+            self.diagnostics.maybe_flush_reports()
 
             # Sleep to maintain target loop rate
             elapsed = time.monotonic() - loop_start
@@ -477,6 +485,9 @@ class Bot:
         # Cancel all open orders
         cancelled = self.execution.cancel_all_open()
         self.log.info("shutdown_cancelled_orders", count=cancelled)
+
+        # Diagnostics: final report flush
+        self.diagnostics.flush_reports(final=True)
 
         # Flush state
         self.state.flush()

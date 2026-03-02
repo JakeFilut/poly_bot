@@ -20,6 +20,7 @@ from typing import Deque, Dict, List, Optional, Tuple
 
 from analytics import AnalyticsTracker
 from config import Config
+from diagnostics import Diagnostics
 from logger import Logger
 from polymarket_api import BookSnapshot, PolymarketAPI
 from risk import LiveRiskGuard
@@ -58,6 +59,9 @@ class ExecutionEngine:
 
         # LIVE risk guard (set externally; only used when MODE=LIVE)
         self.live_risk: Optional[LiveRiskGuard] = None
+
+        # Diagnostics tracker (set externally after construction)
+        self.diagnostics: Optional[Diagnostics] = None
 
         # Self-test: force-fill counter (decremented on each forced fill)
         self._selftest_remaining: int = 0
@@ -169,6 +173,8 @@ class ExecutionEngine:
                             cancel_payload["slug"] = action.slug
                             cancel_payload["outcome"] = action.outcome
                             self.log.log("ORDER_CANCELED", **cancel_payload)
+                        if self.diagnostics:
+                            self.diagnostics.on_order_canceled()
                     else:
                         self.log.error(
                             "cancel_for_replace_rejected",
@@ -283,6 +289,15 @@ class ExecutionEngine:
             )
             self.log.log("ORDER_INTENT", **self.analytics.intent_dict(intent_meta))
 
+        # Diagnostics: order intent
+        if self.diagnostics:
+            _es = "PASSIVE"
+            if action.action == "BUY" and action.price >= ba:
+                _es = "CROSS"
+            elif action.action == "SELL" and action.price <= bb:
+                _es = "CROSS"
+            self.diagnostics.on_order_intent(side=action.action, entry_style=_es)
+
         # Place order
         try:
             if action.action == "BUY":
@@ -338,6 +353,10 @@ class ExecutionEngine:
             )
             self.log.log("ORDER_PLACED", **placed_payload)
 
+        # Diagnostics: order placed
+        if self.diagnostics:
+            self.diagnostics.on_order_placed()
+
         # Record cross notional for LIVE risk discipline
         if self.cfg.MODE == "LIVE" and self.live_risk is not None:
             is_cross = False
@@ -360,16 +379,6 @@ class ExecutionEngine:
             reason=action.reason,
             mode=self.cfg.MODE,
         )
-
-        # Record cross notional for LIVE risk guard
-        if self.cfg.MODE == "LIVE" and self.live_risk is not None:
-            is_cross = False
-            if action.action == "BUY" and action.price >= ba:
-                is_cross = True
-            elif action.action == "SELL" and action.price <= bb:
-                is_cross = True
-            if is_cross:
-                self.live_risk.record_cross(action.size_shares * action.price)
 
         # In DRY_RUN, respect fill mode setting
         if self.cfg.MODE == "DRY_RUN":
@@ -463,6 +472,11 @@ class ExecutionEngine:
                 )
                 fill_payload["fill_source"] = f"dry_{fill_mode}"
                 self.log.log("FILL", **fill_payload)
+            if self.diagnostics:
+                self.diagnostics.on_fill(
+                    side="BUY", fill_price=order.price, fill_shares=order.size,
+                    entry_style=fill_payload.get("entry_style", "UNKNOWN") if self.analytics else "UNKNOWN",
+                )
         elif order.side == "SELL":
             avg_cost_before = 0.0
             inv_before = self.state.get_inventory(order.slug, order.outcome)
@@ -513,6 +527,12 @@ class ExecutionEngine:
                 )
                 fill_payload["fill_source"] = f"dry_{fill_mode}"
                 self.log.log("FILL", **fill_payload)
+            if self.diagnostics:
+                self.diagnostics.on_fill(
+                    side="SELL", fill_price=order.price, fill_shares=order.size,
+                    entry_style=fill_payload.get("entry_style", "UNKNOWN") if self.analytics else "UNKNOWN",
+                    realized_pnl=realized_this_fill,
+                )
 
         # Record fill timestamp for per-token cooldown
         self._last_fill_by_token[(order.slug, order.outcome)] = time.time()
@@ -862,6 +882,8 @@ class ExecutionEngine:
                         cancel_payload["slug"] = order.slug
                         cancel_payload["outcome"] = order.outcome
                         self.log.log("ORDER_CANCELED", **cancel_payload)
+                    if self.diagnostics:
+                        self.diagnostics.on_order_canceled()
                 self._record_cancel()
                 self._ops_this_tick += 1
             except Exception as e:
@@ -940,6 +962,11 @@ class ExecutionEngine:
                         bin_ret_30s=sf.ret_30s or 0.0 if sf else 0.0,
                     )
                     self.log.log("FILL", **fill_payload)
+                if self.diagnostics:
+                    self.diagnostics.on_fill(
+                        side="BUY", fill_price=price, fill_shares=qty,
+                        entry_style=fill_payload.get("entry_style", "UNKNOWN") if self.analytics else "UNKNOWN",
+                    )
             elif side == "SELL":
                 avg_cost_before = 0.0
                 inv_before = self.state.get_inventory(slug, outcome)
@@ -983,6 +1010,12 @@ class ExecutionEngine:
                         realized_pnl=realized_this_fill,
                     )
                     self.log.log("FILL", **fill_payload)
+                if self.diagnostics:
+                    self.diagnostics.on_fill(
+                        side="SELL", fill_price=price, fill_shares=qty,
+                        entry_style=fill_payload.get("entry_style", "UNKNOWN") if self.analytics else "UNKNOWN",
+                        realized_pnl=realized_this_fill,
+                    )
 
             # Record fill timestamp for per-token cooldown
             self._last_fill_by_token[(slug, outcome)] = time.time()
@@ -1025,6 +1058,8 @@ class ExecutionEngine:
                     cancel_payload["slug"] = order.slug
                     cancel_payload["outcome"] = order.outcome
                     self.log.log("ORDER_CANCELED", **cancel_payload)
+                if self.diagnostics:
+                    self.diagnostics.on_order_canceled()
                 self.state.remove_order(order_id)
                 self.state.remove_shadow_order(order_id)
                 count += 1
