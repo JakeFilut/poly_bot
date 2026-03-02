@@ -113,7 +113,7 @@ class Config:
     MIN_ORDER_SHARES: float = 1.0  # minimum shares per order
 
     # -- Aggression --
-    CROSS_PROB_1C: float = 0.10  # probability of crossing at 1¢ spread
+    CROSS_PROB_1C: float = 0.05  # probability of crossing at 1¢ spread
 
     # -- Cadence (15-min) --
     BUY_HEAVY_SEC: int = 60  # first N seconds: heavy buy
@@ -149,6 +149,14 @@ class Config:
     # -- Logging --
     LOG_FILE: str = "/home/ubuntu/github/logs/poly_bot/bot_log.jsonl"
     LOG_ROLLUP_SEC: int = 60
+
+    # -- LIVE risk controls (only enforced when MODE=LIVE) --
+    LIVE_MAX_CAPITAL_USD: float = 400.0          # Max deployed cost basis + pending buys
+    MAX_DAILY_LOSS_USD: float = 100.0            # Hard daily kill switch threshold
+    MAX_INTRADAY_DRAWDOWN_USD: float = 60.0      # Drawdown pause threshold
+    MAX_CAPITAL_PER_ASSET_USD: float = 150.0     # Per-asset cost basis cap
+    MAX_CROSS_NOTIONAL_PER_HOUR_USD: float = 100.0  # Hourly crossing/taker budget
+    PAUSE_MINUTES_ON_DD: int = 45                # Minutes to pause on drawdown breach
 
     # -- Fee simulation --
     SIM_FEE_BPS: float = 0.0  # Simulated fee in basis points (e.g., 5.0 = 5 bps = 0.05%)
@@ -216,7 +224,7 @@ def load_config() -> Config:
         SELL_MIN_SHARES=_env_float("SELL_MIN_SHARES", 5.0),
         CLIP_UNIT_USD=_env_float("CLIP_UNIT_USD", 1.10),
         CLIP_LADDER_MULTS=_env_list_int("CLIP_LADDER_MULTS", [1, 3, 8, 10, 12]),
-        CROSS_PROB_1C=_env_float("CROSS_PROB_1C", 0.10),
+        CROSS_PROB_1C=_env_float("CROSS_PROB_1C", 0.05),
         BUY_HEAVY_SEC=_env_int("BUY_HEAVY_SEC", 60),
         BUY_MED_SEC=_env_int("BUY_MED_SEC", 120),
         SELL_START_SEC=_env_int("SELL_START_SEC", 300),
@@ -238,6 +246,12 @@ def load_config() -> Config:
         RETRY_BACKOFF_BASE=_env_float("RETRY_BACKOFF_BASE", 0.5),
         LOG_FILE=_env("LOG_FILE", "/home/ubuntu/github/logs/poly_bot/bot_log.jsonl"),
         LOG_ROLLUP_SEC=_env_int("LOG_ROLLUP_SEC", 60),
+        LIVE_MAX_CAPITAL_USD=_env_float("LIVE_MAX_CAPITAL_USD", 400.0),
+        MAX_DAILY_LOSS_USD=_env_float("MAX_DAILY_LOSS_USD", 100.0),
+        MAX_INTRADAY_DRAWDOWN_USD=_env_float("MAX_INTRADAY_DRAWDOWN_USD", 60.0),
+        MAX_CAPITAL_PER_ASSET_USD=_env_float("MAX_CAPITAL_PER_ASSET_USD", 150.0),
+        MAX_CROSS_NOTIONAL_PER_HOUR_USD=_env_float("MAX_CROSS_NOTIONAL_PER_HOUR_USD", 100.0),
+        PAUSE_MINUTES_ON_DD=_env_int("PAUSE_MINUTES_ON_DD", 45),
         SIM_FEE_BPS=_env_float("SIM_FEE_BPS", 0.0),
     )
     _validate(cfg)

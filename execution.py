@@ -18,9 +18,12 @@ import uuid
 from collections import deque
 from typing import Deque, Dict, List, Optional, Tuple
 
+from analytics import AnalyticsTracker
 from config import Config
+from diagnostics import Diagnostics
 from logger import Logger
 from polymarket_api import BookSnapshot, PolymarketAPI
+from risk import LiveRiskGuard
 from state import OpenOrder, ShadowOrder, StateManager
 from strategy import TradeAction
 
@@ -50,6 +53,15 @@ class ExecutionEngine:
 
         # Features engine reference (set externally after construction)
         self._features = None  # type: Optional[object]
+
+        # Analytics tracker (set externally after construction)
+        self.analytics: Optional[AnalyticsTracker] = None
+
+        # LIVE risk guard (set externally; only used when MODE=LIVE)
+        self.live_risk: Optional[LiveRiskGuard] = None
+
+        # Diagnostics tracker (set externally after construction)
+        self.diagnostics: Optional[Diagnostics] = None
 
         # Self-test: force-fill counter (decremented on each forced fill)
         self._selftest_remaining: int = 0
@@ -147,6 +159,22 @@ class ExecutionEngine:
                             old_price=ex_order.price,
                             new_price=action.price,
                         )
+                        # Emit ORDER_CANCELED analytics event
+                        if self.analytics:
+                            book = self._get_book_for_token(ex_order.token_id)
+                            cancel_payload = self.analytics.record_cancel(
+                                order_id=ex_order.order_id,
+                                client_order_id=ex_order.client_order_id,
+                                cancel_reason="replace",
+                                created_ts=ex_order.created_ts,
+                                best_bid=book.best_bid if book else 0.0,
+                                best_ask=book.best_ask if book else 0.0,
+                            )
+                            cancel_payload["slug"] = action.slug
+                            cancel_payload["outcome"] = action.outcome
+                            self.log.log("ORDER_CANCELED", **cancel_payload)
+                        if self.diagnostics:
+                            self.diagnostics.on_order_canceled()
                     else:
                         self.log.error(
                             "cancel_for_replace_rejected",
@@ -198,10 +226,77 @@ class ExecutionEngine:
             )
             return
 
+        # --- LIVE risk guard gate (hard risk controls) ---
+        if self.cfg.MODE == "LIVE" and self.live_risk is not None:
+            book_for_risk = self._get_book_for_token(token_id)
+            risk_bb = book_for_risk.best_bid if book_for_risk else 0.0
+            risk_ba = book_for_risk.best_ask if book_for_risk else 1.0
+            risk_ok, risk_reason = self.live_risk.check_order_allowed(
+                side=action.action, slug=action.slug, outcome=action.outcome,
+                price=action.price, size_shares=action.size_shares,
+                best_bid=risk_bb, best_ask=risk_ba,
+            )
+            if not risk_ok:
+                self.log.log(
+                    "LIVE_RISK_BLOCK",
+                    slug=action.slug, outcome=action.outcome,
+                    side=action.action, price=action.price,
+                    size_shares=action.size_shares,
+                    reason=risk_reason,
+                )
+                return
+
         # Generate idempotent client order ID
         client_id = str(uuid.uuid4())
         if self.state.is_client_id_used(client_id):
             client_id = str(uuid.uuid4())  # extremely unlikely collision
+
+        # --- ORDER_INTENT: emit before placement ---
+        book_snap = self._get_book_for_token(token_id)
+        bb = book_snap.best_bid if book_snap else 0.0
+        ba = book_snap.best_ask if book_snap else 1.0
+        bm = book_snap.mid if book_snap else 0.5
+        bs = book_snap.spread if book_snap else 1.0
+
+        bin_ret_30s = 0.0
+        bin_ret_120s = 0.0
+        cadence_sec = 0
+        buy_w = 0.0
+        sell_w = 0.0
+        if self._features is not None:
+            feat = getattr(self._features, '_last_features', {})
+            sf = feat.get(action.slug)
+            if sf:
+                bin_ret_30s = sf.ret_30s or 0.0
+                bin_ret_120s = sf.ret_120s or 0.0
+        if hasattr(self, '_cadence_info'):
+            cadence_sec = self._cadence_info.get('sec', 0)
+            buy_w = self._cadence_info.get('buy_w', 0.0)
+            sell_w = self._cadence_info.get('sell_w', 0.0)
+
+        intent_meta = None
+        if self.analytics:
+            intent_meta = self.analytics.record_intent(
+                client_order_id=client_id,
+                slug=action.slug, outcome=action.outcome,
+                token_id=token_id, side=action.action,
+                desired_price=action.price, desired_shares=action.size_shares,
+                desired_usd=action.size_usd,
+                best_bid=bb, best_ask=ba, mid=bm, spread=bs,
+                bin_ret_30s=bin_ret_30s, bin_ret_120s=bin_ret_120s,
+                cadence_sec=cadence_sec, buy_weight=buy_w, sell_weight=sell_w,
+                reason=action.reason,
+            )
+            self.log.log("ORDER_INTENT", **self.analytics.intent_dict(intent_meta))
+
+        # Diagnostics: order intent
+        if self.diagnostics:
+            _es = "PASSIVE"
+            if action.action == "BUY" and action.price >= ba:
+                _es = "CROSS"
+            elif action.action == "SELL" and action.price <= bb:
+                _es = "CROSS"
+            self.diagnostics.on_order_intent(side=action.action, entry_style=_es)
 
         # Place order
         try:
@@ -227,6 +322,8 @@ class ExecutionEngine:
                 slug=action.slug, outcome=action.outcome,
                 action=action.action,
             )
+            if self.analytics:
+                self.analytics.record_error()
             self._ops_this_tick += 1
             return
 
@@ -246,6 +343,29 @@ class ExecutionEngine:
             created_ts=time.time(),
         )
         self.state.track_order(order)
+
+        # --- ORDER_PLACED: emit after API returns ---
+        if self.analytics:
+            placed_payload = self.analytics.record_placed(
+                client_order_id=client_id, order_id=order_id,
+                posted_price=action.price, posted_shares=action.size_shares,
+                api_response=result,
+            )
+            self.log.log("ORDER_PLACED", **placed_payload)
+
+        # Diagnostics: order placed
+        if self.diagnostics:
+            self.diagnostics.on_order_placed()
+
+        # Record cross notional for LIVE risk discipline
+        if self.cfg.MODE == "LIVE" and self.live_risk is not None:
+            is_cross = False
+            if action.action == "BUY" and action.price >= ba:
+                is_cross = True
+            elif action.action == "SELL" and action.price <= bb:
+                is_cross = True
+            if is_cross:
+                self.live_risk.record_cross(action.price * action.size_shares)
 
         self.log.order_place(
             order_id=order_id,
@@ -327,12 +447,48 @@ class ExecutionEngine:
                 total_shares=inv.shares if inv else 0,
                 **touch_extra,
             )
+            # Analytics FILL for DRY_RUN
+            if self.analytics:
+                book = self._get_book_for_token(order.token_id)
+                sf = None
+                if self._features:
+                    feat = getattr(self._features, '_last_features', {})
+                    for _s, _sf in feat.items():
+                        if (_sf.up and _sf.up.token_id == order.token_id) or \
+                           (_sf.down and _sf.down.token_id == order.token_id):
+                            sf = _sf
+                            break
+                fill_payload = self.analytics.record_fill(
+                    order_id=order.order_id,
+                    client_order_id=order.client_order_id,
+                    slug=order.slug, outcome=order.outcome,
+                    token_id=order.token_id, side="BUY",
+                    fill_price=order.price, fill_shares=order.size,
+                    best_bid=book.best_bid if book else 0.0,
+                    best_ask=book.best_ask if book else 0.0,
+                    mid=book.mid if book else 0.0,
+                    spread=book.spread if book else 0.0,
+                    bin_ret_30s=sf.ret_30s or 0.0 if sf else 0.0,
+                )
+                fill_payload["fill_source"] = f"dry_{fill_mode}"
+                self.log.log("FILL", **fill_payload)
+            if self.diagnostics:
+                self.diagnostics.on_fill(
+                    side="BUY", fill_price=order.price, fill_shares=order.size,
+                    entry_style=fill_payload.get("entry_style", "UNKNOWN") if self.analytics else "UNKNOWN",
+                )
         elif order.side == "SELL":
+            avg_cost_before = 0.0
+            inv_before = self.state.get_inventory(order.slug, order.outcome)
+            if inv_before:
+                avg_cost_before = inv_before.avg_cost
+            realized_before = self.state.realized_pnl
             inv = self.state.apply_sell_fill(
                 order.slug, order.outcome, order.size,
                 sell_price=order.price,
                 fee_bps=self.cfg.SIM_FEE_BPS,
             )
+            realized_this_fill = self.state.realized_pnl - realized_before
             self.log.dry_fill(
                 slug=order.slug, outcome=order.outcome,
                 token_id=order.token_id, side="SELL",
@@ -343,6 +499,40 @@ class ExecutionEngine:
                 realized_pnl=round(self.state.realized_pnl, 4),
                 **touch_extra,
             )
+            # Analytics FILL for DRY_RUN
+            if self.analytics:
+                book = self._get_book_for_token(order.token_id)
+                sf = None
+                if self._features:
+                    feat = getattr(self._features, '_last_features', {})
+                    for _s, _sf in feat.items():
+                        if (_sf.up and _sf.up.token_id == order.token_id) or \
+                           (_sf.down and _sf.down.token_id == order.token_id):
+                            sf = _sf
+                            break
+                fill_payload = self.analytics.record_fill(
+                    order_id=order.order_id,
+                    client_order_id=order.client_order_id,
+                    slug=order.slug, outcome=order.outcome,
+                    token_id=order.token_id, side="SELL",
+                    fill_price=order.price, fill_shares=order.size,
+                    best_bid=book.best_bid if book else 0.0,
+                    best_ask=book.best_ask if book else 0.0,
+                    mid=book.mid if book else 0.0,
+                    spread=book.spread if book else 0.0,
+                    bin_ret_30s=sf.ret_30s or 0.0 if sf else 0.0,
+                    avg_cost_before_sell=avg_cost_before,
+                    position_shares_after=inv.shares if inv else 0.0,
+                    realized_pnl=realized_this_fill,
+                )
+                fill_payload["fill_source"] = f"dry_{fill_mode}"
+                self.log.log("FILL", **fill_payload)
+            if self.diagnostics:
+                self.diagnostics.on_fill(
+                    side="SELL", fill_price=order.price, fill_shares=order.size,
+                    entry_style=fill_payload.get("entry_style", "UNKNOWN") if self.analytics else "UNKNOWN",
+                    realized_pnl=realized_this_fill,
+                )
 
         # Record fill timestamp for per-token cooldown
         self._last_fill_by_token[(order.slug, order.outcome)] = time.time()
@@ -526,6 +716,14 @@ class ExecutionEngine:
 
         return count
 
+    def _get_book_for_token(self, token_id: str) -> Optional[BookSnapshot]:
+        """Get cached book snapshot for a token_id."""
+        if self._features is not None:
+            book = self._features._book_cache.get(token_id)
+            if book is not None:
+                return book
+        return None
+
     def _get_book_for_order(self, order: OpenOrder) -> Optional[BookSnapshot]:
         """Get order book snapshot for an order's token.
 
@@ -670,6 +868,22 @@ class ExecutionEngine:
                         reason="TTL_expired",
                         age_ms=round((time.time() - order.created_ts) * 1000),
                     )
+                    # Emit ORDER_CANCELED analytics event
+                    if self.analytics:
+                        book = self._get_book_for_token(order.token_id)
+                        cancel_payload = self.analytics.record_cancel(
+                            order_id=order.order_id,
+                            client_order_id=order.client_order_id,
+                            cancel_reason="ttl_expired",
+                            created_ts=order.created_ts,
+                            best_bid=book.best_bid if book else 0.0,
+                            best_ask=book.best_ask if book else 0.0,
+                        )
+                        cancel_payload["slug"] = order.slug
+                        cancel_payload["outcome"] = order.outcome
+                        self.log.log("ORDER_CANCELED", **cancel_payload)
+                    if self.diagnostics:
+                        self.diagnostics.on_order_canceled()
                 self._record_cancel()
                 self._ops_this_tick += 1
             except Exception as e:
@@ -677,6 +891,8 @@ class ExecutionEngine:
                     f"cancel_failed: {e}",
                     order_id=order.order_id,
                 )
+                if self.analytics:
+                    self.analytics.record_error()
                 # Still record the cancel attempt for rate limiting
                 self._record_cancel()
                 self._ops_this_tick += 1
@@ -722,16 +938,84 @@ class ExecutionEngine:
                     side="BUY", qty=qty, price=price,
                     avg_cost=inv.avg_cost, total_shares=inv.shares,
                 )
+                # Emit analytics FILL
+                if self.analytics:
+                    book = self._get_book_for_token(token_id)
+                    sf = None
+                    if self._features:
+                        feat = getattr(self._features, '_last_features', {})
+                        for _s, _sf in feat.items():
+                            if (_sf.up and _sf.up.token_id == token_id) or \
+                               (_sf.down and _sf.down.token_id == token_id):
+                                sf = _sf
+                                break
+                    fill_payload = self.analytics.record_fill(
+                        order_id=order_id,
+                        client_order_id=order.client_order_id,
+                        slug=slug, outcome=outcome, token_id=token_id,
+                        side="BUY",
+                        fill_price=price, fill_shares=qty,
+                        best_bid=book.best_bid if book else 0.0,
+                        best_ask=book.best_ask if book else 0.0,
+                        mid=book.mid if book else 0.0,
+                        spread=book.spread if book else 0.0,
+                        bin_ret_30s=sf.ret_30s or 0.0 if sf else 0.0,
+                    )
+                    self.log.log("FILL", **fill_payload)
+                if self.diagnostics:
+                    self.diagnostics.on_fill(
+                        side="BUY", fill_price=price, fill_shares=qty,
+                        entry_style=fill_payload.get("entry_style", "UNKNOWN") if self.analytics else "UNKNOWN",
+                    )
             elif side == "SELL":
+                avg_cost_before = 0.0
+                inv_before = self.state.get_inventory(slug, outcome)
+                if inv_before:
+                    avg_cost_before = inv_before.avg_cost
+                realized_before = self.state.realized_pnl
                 inv = self.state.apply_sell_fill(slug, outcome, qty,
                                                 sell_price=price,
                                                 fee_bps=self.cfg.SIM_FEE_BPS)
+                realized_this_fill = self.state.realized_pnl - realized_before
                 self.log.fill(
                     order_id=order_id, slug=slug, outcome=outcome,
                     side="SELL", qty=qty, price=price,
                     remaining_shares=inv.shares if inv else 0,
                     realized_pnl=round(self.state.realized_pnl, 4),
                 )
+                # Emit analytics FILL
+                if self.analytics:
+                    book = self._get_book_for_token(token_id)
+                    sf = None
+                    if self._features:
+                        feat = getattr(self._features, '_last_features', {})
+                        for _s, _sf in feat.items():
+                            if (_sf.up and _sf.up.token_id == token_id) or \
+                               (_sf.down and _sf.down.token_id == token_id):
+                                sf = _sf
+                                break
+                    fill_payload = self.analytics.record_fill(
+                        order_id=order_id,
+                        client_order_id=order.client_order_id,
+                        slug=slug, outcome=outcome, token_id=token_id,
+                        side="SELL",
+                        fill_price=price, fill_shares=qty,
+                        best_bid=book.best_bid if book else 0.0,
+                        best_ask=book.best_ask if book else 0.0,
+                        mid=book.mid if book else 0.0,
+                        spread=book.spread if book else 0.0,
+                        bin_ret_30s=sf.ret_30s or 0.0 if sf else 0.0,
+                        avg_cost_before_sell=avg_cost_before,
+                        position_shares_after=inv.shares if inv else 0.0,
+                        realized_pnl=realized_this_fill,
+                    )
+                    self.log.log("FILL", **fill_payload)
+                if self.diagnostics:
+                    self.diagnostics.on_fill(
+                        side="SELL", fill_price=price, fill_shares=qty,
+                        entry_style=fill_payload.get("entry_style", "UNKNOWN") if self.analytics else "UNKNOWN",
+                        realized_pnl=realized_this_fill,
+                    )
 
             # Record fill timestamp for per-token cooldown
             self._last_fill_by_token[(slug, outcome)] = time.time()
@@ -761,8 +1045,21 @@ class ExecutionEngine:
         """Cancel all tracked open orders.  For graceful shutdown."""
         count = 0
         for order_id in list(self.state.open_orders.keys()):
+            order = self.state.open_orders.get(order_id)
             try:
                 self.api.cancel_order(order_id)
+                if self.analytics and order:
+                    cancel_payload = self.analytics.record_cancel(
+                        order_id=order_id,
+                        client_order_id=order.client_order_id,
+                        cancel_reason="shutdown",
+                        created_ts=order.created_ts,
+                    )
+                    cancel_payload["slug"] = order.slug
+                    cancel_payload["outcome"] = order.outcome
+                    self.log.log("ORDER_CANCELED", **cancel_payload)
+                if self.diagnostics:
+                    self.diagnostics.on_order_canceled()
                 self.state.remove_order(order_id)
                 self.state.remove_shadow_order(order_id)
                 count += 1

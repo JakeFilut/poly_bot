@@ -25,7 +25,9 @@ import time
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
+from analytics import AnalyticsTracker
 from config import load_config
+from diagnostics import Diagnostics
 from logger import Logger
 from state import StateManager
 from polymarket_api import PolymarketAPI
@@ -34,7 +36,7 @@ from market_universe import MarketUniverse
 from features import FeatureEngine
 from strategy import Strategy
 from execution import ExecutionEngine
-from risk import RiskManager
+from risk import LiveRiskGuard, RiskManager
 
 
 class Bot:
@@ -70,8 +72,30 @@ class Bot:
         self.strategy = Strategy(self.cfg, self.state, self.log)
         self.execution = ExecutionEngine(self.cfg, self.pm_api, self.state, self.log)
 
+        # -- Analytics tracker --
+        self.analytics = AnalyticsTracker()
+
+        # -- Diagnostics (auto-generated paper-trade reports) --
+        self.diagnostics = Diagnostics(self.state)
+
+        # -- LIVE risk guard (only active when MODE=LIVE) --
+        self.live_risk: LiveRiskGuard | None = None
+        if self.cfg.MODE == "LIVE":
+            self.live_risk = LiveRiskGuard(self.cfg, self.state, self.log)
+            self.log.info(
+                "live_risk_guard_initialized",
+                max_capital=self.cfg.LIVE_MAX_CAPITAL_USD,
+                max_daily_loss=self.cfg.MAX_DAILY_LOSS_USD,
+                max_dd=self.cfg.MAX_INTRADAY_DRAWDOWN_USD,
+                max_cross_per_hr=self.cfg.MAX_CROSS_NOTIONAL_PER_HOUR_USD,
+                pause_minutes=self.cfg.PAUSE_MINUTES_ON_DD,
+            )
+
         # Wire features cache into execution for probabilistic book lookups
         self.execution._features = self.features
+        self.execution.analytics = self.analytics
+        self.execution.live_risk = self.live_risk
+        self.execution.diagnostics = self.diagnostics
 
         # Self-test mode: force-fill the next N orders
         if self.cfg.DRY_RUN_SELFTEST:
@@ -204,8 +228,33 @@ class Bot:
                 mark_details=mark_details,
             )
 
+            # Analytics: equity tracking for drawdown
+            equity = self.state.realized_pnl + unreal
+            self.analytics.update_equity(equity)
+
+            # Analytics: MINUTE_ROLLUP
+            inv_snap = self.state.inventory_snapshot()
+            inv_notional = sum(v.get("usd_value", 0) for v in inv_snap.values())
+            sorted_inv = sorted(
+                inv_snap.items(),
+                key=lambda kv: kv[1].get("usd_value", 0),
+                reverse=True,
+            )[:5]
+            top_pos = [{"position": k, **v} for k, v in sorted_inv]
+            minute_payload = self.analytics.maybe_minute_rollup(
+                inventory_notional=inv_notional,
+                top_positions=top_pos,
+            )
+            if minute_payload:
+                self.log.log("MINUTE_ROLLUP", **minute_payload)
+                # Also clean up stale analytics metadata
+                self.analytics.cleanup_stale()
+
             # Hourly PnL check
             self._check_hourly_pnl()
+
+            # Diagnostics: flush reports on ET hour boundary
+            self.diagnostics.maybe_flush_reports()
 
             # Sleep to maintain target loop rate
             elapsed = time.monotonic() - loop_start
@@ -233,6 +282,25 @@ class Bot:
         if fill_count > 0:
             self.log.info("fills_synced", count=fill_count)
 
+        # 4b. LIVE risk guard: update equity and check kill switch / DD pause
+        if self.live_risk is not None:
+            unreal_for_risk = self._estimate_unrealized()
+            self.live_risk.update_equity(
+                realized_pnl=self.state.realized_pnl,
+                unrealized_pnl=unreal_for_risk,
+            )
+            # On halt or pause: cancel all orders and skip strategy
+            if not self.live_risk.trading_allowed:
+                if self.state.open_orders:
+                    cancelled = self.execution.cancel_all_open()
+                    if cancelled > 0:
+                        self.log.info(
+                            "risk_halt_cancelled_orders", count=cancelled,
+                            halted=self.live_risk.is_halted,
+                            paused=self.live_risk.is_paused,
+                        )
+                return  # skip strategy + execution this tick
+
         # 5. Run strategy to generate actions
         actions = self.strategy.generate_actions(
             all_features=all_features,
@@ -240,8 +308,15 @@ class Bot:
             risk_allows_sell=self.risk.allows_sell,
         )
 
-        # 6. Execute actions
+        # 6. Execute actions — pass cadence info for analytics
         if actions:
+            from strategy import cadence_weight, _seconds_from_quarter
+            now_utc = datetime.now(timezone.utc)
+            bw, sw = cadence_weight(self.cfg, now_utc)
+            sec_q = _seconds_from_quarter(now_utc)
+            self.execution._cadence_info = {
+                'sec': sec_q, 'buy_w': bw, 'sell_w': sw,
+            }
             self.execution.execute_actions(actions)
 
         # 7. Update cash estimate after fills
@@ -369,6 +444,17 @@ class Bot:
         # ET time for the completed hour
         hour_et = self._current_hour_utc.astimezone(self._et)
 
+        # Analytics enhanced hourly fields
+        analytics_hourly = self.analytics.get_and_reset_hourly_analytics(
+            unrealized_start=self._hourly_unrealized_start,
+            unrealized_end=unrealized_end,
+        )
+
+        # Live risk guard snapshot for hourly rollup
+        live_risk_snap = {}
+        if self.live_risk is not None:
+            live_risk_snap = self.live_risk.snapshot()
+
         self.log.hourly_pnl(
             hour_start_utc=self._current_hour_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
             hour_start_et=hour_et.strftime("%Y-%m-%d %H:%M ET"),
@@ -380,6 +466,8 @@ class Bot:
             top_positions=top_positions,
             mark_details=mark_details,
             **fill_stats,
+            **analytics_hourly,
+            **live_risk_snap,
         )
 
         # Reset for next hour
@@ -397,6 +485,9 @@ class Bot:
         # Cancel all open orders
         cancelled = self.execution.cancel_all_open()
         self.log.info("shutdown_cancelled_orders", count=cancelled)
+
+        # Diagnostics: final report flush
+        self.diagnostics.flush_reports(final=True)
 
         # Flush state
         self.state.flush()

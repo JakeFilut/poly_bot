@@ -79,6 +79,9 @@ class FeatureEngine:
         self._book_cache_ts: Dict[str, float] = {}
         self._book_cache_ttl = 0.5  # 500ms
 
+        # Last computed features (for analytics lookups)
+        self._last_features: Dict[str, "SlugFeatures"] = {}
+
     def compute_all(self) -> Dict[str, SlugFeatures]:
         """Compute features for all active slugs.  Returns slug -> SlugFeatures."""
         now = time.time()
@@ -103,6 +106,7 @@ class FeatureEngine:
 
             result[slug] = sf
 
+        self._last_features = result
         return result
 
     def _compute_token(self, slug: str, outcome: str, token_id: str,
