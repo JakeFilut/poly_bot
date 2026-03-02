@@ -25,6 +25,7 @@ import time
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
+from analytics import AnalyticsTracker
 from config import load_config
 from logger import Logger
 from state import StateManager
@@ -70,8 +71,12 @@ class Bot:
         self.strategy = Strategy(self.cfg, self.state, self.log)
         self.execution = ExecutionEngine(self.cfg, self.pm_api, self.state, self.log)
 
+        # -- Analytics tracker --
+        self.analytics = AnalyticsTracker()
+
         # Wire features cache into execution for probabilistic book lookups
         self.execution._features = self.features
+        self.execution.analytics = self.analytics
 
         # Self-test mode: force-fill the next N orders
         if self.cfg.DRY_RUN_SELFTEST:
@@ -204,6 +209,28 @@ class Bot:
                 mark_details=mark_details,
             )
 
+            # Analytics: equity tracking for drawdown
+            equity = self.state.realized_pnl + unreal
+            self.analytics.update_equity(equity)
+
+            # Analytics: MINUTE_ROLLUP
+            inv_snap = self.state.inventory_snapshot()
+            inv_notional = sum(v.get("usd_value", 0) for v in inv_snap.values())
+            sorted_inv = sorted(
+                inv_snap.items(),
+                key=lambda kv: kv[1].get("usd_value", 0),
+                reverse=True,
+            )[:5]
+            top_pos = [{"position": k, **v} for k, v in sorted_inv]
+            minute_payload = self.analytics.maybe_minute_rollup(
+                inventory_notional=inv_notional,
+                top_positions=top_pos,
+            )
+            if minute_payload:
+                self.log.log("MINUTE_ROLLUP", **minute_payload)
+                # Also clean up stale analytics metadata
+                self.analytics.cleanup_stale()
+
             # Hourly PnL check
             self._check_hourly_pnl()
 
@@ -240,8 +267,15 @@ class Bot:
             risk_allows_sell=self.risk.allows_sell,
         )
 
-        # 6. Execute actions
+        # 6. Execute actions — pass cadence info for analytics
         if actions:
+            from strategy import cadence_weight, _seconds_from_quarter
+            now_utc = datetime.now(timezone.utc)
+            bw, sw = cadence_weight(self.cfg, now_utc)
+            sec_q = _seconds_from_quarter(now_utc)
+            self.execution._cadence_info = {
+                'sec': sec_q, 'buy_w': bw, 'sell_w': sw,
+            }
             self.execution.execute_actions(actions)
 
         # 7. Update cash estimate after fills
@@ -369,6 +403,12 @@ class Bot:
         # ET time for the completed hour
         hour_et = self._current_hour_utc.astimezone(self._et)
 
+        # Analytics enhanced hourly fields
+        analytics_hourly = self.analytics.get_and_reset_hourly_analytics(
+            unrealized_start=self._hourly_unrealized_start,
+            unrealized_end=unrealized_end,
+        )
+
         self.log.hourly_pnl(
             hour_start_utc=self._current_hour_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
             hour_start_et=hour_et.strftime("%Y-%m-%d %H:%M ET"),
@@ -380,6 +420,7 @@ class Bot:
             top_positions=top_positions,
             mark_details=mark_details,
             **fill_stats,
+            **analytics_hourly,
         )
 
         # Reset for next hour
