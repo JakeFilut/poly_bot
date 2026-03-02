@@ -22,6 +22,7 @@ from analytics import AnalyticsTracker
 from config import Config
 from logger import Logger
 from polymarket_api import BookSnapshot, PolymarketAPI
+from risk import LiveRiskGuard
 from state import OpenOrder, ShadowOrder, StateManager
 from strategy import TradeAction
 
@@ -54,6 +55,9 @@ class ExecutionEngine:
 
         # Analytics tracker (set externally after construction)
         self.analytics: Optional[AnalyticsTracker] = None
+
+        # LIVE risk guard (set externally; only used when MODE=LIVE)
+        self.live_risk: Optional[LiveRiskGuard] = None
 
         # Self-test: force-fill counter (decremented on each forced fill)
         self._selftest_remaining: int = 0
@@ -216,6 +220,26 @@ class ExecutionEngine:
             )
             return
 
+        # --- LIVE risk guard gate (hard risk controls) ---
+        if self.cfg.MODE == "LIVE" and self.live_risk is not None:
+            book_for_risk = self._get_book_for_token(token_id)
+            risk_bb = book_for_risk.best_bid if book_for_risk else 0.0
+            risk_ba = book_for_risk.best_ask if book_for_risk else 1.0
+            risk_ok, risk_reason = self.live_risk.check_order_allowed(
+                side=action.action, slug=action.slug, outcome=action.outcome,
+                price=action.price, size_shares=action.size_shares,
+                best_bid=risk_bb, best_ask=risk_ba,
+            )
+            if not risk_ok:
+                self.log.log(
+                    "LIVE_RISK_BLOCK",
+                    slug=action.slug, outcome=action.outcome,
+                    side=action.action, price=action.price,
+                    size_shares=action.size_shares,
+                    reason=risk_reason,
+                )
+                return
+
         # Generate idempotent client order ID
         client_id = str(uuid.uuid4())
         if self.state.is_client_id_used(client_id):
@@ -314,6 +338,16 @@ class ExecutionEngine:
             )
             self.log.log("ORDER_PLACED", **placed_payload)
 
+        # Record cross notional for LIVE risk discipline
+        if self.cfg.MODE == "LIVE" and self.live_risk is not None:
+            is_cross = False
+            if action.action == "BUY" and action.price >= ba:
+                is_cross = True
+            elif action.action == "SELL" and action.price <= bb:
+                is_cross = True
+            if is_cross:
+                self.live_risk.record_cross(action.price * action.size_shares)
+
         self.log.order_place(
             order_id=order_id,
             client_order_id=client_id,
@@ -326,6 +360,16 @@ class ExecutionEngine:
             reason=action.reason,
             mode=self.cfg.MODE,
         )
+
+        # Record cross notional for LIVE risk guard
+        if self.cfg.MODE == "LIVE" and self.live_risk is not None:
+            is_cross = False
+            if action.action == "BUY" and action.price >= ba:
+                is_cross = True
+            elif action.action == "SELL" and action.price <= bb:
+                is_cross = True
+            if is_cross:
+                self.live_risk.record_cross(action.size_shares * action.price)
 
         # In DRY_RUN, respect fill mode setting
         if self.cfg.MODE == "DRY_RUN":

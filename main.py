@@ -35,7 +35,7 @@ from market_universe import MarketUniverse
 from features import FeatureEngine
 from strategy import Strategy
 from execution import ExecutionEngine
-from risk import RiskManager
+from risk import LiveRiskGuard, RiskManager
 
 
 class Bot:
@@ -74,9 +74,23 @@ class Bot:
         # -- Analytics tracker --
         self.analytics = AnalyticsTracker()
 
+        # -- LIVE risk guard (only active when MODE=LIVE) --
+        self.live_risk: LiveRiskGuard | None = None
+        if self.cfg.MODE == "LIVE":
+            self.live_risk = LiveRiskGuard(self.cfg, self.state, self.log)
+            self.log.info(
+                "live_risk_guard_initialized",
+                max_capital=self.cfg.LIVE_MAX_CAPITAL_USD,
+                max_daily_loss=self.cfg.MAX_DAILY_LOSS_USD,
+                max_dd=self.cfg.MAX_INTRADAY_DRAWDOWN_USD,
+                max_cross_per_hr=self.cfg.MAX_CROSS_NOTIONAL_PER_HOUR_USD,
+                pause_minutes=self.cfg.PAUSE_MINUTES_ON_DD,
+            )
+
         # Wire features cache into execution for probabilistic book lookups
         self.execution._features = self.features
         self.execution.analytics = self.analytics
+        self.execution.live_risk = self.live_risk
 
         # Self-test mode: force-fill the next N orders
         if self.cfg.DRY_RUN_SELFTEST:
@@ -260,6 +274,25 @@ class Bot:
         if fill_count > 0:
             self.log.info("fills_synced", count=fill_count)
 
+        # 4b. LIVE risk guard: update equity and check kill switch / DD pause
+        if self.live_risk is not None:
+            unreal_for_risk = self._estimate_unrealized()
+            self.live_risk.update_equity(
+                realized_pnl=self.state.realized_pnl,
+                unrealized_pnl=unreal_for_risk,
+            )
+            # On halt or pause: cancel all orders and skip strategy
+            if not self.live_risk.trading_allowed:
+                if self.state.open_orders:
+                    cancelled = self.execution.cancel_all_open()
+                    if cancelled > 0:
+                        self.log.info(
+                            "risk_halt_cancelled_orders", count=cancelled,
+                            halted=self.live_risk.is_halted,
+                            paused=self.live_risk.is_paused,
+                        )
+                return  # skip strategy + execution this tick
+
         # 5. Run strategy to generate actions
         actions = self.strategy.generate_actions(
             all_features=all_features,
@@ -409,6 +442,11 @@ class Bot:
             unrealized_end=unrealized_end,
         )
 
+        # Live risk guard snapshot for hourly rollup
+        live_risk_snap = {}
+        if self.live_risk is not None:
+            live_risk_snap = self.live_risk.snapshot()
+
         self.log.hourly_pnl(
             hour_start_utc=self._current_hour_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
             hour_start_et=hour_et.strftime("%Y-%m-%d %H:%M ET"),
@@ -421,6 +459,7 @@ class Bot:
             mark_details=mark_details,
             **fill_stats,
             **analytics_hourly,
+            **live_risk_snap,
         )
 
         # Reset for next hour

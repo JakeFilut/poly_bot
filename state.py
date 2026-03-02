@@ -193,6 +193,10 @@ class StateManager:
                 client_order_id TEXT NOT NULL,
                 was_crossing INTEGER NOT NULL DEFAULT 0
             );
+            CREATE TABLE IF NOT EXISTS live_risk_halt (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
         """)
         self._conn.commit()
 
@@ -379,6 +383,32 @@ class StateManager:
                 "usd_value": round(inv.cost_basis_usd, 4),
             }
         return snap
+
+    # ------------------------------------------------------------------
+    # LIVE risk halt persistence
+    # ------------------------------------------------------------------
+    def set_risk_halt(self, key: str, value: str) -> None:
+        """Persist a risk halt key-value pair to SQLite."""
+        self._conn.execute(
+            "INSERT OR REPLACE INTO live_risk_halt (key, value) VALUES (?, ?)",
+            (key, value),
+        )
+        self._conn.commit()
+
+    def get_risk_halt(self, key: str) -> str | None:
+        """Read a persisted risk halt value."""
+        try:
+            row = self._conn.execute(
+                "SELECT value FROM live_risk_halt WHERE key=?", (key,)
+            ).fetchone()
+            return row[0] if row else None
+        except sqlite3.OperationalError:
+            return None
+
+    def clear_risk_halt(self, key: str) -> None:
+        """Remove a persisted risk halt key."""
+        self._conn.execute("DELETE FROM live_risk_halt WHERE key=?", (key,))
+        self._conn.commit()
 
     # ------------------------------------------------------------------
     # Flush / close
