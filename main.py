@@ -303,8 +303,18 @@ class Bot:
 
     def _tick(self, loop_count: int) -> None:
         """One iteration of the main loop."""
-        # 1. Refresh universe periodically
-        if self.universe.needs_refresh():
+        # 1. Refresh universe: forced rollover at hour boundary OR periodic
+        now_utc = datetime.now(timezone.utc)
+        rollover = self.universe.needs_rollover(now_utc)
+        if rollover or self.universe.needs_refresh():
+            if rollover:
+                self.log.info(
+                    "universe_rollover_triggered",
+                    now_utc=now_utc.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+                    earliest_end=self.universe.earliest_end_utc().strftime(
+                        "%Y-%m-%dT%H:%M:%SZ") if self.universe.earliest_end_utc() else "?",
+                    active_slugs=self.universe.active_slugs(),
+                )
             self.universe.refresh()
             # Purge caches for removed markets
             removed_tids = self.universe.get_removed_token_ids()

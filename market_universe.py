@@ -75,6 +75,26 @@ class MarketUniverse:
     def needs_refresh(self) -> bool:
         return time.time() - self._last_refresh > self.cfg.UNIVERSE_REFRESH_SEC
 
+    def earliest_end_utc(self) -> datetime | None:
+        """Return the soonest end_date_utc across active pairs, or None."""
+        ends = [p.end_date_utc for p in self.pairs.values() if p.end_date_utc]
+        return min(ends) if ends else None
+
+    def needs_rollover(self, now_utc: datetime | None = None) -> bool:
+        """True when active markets have expired (now >= earliest_end - 1s).
+
+        This allows the main loop to force an immediate refresh at the hour
+        boundary instead of waiting for the periodic UNIVERSE_REFRESH_SEC timer.
+        """
+        if not self.pairs:
+            return False
+        if now_utc is None:
+            now_utc = datetime.now(timezone.utc)
+        earliest = self.earliest_end_utc()
+        if earliest is None:
+            return False
+        return now_utc >= earliest - timedelta(seconds=1)
+
     def refresh(self) -> int:
         """Refresh universe from Gamma API.  Returns count of active pairs.
 
@@ -234,6 +254,18 @@ class MarketUniverse:
             if old_pair:
                 removed_token_ids.append(old_pair.up_token_id)
                 removed_token_ids.append(old_pair.down_token_id)
+
+        # ── Rollover detection: emit clear log when slugs change ─────
+        if removed or added:
+            self.log.info(
+                "UNIVERSE_ROLLOVER",
+                now_utc=now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                from_slugs=sorted(removed),
+                to_slugs=sorted(added),
+                removed_count=len(removed),
+                added_count=len(added),
+                removed_token_ids=[t[:16] + "..." for t in removed_token_ids],
+            )
 
         self.pairs = new_pairs
         self.token_lookup = new_lookup
