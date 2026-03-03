@@ -127,6 +127,7 @@ class Config:
 
     # -- Universe refresh --
     UNIVERSE_REFRESH_SEC: int = 120
+    UNIVERSE_DEBUG: bool = False  # Log every candidate market with pass/reject reason
 
     # -- State persistence --
     STATE_DB_PATH: str = "/home/ubuntu/github/logs/poly_bot/state.db"
@@ -237,6 +238,7 @@ def load_config() -> Config:
         SELL_BURST3_START=_env_int("SELL_BURST3_START", 780),
         SELL_BURST3_END=_env_int("SELL_BURST3_END", 840),
         UNIVERSE_REFRESH_SEC=_env_int("UNIVERSE_REFRESH_SEC", 120),
+        UNIVERSE_DEBUG=_env_bool("UNIVERSE_DEBUG", False),
         STATE_DB_PATH=_env("STATE_DB_PATH", "/home/ubuntu/github/logs/poly_bot/state.db"),
         STATE_FLUSH_SEC=_env_int("STATE_FLUSH_SEC", 10),
         PER_TOKEN_COOLDOWN_SEC=_env_float("PER_TOKEN_COOLDOWN_SEC", 3.0),
