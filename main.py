@@ -306,6 +306,10 @@ class Bot:
         # 1. Refresh universe periodically
         if self.universe.needs_refresh():
             self.universe.refresh()
+            # Purge caches for removed markets
+            removed_tids = self.universe.get_removed_token_ids()
+            if removed_tids:
+                self._purge_stale_caches(removed_tids)
 
         # 2. Binance price update
         self.binance.refresh_all()
@@ -442,6 +446,22 @@ class Bot:
     def _estimate_unrealized_conservative(self) -> float:
         """Mark-to-market using actual prices. Applies SIM_FEE_BPS if configured."""
         return self._estimate_unrealized()
+
+    # ------------------------------------------------------------------
+    # Cache purging (on universe refresh)
+    # ------------------------------------------------------------------
+    def _purge_stale_caches(self, removed_token_ids: list[str]) -> None:
+        """Remove book cache, spread tapes, and mark cache for removed tokens."""
+        purged = 0
+        for tid in removed_token_ids:
+            if tid in self.features._book_cache:
+                del self.features._book_cache[tid]
+                self.features._book_cache_ts.pop(tid, None)
+                purged += 1
+            self.state.spread_tapes.pop(tid, None)
+            self._last_valid_mid.pop(tid, None)
+        if purged > 0:
+            self.log.info("caches_purged", token_ids=purged)
 
     # ------------------------------------------------------------------
     # Hourly PnL tracking
