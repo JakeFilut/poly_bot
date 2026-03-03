@@ -2472,8 +2472,12 @@ def main():
     # Startup orderbook sanity check: probe up to 3 cached token_ids
     # Cross-reference against the most recent trade price for each.
     # Uses /price fallback when /book is suspect.
+    # NOTE: last_px comes from the trades table — if the cached token belongs
+    # to a previous hour's (now-resolved) market, last_px will be stale and
+    # the orderbook may be empty.  We detect this via trade age and warn.
     _sanity_items = list(_token_cache.items())[:6]  # (slug,outcome)->tid
     _sanity_done = set()
+    _now_epoch = epoch_sec()
     if _sanity_items:
         print("  Orderbook sanity check (book vs last trade price):")
         for (_s_slug, _s_out), _st_tid in _sanity_items:
@@ -2481,18 +2485,30 @@ def main():
                 continue
             _sanity_done.add(_st_tid)
             _st_snap = fetch_orderbook(_st_tid)
-            # Get last known trade price for this token from DB
+            # Get last known trade price AND its timestamp for this token from DB
             _last_px_row = conn.execute(
-                "SELECT price FROM trades WHERE clob_token_id = ? ORDER BY timestamp_epoch DESC LIMIT 1",
+                "SELECT price, timestamp_epoch FROM trades "
+                "WHERE clob_token_id = ? ORDER BY timestamp_epoch DESC LIMIT 1",
                 (_st_tid,)).fetchone()
             _last_px = _last_px_row[0] if _last_px_row else None
+            _last_px_epoch = int(_last_px_row[1]) if (_last_px_row and _last_px_row[1]) else 0
+            _trade_age_sec = int(_now_epoch - _last_px_epoch) if _last_px_epoch else -1
+            _stale_tag = ""
+            if _trade_age_sec > 3600:
+                _stale_tag = f" [STALE trade_age={_trade_age_sec}s]"
+            # Also fetch live midprice for comparison regardless of suspect flag
+            _live_mid = None
+            _live_pp = fetch_clob_midprice(_st_tid)
+            if _live_pp:
+                _live_bp, _live_sp = _live_pp
+                _live_bpf, _live_spf = ffloat(_live_bp), ffloat(_live_sp)
+                if _live_bpf is not None and _live_spf is not None:
+                    _live_mid = (_live_bpf + _live_spf) / 2.0
             _fallback_used = False
             if _st_snap and _st_snap.suspect:
                 # Try /price fallback
-                _pp = fetch_clob_midprice(_st_tid)
-                if _pp:
-                    _bp, _sp = _pp
-                    _bpf, _spf = ffloat(_bp), ffloat(_sp)
+                if _live_pp:
+                    _bpf, _spf = ffloat(_live_pp[0]), ffloat(_live_pp[1])
                     if _bpf is not None and _spf is not None and _bpf > 0.02 and _spf < 0.98:
                         _st_snap = BookSnap(
                             best_bid=clean_number(_spf), best_ask=clean_number(_bpf),
@@ -2508,19 +2524,27 @@ def main():
                     _dist_s = min(abs(_px_s - _bb_s), abs(_px_s - _ba_s))
                     if _dist_s > 0.05:
                         _verdict = f"MISMATCH(dist={_dist_s:.3f})"
+                        if _trade_age_sec > 3600:
+                            _verdict += " (likely stale token from previous hour)"
                 _src_tag = " [/price fallback]" if _fallback_used else ""
+                _mid_tag = f" live_mid={clean_number(_live_mid)}" if _live_mid else ""
                 print(f"    {_s_slug}:{_s_out} tid={_st_tid[:16]}... "
                       f"bb={_st_snap.best_bid} ba={_st_snap.best_ask} spr={_st_snap.spread} "
-                      f"last_px={_last_px or 'N/A'} -> {_verdict}{_src_tag}")
+                      f"last_px={_last_px or 'N/A'}{_mid_tag} "
+                      f"trade_age={_trade_age_sec}s -> {_verdict}{_src_tag}{_stale_tag}")
                 write_jsonl({"event_type": "ORDERBOOK_SANITY_CHECK",
                              "slug": _s_slug, "outcome": _s_out,
                              "token_id": _st_tid, "best_bid": _st_snap.best_bid,
                              "best_ask": _st_snap.best_ask, "spread": _st_snap.spread,
                              "last_trade_price": _last_px or "",
+                             "trade_age_sec": _trade_age_sec,
+                             "live_midprice": clean_number(_live_mid) if _live_mid else "",
                              "suspect": _st_snap.suspect, "verdict": _verdict,
-                             "price_fallback": _fallback_used})
+                             "price_fallback": _fallback_used,
+                             "stale_token": _trade_age_sec > 3600})
             else:
-                print(f"    {_s_slug}:{_s_out} tid={_st_tid[:16]}... FAILED (no data)")
+                print(f"    {_s_slug}:{_s_out} tid={_st_tid[:16]}... FAILED (no data)"
+                      f"{_stale_tag}")
     else:
         print("  Orderbook sanity check: no cached tokens yet, will verify on first trade")
     print("  Ctrl+C to stop.\n")
