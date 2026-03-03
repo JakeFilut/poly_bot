@@ -30,6 +30,7 @@ class OrderMeta:
     outcome: str = ""
     token_id: str = ""
     side: str = ""
+    asset: str = ""  # BTC/ETH/SOL/XRP
 
     # Pricing at intent time
     desired_price: float = 0.0
@@ -46,6 +47,9 @@ class OrderMeta:
     bin_ret_30s: float = 0.0
     bin_ret_120s: float = 0.0
 
+    # Spread percentile at intent
+    spread_pctl_60s: float = 0.0
+
     # Cadence
     cadence_sec_from_quarter_et: int = 0
     buy_weight: float = 0.0
@@ -61,6 +65,14 @@ class OrderMeta:
 
     # Spread at intent
     spread_cents_at_intent: float = 0.0
+
+    # Risk snapshot at intent time
+    total_exposure_usd: float = 0.0
+    outcome_exposure_usd: float = 0.0
+    pending_buy_usd: float = 0.0
+    available_cash_usd: float = 0.0
+    inventory_shares_before: float = 0.0
+    avg_cost_before: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -107,13 +119,21 @@ class AnalyticsTracker:
     def record_intent(self, *,
                       client_order_id: str,
                       slug: str, outcome: str, token_id: str, side: str,
+                      asset: str = "",
                       desired_price: float, desired_shares: float,
                       desired_usd: float,
                       best_bid: float, best_ask: float, mid: float,
                       spread: float,
                       bin_ret_30s: float, bin_ret_120s: float,
+                      spread_pctl_60s: float = 0.0,
                       cadence_sec: int, buy_weight: float, sell_weight: float,
-                      reason: str) -> OrderMeta:
+                      reason: str,
+                      total_exposure_usd: float = 0.0,
+                      outcome_exposure_usd: float = 0.0,
+                      pending_buy_usd: float = 0.0,
+                      available_cash_usd: float = 0.0,
+                      inventory_shares_before: float = 0.0,
+                      avg_cost_before: float = 0.0) -> OrderMeta:
         """Record intent and classify PASSIVE vs CROSS."""
         now = time.time()
 
@@ -128,15 +148,23 @@ class AnalyticsTracker:
         meta = OrderMeta(
             client_order_id=client_order_id,
             slug=slug, outcome=outcome, token_id=token_id, side=side,
+            asset=asset,
             desired_price=desired_price, desired_shares=desired_shares,
             desired_usd=desired_usd,
             best_bid=best_bid, best_ask=best_ask, mid=mid, spread=spread,
             bin_ret_30s=bin_ret_30s, bin_ret_120s=bin_ret_120s,
+            spread_pctl_60s=spread_pctl_60s,
             cadence_sec_from_quarter_et=cadence_sec,
             buy_weight=buy_weight, sell_weight=sell_weight,
             entry_style=entry_style, reason=reason,
             intent_ts=now,
             spread_cents_at_intent=round(spread * 100, 2),
+            total_exposure_usd=total_exposure_usd,
+            outcome_exposure_usd=outcome_exposure_usd,
+            pending_buy_usd=pending_buy_usd,
+            available_cash_usd=available_cash_usd,
+            inventory_shares_before=inventory_shares_before,
+            avg_cost_before=avg_cost_before,
         )
         self._order_meta[client_order_id] = meta
         return meta
@@ -146,16 +174,20 @@ class AnalyticsTracker:
         return {
             "slug": meta.slug,
             "outcome": meta.outcome,
+            "asset": meta.asset,
             "token_id": meta.token_id,
             "side": meta.side,
             "desired_price": meta.desired_price,
             "desired_shares": meta.desired_shares,
             "desired_usd": round(meta.desired_usd, 4),
-            "best_bid": meta.best_bid,
-            "best_ask": meta.best_ask,
-            "mid": round(meta.mid, 4),
-            "spread": round(meta.spread, 4),
+            "snapshot_at_placement": {
+                "best_bid": meta.best_bid,
+                "best_ask": meta.best_ask,
+                "mid": round(meta.mid, 4),
+                "spread": round(meta.spread, 4),
+            },
             "spread_cents": meta.spread_cents_at_intent,
+            "spread_pctl_60s": round(meta.spread_pctl_60s, 4),
             "bin_ret_30s": round(meta.bin_ret_30s, 6),
             "bin_ret_120s": round(meta.bin_ret_120s, 6),
             "cadence_sec_from_quarter_et": meta.cadence_sec_from_quarter_et,
@@ -164,6 +196,12 @@ class AnalyticsTracker:
             "entry_style": meta.entry_style,
             "reason": meta.reason,
             "client_order_id": meta.client_order_id,
+            "total_exposure_usd": round(meta.total_exposure_usd, 2),
+            "outcome_exposure_usd": round(meta.outcome_exposure_usd, 2),
+            "pending_buy_usd": round(meta.pending_buy_usd, 2),
+            "available_cash_usd": round(meta.available_cash_usd, 2),
+            "inventory_shares_before": round(meta.inventory_shares_before, 2),
+            "avg_cost_before": round(meta.avg_cost_before, 4),
         }
 
     # ------------------------------------------------------------------
@@ -194,8 +232,15 @@ class AnalyticsTracker:
         if meta:
             payload["slug"] = meta.slug
             payload["outcome"] = meta.outcome
+            payload["asset"] = meta.asset
             payload["side"] = meta.side
             payload["entry_style"] = meta.entry_style
+            payload["snapshot_at_placement"] = {
+                "best_bid": meta.best_bid,
+                "best_ask": meta.best_ask,
+                "mid": round(meta.mid, 4),
+                "spread": round(meta.spread, 4),
+            }
         if api_response:
             # Include select API debug fields
             for k in ("status", "orderID", "transactionsHash"):
@@ -240,6 +285,7 @@ class AnalyticsTracker:
     # ------------------------------------------------------------------
     def record_fill(self, *, order_id: str, client_order_id: str,
                     slug: str, outcome: str, token_id: str, side: str,
+                    asset: str = "",
                     fill_price: float, fill_shares: float,
                     best_bid: float = 0.0, best_ask: float = 0.0,
                     mid: float = 0.0, spread: float = 0.0,
@@ -259,6 +305,7 @@ class AnalyticsTracker:
         entry_style = meta.entry_style if meta else "UNKNOWN"
         time_to_fill_ms = 0.0
         spread_cents_at_placement = 0.0
+        resolved_asset = asset or (meta.asset if meta else "")
         if meta and meta.placed_ts > 0:
             time_to_fill_ms = round((now - meta.placed_ts) * 1000, 1)
             spread_cents_at_placement = meta.spread_cents_at_intent
@@ -283,14 +330,15 @@ class AnalyticsTracker:
             "client_order_id": client_order_id,
             "slug": slug,
             "outcome": outcome,
+            "asset": resolved_asset,
             "token_id": token_id,
             "side": side,
             "fill_price": fill_price,
             "fill_shares": fill_shares,
             "fill_usd": fill_usd,
             "fill_source": "live_sync",
-            "time_to_fill_ms": time_to_fill_ms,
             "entry_style": entry_style,
+            "time_to_fill_ms": time_to_fill_ms,
             "edge_vs_mid": edge_vs_mid,
             "spread_cents_at_placement": spread_cents_at_placement,
             "spread_cents_at_fill": spread_cents_at_fill,
