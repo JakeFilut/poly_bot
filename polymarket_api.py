@@ -122,6 +122,128 @@ class PolymarketAPI:
 
         return _fetch()
 
+    def search_markets_by_slug_prefix(
+        self,
+        slug_prefix: str,
+        now_utc: "datetime | None" = None,
+        *,
+        active_only: bool = True,
+        max_pages: int = 5,
+        page_size: int = 100,
+    ) -> Tuple[List[dict], dict]:
+        """Find active markets whose slug starts with *slug_prefix*.
+
+        Strategy:
+          1. Narrow query: tag_id=21, end_date_min=now, end_date_max=now+65m.
+             This limits results to crypto markets expiring within the current
+             hour window — exactly the set where hourly up/down markets live.
+          2. Page through results, client-side filter by slug prefix.
+          3. Fallback: if the time-window query returns zero prefix-matches,
+             re-query without end_date bounds and page until found.
+
+        Returns (matched_markets, diagnostics_dict).
+        """
+        from datetime import datetime, timedelta, timezone
+
+        if now_utc is None:
+            now_utc = datetime.now(timezone.utc)
+
+        retry = _retry(self.cfg.RETRY_MAX, self.cfg.RETRY_BACKOFF_BASE, self.log)
+
+        diag: dict = {
+            "slug_prefix": slug_prefix,
+            "strategy": "",
+            "endpoint": f"{self.cfg.GAMMA_API_URL}/markets",
+            "params": {},
+            "pages_fetched": 0,
+            "total_fetched": 0,
+            "prefix_matched": 0,
+            "all_slugs": [],
+        }
+
+        def _page_through(base_params: dict) -> Tuple[List[dict], List[str]]:
+            """Page through Gamma /markets with base_params, filter by slug prefix."""
+            matched: List[dict] = []
+            all_slugs: List[str] = []
+
+            for page in range(max_pages):
+                params = dict(base_params)
+                params["offset"] = page * page_size
+
+                @retry
+                def _fetch(_p=params):
+                    resp = requests.get(
+                        f"{self.cfg.GAMMA_API_URL}/markets",
+                        params=_p,
+                        timeout=10,
+                    )
+                    resp.raise_for_status()
+                    return resp.json()
+
+                batch = _fetch()
+                if not isinstance(batch, list):
+                    batch = []
+
+                diag["pages_fetched"] += 1
+                diag["total_fetched"] += len(batch)
+
+                for m in batch:
+                    slug = m.get("slug", "") or ""
+                    all_slugs.append(slug)
+                    if slug.startswith(slug_prefix):
+                        matched.append(m)
+
+                # Stop paging when a partial page is returned
+                if len(batch) < page_size:
+                    break
+
+            return matched, all_slugs
+
+        # ── Strategy 1: time-window narrowed query ───────────────────
+        end_min = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+        end_max = (now_utc + timedelta(minutes=65)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        narrow_params = {
+            "tag_id": 21,
+            "closed": "false",
+            "limit": page_size,
+            "end_date_min": end_min,
+            "end_date_max": end_max,
+        }
+        if active_only:
+            narrow_params["active"] = "true"
+
+        diag["strategy"] = "time_window"
+        diag["params"] = dict(narrow_params)
+
+        matched, all_slugs = _page_through(narrow_params)
+        diag["all_slugs"] = all_slugs
+        diag["prefix_matched"] = len(matched)
+
+        if matched:
+            return matched, diag
+
+        # ── Strategy 2: broad fallback — page through all active crypto ──
+        diag["strategy"] = "broad_fallback"
+        diag["pages_fetched"] = 0
+        diag["total_fetched"] = 0
+
+        broad_params = {
+            "tag_id": 21,
+            "closed": "false",
+            "limit": page_size,
+        }
+        if active_only:
+            broad_params["active"] = "true"
+
+        diag["params"] = dict(broad_params)
+
+        matched, all_slugs = _page_through(broad_params)
+        diag["all_slugs"] = all_slugs
+        diag["prefix_matched"] = len(matched)
+
+        return matched, diag
+
     def get_orderbook(self, token_id: str) -> BookSnapshot | None:
         """Fetch orderbook for a token."""
         retry = _retry(self.cfg.RETRY_MAX, self.cfg.RETRY_BACKOFF_BASE, self.log)

@@ -77,29 +77,57 @@ class MarketUniverse:
     def refresh(self) -> int:
         """Refresh universe from Gamma API.  Returns count of active pairs.
 
-        Pipeline:
-          1. Fetch all active crypto markets (tag_id=21)
-          2. Strict filter each market (slug prefix, duration, time window)
-          3. Per-symbol dedup: keep only the one current-hour market per asset
-          4. Log every candidate with pass/reject reason
+        Pipeline (deterministic per-asset search):
+          1. For each slug prefix, query Gamma /markets with time-window
+             narrowing (end_date_min=now, end_date_max=now+65m) + tag_id=21.
+             Falls back to broad tag_id=21 pagination if time-window yields 0.
+          2. Client-side filter by slug prefix.
+          3. Strict filter each market (duration, time window, active, etc.)
+          4. Per-symbol dedup: keep only the one current-hour market per asset
+          5. Log endpoint, params, and first 50 slugs per asset for verification
         """
         now_utc = datetime.now(timezone.utc)
 
-        try:
-            raw_markets = self.api.get_markets(tag_id=self.CRYPTO_TAG_ID)
-        except Exception as e:
-            self.log.api_error(fn="universe_refresh", error=str(e))
-            self.log.warn("universe_refresh_failed; keeping current universe")
-            self._last_refresh = time.time()
-            return len(self.pairs)
-
         debug = getattr(self.cfg, "UNIVERSE_DEBUG", False)
 
-        if debug:
+        # ── Per-asset deterministic fetch ────────────────────────────
+        # Instead of a single bulk fetch that may miss low-volume hourly
+        # markets, query once per slug prefix so we are guaranteed to see
+        # our target markets regardless of their volume ranking.
+        raw_markets: List[dict] = []
+        per_asset_raw: Dict[str, List[dict]] = {}
+
+        for prefix, asset_name in _SLUG_PREFIX_TO_ASSET.items():
+            if asset_name not in self.cfg.ASSETS:
+                continue
+            try:
+                batch, diag = self.api.search_markets_by_slug_prefix(
+                    prefix, now_utc=now_utc,
+                )
+            except Exception as e:
+                self.log.api_error(
+                    fn="universe_refresh_search",
+                    slug_prefix=prefix, asset=asset_name, error=str(e),
+                )
+                batch = []
+                diag = {"error": str(e)}
+
+            per_asset_raw[asset_name] = batch
+            raw_markets.extend(batch)
+
+            # Always log discovery diagnostics for every asset search
             self.log.info(
                 "universe_debug_fetch",
+                asset=asset_name,
+                slug_prefix=prefix,
+                strategy=diag.get("strategy", "?"),
+                endpoint=diag.get("endpoint", "?"),
+                params=diag.get("params", {}),
                 now_utc=now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                raw_count=len(raw_markets),
+                pages_fetched=diag.get("pages_fetched", 0),
+                total_fetched=diag.get("total_fetched", 0),
+                prefix_matched=diag.get("prefix_matched", 0),
+                slugs_first_50=diag.get("all_slugs", [])[:50],
             )
 
         # ── Phase 1: strict filter every market ──────────────────────
@@ -236,6 +264,7 @@ class MarketUniverse:
         self.log.info(
             "universe_refreshed",
             raw_count=len(raw_markets),
+            per_asset_raw_counts={a: len(b) for a, b in per_asset_raw.items()},
             candidates_passed=len(candidates),
             total_rejected=len(rejections),
             active=len(self.pairs),
