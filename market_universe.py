@@ -139,42 +139,55 @@ class MarketUniverse:
 
         # ── Phase 2: per-symbol dedup ────────────────────────────────
         # For each asset, keep ONLY the market whose time window contains now.
-        # If multiple qualify (shouldn't happen), pick the one ending soonest.
+        # If multiple qualify, WARNING + keep ending-soonest only.
         best_per_asset: Dict[str, TokenPair] = {}
-        dupes_rejected: List[dict] = []
+        # Track ALL candidates per asset to detect duplicates
+        all_per_asset: Dict[str, List[TokenPair]] = {}
 
         for pair in candidates:
             asset = pair.asset
-            if asset not in best_per_asset:
-                best_per_asset[asset] = pair
+            if asset not in all_per_asset:
+                all_per_asset[asset] = []
+            all_per_asset[asset].append(pair)
+
+        for asset, asset_pairs in all_per_asset.items():
+            if len(asset_pairs) > 1:
+                # GUARDRAIL: multiple markets for same symbol
+                # Sort by end_date ascending → pick ending-soonest
+                asset_pairs.sort(
+                    key=lambda p: p.end_date_utc or datetime.max.replace(tzinfo=timezone.utc),
+                )
+                kept = asset_pairs[0]
+                rejected_slugs = [p.slug for p in asset_pairs[1:]]
+                self.log.warn(
+                    f"GUARDRAIL: {asset} has {len(asset_pairs)} qualifying markets, "
+                    f"keeping ending-soonest only",
+                    asset=asset,
+                    kept_slug=kept.slug,
+                    kept_end=kept.end_date_utc.strftime("%Y-%m-%dT%H:%M:%SZ") if kept.end_date_utc else "?",
+                    rejected_slugs=rejected_slugs,
+                )
+                best_per_asset[asset] = kept
             else:
-                existing = best_per_asset[asset]
-                # Prefer the one ending soonest (tightest current window)
-                if (pair.end_date_utc and existing.end_date_utc
-                        and pair.end_date_utc < existing.end_date_utc):
-                    dupes_rejected.append({
-                        "kept": pair.slug,
-                        "rejected": existing.slug,
-                        "asset": asset,
-                        "reason": "duplicate_asset_replaced",
-                    })
-                    best_per_asset[asset] = pair
-                else:
-                    dupes_rejected.append({
-                        "kept": existing.slug,
-                        "rejected": pair.slug,
-                        "asset": asset,
-                        "reason": "duplicate_asset_skipped",
-                    })
+                best_per_asset[asset] = asset_pairs[0]
 
-        if dupes_rejected:
-            self.log.info(
-                "universe_dedup_rejected",
-                count=len(dupes_rejected),
-                details=dupes_rejected,
+        # ── Phase 3: hard guardrail — max 4 active markets ─────────
+        if len(best_per_asset) > 4:
+            all_slugs = [p.slug for p in best_per_asset.values()]
+            self.log.error(
+                f"GUARDRAIL: {len(best_per_asset)} active markets (max 4). "
+                f"Refusing to trade. Slugs: {all_slugs}",
+                active_count=len(best_per_asset),
+                slugs=all_slugs,
             )
+            # Return empty universe — no trading this cycle
+            self.pairs = {}
+            self.token_lookup = {}
+            self._last_refresh = time.time()
+            self._last_removed_token_ids = []
+            return 0
 
-        # ── Phase 3: build final universe ────────────────────────────
+        # ── Phase 4: build final universe ────────────────────────────
         new_pairs: Dict[str, TokenPair] = {}
         new_lookup: Dict[str, Tuple[str, str]] = {}
         for pair in best_per_asset.values():
@@ -197,40 +210,51 @@ class MarketUniverse:
         self.token_lookup = new_lookup
         self._last_refresh = time.time()
 
-        # ── Logging ──────────────────────────────────────────────────
-        active_summary = {}
+        # ── FINAL TRADABLE UNIVERSE — single JSON line per refresh ──
+        final_universe = []
         for pair in self.pairs.values():
-            start_s = pair.start_date_utc.strftime("%H:%M") if pair.start_date_utc else "?"
-            end_s = pair.end_date_utc.strftime("%H:%M") if pair.end_date_utc else "?"
-            active_summary[pair.asset] = {
+            start_iso = pair.start_date_utc.strftime("%Y-%m-%dT%H:%M:%SZ") if pair.start_date_utc else None
+            end_iso = pair.end_date_utc.strftime("%Y-%m-%dT%H:%M:%SZ") if pair.end_date_utc else None
+            final_universe.append({
+                "asset": pair.asset,
                 "slug": pair.slug,
-                "window": f"{start_s}-{end_s} UTC",
+                "start_utc": start_iso,
+                "end_utc": end_iso,
                 "duration_min": pair.duration_minutes,
-            }
+            })
+        # Sort for deterministic output
+        final_universe.sort(key=lambda x: x["asset"])
 
         self.log.info(
-            "universe_refreshed",
+            "TRADABLE_UNIVERSE",
             now_utc=now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            count=len(self.pairs),
+            markets=final_universe,
+        )
+
+        # ── Additional logging ───────────────────────────────────────
+        self.log.info(
+            "universe_refreshed",
             raw_count=len(raw_markets),
             candidates_passed=len(candidates),
             total_rejected=len(rejections),
             active=len(self.pairs),
             added=len(added),
             removed=len(removed),
-            active_markets=active_summary,
         )
 
         if debug:
             # Print every active market explicitly
             for asset in ("BTC", "ETH", "SOL", "XRP"):
-                info = active_summary.get(asset)
-                if info:
+                pair = best_per_asset.get(asset)
+                if pair:
                     self.log.info(
                         "universe_active_market",
                         asset=asset,
-                        slug=info["slug"],
-                        window=info["window"],
-                        duration_min=info["duration_min"],
+                        slug=pair.slug,
+                        start_utc=pair.start_date_utc.strftime("%Y-%m-%dT%H:%M:%SZ") if pair.start_date_utc else "?",
+                        end_utc=pair.end_date_utc.strftime("%Y-%m-%dT%H:%M:%SZ") if pair.end_date_utc else "?",
+                        duration_min=pair.duration_minutes,
                         status="TRADING",
                     )
                 else:
@@ -313,10 +337,11 @@ class MarketUniverse:
         game_start_raw = m.get("game_start_time") or m.get("startDate") or ""
         if game_start_raw:
             parsed_start = _parse_iso_utc(game_start_raw)
-            if parsed_start:
-                actual_duration = (end_date_utc - parsed_start).total_seconds() / 60
-                duration_minutes = round(actual_duration)
-                start_date_utc = parsed_start
+            if parsed_start is None:
+                return {"pass": False, "reason": f"unparseable_start_date:{game_start_raw[:30]}", "pair": None}
+            actual_duration = (end_date_utc - parsed_start).total_seconds() / 60
+            duration_minutes = round(actual_duration)
+            start_date_utc = parsed_start
 
         # ── Gate 6: duration must be exactly 60 minutes ──
         # Allow small tolerance (55-65 min) for API rounding
