@@ -21,6 +21,7 @@ import os
 import random
 import signal
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -105,6 +106,11 @@ class Bot:
                 force_fill_count=self.cfg.DRY_RUN_SELFTEST_N,
             )
 
+        # -- F247 wallet tracker (background thread) --
+        self._tracker_thread: threading.Thread | None = None
+        if self.cfg.TRACK_F247_WALLET:
+            self._start_tracker()
+
         # -- Shutdown flag --
         self._running = True
         self._last_state_flush = time.monotonic()
@@ -129,6 +135,36 @@ class Bot:
         sig_name = signal.Signals(signum).name
         self.log.info(f"signal_received: {sig_name}, shutting down gracefully")
         self._running = False
+
+    # ------------------------------------------------------------------
+    # F247 wallet tracker
+    # ------------------------------------------------------------------
+    def _start_tracker(self) -> None:
+        """Launch the F247 copy-wallet tracker in a daemon thread."""
+        import f247_copywallet_tracker as tracker
+
+        def _run():
+            try:
+                tracker.main()
+            except Exception as e:
+                self.log.error(f"tracker_thread_error: {e}")
+
+        self._tracker_thread = threading.Thread(
+            target=_run, name="f247_tracker", daemon=True,
+        )
+        self._tracker_thread.start()
+        self.log.info("f247_tracker_started")
+
+    def _stop_tracker(self) -> None:
+        """Signal the tracker thread to stop and wait for it."""
+        import f247_copywallet_tracker as tracker
+        tracker.STOP = True
+        if self._tracker_thread and self._tracker_thread.is_alive():
+            self._tracker_thread.join(timeout=10)
+            self.log.info(
+                "f247_tracker_stopped",
+                clean=not self._tracker_thread.is_alive(),
+            )
 
     # ------------------------------------------------------------------
     # Startup sync
@@ -481,6 +517,10 @@ class Bot:
     def _shutdown(self) -> None:
         """Graceful shutdown: cancel orders, flush state."""
         self.log.info("shutdown_begin")
+
+        # Stop F247 wallet tracker
+        if self._tracker_thread is not None:
+            self._stop_tracker()
 
         # Cancel all open orders
         cancelled = self.execution.cancel_all_open()

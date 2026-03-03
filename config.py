@@ -158,6 +158,9 @@ class Config:
     MAX_CROSS_NOTIONAL_PER_HOUR_USD: float = 100.0  # Hourly crossing/taker budget
     PAUSE_MINUTES_ON_DD: int = 45                # Minutes to pause on drawdown breach
 
+    # -- F247 copy-wallet tracker --
+    TRACK_F247_WALLET: bool = True  # Run the F247 wallet tracker in a background thread
+
     # -- Fee simulation --
     SIM_FEE_BPS: float = 0.0  # Simulated fee in basis points (e.g., 5.0 = 5 bps = 0.05%)
 
@@ -253,6 +256,7 @@ def load_config() -> Config:
         MAX_CROSS_NOTIONAL_PER_HOUR_USD=_env_float("MAX_CROSS_NOTIONAL_PER_HOUR_USD", 100.0),
         PAUSE_MINUTES_ON_DD=_env_int("PAUSE_MINUTES_ON_DD", 45),
         SIM_FEE_BPS=_env_float("SIM_FEE_BPS", 0.0),
+        TRACK_F247_WALLET=_env_bool("TRACK_F247_WALLET", True),
     )
     _validate(cfg)
     # Ensure log/state directories exist
