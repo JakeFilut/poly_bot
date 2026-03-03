@@ -11,6 +11,7 @@ STRICT filtering:
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -358,19 +359,51 @@ class MarketUniverse:
         if end_date_utc is None:
             return {"pass": False, "reason": f"unparseable_end_date:{end_date_raw[:30]}", "pair": None}
 
-        # For hourly markets: start = end - 60 minutes
+        # Default for hourly markets: start = end - 60 minutes.
+        # This is the correct interpretation for Polymarket hourly up/down
+        # markets whose endDate marks the hour boundary.
         start_date_utc = end_date_utc - timedelta(minutes=self.REQUIRED_DURATION_MINUTES)
         duration_minutes = self.REQUIRED_DURATION_MINUTES
 
-        # If game_start_time is available, use it for precise duration check
-        game_start_raw = m.get("game_start_time") or m.get("startDate") or ""
-        if game_start_raw:
-            parsed_start = _parse_iso_utc(game_start_raw)
+        # Try game_start_time / startDate for a more precise window, but
+        # ONLY adopt it if the resulting duration is sane (55-65 min).
+        # Gamma's startDate is often the *event series creation date*
+        # (e.g. March 1 for a series that runs through March 3), which
+        # produces wildly wrong durations like 2936m.  Ignore those.
+        game_start_raw = m.get("game_start_time") or ""
+        start_date_raw = m.get("startDate") or ""
+        _start_source = "default(end-60m)"
+
+        for candidate_raw, label in [
+            (game_start_raw, "game_start_time"),
+            (start_date_raw, "startDate"),
+        ]:
+            if not candidate_raw:
+                continue
+            parsed_start = _parse_iso_utc(candidate_raw)
             if parsed_start is None:
-                return {"pass": False, "reason": f"unparseable_start_date:{game_start_raw[:30]}", "pair": None}
-            actual_duration = (end_date_utc - parsed_start).total_seconds() / 60
-            duration_minutes = round(actual_duration)
-            start_date_utc = parsed_start
+                continue  # skip unparseable, don't reject the market
+            candidate_dur = round(
+                (end_date_utc - parsed_start).total_seconds() / 60
+            )
+            if 55 <= candidate_dur <= 65:
+                start_date_utc = parsed_start
+                duration_minutes = candidate_dur
+                _start_source = label
+                break  # use first sane source
+
+        # Debug log: raw Gamma time fields for this slug
+        self.log.info(
+            "universe_gate5_debug",
+            slug=slug,
+            endDate_raw=end_date_raw[:40],
+            game_start_time_raw=game_start_raw[:40] if game_start_raw else "",
+            startDate_raw=start_date_raw[:40] if start_date_raw else "",
+            computed_start=start_date_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            computed_end=end_date_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            duration_min=duration_minutes,
+            start_source=_start_source,
+        )
 
         # ── Gate 6: duration must be exactly 60 minutes ──
         # Allow small tolerance (55-65 min) for API rounding
@@ -451,20 +484,42 @@ class MarketUniverse:
 # Helpers
 # ------------------------------------------------------------------
 def _parse_iso_utc(s: str) -> datetime | None:
-    """Parse ISO 8601 datetime string to UTC datetime."""
+    """Parse ISO 8601 datetime string to UTC datetime.
+
+    Handles variable-length fractional seconds (e.g. .57018Z) which
+    datetime.fromisoformat on Python < 3.11 rejects (only 3 or 6 digits).
+    """
     if not s:
         return None
     try:
-        # Handle various ISO formats
         s = s.strip()
         if s.endswith("Z"):
             s = s[:-1] + "+00:00"
+        # Normalise fractional seconds to exactly 6 digits so fromisoformat
+        # works on all Python 3.x versions.
+        s = _normalise_fractional_seconds(s)
         dt = datetime.fromisoformat(s)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(timezone.utc)
     except (ValueError, TypeError):
         return None
+
+
+_FRAC_RE = re.compile(r"(\d{2}:\d{2}:\d{2})\.(\d+)")
+
+
+def _normalise_fractional_seconds(s: str) -> str:
+    """Pad or truncate fractional seconds to exactly 6 digits."""
+    m = _FRAC_RE.search(s)
+    if not m:
+        return s
+    frac = m.group(2)
+    if len(frac) == 3 or len(frac) == 6:
+        return s  # already fine
+    # Pad to 6 or truncate to 6
+    normalised = frac[:6].ljust(6, "0")
+    return s[:m.start(2)] + normalised + s[m.end(2):]
 
 
 def _extract_outcome_tokens(tokens: list) -> Tuple[str, str]:
