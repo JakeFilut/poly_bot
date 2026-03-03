@@ -81,9 +81,9 @@ class Logger:
     def order_place(self, **kw):
         self.log("ORDER_PLACE", **kw)
 
-    def order_cancel(self, **kw):
+    def order_canceled(self, **kw):
         self._cancel_count += 1
-        self.log("ORDER_CANCEL", **kw)
+        self.log("ORDER_CANCELED", **kw)
 
     def fill(self, **kw):
         self._fill_count += 1
@@ -98,9 +98,9 @@ class Logger:
     def _track_hourly_fill(self, kw: dict) -> None:
         """Accumulate per-hour and per-rollup fill counts and volumes."""
         side = kw.get("side", "")
-        qty = kw.get("qty", 0) or kw.get("qty_shares", 0)
-        price = kw.get("price", 0)
-        usd = qty * price if qty and price else kw.get("usd", 0)
+        qty = kw.get("fill_shares", 0) or kw.get("qty_shares", 0) or kw.get("qty", 0)
+        price = kw.get("fill_price", 0) or kw.get("price", 0)
+        usd = kw.get("fill_usd", 0) or (qty * price if qty and price else kw.get("usd", 0))
         if side == "BUY":
             self._hourly_buy_fills += 1
             self._hourly_gross_buy_usd += usd
@@ -121,6 +121,8 @@ class Logger:
         self.log("API_ERROR", **kw)
 
     def dry_run_order(self, **kw):
+        """Deprecated: only emits when DEBUG_LOG_ORDERS is set.
+        Called from polymarket_api.py behind a config guard."""
         self._dry_run_orders += 1
         self.log("DRY_RUN_ORDER", **kw)
 

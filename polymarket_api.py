@@ -312,10 +312,11 @@ class PolymarketAPI:
 
         if self.cfg.MODE == "DRY_RUN":
             mock_id = f"dry_{cid[:8]}"
-            self.log.dry_run_order(
-                action="BUY", token_id=token_id, price=price,
-                size=size_shares, client_order_id=cid,
-            )
+            if self.cfg.DEBUG_LOG_ORDERS:
+                self.log.dry_run_order(
+                    action="BUY", token_id=token_id, price=price,
+                    size=size_shares, client_order_id=cid,
+                )
             return {"order_id": mock_id, "client_order_id": cid, "status": "DRY_RUN"}
 
         return self._place_order(token_id, "BUY", price, size_shares, cid)
@@ -327,10 +328,11 @@ class PolymarketAPI:
 
         if self.cfg.MODE == "DRY_RUN":
             mock_id = f"dry_{cid[:8]}"
-            self.log.dry_run_order(
-                action="SELL", token_id=token_id, price=price,
-                size=size_shares, client_order_id=cid,
-            )
+            if self.cfg.DEBUG_LOG_ORDERS:
+                self.log.dry_run_order(
+                    action="SELL", token_id=token_id, price=price,
+                    size=size_shares, client_order_id=cid,
+                )
             return {"order_id": mock_id, "client_order_id": cid, "status": "DRY_RUN"}
 
         return self._place_order(token_id, "SELL", price, size_shares, cid)
@@ -373,7 +375,8 @@ class PolymarketAPI:
     def cancel_order(self, order_id: str) -> bool:
         """Cancel an order.  Returns True on success."""
         if self.cfg.MODE == "DRY_RUN":
-            self.log.dry_run_order(action="CANCEL", order_id=order_id)
+            if self.cfg.DEBUG_LOG_ORDERS:
+                self.log.dry_run_order(action="CANCEL", order_id=order_id)
             return True
 
         retry = _retry(self.cfg.RETRY_MAX, self.cfg.RETRY_BACKOFF_BASE, self.log)
@@ -392,7 +395,8 @@ class PolymarketAPI:
     def cancel_all(self) -> int:
         """Cancel all open orders.  Returns count cancelled."""
         if self.cfg.MODE == "DRY_RUN":
-            self.log.dry_run_order(action="CANCEL_ALL")
+            if self.cfg.DEBUG_LOG_ORDERS:
+                self.log.dry_run_order(action="CANCEL_ALL")
             return 0
 
         try:

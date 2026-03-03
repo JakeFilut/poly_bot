@@ -151,15 +151,7 @@ class ExecutionEngine:
                     if success:
                         self.state.remove_order(ex_order.order_id)
                         self.state.remove_shadow_order(ex_order.order_id)
-                        self.log.order_cancel(
-                            order_id=ex_order.order_id,
-                            slug=action.slug,
-                            outcome=action.outcome,
-                            reason="replace_stale_price",
-                            old_price=ex_order.price,
-                            new_price=action.price,
-                        )
-                        # Emit ORDER_CANCELED analytics event
+                        # Emit consolidated ORDER_CANCELED
                         if self.analytics:
                             book = self._get_book_for_token(ex_order.token_id)
                             cancel_payload = self.analytics.record_cancel(
@@ -172,7 +164,15 @@ class ExecutionEngine:
                             )
                             cancel_payload["slug"] = action.slug
                             cancel_payload["outcome"] = action.outcome
-                            self.log.log("ORDER_CANCELED", **cancel_payload)
+                            self.log.order_canceled(**cancel_payload)
+                        else:
+                            self.log.order_canceled(
+                                order_id=ex_order.order_id,
+                                slug=action.slug,
+                                outcome=action.outcome,
+                                cancel_reason="replace",
+                                time_alive_ms=round((time.time() - ex_order.created_ts) * 1000),
+                            )
                         if self.diagnostics:
                             self.diagnostics.on_order_canceled()
                     else:
@@ -454,17 +454,7 @@ class ExecutionEngine:
                 token_id=order.token_id,
                 qty=order.size, price=order.price,
             )
-            self.log.dry_fill(
-                slug=order.slug, outcome=order.outcome,
-                token_id=order.token_id, side="BUY",
-                price=order.price, qty_shares=order.size, usd=usd,
-                reason=reason, fill_mode=fill_mode,
-                order_id=order.order_id,
-                avg_cost=inv.avg_cost if inv else 0,
-                total_shares=inv.shares if inv else 0,
-                **touch_extra,
-            )
-            # Analytics FILL for DRY_RUN
+            # Emit DRY_FILL with same schema as FILL
             fill_entry_style = "UNKNOWN"
             if self.analytics:
                 book = self._get_book_for_token(order.token_id)
@@ -483,8 +473,20 @@ class ExecutionEngine:
                     bin_ret_30s=sf.ret_30s or 0.0 if sf else 0.0,
                 )
                 fill_payload["fill_source"] = f"dry_{fill_mode}"
-                self.log.log("FILL", **fill_payload)
+                fill_payload["fill_mode"] = fill_mode
+                if touch_extra:
+                    fill_payload.update(touch_extra)
+                self.log.dry_fill(**fill_payload)
                 fill_entry_style = fill_payload.get("entry_style", "UNKNOWN")
+            else:
+                self.log.dry_fill(
+                    slug=order.slug, outcome=order.outcome,
+                    token_id=order.token_id, side="BUY",
+                    fill_price=order.price, fill_shares=order.size,
+                    fill_usd=usd, fill_mode=fill_mode,
+                    order_id=order.order_id,
+                    **touch_extra,
+                )
             if self.diagnostics:
                 self.diagnostics.on_fill(
                     side="BUY", fill_price=order.price, fill_shares=order.size,
@@ -502,17 +504,7 @@ class ExecutionEngine:
                 fee_bps=self.cfg.SIM_FEE_BPS,
             )
             realized_this_fill = self.state.realized_pnl - realized_before
-            self.log.dry_fill(
-                slug=order.slug, outcome=order.outcome,
-                token_id=order.token_id, side="SELL",
-                price=order.price, qty_shares=order.size, usd=usd,
-                reason=reason, fill_mode=fill_mode,
-                order_id=order.order_id,
-                remaining_shares=inv.shares if inv else 0,
-                realized_pnl=round(self.state.realized_pnl, 4),
-                **touch_extra,
-            )
-            # Analytics FILL for DRY_RUN
+            # Emit DRY_FILL with same schema as FILL
             fill_entry_style = "UNKNOWN"
             if self.analytics:
                 book = self._get_book_for_token(order.token_id)
@@ -534,8 +526,21 @@ class ExecutionEngine:
                     realized_pnl=realized_this_fill,
                 )
                 fill_payload["fill_source"] = f"dry_{fill_mode}"
-                self.log.log("FILL", **fill_payload)
+                fill_payload["fill_mode"] = fill_mode
+                if touch_extra:
+                    fill_payload.update(touch_extra)
+                self.log.dry_fill(**fill_payload)
                 fill_entry_style = fill_payload.get("entry_style", "UNKNOWN")
+            else:
+                self.log.dry_fill(
+                    slug=order.slug, outcome=order.outcome,
+                    token_id=order.token_id, side="SELL",
+                    fill_price=order.price, fill_shares=order.size,
+                    fill_usd=usd, fill_mode=fill_mode,
+                    order_id=order.order_id,
+                    realized_pnl=round(realized_this_fill, 4),
+                    **touch_extra,
+                )
             if self.diagnostics:
                 self.diagnostics.on_fill(
                     side="SELL", fill_price=order.price, fill_shares=order.size,
@@ -884,14 +889,7 @@ class ExecutionEngine:
                 if success:
                     self.state.remove_order(order.order_id)
                     self.state.remove_shadow_order(order.order_id)
-                    self.log.order_cancel(
-                        order_id=order.order_id,
-                        slug=order.slug,
-                        outcome=order.outcome,
-                        reason="TTL_expired",
-                        age_ms=round((time.time() - order.created_ts) * 1000),
-                    )
-                    # Emit ORDER_CANCELED analytics event
+                    # Emit consolidated ORDER_CANCELED
                     if self.analytics:
                         book = self._get_book_for_token(order.token_id)
                         cancel_payload = self.analytics.record_cancel(
@@ -904,7 +902,15 @@ class ExecutionEngine:
                         )
                         cancel_payload["slug"] = order.slug
                         cancel_payload["outcome"] = order.outcome
-                        self.log.log("ORDER_CANCELED", **cancel_payload)
+                        self.log.order_canceled(**cancel_payload)
+                    else:
+                        self.log.order_canceled(
+                            order_id=order.order_id,
+                            slug=order.slug,
+                            outcome=order.outcome,
+                            cancel_reason="ttl_expired",
+                            time_alive_ms=round((time.time() - order.created_ts) * 1000),
+                        )
                     if self.diagnostics:
                         self.diagnostics.on_order_canceled()
                 self._record_cancel()
@@ -1059,7 +1065,7 @@ class ExecutionEngine:
                     )
                     cancel_payload["slug"] = order.slug
                     cancel_payload["outcome"] = order.outcome
-                    self.log.log("ORDER_CANCELED", **cancel_payload)
+                    self.log.order_canceled(**cancel_payload)
                 if self.diagnostics:
                     self.diagnostics.on_order_canceled()
                 self.state.remove_order(order_id)

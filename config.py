@@ -150,6 +150,7 @@ class Config:
     # -- Logging --
     LOG_FILE: str = "/home/ubuntu/github/logs/poly_bot/bot_log.jsonl"
     LOG_ROLLUP_SEC: int = 60
+    DEBUG_LOG_ORDERS: bool = False  # Emit DRY_RUN_ORDER events (verbose; off by default)
 
     # -- LIVE risk controls (only enforced when MODE=LIVE) --
     LIVE_MAX_CAPITAL_USD: float = 400.0          # Max deployed cost basis + pending buys
@@ -259,6 +260,7 @@ def load_config() -> Config:
         PAUSE_MINUTES_ON_DD=_env_int("PAUSE_MINUTES_ON_DD", 45),
         SIM_FEE_BPS=_env_float("SIM_FEE_BPS", 0.0),
         TRACK_F247_WALLET=_env_bool("TRACK_F247_WALLET", True),
+        DEBUG_LOG_ORDERS=_env_bool("DEBUG_LOG_ORDERS", False),
     )
     _validate(cfg)
     # Ensure log/state directories exist
