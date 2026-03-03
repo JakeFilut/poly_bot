@@ -356,6 +356,12 @@ class AnalyticsTracker:
             payload["avg_cost_before_sell"] = round(avg_cost_before_sell, 4)
             payload["realized_pnl"] = round(realized_pnl, 4)
             payload["position_shares_after"] = round(position_shares_after, 2)
+
+            # Edge-vs-cost diagnostics (execution quality)
+            payload["edge_vs_cost_at_fill"] = round(best_bid - avg_cost_before_sell, 4)
+            best_bid_at_intent = meta.best_bid if meta else 0.0
+            payload["edge_vs_cost_at_intent"] = round(best_bid_at_intent - avg_cost_before_sell, 4)
+
             self._minute_realized_pnl += realized_pnl
             self._hour_realized_pnl += realized_pnl
 
