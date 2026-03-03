@@ -260,6 +260,8 @@ class ExecutionEngine:
 
         bin_ret_30s = 0.0
         bin_ret_120s = 0.0
+        spread_pctl = 0.0
+        asset = ""
         cadence_sec = 0
         buy_w = 0.0
         sell_w = 0.0
@@ -269,10 +271,30 @@ class ExecutionEngine:
             if sf:
                 bin_ret_30s = sf.ret_30s or 0.0
                 bin_ret_120s = sf.ret_120s or 0.0
+                asset = sf.asset
+                # Get spread_pctl from the specific outcome's TokenFeatures
+                tf_out = sf.up if action.outcome == "Up" else sf.down
+                if tf_out:
+                    spread_pctl = tf_out.spread_pctl_60s
         if hasattr(self, '_cadence_info'):
             cadence_sec = self._cadence_info.get('sec', 0)
             buy_w = self._cadence_info.get('buy_w', 0.0)
             sell_w = self._cadence_info.get('sell_w', 0.0)
+
+        # Risk snapshot at intent time
+        total_exposure = self.state.total_exposure_usd()
+        inv_before = self.state.get_inventory(action.slug, action.outcome)
+        outcome_exposure = 0.0
+        inv_shares_before = 0.0
+        avg_cost_before = 0.0
+        if inv_before:
+            outcome_exposure = inv_before.shares * inv_before.avg_cost
+            inv_shares_before = inv_before.shares
+            avg_cost_before = inv_before.avg_cost
+        pending_buy = sum(
+            o.size * o.price for o in self.state.open_orders.values()
+            if o.side == "BUY"
+        )
 
         intent_meta = None
         if self.analytics:
@@ -280,12 +302,20 @@ class ExecutionEngine:
                 client_order_id=client_id,
                 slug=action.slug, outcome=action.outcome,
                 token_id=token_id, side=action.action,
+                asset=asset,
                 desired_price=action.price, desired_shares=action.size_shares,
                 desired_usd=action.size_usd,
                 best_bid=bb, best_ask=ba, mid=bm, spread=bs,
                 bin_ret_30s=bin_ret_30s, bin_ret_120s=bin_ret_120s,
+                spread_pctl_60s=spread_pctl,
                 cadence_sec=cadence_sec, buy_weight=buy_w, sell_weight=sell_w,
                 reason=action.reason,
+                total_exposure_usd=total_exposure,
+                outcome_exposure_usd=outcome_exposure,
+                pending_buy_usd=pending_buy,
+                available_cash_usd=self.cfg.MAX_TOTAL_EXPOSURE_USD * 2 - total_exposure - pending_buy,
+                inventory_shares_before=inv_shares_before,
+                avg_cost_before=avg_cost_before,
             )
             self.log.log("ORDER_INTENT", **self.analytics.intent_dict(intent_meta))
 
@@ -367,19 +397,6 @@ class ExecutionEngine:
             if is_cross:
                 self.live_risk.record_cross(action.price * action.size_shares)
 
-        self.log.order_place(
-            order_id=order_id,
-            client_order_id=client_id,
-            slug=action.slug,
-            outcome=action.outcome,
-            side=action.action,
-            price=action.price,
-            size=action.size_shares,
-            usd=action.size_usd,
-            reason=action.reason,
-            mode=self.cfg.MODE,
-        )
-
         # In DRY_RUN, respect fill mode setting
         if self.cfg.MODE == "DRY_RUN":
             if self.cfg.DRY_RUN_FILL_MODE == "instant":
@@ -448,21 +465,16 @@ class ExecutionEngine:
                 **touch_extra,
             )
             # Analytics FILL for DRY_RUN
+            fill_entry_style = "UNKNOWN"
             if self.analytics:
                 book = self._get_book_for_token(order.token_id)
-                sf = None
-                if self._features:
-                    feat = getattr(self._features, '_last_features', {})
-                    for _s, _sf in feat.items():
-                        if (_sf.up and _sf.up.token_id == order.token_id) or \
-                           (_sf.down and _sf.down.token_id == order.token_id):
-                            sf = _sf
-                            break
+                sf, _asset = self._resolve_slug_features(order.token_id)
                 fill_payload = self.analytics.record_fill(
                     order_id=order.order_id,
                     client_order_id=order.client_order_id,
                     slug=order.slug, outcome=order.outcome,
                     token_id=order.token_id, side="BUY",
+                    asset=_asset,
                     fill_price=order.price, fill_shares=order.size,
                     best_bid=book.best_bid if book else 0.0,
                     best_ask=book.best_ask if book else 0.0,
@@ -472,10 +484,11 @@ class ExecutionEngine:
                 )
                 fill_payload["fill_source"] = f"dry_{fill_mode}"
                 self.log.log("FILL", **fill_payload)
+                fill_entry_style = fill_payload.get("entry_style", "UNKNOWN")
             if self.diagnostics:
                 self.diagnostics.on_fill(
                     side="BUY", fill_price=order.price, fill_shares=order.size,
-                    entry_style=fill_payload.get("entry_style", "UNKNOWN") if self.analytics else "UNKNOWN",
+                    entry_style=fill_entry_style,
                 )
         elif order.side == "SELL":
             avg_cost_before = 0.0
@@ -500,21 +513,16 @@ class ExecutionEngine:
                 **touch_extra,
             )
             # Analytics FILL for DRY_RUN
+            fill_entry_style = "UNKNOWN"
             if self.analytics:
                 book = self._get_book_for_token(order.token_id)
-                sf = None
-                if self._features:
-                    feat = getattr(self._features, '_last_features', {})
-                    for _s, _sf in feat.items():
-                        if (_sf.up and _sf.up.token_id == order.token_id) or \
-                           (_sf.down and _sf.down.token_id == order.token_id):
-                            sf = _sf
-                            break
+                sf, _asset = self._resolve_slug_features(order.token_id)
                 fill_payload = self.analytics.record_fill(
                     order_id=order.order_id,
                     client_order_id=order.client_order_id,
                     slug=order.slug, outcome=order.outcome,
                     token_id=order.token_id, side="SELL",
+                    asset=_asset,
                     fill_price=order.price, fill_shares=order.size,
                     best_bid=book.best_bid if book else 0.0,
                     best_ask=book.best_ask if book else 0.0,
@@ -527,10 +535,11 @@ class ExecutionEngine:
                 )
                 fill_payload["fill_source"] = f"dry_{fill_mode}"
                 self.log.log("FILL", **fill_payload)
+                fill_entry_style = fill_payload.get("entry_style", "UNKNOWN")
             if self.diagnostics:
                 self.diagnostics.on_fill(
                     side="SELL", fill_price=order.price, fill_shares=order.size,
-                    entry_style=fill_payload.get("entry_style", "UNKNOWN") if self.analytics else "UNKNOWN",
+                    entry_style=fill_entry_style,
                     realized_pnl=realized_this_fill,
                 )
 
@@ -736,6 +745,20 @@ class ExecutionEngine:
                 return book
         return self.api.get_orderbook(order.token_id)
 
+    def _resolve_slug_features(self, token_id: str):
+        """Resolve (SlugFeatures, asset) for a token_id from cached features.
+
+        Returns (SlugFeatures | None, asset_str).
+        """
+        if self._features is None:
+            return None, ""
+        feat = getattr(self._features, '_last_features', {})
+        for _s, _sf in feat.items():
+            if (_sf.up and _sf.up.token_id == token_id) or \
+               (_sf.down and _sf.down.token_id == token_id):
+                return _sf, _sf.asset
+        return None, ""
+
     def _compute_fill_probability(self, order: OpenOrder,
                                   book: BookSnapshot) -> float:
         """Per-tick fill probability based on order vs. book.
@@ -933,27 +956,16 @@ class ExecutionEngine:
 
             if side == "BUY":
                 inv = self.state.apply_buy_fill(slug, outcome, token_id, qty, price)
-                self.log.fill(
-                    order_id=order_id, slug=slug, outcome=outcome,
-                    side="BUY", qty=qty, price=price,
-                    avg_cost=inv.avg_cost, total_shares=inv.shares,
-                )
-                # Emit analytics FILL
+                # Emit analytics FILL (canonical event)
+                fill_entry_style = "UNKNOWN"
                 if self.analytics:
                     book = self._get_book_for_token(token_id)
-                    sf = None
-                    if self._features:
-                        feat = getattr(self._features, '_last_features', {})
-                        for _s, _sf in feat.items():
-                            if (_sf.up and _sf.up.token_id == token_id) or \
-                               (_sf.down and _sf.down.token_id == token_id):
-                                sf = _sf
-                                break
+                    sf, _asset = self._resolve_slug_features(token_id)
                     fill_payload = self.analytics.record_fill(
                         order_id=order_id,
                         client_order_id=order.client_order_id,
                         slug=slug, outcome=outcome, token_id=token_id,
-                        side="BUY",
+                        side="BUY", asset=_asset,
                         fill_price=price, fill_shares=qty,
                         best_bid=book.best_bid if book else 0.0,
                         best_ask=book.best_ask if book else 0.0,
@@ -962,10 +974,11 @@ class ExecutionEngine:
                         bin_ret_30s=sf.ret_30s or 0.0 if sf else 0.0,
                     )
                     self.log.log("FILL", **fill_payload)
+                    fill_entry_style = fill_payload.get("entry_style", "UNKNOWN")
                 if self.diagnostics:
                     self.diagnostics.on_fill(
                         side="BUY", fill_price=price, fill_shares=qty,
-                        entry_style=fill_payload.get("entry_style", "UNKNOWN") if self.analytics else "UNKNOWN",
+                        entry_style=fill_entry_style,
                     )
             elif side == "SELL":
                 avg_cost_before = 0.0
@@ -977,28 +990,16 @@ class ExecutionEngine:
                                                 sell_price=price,
                                                 fee_bps=self.cfg.SIM_FEE_BPS)
                 realized_this_fill = self.state.realized_pnl - realized_before
-                self.log.fill(
-                    order_id=order_id, slug=slug, outcome=outcome,
-                    side="SELL", qty=qty, price=price,
-                    remaining_shares=inv.shares if inv else 0,
-                    realized_pnl=round(self.state.realized_pnl, 4),
-                )
-                # Emit analytics FILL
+                # Emit analytics FILL (canonical event)
+                fill_entry_style = "UNKNOWN"
                 if self.analytics:
                     book = self._get_book_for_token(token_id)
-                    sf = None
-                    if self._features:
-                        feat = getattr(self._features, '_last_features', {})
-                        for _s, _sf in feat.items():
-                            if (_sf.up and _sf.up.token_id == token_id) or \
-                               (_sf.down and _sf.down.token_id == token_id):
-                                sf = _sf
-                                break
+                    sf, _asset = self._resolve_slug_features(token_id)
                     fill_payload = self.analytics.record_fill(
                         order_id=order_id,
                         client_order_id=order.client_order_id,
                         slug=slug, outcome=outcome, token_id=token_id,
-                        side="SELL",
+                        side="SELL", asset=_asset,
                         fill_price=price, fill_shares=qty,
                         best_bid=book.best_bid if book else 0.0,
                         best_ask=book.best_ask if book else 0.0,
@@ -1010,10 +1011,11 @@ class ExecutionEngine:
                         realized_pnl=realized_this_fill,
                     )
                     self.log.log("FILL", **fill_payload)
+                    fill_entry_style = fill_payload.get("entry_style", "UNKNOWN")
                 if self.diagnostics:
                     self.diagnostics.on_fill(
                         side="SELL", fill_price=price, fill_shares=qty,
-                        entry_style=fill_payload.get("entry_style", "UNKNOWN") if self.analytics else "UNKNOWN",
+                        entry_style=fill_entry_style,
                         realized_pnl=realized_this_fill,
                     )
 
