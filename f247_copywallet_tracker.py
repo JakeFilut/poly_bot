@@ -168,10 +168,6 @@ def _handle_stop(signum, frame):
     print("\n[stop] Finishing current loop...")
 
 
-signal.signal(signal.SIGINT, _handle_stop)
-signal.signal(signal.SIGTERM, _handle_stop)
-
-
 # -------------------- JSONL event log --------------------
 _jsonl_fh = None
 
@@ -3202,4 +3198,6 @@ def main():
 
 
 if __name__ == "__main__":
+    signal.signal(signal.SIGINT, _handle_stop)
+    signal.signal(signal.SIGTERM, _handle_stop)
     main()
