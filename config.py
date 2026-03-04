@@ -112,8 +112,14 @@ class Config:
     PRICE_MAX: float = 0.99
     MIN_ORDER_SHARES: float = 1.0  # minimum shares per order
 
-    # -- Aggression --
-    CROSS_PROB_1C: float = 0.05  # probability of crossing at 1¢ spread
+    # -- Aggression / cross discipline --
+    CROSS_PROB_1C: float = 0.02  # probability of crossing at 1¢ spread
+    CROSS_MIN_ABS_RET_30S: float = 0.0008  # min |bin_ret_30s| to allow crossing (0.08%)
+    CROSS_MIN_SPREAD_PCTL: float = 0.85    # min spread_pctl_60s to allow crossing
+
+    # -- Entry selectivity --
+    ENTRY_MIN_SPREAD_PCTL: float = 0.80    # min spread_pctl for entry (stricter than SPREAD_PCTL_MIN)
+    ENTRY_MIN_ABS_RET_30S: float = 0.0005  # min |bin_ret_30s| for entry (0.05%)
 
     # -- Cadence (15-min) --
     BUY_HEAVY_SEC: int = 60  # first N seconds: heavy buy
@@ -229,7 +235,11 @@ def load_config() -> Config:
         SELL_MIN_SHARES=_env_float("SELL_MIN_SHARES", 5.0),
         CLIP_UNIT_USD=_env_float("CLIP_UNIT_USD", 1.10),
         CLIP_LADDER_MULTS=_env_list_int("CLIP_LADDER_MULTS", [1, 3, 8, 10, 12]),
-        CROSS_PROB_1C=_env_float("CROSS_PROB_1C", 0.05),
+        CROSS_PROB_1C=_env_float("CROSS_PROB_1C", 0.02),
+        CROSS_MIN_ABS_RET_30S=_env_float("CROSS_MIN_ABS_RET_30S", 0.0008),
+        CROSS_MIN_SPREAD_PCTL=_env_float("CROSS_MIN_SPREAD_PCTL", 0.85),
+        ENTRY_MIN_SPREAD_PCTL=_env_float("ENTRY_MIN_SPREAD_PCTL", 0.80),
+        ENTRY_MIN_ABS_RET_30S=_env_float("ENTRY_MIN_ABS_RET_30S", 0.0005),
         BUY_HEAVY_SEC=_env_int("BUY_HEAVY_SEC", 60),
         BUY_MED_SEC=_env_int("BUY_MED_SEC", 120),
         SELL_START_SEC=_env_int("SELL_START_SEC", 300),

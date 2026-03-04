@@ -126,44 +126,72 @@ def _pick_buy_direction(sf: SlugFeatures, cfg: Config) -> str | None:
 # 9.3  Entry Gating
 # ═══════════════════════════════════════════════════════════════════════════
 def _entry_gated(tf: TokenFeatures, cfg: Config,
-                 exposure_ok: bool, cash_ok: bool) -> tuple[bool, str]:
-    """Check if entry is allowed.  Returns (allowed, reason_if_blocked)."""
+                 exposure_ok: bool, cash_ok: bool) -> tuple[bool, str, str, float, float]:
+    """Check if entry is allowed.
+
+    Returns (allowed, reason_if_blocked, gate_code, gate_value, gate_threshold).
+    gate_code is a structured identifier for programmatic filtering.
+    """
     if not tf.has_book:
-        return False, "no_book"
-    # Volatility filter: skip entry when Binance isn't moving
+        return False, "no_book", "no_book", 0.0, 0.0
     bin_ret_30s = abs(tf.ret_30s or 0)
+    # Entry selectivity: minimum spread percentile
+    if tf.spread_pctl_60s < cfg.ENTRY_MIN_SPREAD_PCTL:
+        return (False,
+                f"spread_pctl({tf.spread_pctl_60s:.2f}<{cfg.ENTRY_MIN_SPREAD_PCTL})",
+                "spread_pctl_gate", tf.spread_pctl_60s, cfg.ENTRY_MIN_SPREAD_PCTL)
+    # Entry selectivity: minimum absolute momentum
+    if bin_ret_30s < cfg.ENTRY_MIN_ABS_RET_30S:
+        return (False,
+                f"low_vol_entry(|ret30|={bin_ret_30s:.6f}<{cfg.ENTRY_MIN_ABS_RET_30S})",
+                "low_vol_gate", bin_ret_30s, cfg.ENTRY_MIN_ABS_RET_30S)
+    # Legacy volatility filter (may be stricter than ENTRY_MIN_ABS_RET_30S)
     if bin_ret_30s < cfg.VOL_MIN_RET_30S:
-        return False, f"low_vol(bin_ret_30s={bin_ret_30s:.6f}<{cfg.VOL_MIN_RET_30S})"
+        return (False,
+                f"low_vol(bin_ret_30s={bin_ret_30s:.6f}<{cfg.VOL_MIN_RET_30S})",
+                "low_vol_gate", bin_ret_30s, cfg.VOL_MIN_RET_30S)
+    # Legacy spread percentile gate (may be less strict than ENTRY_MIN)
     if tf.spread_pctl_60s < cfg.SPREAD_PCTL_MIN:
-        return False, f"spread_pctl({tf.spread_pctl_60s:.2f}<{cfg.SPREAD_PCTL_MIN})"
+        return (False,
+                f"spread_pctl({tf.spread_pctl_60s:.2f}<{cfg.SPREAD_PCTL_MIN})",
+                "spread_pctl_gate", tf.spread_pctl_60s, cfg.SPREAD_PCTL_MIN)
     if tf.spread > cfg.SPREAD_MAX_SANE:
-        return False, f"spread_too_wide({tf.spread:.4f}>{cfg.SPREAD_MAX_SANE})"
+        return (False,
+                f"spread_too_wide({tf.spread:.4f}>{cfg.SPREAD_MAX_SANE})",
+                "spread_wide_gate", tf.spread, cfg.SPREAD_MAX_SANE)
     if tf.spread <= 0:
-        return False, "zero_spread"
+        return False, "zero_spread", "zero_spread", 0.0, 0.0
     if not exposure_ok:
-        return False, "exposure_cap"
+        return False, "exposure_cap", "risk_cap_gate", 0.0, 0.0
     if not cash_ok:
-        return False, "cash_reserve"
-    return True, ""
+        return False, "cash_reserve", "risk_cap_gate", 0.0, 0.0
+    return True, "", "", 0.0, 0.0
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 9.4  Entry Pricing (Aggression)
 # ═══════════════════════════════════════════════════════════════════════════
 def _entry_price(tf: TokenFeatures, cfg: Config) -> float:
-    """Determine limit buy price based on spread."""
+    """Determine limit buy price based on spread.
+
+    Crossing is only proposed when ALL conditions are met:
+      - 1¢ spread
+      - |bin_ret_30s| >= CROSS_MIN_ABS_RET_30S (strong momentum)
+      - spread_pctl_60s >= CROSS_MIN_SPREAD_PCTL (tight regime)
+      - random draw < CROSS_PROB_1C
+    Execution layer enforces cross budget on top of this.
+    """
     spread_cents = round(tf.spread * 100)  # integer cents
 
     if spread_cents <= 1:
         bin_ret_30s = abs(tf.ret_30s or 0)
-        # Weak momentum → force passive (bid-side) to reduce adverse selection
-        if bin_ret_30s < cfg.VOL_MIN_RET_30S:
-            return tf.best_bid  # passive: avoid crossing in low-vol
-        # Only cross when strong momentum (> 0.08%)
-        if bin_ret_30s > 0.0008 and random.random() < cfg.CROSS_PROB_1C:
-            return tf.best_ask  # cross (taker)
+        # Only cross when strong momentum + tight spread percentile
+        if (bin_ret_30s >= cfg.CROSS_MIN_ABS_RET_30S
+                and tf.spread_pctl_60s >= cfg.CROSS_MIN_SPREAD_PCTL
+                and random.random() < cfg.CROSS_PROB_1C):
+            return tf.best_ask  # cross proposal (budget checked in execution)
         else:
-            return tf.best_bid  # join bid (maker)
+            return tf.best_bid  # passive (maker)
     else:
         # Wider spread: passive, bid-side price improvement
         # Target: mid - 0.01, but at least best_bid
@@ -367,7 +395,7 @@ class Strategy:
             exposure_ok = buy_ok
 
             # Entry gate
-            allowed, gate_reason = _entry_gated(
+            allowed, gate_reason, gate_code, gate_val, gate_thresh = _entry_gated(
                 tf, self.cfg, exposure_ok, cash_ok,
             )
             if not allowed:
@@ -377,6 +405,9 @@ class Strategy:
                     spread=tf.spread, spread_pctl_60s=round(tf.spread_pctl_60s, 4),
                     buy_weight=buy_weight, sec_from_q=sec_from_q,
                     total_exposure_usd=round(self.state.total_exposure_usd(), 2),
+                    decision_reason_code=gate_code,
+                    decision_reason_value=round(gate_val, 6),
+                    decision_reason_threshold=round(gate_thresh, 6),
                 )
                 continue
 

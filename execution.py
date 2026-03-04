@@ -23,7 +23,7 @@ from config import Config
 from diagnostics import Diagnostics
 from logger import Logger
 from polymarket_api import BookSnapshot, PolymarketAPI
-from risk import LiveRiskGuard
+from risk import LiveRiskGuard, _et_hour_key
 from state import OpenOrder, ShadowOrder, StateManager
 from strategy import TradeAction
 
@@ -70,6 +70,10 @@ class ExecutionEngine:
         self._shadow_fills_this_min: int = 0
         self._shadow_expired_this_min: int = 0
         self._shadow_stats_ts: float = time.time()
+
+        # Cross budget tracking (works in both DRY_RUN and LIVE modes)
+        self._cross_notional_hour: float = 0.0
+        self._cross_hour_key: str = _et_hour_key()
 
     # ------------------------------------------------------------------
     # Main entry point: process a batch of actions
@@ -281,6 +285,43 @@ class ExecutionEngine:
             buy_w = self._cadence_info.get('buy_w', 0.0)
             sell_w = self._cadence_info.get('sell_w', 0.0)
 
+        # --- Cross discipline gate (both DRY_RUN and LIVE) ---
+        is_cross = False
+        cross_reason = "passive"
+        if action.action == "BUY" and action.price >= ba:
+            is_cross = True
+        elif action.action == "SELL" and action.price <= bb:
+            is_cross = True
+
+        if is_cross:
+            notional = action.price * action.size_shares
+            # Reset cross budget on ET hour boundary
+            current_hour = _et_hour_key()
+            if current_hour != self._cross_hour_key:
+                self._cross_hour_key = current_hour
+                self._cross_notional_hour = 0.0
+            # Check cross budget
+            if self._cross_notional_hour + notional > self.cfg.MAX_CROSS_NOTIONAL_PER_HOUR_USD:
+                # Force passive
+                original_price = action.price
+                is_cross = False
+                cross_reason = "forced_passive_cross_budget"
+                if action.action == "BUY":
+                    action.price = bb
+                elif action.action == "SELL":
+                    action.price = max(0.01, ba)
+                self.log.info(
+                    "cross_budget_exceeded_forcing_passive",
+                    slug=action.slug, outcome=action.outcome,
+                    side=action.action, original_price=original_price,
+                    forced_price=action.price,
+                    cross_notional_hour=round(self._cross_notional_hour, 2),
+                    budget=self.cfg.MAX_CROSS_NOTIONAL_PER_HOUR_USD,
+                    decision_reason_code="cross_budget_gate",
+                )
+            else:
+                cross_reason = "budget_ok_strong_momo"
+
         # Risk snapshot at intent time
         total_exposure = self.state.total_exposure_usd()
         inv_before = self.state.get_inventory(action.slug, action.outcome)
@@ -310,6 +351,8 @@ class ExecutionEngine:
                 spread_pctl_60s=spread_pctl,
                 cadence_sec=cadence_sec, buy_weight=buy_w, sell_weight=sell_w,
                 reason=action.reason,
+                is_cross=is_cross,
+                cross_reason=cross_reason,
                 total_exposure_usd=total_exposure,
                 outcome_exposure_usd=outcome_exposure,
                 pending_buy_usd=pending_buy,
@@ -387,15 +430,12 @@ class ExecutionEngine:
         if self.diagnostics:
             self.diagnostics.on_order_placed()
 
-        # Record cross notional for LIVE risk discipline
-        if self.cfg.MODE == "LIVE" and self.live_risk is not None:
-            is_cross = False
-            if action.action == "BUY" and action.price >= ba:
-                is_cross = True
-            elif action.action == "SELL" and action.price <= bb:
-                is_cross = True
-            if is_cross:
-                self.live_risk.record_cross(action.price * action.size_shares)
+        # Record cross notional (universal tracker + LIVE risk guard)
+        if is_cross:
+            cross_usd = action.price * action.size_shares
+            self._cross_notional_hour += cross_usd
+            if self.cfg.MODE == "LIVE" and self.live_risk is not None:
+                self.live_risk.record_cross(cross_usd)
 
         # In DRY_RUN, respect fill mode setting
         if self.cfg.MODE == "DRY_RUN":
