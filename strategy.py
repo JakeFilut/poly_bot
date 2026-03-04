@@ -4,8 +4,8 @@ strategy.py – F247-style cadence scalper strategy.
 Core logic:
   - 15-minute cadence scheduler (BUY early, SELL at ~minute 5)
   - Direction selection via Binance 30s momentum
-  - Entry gating: spread percentile, risk checks
-  - Entry pricing: aggressive at 1¢ spread, passive at 2¢+
+  - Entry gating: spread percentile, risk checks, entry quality gates
+  - Entry pricing: bid-only by default, cross only on strong momentum
   - Entry sizing: discrete USD ladder
   - Exit logic: cost-basis TP/SL shaving
   - Both-sides inventory (no forced neutralization)
@@ -14,9 +14,9 @@ from __future__ import annotations
 
 import random
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 from config import Config
@@ -126,46 +126,76 @@ def _pick_buy_direction(sf: SlugFeatures, cfg: Config) -> str | None:
 # 9.3  Entry Gating
 # ═══════════════════════════════════════════════════════════════════════════
 def _entry_gated(tf: TokenFeatures, cfg: Config,
-                 exposure_ok: bool, cash_ok: bool) -> tuple[bool, str, str, float, float]:
-    """Check if entry is allowed.
+                 exposure_ok: bool, cash_ok: bool,
+                 direction: str = "",
+                 sec_from_q: int = 0,
+                 inv: InventoryEntry | None = None,
+                 entry_price: float = 0.0) -> tuple[bool, str, dict]:
+    """Check if entry is allowed.  Returns (allowed, reason_if_blocked, diagnostics)."""
+    diag: dict = {}
 
-    Returns (allowed, reason_if_blocked, gate_code, gate_value, gate_threshold).
-    gate_code is a structured identifier for programmatic filtering.
-    """
     if not tf.has_book:
-        return False, "no_book", "no_book", 0.0, 0.0
-    bin_ret_30s = abs(tf.ret_30s or 0)
-    # Entry selectivity: minimum spread percentile
-    if tf.spread_pctl_60s < cfg.ENTRY_MIN_SPREAD_PCTL:
-        return (False,
-                f"spread_pctl({tf.spread_pctl_60s:.2f}<{cfg.ENTRY_MIN_SPREAD_PCTL})",
-                "spread_pctl_gate", tf.spread_pctl_60s, cfg.ENTRY_MIN_SPREAD_PCTL)
-    # Entry selectivity: minimum absolute momentum
-    if bin_ret_30s < cfg.ENTRY_MIN_ABS_RET_30S:
-        return (False,
-                f"low_vol_entry(|ret30|={bin_ret_30s:.6f}<{cfg.ENTRY_MIN_ABS_RET_30S})",
-                "low_vol_gate", bin_ret_30s, cfg.ENTRY_MIN_ABS_RET_30S)
-    # Legacy volatility filter (may be stricter than ENTRY_MIN_ABS_RET_30S)
+        return False, "no_book", diag
+
+    bin_ret_30s_raw = tf.ret_30s or 0
+    bin_ret_30s = abs(bin_ret_30s_raw)
+
+    # Volatility filter: skip entry when Binance isn't moving
     if bin_ret_30s < cfg.VOL_MIN_RET_30S:
-        return (False,
-                f"low_vol(bin_ret_30s={bin_ret_30s:.6f}<{cfg.VOL_MIN_RET_30S})",
-                "low_vol_gate", bin_ret_30s, cfg.VOL_MIN_RET_30S)
-    # Legacy spread percentile gate (may be less strict than ENTRY_MIN)
+        return False, f"low_vol(bin_ret_30s={bin_ret_30s:.6f}<{cfg.VOL_MIN_RET_30S})", diag
     if tf.spread_pctl_60s < cfg.SPREAD_PCTL_MIN:
-        return (False,
-                f"spread_pctl({tf.spread_pctl_60s:.2f}<{cfg.SPREAD_PCTL_MIN})",
-                "spread_pctl_gate", tf.spread_pctl_60s, cfg.SPREAD_PCTL_MIN)
+        return False, f"spread_pctl({tf.spread_pctl_60s:.2f}<{cfg.SPREAD_PCTL_MIN})", diag
     if tf.spread > cfg.SPREAD_MAX_SANE:
-        return (False,
-                f"spread_too_wide({tf.spread:.4f}>{cfg.SPREAD_MAX_SANE})",
-                "spread_wide_gate", tf.spread, cfg.SPREAD_MAX_SANE)
+        return False, f"spread_too_wide({tf.spread:.4f}>{cfg.SPREAD_MAX_SANE})", diag
     if tf.spread <= 0:
-        return False, "zero_spread", "zero_spread", 0.0, 0.0
+        return False, "zero_spread", diag
     if not exposure_ok:
-        return False, "exposure_cap", "risk_cap_gate", 0.0, 0.0
+        return False, "exposure_cap", diag
     if not cash_ok:
-        return False, "cash_reserve", "risk_cap_gate", 0.0, 0.0
-    return True, "", "", 0.0, 0.0
+        return False, "cash_reserve", diag
+
+    # -- Gate 3: Minimum spread (cents) --
+    spread_cents = tf.spread * 100
+    if spread_cents < cfg.ENTRY_MIN_SPREAD_CENTS:
+        return False, f"spread_gate(spread_cents={spread_cents:.1f}<{cfg.ENTRY_MIN_SPREAD_CENTS})", diag
+
+    # -- Gate 4: Momentum direction must match trade direction --
+    if direction and bin_ret_30s >= cfg.ENTRY_MIN_RET_30S:
+        if direction == "Up" and bin_ret_30s_raw < 0:
+            return False, f"momentum_gate(dir=Up,ret30={bin_ret_30s_raw:.6f})", diag
+        if direction == "Down" and bin_ret_30s_raw > 0:
+            return False, f"momentum_gate(dir=Down,ret30={bin_ret_30s_raw:.6f})", diag
+
+    # -- Gate 5: Prevent buying late in 15-min window --
+    seconds_to_resolution = 900 - sec_from_q
+    if seconds_to_resolution < (900 - cfg.ENTRY_LATE_CUTOFF_SEC):
+        return False, f"late_entry_gate(sec_to_res={seconds_to_resolution})", diag
+
+    # -- Gate 1: Minimum edge before buying --
+    if entry_price > 0:
+        # Expected exit at best_bid
+        edge_vs_cost = tf.best_bid - entry_price
+        offset_from_bid = entry_price - tf.best_bid
+        diag = {
+            "entry_edge": round(edge_vs_cost, 4),
+            "entry_spread": round(spread_cents, 1),
+            "entry_offset_from_bid": round(offset_from_bid, 4),
+            "entry_momentum": round(bin_ret_30s_raw, 6),
+            "entry_seconds_to_resolution": seconds_to_resolution,
+        }
+        if edge_vs_cost < cfg.ENTRY_MIN_EDGE_CENTS:
+            return False, f"edge_gate(edge={edge_vs_cost:.4f}<{cfg.ENTRY_MIN_EDGE_CENTS})", diag
+
+        # -- Gate 2: Only buy near the bid --
+        if offset_from_bid > cfg.ENTRY_MAX_OFFSET_FROM_BID:
+            return False, f"bad_price(offset={offset_from_bid:.4f}>{cfg.ENTRY_MAX_OFFSET_FROM_BID})", diag
+
+        # -- Gate 6: Do not average up --
+        if inv is not None and inv.shares > 0 and inv.avg_cost > 0:
+            if entry_price > inv.avg_cost + cfg.ENTRY_AVG_UP_TOLERANCE:
+                return False, f"bad_average(price={entry_price:.4f}>avg_cost={inv.avg_cost:.4f}+{cfg.ENTRY_AVG_UP_TOLERANCE})", diag
+
+    return True, "", diag
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -174,28 +204,23 @@ def _entry_gated(tf: TokenFeatures, cfg: Config,
 def _entry_price(tf: TokenFeatures, cfg: Config) -> float:
     """Determine limit buy price based on spread.
 
-    Crossing is only proposed when ALL conditions are met:
-      - 1¢ spread
-      - |bin_ret_30s| >= CROSS_MIN_ABS_RET_30S (strong momentum)
-      - spread_pctl_60s >= CROSS_MIN_SPREAD_PCTL (tight regime)
-      - random draw < CROSS_PROB_1C
-    Execution layer enforces cross budget on top of this.
+    Default: buy near the bid.  Only cross when strong momentum.
+    BUY price = min(best_bid + 0.005, mid - 0.005)
     """
+    bin_ret_30s = abs(tf.ret_30s or 0)
     spread_cents = round(tf.spread * 100)  # integer cents
 
     if spread_cents <= 1:
-        bin_ret_30s = abs(tf.ret_30s or 0)
-        # Only cross when strong momentum + tight spread percentile
-        if (bin_ret_30s >= cfg.CROSS_MIN_ABS_RET_30S
-                and tf.spread_pctl_60s >= cfg.CROSS_MIN_SPREAD_PCTL
-                and random.random() < cfg.CROSS_PROB_1C):
-            return tf.best_ask  # cross proposal (budget checked in execution)
-        else:
-            return tf.best_bid  # passive (maker)
+        # Only cross if strong momentum AND random check passes
+        if bin_ret_30s > cfg.CROSS_MIN_RET_30S and random.random() < cfg.CROSS_PROB_1C:
+            return tf.best_ask  # cross (taker)
+        # Otherwise passive at bid
+        return tf.best_bid
     else:
-        # Wider spread: passive, bid-side price improvement
-        # Target: mid - 0.01, but at least best_bid
-        target = round(tf.mid - 0.01, 2)
+        # Wider spread: buy near the bid
+        # Target: min(best_bid + 0.005, mid - 0.005) to stay near bid
+        target = min(tf.best_bid + 0.005, tf.mid - 0.005)
+        target = round(target, 2)
         return max(tf.best_bid, min(target, tf.best_ask - 0.01))
 
 
@@ -312,6 +337,41 @@ class Strategy:
         self.cfg = cfg
         self.state = state
         self.log = logger
+        # Entry quality tracking (reset hourly)
+        self._entry_quality: Dict[str, list] = {
+            "buy_prices": [],
+            "edges_at_entry": [],
+            "skips_by_gate": {},
+            "profit_per_sell": [],
+        }
+
+    def get_and_reset_entry_quality(self) -> dict:
+        """Return accumulated entry quality stats and reset."""
+        stats = dict(self._entry_quality)
+        buy_prices = stats.pop("buy_prices")
+        edges = stats.pop("edges_at_entry")
+        sells = stats.pop("profit_per_sell")
+        skips = stats.pop("skips_by_gate")
+        result = {
+            "avg_buy_price": round(sum(buy_prices) / len(buy_prices), 4) if buy_prices else 0.0,
+            "avg_edge_at_entry": round(sum(edges) / len(edges), 4) if edges else 0.0,
+            "total_buys": len(buy_prices),
+            "total_sells": len(sells),
+            "profit_per_sell": round(sum(sells) / len(sells), 4) if sells else 0.0,
+            "skips_by_gate": dict(skips),
+            "total_skipped": sum(skips.values()),
+        }
+        self._entry_quality = {
+            "buy_prices": [],
+            "edges_at_entry": [],
+            "skips_by_gate": {},
+            "profit_per_sell": [],
+        }
+        return result
+
+    def record_sell_pnl(self, pnl: float) -> None:
+        """Record a sell fill PnL for entry quality tracking."""
+        self._entry_quality["profit_per_sell"].append(pnl)
 
     def generate_actions(self, all_features: dict,
                          risk_allows_buy: callable,
@@ -394,30 +454,44 @@ class Strategy:
             cash_ok = buy_ok  # risk check includes cash
             exposure_ok = buy_ok
 
-            # Entry gate
-            allowed, gate_reason, gate_code, gate_val, gate_thresh = _entry_gated(
+            # Compute price first so entry gates can evaluate edge
+            price = _entry_price(tf, self.cfg)
+
+            # Get existing inventory for avg-up check
+            inv = self.state.get_inventory(slug, direction)
+
+            # Entry gate (with all quality gates)
+            allowed, gate_reason, diag = _entry_gated(
                 tf, self.cfg, exposure_ok, cash_ok,
+                direction=direction,
+                sec_from_q=sec_from_q,
+                inv=inv,
+                entry_price=price,
             )
             if not allowed:
+                reason_code = gate_reason.split("(")[0] if gate_reason else buy_reason
+                skips = self._entry_quality["skips_by_gate"]
+                skips[reason_code] = skips.get(reason_code, 0) + 1
                 self.log.decision(
                     action="SKIP", reason=gate_reason or buy_reason,
                     slug=slug, outcome=direction, asset=sf.asset,
                     spread=tf.spread, spread_pctl_60s=round(tf.spread_pctl_60s, 4),
                     buy_weight=buy_weight, sec_from_q=sec_from_q,
-                    total_exposure_usd=round(self.state.total_exposure_usd(), 2),
-                    decision_reason_code=gate_code,
-                    decision_reason_value=round(gate_val, 6),
-                    decision_reason_threshold=round(gate_thresh, 6),
+                    **diag,
                 )
                 continue
 
-            # Price
-            price = _entry_price(tf, self.cfg)
             shares = _usd_to_shares(desired_usd, price)
             if shares < 1:
                 continue
 
             actual_usd = shares * price
+
+            # Track entry quality
+            self._entry_quality["buy_prices"].append(price)
+            if diag.get("entry_edge") is not None:
+                self._entry_quality["edges_at_entry"].append(diag["entry_edge"])
+
             reason = (f"BUY(w={buy_weight:.2f},spd={tf.spread:.4f},"
                       f"pctl={tf.spread_pctl_60s:.2f},ret30={tf.ret_30s or 0:.6f})")
 
@@ -429,13 +503,7 @@ class Strategy:
                 spread=tf.spread, spread_pctl_60s=round(tf.spread_pctl_60s, 4),
                 ret_30s=tf.ret_30s, buy_weight=buy_weight,
                 sec_from_q=sec_from_q,
-                total_exposure_usd=round(self.state.total_exposure_usd(), 2),
-                outcome_exposure_usd=round(
-                    (inv_before.shares * inv_before.avg_cost) if inv_before else 0.0, 2),
-                inventory_shares_before=round(
-                    inv_before.shares if inv_before else 0.0, 2),
-                avg_cost_before=round(
-                    inv_before.avg_cost if inv_before else 0.0, 4),
+                **diag,
             )
 
             actions.append(TradeAction(

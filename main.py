@@ -153,6 +153,199 @@ class Bot:
         # Graceful shutdown
         self._shutdown()
 
+    def _tick(self, loop_count: int) -> None:
+        """One iteration of the main loop."""
+        # 1. Refresh universe periodically
+        if self.universe.needs_refresh():
+            self.universe.refresh()
+
+        # 2. Binance price update
+        self.binance.refresh_all()
+
+        # 3. Compute features for all active slugs
+        all_features = self.features.compute_all()
+
+        # 4. Sync fills (LIVE mode) – track sell PnL for entry quality
+        pnl_before = self.state.realized_pnl
+        fill_count = self.execution.sync_fills()
+        if fill_count > 0:
+            self.log.info("fills_synced", count=fill_count)
+            pnl_delta = self.state.realized_pnl - pnl_before
+            if pnl_delta != 0:
+                self.strategy.record_sell_pnl(pnl_delta)
+
+        # 5. Run strategy to generate actions
+        actions = self.strategy.generate_actions(
+            all_features=all_features,
+            risk_allows_buy=self.risk.allows_buy,
+            risk_allows_sell=self.risk.allows_sell,
+        )
+
+        # 6. Execute actions – track sell PnL for entry quality
+        pnl_before = self.state.realized_pnl
+        if actions:
+            self.execution.execute_actions(actions)
+        pnl_delta = self.state.realized_pnl - pnl_before
+        if pnl_delta != 0:
+            self.strategy.record_sell_pnl(pnl_delta)
+
+        # 7. Update cash estimate after fills
+        if self.cfg.MODE == "DRY_RUN":
+            # In DRY_RUN, cash = initial - exposure
+            exposure = self.state.total_exposure_usd()
+            self.risk.update_cash(
+                self.cfg.MAX_TOTAL_EXPOSURE_USD * 2 - exposure
+            )
+
+    # ------------------------------------------------------------------
+    # Mark-to-market helpers
+    # ------------------------------------------------------------------
+    def _get_mark_for_token(self, token_id: str) -> tuple[float, str]:
+        """Return (mark_price, mark_source) for a token.
+
+        Hierarchy:
+          1. mid_book    – both bids & asks present → (best_bid+best_ask)/2
+          2. bid_only    – only bids present → best_bid
+          3. ask_only    – only asks present → best_ask
+          4. last_mid_cache – previous valid mid stored in _last_valid_mid
+          5. missing_zero – no data at all → 0.0  (do NOT assume 0.50)
+        """
+        book = self.features._book_cache.get(token_id)
+        if book is not None:
+            has_bids = len(book.bids) > 0
+            has_asks = len(book.asks) > 0
+            if has_bids and has_asks:
+                mid = (book.best_bid + book.best_ask) / 2
+                self._last_valid_mid[token_id] = mid
+                return mid, "mid_book"
+            if has_bids:
+                self._last_valid_mid[token_id] = book.best_bid
+                return book.best_bid, "bid_only"
+            if has_asks:
+                return book.best_ask, "ask_only"
+
+        # Fallback: last known valid mid
+        cached_mid = self._last_valid_mid.get(token_id)
+        if cached_mid is not None:
+            return cached_mid, "last_mid_cache"
+
+        # Nothing available → contribute 0
+        return 0.0, "missing_zero"
+
+    def _compute_unrealized_with_marks(self) -> tuple[float, list[dict]]:
+        """Compute total unrealized PnL and per-token mark details.
+
+        Returns (total_unrealized_usd, [mark_detail_per_position]).
+        """
+        fee_bps = self.cfg.SIM_FEE_BPS
+        fee_rate = fee_bps / 10_000.0 if fee_bps > 0 else 0.0
+        total = 0.0
+        marks: list[dict] = []
+
+        for (slug, outcome), inv in self.state.inventory.items():
+            if inv.shares <= 0:
+                continue
+            pair = self.universe.get_pair(slug)
+            if pair is None:
+                continue
+            token_id = pair.up_token_id if outcome == "Up" else pair.down_token_id
+            mark, source = self._get_mark_for_token(token_id)
+            pnl = inv.shares * (mark - inv.avg_cost)
+            if fee_rate > 0 and mark > 0:
+                pnl -= fee_rate * inv.shares * (mark + inv.avg_cost)
+            total += pnl
+            marks.append({
+                "position": f"{slug}:{outcome}",
+                "shares": round(inv.shares, 2),
+                "avg_cost": round(inv.avg_cost, 4),
+                "mark": round(mark, 4),
+                "mark_source": source,
+                "unrealized": round(pnl, 4),
+            })
+
+        return total, marks
+
+    def _estimate_unrealized(self) -> float:
+        """Rough unrealized P&L estimate based on actual market prices."""
+        total, _ = self._compute_unrealized_with_marks()
+        return total
+
+    # ------------------------------------------------------------------
+    # Conservative mark-to-market (best_bid for longs)
+    # ------------------------------------------------------------------
+    def _estimate_unrealized_conservative(self) -> float:
+        """Mark-to-market using actual prices. Applies SIM_FEE_BPS if configured."""
+        return self._estimate_unrealized()
+
+    # ------------------------------------------------------------------
+    # Hourly PnL tracking
+    # ------------------------------------------------------------------
+    def _get_current_hour_utc(self) -> datetime:
+        """Return the current hour boundary (truncated to hour)."""
+        now = datetime.now(timezone.utc)
+        return now.replace(minute=0, second=0, microsecond=0)
+
+    def _check_hourly_pnl(self) -> None:
+        """Emit HOURLY_PNL event if an hour boundary has been crossed."""
+        now_hour = self._get_current_hour_utc()
+        if now_hour <= self._current_hour_utc:
+            return
+
+        # Hour boundary crossed — compute metrics for the completed hour
+        unrealized_end, mark_details = self._compute_unrealized_with_marks()
+        realized_this_hour = self.state.realized_pnl - self._hourly_realized_start
+        net_pnl = realized_this_hour + (unrealized_end - self._hourly_unrealized_start)
+
+        # Fill stats from logger
+        fill_stats = self.log.get_and_reset_hourly_fills()
+
+        # Top positions
+        inv_snap = self.state.inventory_snapshot()
+        sorted_inv = sorted(
+            inv_snap.items(),
+            key=lambda kv: kv[1].get("usd_value", 0),
+            reverse=True,
+        )[:5]
+        top_positions = [{"position": k, **v} for k, v in sorted_inv]
+
+        # Inventory notional at end
+        inv_notional = sum(v.get("usd_value", 0) for v in inv_snap.values())
+
+        # ET time for the completed hour
+        hour_et = self._current_hour_utc.astimezone(self._et)
+
+        self.log.hourly_pnl(
+            hour_start_utc=self._current_hour_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            hour_start_et=hour_et.strftime("%Y-%m-%d %H:%M ET"),
+            realized_usd=round(realized_this_hour, 4),
+            unrealized_start_usd=round(self._hourly_unrealized_start, 4),
+            unrealized_end_usd=round(unrealized_end, 4),
+            net_pnl_usd=round(net_pnl, 4),
+            inventory_notional_end_usd=round(inv_notional, 4),
+            top_positions=top_positions,
+            mark_details=mark_details,
+            **fill_stats,
+        )
+
+        # Entry quality report
+        eq = self.strategy.get_and_reset_entry_quality()
+        self.log.entry_quality_report(
+            hour_start_utc=self._current_hour_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            hour_start_et=hour_et.strftime("%Y-%m-%d %H:%M ET"),
+            avg_buy_price=eq["avg_buy_price"],
+            avg_edge_at_entry=eq["avg_edge_at_entry"],
+            total_buys=eq["total_buys"],
+            total_sells=eq["total_sells"],
+            profit_per_sell=eq["profit_per_sell"],
+            skips_by_gate=eq["skips_by_gate"],
+            total_skipped=eq["total_skipped"],
+        )
+
+        # Reset for next hour
+        self._current_hour_utc = now_hour
+        self._hourly_unrealized_start = unrealized_end
+        self._hourly_realized_start = self.state.realized_pnl
+
     # ------------------------------------------------------------------
     # Shutdown
     # ------------------------------------------------------------------
