@@ -160,6 +160,13 @@ CRYPTO_KEYWORDS = {
 
 STOP = False
 
+# Callback for bridging fills to the bot's main logger.
+# Set by wallet_tracker.py before starting the main loop.
+# Signature: ON_FILL_CB(trade_dict) where trade_dict has:
+#   tx_hash, ts_epoch, ts_iso, slug, asset, outcome, side, price,
+#   qty_shares, notional_usd, token_id
+ON_FILL_CB = None
+
 
 # -------------------- signals --------------------
 def _handle_stop(signum, frame):
@@ -2958,6 +2965,25 @@ def main():
                         total_usdc += float(usdc_size)
                     except Exception:
                         pass
+
+                    # Bridge fill to bot logger via callback
+                    if ON_FILL_CB is not None:
+                        try:
+                            ON_FILL_CB({
+                                "tx_hash": tx,
+                                "ts_epoch": ts_int,
+                                "ts_iso": iso,
+                                "slug": slug,
+                                "asset": crypto,
+                                "outcome": outcome,
+                                "side": side,
+                                "price": float(price),
+                                "qty_shares": float(size),
+                                "notional_usd": float(usdc_size),
+                                "token_id": str(token_id) if token_id else "",
+                            })
+                        except Exception:
+                            pass  # never crash tracker for callback errors
 
                     # DATA_COVERAGE counters
                     coverage_increment("trades")

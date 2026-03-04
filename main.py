@@ -36,9 +36,10 @@ import os
 import random
 import signal
 import time
+import uuid
 
 from config import load_config
-from logger import Logger
+from logger import Logger, _utc_iso
 
 
 class Bot:
@@ -49,16 +50,18 @@ class Bot:
         # -- Config (read-only, shared) --
         self.cfg = load_config()
 
+        # -- RUN_ID: unique per process, included in every log event --
+        self._run_id = uuid.uuid4().hex[:12]
+
         # -- Logger (shared for lifecycle events only) --
         self.log = Logger(
             log_file=self.cfg.LOG_FILE,
             rollup_sec=self.cfg.LOG_ROLLUP_SEC,
+            run_id=self._run_id,
         )
         self.log.log_config(self.cfg.redacted_dict())
 
         # ── Module A: Strategy Engine (owns ALL trading) ─────────────
-        # Imported here — strategy_engine.py contains the full trading
-        # pipeline: universe, features, strategy, execution, risk, PnL.
         from strategy_engine import StrategyEngine
         self.engine = StrategyEngine(self.cfg, self.log)
 
@@ -70,6 +73,7 @@ class Bot:
             from wallet_tracker import WalletTracker
             self._tracker = WalletTracker(
                 log_fn=self.log.info,  # simple log function, no state leak
+                bot_logger=self.log,   # for COPYWALLET_FILL events
             )
 
         # -- Shutdown flag --
@@ -81,7 +85,9 @@ class Bot:
         signal.signal(signal.SIGTERM, self._handle_signal)
 
         self.log.info(
-            "architecture_initialized",
+            "bot_startup",
+            run_id=self._run_id,
+            start_ts_utc=_utc_iso(),
             strategy_engine="strategy_engine.StrategyEngine",
             wallet_tracker="wallet_tracker.WalletTracker" if self._tracker else "disabled",
             isolation="ENFORCED — zero shared execution path",
