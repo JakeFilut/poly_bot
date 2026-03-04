@@ -23,6 +23,7 @@ No imports from wallet_tracker into strategy_engine.
 from __future__ import annotations
 
 import hashlib
+import re
 import sys
 import threading
 from datetime import datetime, timezone
@@ -67,6 +68,32 @@ def _assert_no_execution_leak() -> None:
             )
 
 
+_SUB_HOURLY_RE = re.compile(r"(15m|5m|30m|15-min|5-min|30-min)", re.IGNORECASE)
+
+
+def _parse_window(slug: str) -> str:
+    """Derive market window from slug naming pattern.
+
+    Returns '15m', '30m', '5m', or '1h' (default hourly).
+    """
+    m = _SUB_HOURLY_RE.search(slug)
+    if m:
+        token = m.group(1).lower().replace("-min", "m")
+        return token  # '15m', '5m', '30m'
+    return "1h"
+
+
+def _hour_bucket_et(ts_epoch: float) -> str:
+    """Return 'YYYY-MM-DD HH:00' in America/New_York for the given epoch."""
+    if not ts_epoch:
+        return ""
+    try:
+        dt_et = datetime.fromtimestamp(ts_epoch, tz=timezone.utc).astimezone(_ET)
+        return dt_et.strftime("%Y-%m-%d %H:00")
+    except Exception:
+        return ""
+
+
 def _idempotency_key(tx_hash: str, ts_iso: str, slug: str,
                      side: str, price: float, qty: float) -> str:
     """Generate dedup key: tx_hash if available, else content hash."""
@@ -92,7 +119,7 @@ class WalletTracker:
       - Share any mutable state with the strategy engine
     """
 
-    def __init__(self, log_fn=None, bot_logger=None):
+    def __init__(self, log_fn=None, bot_logger=None, diag_callback=None):
         """
         Args:
             log_fn: Optional callable(msg, **kwargs) for lifecycle logs.
@@ -100,10 +127,13 @@ class WalletTracker:
                     engine logger that could leak state.
             bot_logger: Optional Logger instance for emitting
                        COPYWALLET_FILL events to bot_log.jsonl.
+            diag_callback: Optional callable(**kwargs) for feeding fills
+                          into Diagnostics.on_copywallet_fill().
         """
         self._thread: threading.Thread | None = None
         self._log = log_fn or (lambda msg, **kw: None)
         self._bot_logger = bot_logger
+        self._diag_callback = diag_callback
         # Thread-safe dedup set for COPYWALLET_FILL events
         self._seen_keys: set[str] = set()
         self._seen_lock = threading.Lock()
@@ -116,7 +146,7 @@ class WalletTracker:
         Logger.log() is just a print+write which is safe enough for
         append-only line-buffered output.
         """
-        if self._bot_logger is None:
+        if self._bot_logger is None and self._diag_callback is None:
             return
 
         tx_hash = trade.get("tx_hash", "")
@@ -143,22 +173,43 @@ class WalletTracker:
             except Exception:
                 pass
 
-        self._bot_logger.log(
-            "COPYWALLET_FILL",
-            wallet_address=_WALLET_ADDRESS,
-            idempotency_key=key,
-            tx_hash=tx_hash,
-            slug=slug,
-            asset=trade.get("asset", ""),
-            outcome=trade.get("outcome", ""),
-            side=side,
-            price=price,
-            qty_shares=qty,
-            notional_usd=trade.get("notional_usd", 0.0),
-            token_id=trade.get("token_id", ""),
-            trade_ts_utc=ts_iso,
-            ts_et=ts_et,
-        )
+        # Derived fields for easier comparison
+        window = _parse_window(slug)
+        hour_bucket_et = _hour_bucket_et(ts_epoch)
+
+        if self._bot_logger is not None:
+            self._bot_logger.log(
+                "COPYWALLET_FILL",
+                wallet_address=_WALLET_ADDRESS,
+                idempotency_key=key,
+                tx_hash=tx_hash,
+                slug=slug,
+                asset=trade.get("asset", ""),
+                outcome=trade.get("outcome", ""),
+                side=side,
+                price=price,
+                qty_shares=qty,
+                notional_usd=trade.get("notional_usd", 0.0),
+                token_id=trade.get("token_id", ""),
+                trade_ts_utc=ts_iso,
+                ts_et=ts_et,
+                window=window,
+                hour_bucket_et=hour_bucket_et,
+            )
+
+        # Feed into diagnostics for comparison reports
+        if self._diag_callback is not None:
+            try:
+                self._diag_callback(
+                    slug=slug,
+                    outcome=trade.get("outcome", ""),
+                    side=side,
+                    price=price,
+                    qty_shares=qty,
+                    hour_bucket_et=hour_bucket_et,
+                )
+            except Exception:
+                pass  # never crash tracker for callback errors
 
     def start(self) -> None:
         """Launch the tracker in a daemon thread."""

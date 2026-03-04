@@ -5,6 +5,9 @@ Every ET hour boundary and at shutdown, writes:
   reports/paper_hourly_pnl.csv
   reports/paper_hourly_pnl_chart.txt
   reports/paper_diagnostics_report.txt
+  reports/copywallet_hourly_pnl.csv
+  reports/copywallet_hourly_pnl_chart.txt
+  reports/compare_hourly_pnl.csv
   reports/snapshots/paper_report_YYYY-mm-dd_HH00_ET.txt
   reports/snapshots/paper_hourly_YYYY-mm-dd_HH00_ET.csv
 
@@ -15,12 +18,14 @@ No external dependencies beyond stdlib.
 """
 from __future__ import annotations
 
+import json
 import math
 import os
+import threading
 import time
 from collections import OrderedDict
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from state import StateManager
@@ -101,6 +106,20 @@ class Diagnostics:
         self._hourly_pnl: OrderedDict[str, float] = OrderedDict()
         self._current_hour_et: str = _et_hour_key()
 
+        # --- Per-hour bot metrics for comparison ---
+        # hour_et -> {cross_fills, total_fills, spread_pctl_sum, spread_pctl_n,
+        #             hold_time_sum, hold_time_n}
+        self._hourly_bot_metrics: Dict[str, Dict] = {}
+
+        # --- Copywallet tracking (thread-safe: fills arrive from tracker thread) ---
+        self._cw_lock = threading.Lock()
+        # Shadow inventory: (slug, outcome) -> {shares, avg_cost}
+        self._cw_inventory: Dict[Tuple[str, str], Dict] = {}
+        self._cw_hourly_pnl: OrderedDict[str, float] = OrderedDict()
+        self._cw_buy_fills: int = 0
+        self._cw_sell_fills: int = 0
+        self._cw_sell_pnls: List[float] = []
+
         # --- Restore from SQLite ---
         self._restore()
 
@@ -114,7 +133,6 @@ class Diagnostics:
             self._hourly_pnl[k] = v
 
         # Restore counters
-        import json
         raw = self._state.diag_get_counter("diag_counters")
         if raw:
             try:
@@ -132,16 +150,36 @@ class Diagnostics:
                 self._sell_pnls = d.get("sell_pnls", [])
                 self._passive_sell_pnls = d.get("passive_sell_pnls", [])
                 self._cross_sell_pnls = d.get("cross_sell_pnls", [])
+                self._hourly_bot_metrics = d.get("hourly_bot_metrics", {})
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        # Restore copywallet hourly PnL
+        cw_saved = self._state.diag_load_copywallet_hourly_pnl()
+        for k, v in cw_saved.items():
+            self._cw_hourly_pnl[k] = v
+
+        # Restore copywallet counters
+        cw_raw = self._state.diag_get_counter("diag_cw_counters")
+        if cw_raw:
+            try:
+                d = json.loads(cw_raw)
+                self._cw_buy_fills = d.get("buy_fills", 0)
+                self._cw_sell_fills = d.get("sell_fills", 0)
+                self._cw_sell_pnls = d.get("sell_pnls", [])
+                # Restore shadow inventory
+                for key_str, inv in d.get("inventory", {}).items():
+                    slug, outcome = key_str.split("|", 1)
+                    self._cw_inventory[(slug, outcome)] = inv
             except (json.JSONDecodeError, TypeError):
                 pass
 
     def _persist(self) -> None:
         """Persist counters + hourly buckets to SQLite."""
-        import json
-        # Persist hourly buckets
+        # Persist bot hourly buckets
         for hour_et, pnl in self._hourly_pnl.items():
             self._state.diag_set_hourly_pnl(hour_et, pnl)
-        # Persist counters
+        # Persist bot counters
         d = {
             "start_ts": self._start_ts,
             "orders_placed": self._orders_placed,
@@ -156,8 +194,24 @@ class Diagnostics:
             "sell_pnls": self._sell_pnls[-500:],  # cap to avoid unbounded growth
             "passive_sell_pnls": self._passive_sell_pnls[-500:],
             "cross_sell_pnls": self._cross_sell_pnls[-500:],
+            "hourly_bot_metrics": self._hourly_bot_metrics,
         }
         self._state.diag_set_counter("diag_counters", json.dumps(d))
+
+        # Persist copywallet hourly buckets
+        with self._cw_lock:
+            for hour_et, pnl in self._cw_hourly_pnl.items():
+                self._state.diag_set_copywallet_hourly_pnl(hour_et, pnl)
+            inv_serialized = {}
+            for (slug, outcome), inv in self._cw_inventory.items():
+                inv_serialized[f"{slug}|{outcome}"] = inv
+            cw_d = {
+                "buy_fills": self._cw_buy_fills,
+                "sell_fills": self._cw_sell_fills,
+                "sell_pnls": self._cw_sell_pnls[-500:],
+                "inventory": inv_serialized,
+            }
+        self._state.diag_set_counter("diag_cw_counters", json.dumps(cw_d))
 
     # ------------------------------------------------------------------
     # Event hooks (called from execution.py)
@@ -179,6 +233,9 @@ class Diagnostics:
                 entry_style: str = "UNKNOWN",
                 realized_pnl: float = 0.0, **kw) -> None:
         """Record a fill (DRY_FILL or LIVE FILL)."""
+        hour = _et_hour_key()
+        is_cross = entry_style == "CROSS"
+
         if side == "BUY":
             self._buy_fills += 1
             if entry_style == "PASSIVE":
@@ -199,10 +256,66 @@ class Diagnostics:
                 self._cross_sell_pnls.append(realized_pnl)
 
             # Add to hourly bucket
-            hour = _et_hour_key()
             if hour not in self._hourly_pnl:
                 self._hourly_pnl[hour] = 0.0
             self._hourly_pnl[hour] += realized_pnl
+
+        # Track per-hour bot metrics for comparison
+        m = self._hourly_bot_metrics.setdefault(hour, {
+            "cross_fills": 0, "total_fills": 0,
+            "spread_pctl_sum": 0.0, "spread_pctl_n": 0,
+            "hold_time_sum": 0.0, "hold_time_n": 0,
+        })
+        m["total_fills"] += 1
+        if is_cross:
+            m["cross_fills"] += 1
+        spread_pctl = kw.get("spread_pctl_60s", 0.0)
+        if spread_pctl > 0:
+            m["spread_pctl_sum"] += spread_pctl
+            m["spread_pctl_n"] += 1
+        hold_time = kw.get("holding_time_sec", 0.0)
+        if hold_time > 0:
+            m["hold_time_sum"] += hold_time
+            m["hold_time_n"] += 1
+
+    # ------------------------------------------------------------------
+    # Copywallet fill hook (called from tracker thread via main.py)
+    # ------------------------------------------------------------------
+    def on_copywallet_fill(self, *, slug: str, outcome: str, side: str,
+                           price: float, qty_shares: float,
+                           hour_bucket_et: str = "", **kw) -> None:
+        """Track copywallet fills for comparison reports.
+
+        Thread-safe: called from the wallet tracker daemon thread.
+        """
+        hour = hour_bucket_et or _et_hour_key()
+        with self._cw_lock:
+            key = (slug, outcome)
+            if side == "BUY":
+                self._cw_buy_fills += 1
+                inv = self._cw_inventory.setdefault(key, {"shares": 0.0, "avg_cost": 0.0})
+                total_cost = inv["shares"] * inv["avg_cost"] + qty_shares * price
+                inv["shares"] += qty_shares
+                inv["avg_cost"] = total_cost / inv["shares"] if inv["shares"] > 0 else 0.0
+            elif side == "SELL":
+                self._cw_sell_fills += 1
+                inv = self._cw_inventory.get(key)
+                realized = 0.0
+                if inv and inv["shares"] > 0:
+                    avg_cost = inv["avg_cost"]
+                    sell_qty = min(qty_shares, inv["shares"])
+                    realized = sell_qty * (price - avg_cost)
+                    inv["shares"] -= sell_qty
+                    if inv["shares"] < 0.01:
+                        inv["shares"] = 0.0
+                        inv["avg_cost"] = 0.0
+                else:
+                    # Unknown position — approximate with 0 PnL
+                    realized = 0.0
+                self._cw_sell_pnls.append(realized)
+                if hour not in self._cw_hourly_pnl:
+                    self._cw_hourly_pnl[hour] = 0.0
+                self._cw_hourly_pnl[hour] += realized
 
     # ------------------------------------------------------------------
     # Hourly flush check (called from main loop)
@@ -239,13 +352,25 @@ class Diagnostics:
         chart_content = self._build_chart()
         report_content = self._build_report()
 
-        # Main files
+        # Main bot files
         self._safe_write(os.path.join(self._reports_dir, "paper_hourly_pnl.csv"),
                          csv_content)
         self._safe_write(os.path.join(self._reports_dir, "paper_hourly_pnl_chart.txt"),
                          chart_content)
         self._safe_write(os.path.join(self._reports_dir, "paper_diagnostics_report.txt"),
                          report_content)
+
+        # Copywallet files
+        with self._cw_lock:
+            cw_csv = self._build_copywallet_csv()
+            cw_chart = self._build_copywallet_chart()
+            compare_csv = self._build_compare_csv()
+        self._safe_write(os.path.join(self._reports_dir, "copywallet_hourly_pnl.csv"),
+                         cw_csv)
+        self._safe_write(os.path.join(self._reports_dir, "copywallet_hourly_pnl_chart.txt"),
+                         cw_chart)
+        self._safe_write(os.path.join(self._reports_dir, "compare_hourly_pnl.csv"),
+                         compare_csv)
 
         # Timestamped snapshots
         if snapshot_tag:
@@ -305,6 +430,84 @@ class Diagnostics:
         lines.append("")
         lines.append(f"  TOTAL   {'+' if total >= 0 else ''}{total:.4f}")
         lines.append("")
+        return "\n".join(lines) + "\n"
+
+    # ------------------------------------------------------------------
+    # Copywallet CSV builder
+    # ------------------------------------------------------------------
+    def _build_copywallet_csv(self) -> str:
+        """Build copywallet_hourly_pnl.csv. Caller holds _cw_lock."""
+        lines = ["hour_et,realized_pnl"]
+        for hour, pnl in self._cw_hourly_pnl.items():
+            lines.append(f"{hour},{pnl:.4f}")
+        return "\n".join(lines) + "\n"
+
+    # ------------------------------------------------------------------
+    # Copywallet ASCII chart builder
+    # ------------------------------------------------------------------
+    def _build_copywallet_chart(self) -> str:
+        """Build copywallet_hourly_pnl_chart.txt. Caller holds _cw_lock."""
+        if not self._cw_hourly_pnl:
+            return "No copywallet hourly data yet.\n"
+
+        max_abs = max(abs(v) for v in self._cw_hourly_pnl.values()) or 1.0
+        max_bars = 40
+        lines = ["COPYWALLET HOURLY REALIZED PnL (ET)", ""]
+
+        for hour, pnl in self._cw_hourly_pnl.items():
+            short_hour = hour.split(" ")[-1] if " " in hour else hour
+            bar_len = int(abs(pnl) / max_abs * max_bars)
+            bar_len = max(bar_len, 1) if abs(pnl) > 0.0001 else 0
+            if pnl >= 0:
+                bar = "\u2588" * bar_len
+                sign = "+"
+            else:
+                bar = "\u2591" * bar_len
+                sign = ""
+            lines.append(f"  {short_hour}  {sign}{pnl:>8.4f}  {bar}")
+
+        total = sum(self._cw_hourly_pnl.values())
+        lines.append("")
+        lines.append(f"  TOTAL   {'+' if total >= 0 else ''}{total:.4f}")
+        lines.append("")
+        return "\n".join(lines) + "\n"
+
+    # ------------------------------------------------------------------
+    # Comparison CSV builder
+    # ------------------------------------------------------------------
+    def _build_compare_csv(self) -> str:
+        """Build compare_hourly_pnl.csv. Caller holds _cw_lock."""
+        header = ("hour_et,bot_realized,copywallet_realized,bot_minus_copywallet,"
+                  "bot_cross_rate,bot_avg_spread_pctl,bot_avg_hold_time_sec")
+        lines = [header]
+
+        # Union of all hour keys
+        all_hours = sorted(set(list(self._hourly_pnl.keys()) +
+                               list(self._cw_hourly_pnl.keys())))
+
+        for hour in all_hours:
+            bot_pnl = self._hourly_pnl.get(hour, 0.0)
+            cw_pnl = self._cw_hourly_pnl.get(hour, 0.0)
+            diff = bot_pnl - cw_pnl
+
+            # Bot metrics for this hour
+            m = self._hourly_bot_metrics.get(hour, {})
+            total_f = m.get("total_fills", 0)
+            cross_f = m.get("cross_fills", 0)
+            cross_rate = cross_f / total_f if total_f > 0 else 0.0
+
+            sp_sum = m.get("spread_pctl_sum", 0.0)
+            sp_n = m.get("spread_pctl_n", 0)
+            avg_spread_pctl = sp_sum / sp_n if sp_n > 0 else 0.0
+
+            ht_sum = m.get("hold_time_sum", 0.0)
+            ht_n = m.get("hold_time_n", 0)
+            avg_hold = ht_sum / ht_n if ht_n > 0 else 0.0
+
+            lines.append(
+                f"{hour},{bot_pnl:.4f},{cw_pnl:.4f},{diff:.4f},"
+                f"{cross_rate:.4f},{avg_spread_pctl:.4f},{avg_hold:.1f}"
+            )
         return "\n".join(lines) + "\n"
 
     # ------------------------------------------------------------------

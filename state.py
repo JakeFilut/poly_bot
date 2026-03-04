@@ -205,6 +205,10 @@ class StateManager:
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS diag_copywallet_hourly_pnl (
+                hour_et TEXT PRIMARY KEY,
+                realized_pnl REAL NOT NULL DEFAULT 0
+            );
         """)
         self._conn.commit()
 
@@ -454,6 +458,27 @@ class StateManager:
             return row[0] if row else None
         except sqlite3.OperationalError:
             return None
+
+    # Copywallet hourly PnL persistence
+    def diag_set_copywallet_hourly_pnl(self, hour_et: str, pnl: float) -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO diag_copywallet_hourly_pnl "
+            "(hour_et, realized_pnl) VALUES (?, ?)",
+            (hour_et, pnl),
+        )
+        self._conn.commit()
+
+    def diag_load_copywallet_hourly_pnl(self) -> Dict[str, float]:
+        result: Dict[str, float] = {}
+        try:
+            for row in self._conn.execute(
+                "SELECT hour_et, realized_pnl FROM diag_copywallet_hourly_pnl "
+                "ORDER BY hour_et"
+            ):
+                result[row[0]] = row[1]
+        except sqlite3.OperationalError:
+            pass
+        return result
 
     # ------------------------------------------------------------------
     # Flush / close

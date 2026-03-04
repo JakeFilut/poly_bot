@@ -496,9 +496,10 @@ class ExecutionEngine:
             )
             # Emit DRY_FILL with same schema as FILL
             fill_entry_style = "UNKNOWN"
+            fill_payload = None
+            book = self._get_book_for_token(order.token_id)
+            sf, _asset = self._resolve_slug_features(order.token_id)
             if self.analytics:
-                book = self._get_book_for_token(order.token_id)
-                sf, _asset = self._resolve_slug_features(order.token_id)
                 fill_payload = self.analytics.record_fill(
                     order_id=order.order_id,
                     client_order_id=order.client_order_id,
@@ -528,9 +529,13 @@ class ExecutionEngine:
                     **touch_extra,
                 )
             if self.diagnostics:
+                diag_kw: dict = {}
+                tf = self._token_features_for(sf, order.token_id)
+                if tf:
+                    diag_kw["spread_pctl_60s"] = tf.spread_pctl_60s
                 self.diagnostics.on_fill(
                     side="BUY", fill_price=order.price, fill_shares=order.size,
-                    entry_style=fill_entry_style,
+                    entry_style=fill_entry_style, **diag_kw,
                 )
         elif order.side == "SELL":
             avg_cost_before = 0.0
@@ -546,9 +551,10 @@ class ExecutionEngine:
             realized_this_fill = self.state.realized_pnl - realized_before
             # Emit DRY_FILL with same schema as FILL
             fill_entry_style = "UNKNOWN"
+            fill_payload = None
+            book = self._get_book_for_token(order.token_id)
+            sf, _asset = self._resolve_slug_features(order.token_id)
             if self.analytics:
-                book = self._get_book_for_token(order.token_id)
-                sf, _asset = self._resolve_slug_features(order.token_id)
                 fill_payload = self.analytics.record_fill(
                     order_id=order.order_id,
                     client_order_id=order.client_order_id,
@@ -582,10 +588,16 @@ class ExecutionEngine:
                     **touch_extra,
                 )
             if self.diagnostics:
+                diag_kw = {}
+                tf = self._token_features_for(sf, order.token_id)
+                if tf:
+                    diag_kw["spread_pctl_60s"] = tf.spread_pctl_60s
+                if fill_payload and "holding_time_sec" in fill_payload:
+                    diag_kw["holding_time_sec"] = fill_payload["holding_time_sec"]
                 self.diagnostics.on_fill(
                     side="SELL", fill_price=order.price, fill_shares=order.size,
                     entry_style=fill_entry_style,
-                    realized_pnl=realized_this_fill,
+                    realized_pnl=realized_this_fill, **diag_kw,
                 )
 
         # Record fill timestamp for per-token cooldown
@@ -789,6 +801,17 @@ class ExecutionEngine:
             if book is not None:
                 return book
         return self.api.get_orderbook(order.token_id)
+
+    @staticmethod
+    def _token_features_for(sf, token_id: str):
+        """Return the TokenFeatures for a specific token_id from a SlugFeatures."""
+        if sf is None:
+            return None
+        if sf.up and sf.up.token_id == token_id:
+            return sf.up
+        if sf.down and sf.down.token_id == token_id:
+            return sf.down
+        return None
 
     def _resolve_slug_features(self, token_id: str):
         """Resolve (SlugFeatures, asset) for a token_id from cached features.
@@ -1004,9 +1027,9 @@ class ExecutionEngine:
                 inv = self.state.apply_buy_fill(slug, outcome, token_id, qty, price)
                 # Emit analytics FILL (canonical event)
                 fill_entry_style = "UNKNOWN"
+                book = self._get_book_for_token(token_id)
+                sf, _asset = self._resolve_slug_features(token_id)
                 if self.analytics:
-                    book = self._get_book_for_token(token_id)
-                    sf, _asset = self._resolve_slug_features(token_id)
                     fill_payload = self.analytics.record_fill(
                         order_id=order_id,
                         client_order_id=order.client_order_id,
@@ -1022,9 +1045,13 @@ class ExecutionEngine:
                     self.log.log("FILL", **fill_payload)
                     fill_entry_style = fill_payload.get("entry_style", "UNKNOWN")
                 if self.diagnostics:
+                    diag_kw = {}
+                    tf = self._token_features_for(sf, token_id)
+                    if tf:
+                        diag_kw["spread_pctl_60s"] = tf.spread_pctl_60s
                     self.diagnostics.on_fill(
                         side="BUY", fill_price=price, fill_shares=qty,
-                        entry_style=fill_entry_style,
+                        entry_style=fill_entry_style, **diag_kw,
                     )
             elif side == "SELL":
                 avg_cost_before = 0.0
@@ -1038,9 +1065,10 @@ class ExecutionEngine:
                 realized_this_fill = self.state.realized_pnl - realized_before
                 # Emit analytics FILL (canonical event)
                 fill_entry_style = "UNKNOWN"
+                fill_payload = None
+                book = self._get_book_for_token(token_id)
+                sf, _asset = self._resolve_slug_features(token_id)
                 if self.analytics:
-                    book = self._get_book_for_token(token_id)
-                    sf, _asset = self._resolve_slug_features(token_id)
                     fill_payload = self.analytics.record_fill(
                         order_id=order_id,
                         client_order_id=order.client_order_id,
@@ -1059,10 +1087,16 @@ class ExecutionEngine:
                     self.log.log("FILL", **fill_payload)
                     fill_entry_style = fill_payload.get("entry_style", "UNKNOWN")
                 if self.diagnostics:
+                    diag_kw = {}
+                    tf = self._token_features_for(sf, token_id)
+                    if tf:
+                        diag_kw["spread_pctl_60s"] = tf.spread_pctl_60s
+                    if fill_payload and "holding_time_sec" in fill_payload:
+                        diag_kw["holding_time_sec"] = fill_payload["holding_time_sec"]
                     self.diagnostics.on_fill(
                         side="SELL", fill_price=price, fill_shares=qty,
                         entry_style=fill_entry_style,
-                        realized_pnl=realized_this_fill,
+                        realized_pnl=realized_this_fill, **diag_kw,
                     )
 
             # Record fill timestamp for per-token cooldown

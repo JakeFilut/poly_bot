@@ -74,6 +74,7 @@ class Bot:
             self._tracker = WalletTracker(
                 log_fn=self.log.info,  # simple log function, no state leak
                 bot_logger=self.log,   # for COPYWALLET_FILL events
+                diag_callback=self.engine.diagnostics.on_copywallet_fill,
             )
 
         # -- Shutdown flag --
