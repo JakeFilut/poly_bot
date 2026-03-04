@@ -137,6 +137,7 @@ class Config:
 
     # -- Universe refresh --
     UNIVERSE_REFRESH_SEC: int = 120
+    UNIVERSE_DEBUG: bool = False  # Log every candidate market with pass/reject reason
 
     # -- State persistence --
     STATE_DB_PATH: str = "/home/ubuntu/github/logs/poly_bot/state.db"
@@ -159,6 +160,18 @@ class Config:
     # -- Logging --
     LOG_FILE: str = "/home/ubuntu/github/logs/poly_bot/bot_log.jsonl"
     LOG_ROLLUP_SEC: int = 60
+    DEBUG_LOG_ORDERS: bool = False  # Emit DRY_RUN_ORDER events (verbose; off by default)
+
+    # -- LIVE risk controls (only enforced when MODE=LIVE) --
+    LIVE_MAX_CAPITAL_USD: float = 400.0          # Max deployed cost basis + pending buys
+    MAX_DAILY_LOSS_USD: float = 100.0            # Hard daily kill switch threshold
+    MAX_INTRADAY_DRAWDOWN_USD: float = 60.0      # Drawdown pause threshold
+    MAX_CAPITAL_PER_ASSET_USD: float = 150.0     # Per-asset cost basis cap
+    MAX_CROSS_NOTIONAL_PER_HOUR_USD: float = 100.0  # Hourly crossing/taker budget
+    PAUSE_MINUTES_ON_DD: int = 45                # Minutes to pause on drawdown breach
+
+    # -- F247 copy-wallet tracker --
+    TRACK_F247_WALLET: bool = True  # Run the F247 wallet tracker in a background thread
 
     # -- Fee simulation --
     SIM_FEE_BPS: float = 0.0  # Simulated fee in basis points (e.g., 5.0 = 5 bps = 0.05%)
@@ -244,6 +257,7 @@ def load_config() -> Config:
         SELL_BURST3_START=_env_int("SELL_BURST3_START", 780),
         SELL_BURST3_END=_env_int("SELL_BURST3_END", 840),
         UNIVERSE_REFRESH_SEC=_env_int("UNIVERSE_REFRESH_SEC", 120),
+        UNIVERSE_DEBUG=_env_bool("UNIVERSE_DEBUG", False),
         STATE_DB_PATH=_env("STATE_DB_PATH", "/home/ubuntu/github/logs/poly_bot/state.db"),
         STATE_FLUSH_SEC=_env_int("STATE_FLUSH_SEC", 10),
         PER_TOKEN_COOLDOWN_SEC=_env_float("PER_TOKEN_COOLDOWN_SEC", 3.0),
@@ -256,7 +270,15 @@ def load_config() -> Config:
         RETRY_BACKOFF_BASE=_env_float("RETRY_BACKOFF_BASE", 0.5),
         LOG_FILE=_env("LOG_FILE", "/home/ubuntu/github/logs/poly_bot/bot_log.jsonl"),
         LOG_ROLLUP_SEC=_env_int("LOG_ROLLUP_SEC", 60),
+        LIVE_MAX_CAPITAL_USD=_env_float("LIVE_MAX_CAPITAL_USD", 400.0),
+        MAX_DAILY_LOSS_USD=_env_float("MAX_DAILY_LOSS_USD", 100.0),
+        MAX_INTRADAY_DRAWDOWN_USD=_env_float("MAX_INTRADAY_DRAWDOWN_USD", 60.0),
+        MAX_CAPITAL_PER_ASSET_USD=_env_float("MAX_CAPITAL_PER_ASSET_USD", 150.0),
+        MAX_CROSS_NOTIONAL_PER_HOUR_USD=_env_float("MAX_CROSS_NOTIONAL_PER_HOUR_USD", 100.0),
+        PAUSE_MINUTES_ON_DD=_env_int("PAUSE_MINUTES_ON_DD", 45),
         SIM_FEE_BPS=_env_float("SIM_FEE_BPS", 0.0),
+        TRACK_F247_WALLET=_env_bool("TRACK_F247_WALLET", True),
+        DEBUG_LOG_ORDERS=_env_bool("DEBUG_LOG_ORDERS", False),
     )
     _validate(cfg)
     # Ensure log/state directories exist

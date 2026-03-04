@@ -193,6 +193,22 @@ class StateManager:
                 client_order_id TEXT NOT NULL,
                 was_crossing INTEGER NOT NULL DEFAULT 0
             );
+            CREATE TABLE IF NOT EXISTS live_risk_halt (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS diag_hourly_pnl (
+                hour_et TEXT PRIMARY KEY,
+                realized_pnl REAL NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS diag_counters (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS diag_copywallet_hourly_pnl (
+                hour_et TEXT PRIMARY KEY,
+                realized_pnl REAL NOT NULL DEFAULT 0
+            );
         """)
         self._conn.commit()
 
@@ -379,6 +395,90 @@ class StateManager:
                 "usd_value": round(inv.cost_basis_usd, 4),
             }
         return snap
+
+    # ------------------------------------------------------------------
+    # LIVE risk halt persistence
+    # ------------------------------------------------------------------
+    def set_risk_halt(self, key: str, value: str) -> None:
+        """Persist a risk halt key-value pair to SQLite."""
+        self._conn.execute(
+            "INSERT OR REPLACE INTO live_risk_halt (key, value) VALUES (?, ?)",
+            (key, value),
+        )
+        self._conn.commit()
+
+    def get_risk_halt(self, key: str) -> str | None:
+        """Read a persisted risk halt value."""
+        try:
+            row = self._conn.execute(
+                "SELECT value FROM live_risk_halt WHERE key=?", (key,)
+            ).fetchone()
+            return row[0] if row else None
+        except sqlite3.OperationalError:
+            return None
+
+    def clear_risk_halt(self, key: str) -> None:
+        """Remove a persisted risk halt key."""
+        self._conn.execute("DELETE FROM live_risk_halt WHERE key=?", (key,))
+        self._conn.commit()
+
+    # ------------------------------------------------------------------
+    # Diagnostics persistence (hourly PnL buckets + counters)
+    # ------------------------------------------------------------------
+    def diag_set_hourly_pnl(self, hour_et: str, pnl: float) -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO diag_hourly_pnl (hour_et, realized_pnl) VALUES (?, ?)",
+            (hour_et, pnl),
+        )
+        self._conn.commit()
+
+    def diag_load_hourly_pnl(self) -> Dict[str, float]:
+        result: Dict[str, float] = {}
+        try:
+            for row in self._conn.execute(
+                "SELECT hour_et, realized_pnl FROM diag_hourly_pnl ORDER BY hour_et"
+            ):
+                result[row[0]] = row[1]
+        except sqlite3.OperationalError:
+            pass
+        return result
+
+    def diag_set_counter(self, key: str, value: str) -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO diag_counters (key, value) VALUES (?, ?)",
+            (key, value),
+        )
+        self._conn.commit()
+
+    def diag_get_counter(self, key: str) -> str | None:
+        try:
+            row = self._conn.execute(
+                "SELECT value FROM diag_counters WHERE key=?", (key,)
+            ).fetchone()
+            return row[0] if row else None
+        except sqlite3.OperationalError:
+            return None
+
+    # Copywallet hourly PnL persistence
+    def diag_set_copywallet_hourly_pnl(self, hour_et: str, pnl: float) -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO diag_copywallet_hourly_pnl "
+            "(hour_et, realized_pnl) VALUES (?, ?)",
+            (hour_et, pnl),
+        )
+        self._conn.commit()
+
+    def diag_load_copywallet_hourly_pnl(self) -> Dict[str, float]:
+        result: Dict[str, float] = {}
+        try:
+            for row in self._conn.execute(
+                "SELECT hour_et, realized_pnl FROM diag_copywallet_hourly_pnl "
+                "ORDER BY hour_et"
+            ):
+                result[row[0]] = row[1]
+        except sqlite3.OperationalError:
+            pass
+        return result
 
     # ------------------------------------------------------------------
     # Flush / close

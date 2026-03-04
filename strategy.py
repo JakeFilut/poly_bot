@@ -412,12 +412,16 @@ class Strategy:
                 if sell_action:
                     self.log.decision(
                         action="SELL", reason=sell_action.reason,
-                        slug=slug, outcome=outcome,
+                        slug=slug, outcome=outcome, asset=sf.asset,
                         edge_vs_cost=round(tf.best_bid - inv.avg_cost, 4),
                         shares=sell_action.size_shares,
                         price=sell_action.price,
+                        spread_pctl_60s=round(tf.spread_pctl_60s, 4),
                         sell_weight=sell_weight,
                         sec_from_q=sec_from_q,
+                        inventory_shares_before=round(inv.shares, 2),
+                        avg_cost_before=round(inv.avg_cost, 4),
+                        total_exposure_usd=round(self.state.total_exposure_usd(), 2),
                     )
                     actions.append(sell_action)
 
@@ -432,7 +436,7 @@ class Strategy:
             if direction is None:
                 self.log.decision(
                     action="SKIP", reason="no_direction",
-                    slug=slug, sec_from_q=sec_from_q,
+                    slug=slug, asset=sf.asset, sec_from_q=sec_from_q,
                 )
                 continue
 
@@ -470,8 +474,8 @@ class Strategy:
                 skips[reason_code] = skips.get(reason_code, 0) + 1
                 self.log.decision(
                     action="SKIP", reason=gate_reason or buy_reason,
-                    slug=slug, outcome=direction,
-                    spread=tf.spread, spread_pctl=tf.spread_pctl_60s,
+                    slug=slug, outcome=direction, asset=sf.asset,
+                    spread=tf.spread, spread_pctl_60s=round(tf.spread_pctl_60s, 4),
                     buy_weight=buy_weight, sec_from_q=sec_from_q,
                     **diag,
                 )
@@ -491,11 +495,12 @@ class Strategy:
             reason = (f"BUY(w={buy_weight:.2f},spd={tf.spread:.4f},"
                       f"pctl={tf.spread_pctl_60s:.2f},ret30={tf.ret_30s or 0:.6f})")
 
+            inv_before = self.state.get_inventory(slug, direction)
             self.log.decision(
                 action="BUY", reason=reason,
-                slug=slug, outcome=direction,
+                slug=slug, outcome=direction, asset=sf.asset,
                 price=price, shares=shares, usd=actual_usd,
-                spread=tf.spread, spread_pctl=tf.spread_pctl_60s,
+                spread=tf.spread, spread_pctl_60s=round(tf.spread_pctl_60s, 4),
                 ret_30s=tf.ret_30s, buy_weight=buy_weight,
                 sec_from_q=sec_from_q,
                 **diag,
