@@ -190,6 +190,10 @@ class Logger:
         """Emit an HOURLY_PNL event at each hour boundary."""
         self.log("HOURLY_PNL", **kw)
 
+    def entry_quality_report(self, **kw) -> None:
+        """Emit an ENTRY_QUALITY_REPORT event at each hour boundary."""
+        self.log("ENTRY_QUALITY_REPORT", **kw)
+
     def get_and_reset_hourly_fills(self) -> dict:
         """Return accumulated hourly fill stats and reset counters."""
         stats = {

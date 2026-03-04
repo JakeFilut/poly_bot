@@ -228,10 +228,14 @@ class Bot:
         # 3. Compute features for all active slugs
         all_features = self.features.compute_all()
 
-        # 4. Sync fills (LIVE mode)
+        # 4. Sync fills (LIVE mode) – track sell PnL for entry quality
+        pnl_before = self.state.realized_pnl
         fill_count = self.execution.sync_fills()
         if fill_count > 0:
             self.log.info("fills_synced", count=fill_count)
+            pnl_delta = self.state.realized_pnl - pnl_before
+            if pnl_delta != 0:
+                self.strategy.record_sell_pnl(pnl_delta)
 
         # 5. Run strategy to generate actions
         actions = self.strategy.generate_actions(
@@ -240,9 +244,13 @@ class Bot:
             risk_allows_sell=self.risk.allows_sell,
         )
 
-        # 6. Execute actions
+        # 6. Execute actions – track sell PnL for entry quality
+        pnl_before = self.state.realized_pnl
         if actions:
             self.execution.execute_actions(actions)
+        pnl_delta = self.state.realized_pnl - pnl_before
+        if pnl_delta != 0:
+            self.strategy.record_sell_pnl(pnl_delta)
 
         # 7. Update cash estimate after fills
         if self.cfg.MODE == "DRY_RUN":
@@ -380,6 +388,20 @@ class Bot:
             top_positions=top_positions,
             mark_details=mark_details,
             **fill_stats,
+        )
+
+        # Entry quality report
+        eq = self.strategy.get_and_reset_entry_quality()
+        self.log.entry_quality_report(
+            hour_start_utc=self._current_hour_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            hour_start_et=hour_et.strftime("%Y-%m-%d %H:%M ET"),
+            avg_buy_price=eq["avg_buy_price"],
+            avg_edge_at_entry=eq["avg_edge_at_entry"],
+            total_buys=eq["total_buys"],
+            total_sells=eq["total_sells"],
+            profit_per_sell=eq["profit_per_sell"],
+            skips_by_gate=eq["skips_by_gate"],
+            total_skipped=eq["total_skipped"],
         )
 
         # Reset for next hour

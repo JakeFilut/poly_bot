@@ -89,14 +89,14 @@ class Config:
     BIN_RET30_THRESHOLD: float = 0.0004
 
     # -- Volatility filter (entry gate) --
-    VOL_MIN_RET_30S: float = 0.0004   # min |bin_ret_30s| to allow entry (0.04%)
+    VOL_MIN_RET_30S: float = 0.0007   # min |bin_ret_30s| to allow entry (0.07%)
     VOL_MIN_RET_120S: float = 0.0006  # min |bin_ret_120s| second gate (0.06%)
 
     # -- Take-profit / stop-loss (in cents i.e. 0.06 = 6¢) --
-    TP_CENTS_MIN: float = 0.08
-    TP_CENTS_TARGET: float = 0.10
-    TP_CENTS_MAX: float = 0.18
-    SL_CENTS: float = 0.05
+    TP_CENTS_MIN: float = 0.10
+    TP_CENTS_TARGET: float = 0.14
+    TP_CENTS_MAX: float = 0.22
+    SL_CENTS: float = 0.04
 
     # -- Sell sizing --
     SELL_FRAC_MED: float = 0.036
@@ -113,7 +113,17 @@ class Config:
     MIN_ORDER_SHARES: float = 1.0  # minimum shares per order
 
     # -- Aggression --
-    CROSS_PROB_1C: float = 0.20  # probability of crossing at 1¢ spread
+    CROSS_PROB_1C: float = 0.10  # probability of crossing at 1¢ spread
+    CROSS_MIN_RET_30S: float = 0.0008  # min |bin_ret_30s| to allow crossing
+
+    # -- Entry quality gates --
+    ENTRY_MIN_EDGE_CENTS: float = 0.03   # require at least 3¢ expected edge
+    ENTRY_MIN_EDGE_BPS: float = 300.0    # 3% edge vs cost (informational)
+    ENTRY_MAX_OFFSET_FROM_BID: float = 0.01  # max entry price above best_bid
+    ENTRY_MIN_SPREAD_CENTS: float = 1.5  # min spread (cents) to allow entry
+    ENTRY_MIN_RET_30S: float = 0.0004    # min |bin_ret_30s| for momentum gate
+    ENTRY_LATE_CUTOFF_SEC: int = 720     # skip entry if < 180s to end of 15-min window
+    ENTRY_AVG_UP_TOLERANCE: float = 0.01 # reject buy if price > avg_cost + this
 
     # -- Cadence (15-min) --
     BUY_HEAVY_SEC: int = 60  # first N seconds: heavy buy
@@ -205,18 +215,26 @@ def load_config() -> Config:
         SPREAD_PCTL_MIN=_env_float("SPREAD_PCTL_MIN", 0.75),
         SPREAD_MAX_SANE=_env_float("SPREAD_MAX_SANE", 0.05),
         BIN_RET30_THRESHOLD=_env_float("BIN_RET30_THRESHOLD", 0.0004),
-        VOL_MIN_RET_30S=_env_float("VOL_MIN_RET_30S", 0.0004),
+        VOL_MIN_RET_30S=_env_float("VOL_MIN_RET_30S", 0.0007),
         VOL_MIN_RET_120S=_env_float("VOL_MIN_RET_120S", 0.0006),
-        TP_CENTS_MIN=_env_float("TP_CENTS_MIN", 0.08),
-        TP_CENTS_TARGET=_env_float("TP_CENTS_TARGET", 0.10),
-        TP_CENTS_MAX=_env_float("TP_CENTS_MAX", 0.18),
-        SL_CENTS=_env_float("SL_CENTS", 0.05),
+        TP_CENTS_MIN=_env_float("TP_CENTS_MIN", 0.10),
+        TP_CENTS_TARGET=_env_float("TP_CENTS_TARGET", 0.14),
+        TP_CENTS_MAX=_env_float("TP_CENTS_MAX", 0.22),
+        SL_CENTS=_env_float("SL_CENTS", 0.04),
         SELL_FRAC_MED=_env_float("SELL_FRAC_MED", 0.036),
         SELL_FRAC_MAX=_env_float("SELL_FRAC_MAX", 0.15),
         SELL_MIN_SHARES=_env_float("SELL_MIN_SHARES", 5.0),
         CLIP_UNIT_USD=_env_float("CLIP_UNIT_USD", 1.10),
         CLIP_LADDER_MULTS=_env_list_int("CLIP_LADDER_MULTS", [1, 3, 8, 10, 12]),
-        CROSS_PROB_1C=_env_float("CROSS_PROB_1C", 0.20),
+        CROSS_PROB_1C=_env_float("CROSS_PROB_1C", 0.10),
+        CROSS_MIN_RET_30S=_env_float("CROSS_MIN_RET_30S", 0.0008),
+        ENTRY_MIN_EDGE_CENTS=_env_float("ENTRY_MIN_EDGE_CENTS", 0.03),
+        ENTRY_MIN_EDGE_BPS=_env_float("ENTRY_MIN_EDGE_BPS", 300.0),
+        ENTRY_MAX_OFFSET_FROM_BID=_env_float("ENTRY_MAX_OFFSET_FROM_BID", 0.01),
+        ENTRY_MIN_SPREAD_CENTS=_env_float("ENTRY_MIN_SPREAD_CENTS", 1.5),
+        ENTRY_MIN_RET_30S=_env_float("ENTRY_MIN_RET_30S", 0.0004),
+        ENTRY_LATE_CUTOFF_SEC=_env_int("ENTRY_LATE_CUTOFF_SEC", 720),
+        ENTRY_AVG_UP_TOLERANCE=_env_float("ENTRY_AVG_UP_TOLERANCE", 0.01),
         BUY_HEAVY_SEC=_env_int("BUY_HEAVY_SEC", 60),
         BUY_MED_SEC=_env_int("BUY_MED_SEC", 120),
         SELL_START_SEC=_env_int("SELL_START_SEC", 300),
