@@ -24,12 +24,14 @@ def _utc_iso() -> str:
 class Logger:
     """Structured JSON logger.  Thread-unsafe (single bot loop)."""
 
-    def __init__(self, log_file: str = "", rollup_sec: int = 60):
+    def __init__(self, log_file: str = "", rollup_sec: int = 60,
+                 run_id: str = ""):
         self._fh: Optional[IO] = None
         if log_file:
             self._fh = open(log_file, "a", buffering=1)  # line-buffered
         self._rollup_sec = rollup_sec
         self._last_rollup_ts = time.monotonic()
+        self._run_id = run_id
 
         # Rollup accumulators
         self._buy_count = 0
@@ -56,6 +58,8 @@ class Logger:
     def log(self, event: str, **kwargs) -> None:
         """Emit one structured JSON log line."""
         record = {"ts": _utc_iso(), "event": event}
+        if self._run_id:
+            record["run_id"] = self._run_id
         if kwargs:
             record.update(kwargs)
         line = json.dumps(record, default=str)
