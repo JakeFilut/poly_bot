@@ -57,6 +57,8 @@ class OrderMeta:
 
     # Classification
     entry_style: str = ""  # "PASSIVE" or "CROSS"
+    is_cross: bool = False
+    cross_reason: str = ""  # e.g. budget_ok_strong_momo, forced_passive_cross_budget
     reason: str = ""
 
     # Timestamps
@@ -128,6 +130,8 @@ class AnalyticsTracker:
                       spread_pctl_60s: float = 0.0,
                       cadence_sec: int, buy_weight: float, sell_weight: float,
                       reason: str,
+                      is_cross: bool = False,
+                      cross_reason: str = "",
                       total_exposure_usd: float = 0.0,
                       outcome_exposure_usd: float = 0.0,
                       pending_buy_usd: float = 0.0,
@@ -156,7 +160,9 @@ class AnalyticsTracker:
             spread_pctl_60s=spread_pctl_60s,
             cadence_sec_from_quarter_et=cadence_sec,
             buy_weight=buy_weight, sell_weight=sell_weight,
-            entry_style=entry_style, reason=reason,
+            entry_style=entry_style,
+            is_cross=is_cross, cross_reason=cross_reason,
+            reason=reason,
             intent_ts=now,
             spread_cents_at_intent=round(spread * 100, 2),
             total_exposure_usd=total_exposure_usd,
@@ -194,6 +200,8 @@ class AnalyticsTracker:
             "buy_weight": round(meta.buy_weight, 2),
             "sell_weight": round(meta.sell_weight, 2),
             "entry_style": meta.entry_style,
+            "is_cross": meta.is_cross,
+            "cross_reason": meta.cross_reason,
             "reason": meta.reason,
             "client_order_id": meta.client_order_id,
             "total_exposure_usd": round(meta.total_exposure_usd, 2),
@@ -338,6 +346,8 @@ class AnalyticsTracker:
             "fill_usd": fill_usd,
             "fill_source": "live_sync",
             "entry_style": entry_style,
+            "is_cross": meta.is_cross if meta else False,
+            "cross_reason": meta.cross_reason if meta else "",
             "time_to_fill_ms": time_to_fill_ms,
             "edge_vs_mid": edge_vs_mid,
             "spread_cents_at_placement": spread_cents_at_placement,
@@ -358,9 +368,12 @@ class AnalyticsTracker:
             payload["position_shares_after"] = round(position_shares_after, 2)
 
             # Edge-vs-cost diagnostics (execution quality)
-            payload["edge_vs_cost_at_fill"] = round(best_bid - avg_cost_before_sell, 4)
+            edge_at_fill = round(best_bid - avg_cost_before_sell, 4)
             best_bid_at_intent = meta.best_bid if meta else 0.0
-            payload["edge_vs_cost_at_intent"] = round(best_bid_at_intent - avg_cost_before_sell, 4)
+            edge_at_intent = round(best_bid_at_intent - avg_cost_before_sell, 4)
+            payload["edge_vs_cost_at_fill"] = edge_at_fill
+            payload["edge_vs_cost_at_intent"] = edge_at_intent
+            payload["edge_decay"] = round(edge_at_fill - edge_at_intent, 4)
 
             self._minute_realized_pnl += realized_pnl
             self._hour_realized_pnl += realized_pnl
