@@ -123,6 +123,7 @@ class StrategyEngine:
         self.execution.analytics = self.analytics
         self.execution.live_risk = self.live_risk
         self.execution.diagnostics = self.diagnostics
+        self.execution._risk_checker = self.risk
 
         # Self-test mode
         if cfg.DRY_RUN_SELFTEST:
