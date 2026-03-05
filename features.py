@@ -39,6 +39,7 @@ class TokenFeatures:
     spread_pctl_60s: float = 0.0
 
     # Binance momentum
+    ret_5s: float | None = None
     ret_30s: float | None = None
     ret_120s: float | None = None
 
@@ -60,6 +61,7 @@ class SlugFeatures:
     asset: str
     up: TokenFeatures | None = None
     down: TokenFeatures | None = None
+    ret_5s: float | None = None
     ret_30s: float | None = None
     ret_120s: float | None = None
 
@@ -93,17 +95,20 @@ class FeatureEngine:
             sf = SlugFeatures(slug=slug, asset=pair.asset)
 
             # Binance returns (shared for both outcomes)
+            sf.ret_5s = self._binance.ret_5s(pair.asset)
             sf.ret_30s = self._binance.ret_30s(pair.asset)
             sf.ret_120s = self._binance.ret_120s(pair.asset)
 
             # Up token features
             sf.up = self._compute_token(
-                slug, "Up", pair.up_token_id, pair.asset, sf.ret_30s, sf.ret_120s, now
+                slug, "Up", pair.up_token_id, pair.asset,
+                sf.ret_5s, sf.ret_30s, sf.ret_120s, now,
             )
 
             # Down token features
             sf.down = self._compute_token(
-                slug, "Down", pair.down_token_id, pair.asset, sf.ret_30s, sf.ret_120s, now
+                slug, "Down", pair.down_token_id, pair.asset,
+                sf.ret_5s, sf.ret_30s, sf.ret_120s, now,
             )
 
             result[slug] = sf
@@ -112,11 +117,12 @@ class FeatureEngine:
         return result
 
     def _compute_token(self, slug: str, outcome: str, token_id: str,
-                       asset: str, ret_30s, ret_120s, now: float) -> TokenFeatures:
+                       asset: str, ret_5s, ret_30s, ret_120s,
+                       now: float) -> TokenFeatures:
         """Compute features for one token."""
         tf = TokenFeatures(
             slug=slug, outcome=outcome, token_id=token_id, asset=asset,
-            ret_30s=ret_30s, ret_120s=ret_120s,
+            ret_5s=ret_5s, ret_30s=ret_30s, ret_120s=ret_120s,
         )
 
         # Get orderbook (with cache)

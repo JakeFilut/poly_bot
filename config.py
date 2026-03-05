@@ -83,7 +83,7 @@ class Config:
     BOOK_MAX_INFLIGHT: int = 10   # Max concurrent order-book HTTP requests
 
     # -- Order management --
-    MAX_OPEN_ORDERS_PER_MARKET: int = 2
+    MAX_OPEN_ORDERS_PER_MARKET: int = 3
     ORDER_TTL_MS: int = 2500
     MAX_ORDER_OPS_PER_LOOP: int = 20
 
@@ -93,13 +93,16 @@ class Config:
     MIN_CASH_USD: float = 50.0
 
     # -- Spread / gating --
-    SPREAD_PCTL_MIN: float = 0.75
-    SPREAD_MAX_SANE: float = 0.05  # 5 cents
-    BIN_RET30_THRESHOLD: float = 0.0004
+    SPREAD_PCTL_MIN: float = 0.90
+    SPREAD_MAX_SANE: float = 0.10  # 10 cents (wallet trades wide spreads)
+    BIN_RET30_THRESHOLD: float = 0.0015
 
     # -- Volatility filter (entry gate) --
-    VOL_MIN_RET_30S: float = 0.0007   # min |bin_ret_30s| to allow entry (0.07%)
+    VOL_MIN_RET_30S: float = 0.0015   # min |bin_ret_30s| to allow entry (wallet threshold)
     VOL_MIN_RET_120S: float = 0.0006  # min |bin_ret_120s| second gate (0.06%)
+
+    # -- Orderbook imbalance gate --
+    OB_IMBALANCE_MIN: float = 0.60    # min bid_size/(bid_size+ask_size) for entry
 
     # -- Take-profit / stop-loss (in cents i.e. 0.06 = 6¢) --
     TP_CENTS_MIN: float = 0.10
@@ -117,12 +120,12 @@ class Config:
     CLIP_LADDER_MULTS: List[int] = field(default_factory=lambda: [1, 3, 8, 10, 12])
 
     # -- Inventory laddering (BUY side) --
-    LADDER_LEVELS: int = 3                       # 0 disables laddering
+    LADDER_LEVELS: int = 2                       # 2-level passive ladder (wallet style)
     LADDER_STEP_CENTS: float = 1.0               # spacing between levels (1 cent)
-    LADDER_SPLIT: List[float] = field(default_factory=lambda: [0.5, 0.3, 0.2])
+    LADDER_SPLIT: List[float] = field(default_factory=lambda: [0.625, 0.375])
     LADDER_MAX_TOTAL_ORDERS_PER_TOKEN: int = 3   # safety: max open BUY orders per (slug,outcome)
     LADDER_ONLY_IF_SPREAD_CENTS_GTE: float = 2.0 # only ladder when spread >= 2c
-    LADDER_ONLY_IF_SPREAD_PCTL_GTE: float = 0.85 # optional additional selectivity
+    LADDER_ONLY_IF_SPREAD_PCTL_GTE: float = 0.90 # wallet only ladders at high spread pctl
     LADDER_LEVEL_CAP_BPS_FROM_MID: float = 150.0 # don't bid too far below mid
 
     # -- Order precision (Polymarket rules) --
@@ -131,15 +134,16 @@ class Config:
     MIN_ORDER_SHARES: float = 1.0  # minimum shares per order
 
     # -- Aggression --
-    CROSS_PROB_1C: float = 0.10  # probability of crossing at 1¢ spread
-    CROSS_MIN_RET_30S: float = 0.0008  # min |bin_ret_30s| to allow crossing
+    CROSS_PROB_1C: float = 0.0   # never cross at 1¢ spread (wallet is passive)
+    CROSS_MIN_RET_30S: float = 0.003   # only cross on very strong momentum
+    CROSS_MIN_SPREAD_PCTL: float = 0.95  # only cross when spread pctl >= 0.95
 
     # -- Entry quality gates --
     ENTRY_MIN_EDGE_CENTS: float = 0.03   # require at least 3¢ expected edge
     ENTRY_MIN_EDGE_BPS: float = 300.0    # 3% edge vs cost (informational)
     ENTRY_MAX_OFFSET_FROM_BID: float = 0.01  # max entry price above best_bid
-    ENTRY_MIN_SPREAD_CENTS: float = 1.5  # min spread (cents) to allow entry
-    ENTRY_MIN_RET_30S: float = 0.0004    # min |bin_ret_30s| for momentum gate
+    ENTRY_MIN_SPREAD_CENTS: float = 2.0  # min spread (cents) to allow entry (wallet threshold)
+    ENTRY_MIN_RET_30S: float = 0.0015    # min |bin_ret_30s| for momentum gate (wallet threshold)
     ENTRY_LATE_CUTOFF_SEC: int = 720     # skip entry if < 180s to end of 15-min window
     ENTRY_AVG_UP_TOLERANCE: float = 0.01 # reject buy if price > avg_cost + this
 
@@ -256,16 +260,17 @@ def load_config() -> Config:
         BINANCE_MAX_STALE_MS=_env_int("BINANCE_MAX_STALE_MS", 3000),
         UNIVERSE_MAX_STALE_MS=_env_int("UNIVERSE_MAX_STALE_MS", 300000),
         BOOK_MAX_INFLIGHT=_env_int("BOOK_MAX_INFLIGHT", 10),
-        MAX_OPEN_ORDERS_PER_MARKET=_env_int("MAX_OPEN_ORDERS_PER_MARKET", 2),
+        MAX_OPEN_ORDERS_PER_MARKET=_env_int("MAX_OPEN_ORDERS_PER_MARKET", 3),
         ORDER_TTL_MS=_env_int("ORDER_TTL_MS", 2500),
         MAX_ORDER_OPS_PER_LOOP=_env_int("MAX_ORDER_OPS_PER_LOOP", 20),
         MAX_POSITION_USD_PER_OUTCOME=_env_float("MAX_POSITION_USD_PER_OUTCOME", 150.0),
         MAX_TOTAL_EXPOSURE_USD=_env_float("MAX_TOTAL_EXPOSURE_USD", 1500.0),
         MIN_CASH_USD=_env_float("MIN_CASH_USD", 50.0),
-        SPREAD_PCTL_MIN=_env_float("SPREAD_PCTL_MIN", 0.75),
-        SPREAD_MAX_SANE=_env_float("SPREAD_MAX_SANE", 0.05),
-        BIN_RET30_THRESHOLD=_env_float("BIN_RET30_THRESHOLD", 0.0004),
-        VOL_MIN_RET_30S=_env_float("VOL_MIN_RET_30S", 0.0007),
+        SPREAD_PCTL_MIN=_env_float("SPREAD_PCTL_MIN", 0.90),
+        SPREAD_MAX_SANE=_env_float("SPREAD_MAX_SANE", 0.10),
+        BIN_RET30_THRESHOLD=_env_float("BIN_RET30_THRESHOLD", 0.0015),
+        VOL_MIN_RET_30S=_env_float("VOL_MIN_RET_30S", 0.0015),
+        OB_IMBALANCE_MIN=_env_float("OB_IMBALANCE_MIN", 0.60),
         VOL_MIN_RET_120S=_env_float("VOL_MIN_RET_120S", 0.0006),
         TP_CENTS_MIN=_env_float("TP_CENTS_MIN", 0.10),
         TP_CENTS_TARGET=_env_float("TP_CENTS_TARGET", 0.14),
@@ -276,20 +281,21 @@ def load_config() -> Config:
         SELL_MIN_SHARES=_env_float("SELL_MIN_SHARES", 5.0),
         CLIP_UNIT_USD=_env_float("CLIP_UNIT_USD", 1.10),
         CLIP_LADDER_MULTS=_env_list_int("CLIP_LADDER_MULTS", [1, 3, 8, 10, 12]),
-        LADDER_LEVELS=_env_int("LADDER_LEVELS", 3),
+        LADDER_LEVELS=_env_int("LADDER_LEVELS", 2),
         LADDER_STEP_CENTS=_env_float("LADDER_STEP_CENTS", 1.0),
-        LADDER_SPLIT=_env_list_float("LADDER_SPLIT", [0.5, 0.3, 0.2]),
+        LADDER_SPLIT=_env_list_float("LADDER_SPLIT", [0.625, 0.375]),
         LADDER_MAX_TOTAL_ORDERS_PER_TOKEN=_env_int("LADDER_MAX_TOTAL_ORDERS_PER_TOKEN", 3),
         LADDER_ONLY_IF_SPREAD_CENTS_GTE=_env_float("LADDER_ONLY_IF_SPREAD_CENTS_GTE", 2.0),
-        LADDER_ONLY_IF_SPREAD_PCTL_GTE=_env_float("LADDER_ONLY_IF_SPREAD_PCTL_GTE", 0.85),
+        LADDER_ONLY_IF_SPREAD_PCTL_GTE=_env_float("LADDER_ONLY_IF_SPREAD_PCTL_GTE", 0.90),
         LADDER_LEVEL_CAP_BPS_FROM_MID=_env_float("LADDER_LEVEL_CAP_BPS_FROM_MID", 150.0),
-        CROSS_PROB_1C=_env_float("CROSS_PROB_1C", 0.10),
-        CROSS_MIN_RET_30S=_env_float("CROSS_MIN_RET_30S", 0.0008),
+        CROSS_PROB_1C=_env_float("CROSS_PROB_1C", 0.0),
+        CROSS_MIN_RET_30S=_env_float("CROSS_MIN_RET_30S", 0.003),
+        CROSS_MIN_SPREAD_PCTL=_env_float("CROSS_MIN_SPREAD_PCTL", 0.95),
         ENTRY_MIN_EDGE_CENTS=_env_float("ENTRY_MIN_EDGE_CENTS", 0.03),
         ENTRY_MIN_EDGE_BPS=_env_float("ENTRY_MIN_EDGE_BPS", 300.0),
         ENTRY_MAX_OFFSET_FROM_BID=_env_float("ENTRY_MAX_OFFSET_FROM_BID", 0.01),
-        ENTRY_MIN_SPREAD_CENTS=_env_float("ENTRY_MIN_SPREAD_CENTS", 1.5),
-        ENTRY_MIN_RET_30S=_env_float("ENTRY_MIN_RET_30S", 0.0004),
+        ENTRY_MIN_SPREAD_CENTS=_env_float("ENTRY_MIN_SPREAD_CENTS", 2.0),
+        ENTRY_MIN_RET_30S=_env_float("ENTRY_MIN_RET_30S", 0.0015),
         ENTRY_LATE_CUTOFF_SEC=_env_int("ENTRY_LATE_CUTOFF_SEC", 720),
         ENTRY_AVG_UP_TOLERANCE=_env_float("ENTRY_AVG_UP_TOLERANCE", 0.01),
         BUY_HEAVY_SEC=_env_int("BUY_HEAVY_SEC", 60),

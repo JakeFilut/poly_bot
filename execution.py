@@ -304,6 +304,7 @@ class ExecutionEngine:
         bm = book_snap.mid if book_snap else 0.5
         bs = book_snap.spread if book_snap else 1.0
 
+        bin_ret_5s = 0.0
         bin_ret_30s = 0.0
         bin_ret_120s = 0.0
         spread_pctl = 0.0
@@ -311,17 +312,22 @@ class ExecutionEngine:
         cadence_sec = 0
         buy_w = 0.0
         sell_w = 0.0
+        ob_imbalance_exec = 0.0
         if self._features is not None:
             feat = getattr(self._features, '_last_features', {})
             sf = feat.get(action.slug)
             if sf:
+                bin_ret_5s = sf.ret_5s or 0.0
                 bin_ret_30s = sf.ret_30s or 0.0
                 bin_ret_120s = sf.ret_120s or 0.0
                 asset = sf.asset
-                # Get spread_pctl from the specific outcome's TokenFeatures
+                # Get spread_pctl and ob_imbalance from the specific outcome's TokenFeatures
                 tf_out = sf.up if action.outcome == "Up" else sf.down
                 if tf_out:
                     spread_pctl = tf_out.spread_pctl_60s
+                    total_sz = tf_out.bid_size + tf_out.ask_size
+                    if total_sz > 0:
+                        ob_imbalance_exec = tf_out.bid_size / total_sz
         if hasattr(self, '_cadence_info'):
             cadence_sec = self._cadence_info.get('sec', 0)
             buy_w = self._cadence_info.get('buy_w', 0.0)
@@ -408,6 +414,18 @@ class ExecutionEngine:
                 _intent_payload["ladder_id"] = action.ladder_id
                 _intent_payload["ladder_level_idx"] = action.ladder_level_idx
                 _intent_payload["ladder_levels_total"] = action.ladder_levels_total
+            # Propagate wallet-copy logging fields from TradeAction
+            if action.intent_timestamp:
+                _intent_payload["intent_timestamp"] = action.intent_timestamp
+            if action.spread_cents:
+                _intent_payload["spread_cents"] = action.spread_cents
+            if action.spread_percentile:
+                _intent_payload["spread_percentile"] = action.spread_percentile
+            _intent_payload["return_5s"] = action.return_5s
+            _intent_payload["return_30s"] = action.return_30s
+            _intent_payload["orderbook_imbalance"] = action.orderbook_imbalance
+            if action.entry_style:
+                _intent_payload["entry_style"] = action.entry_style
             self.log.log("ORDER_INTENT", **_intent_payload)
 
         # Diagnostics: order intent
@@ -568,6 +586,7 @@ class ExecutionEngine:
                 )
                 fill_payload["fill_source"] = f"dry_{fill_mode}"
                 fill_payload["fill_mode"] = fill_mode
+                fill_payload["fill_timestamp"] = time.time()
                 if touch_extra:
                     fill_payload.update(touch_extra)
                 self.log.dry_fill(**fill_payload)
@@ -579,6 +598,7 @@ class ExecutionEngine:
                     fill_price=order.price, fill_shares=order.size,
                     fill_usd=usd, fill_mode=fill_mode,
                     order_id=order.order_id,
+                    fill_timestamp=time.time(),
                     **touch_extra,
                 )
             if self.diagnostics:
@@ -626,6 +646,7 @@ class ExecutionEngine:
                 )
                 fill_payload["fill_source"] = f"dry_{fill_mode}"
                 fill_payload["fill_mode"] = fill_mode
+                fill_payload["fill_timestamp"] = time.time()
                 if touch_extra:
                     fill_payload.update(touch_extra)
                 self.log.dry_fill(**fill_payload)
@@ -638,6 +659,7 @@ class ExecutionEngine:
                     fill_usd=usd, fill_mode=fill_mode,
                     order_id=order.order_id,
                     realized_pnl=round(realized_this_fill, 4),
+                    fill_timestamp=time.time(),
                     **touch_extra,
                 )
             if self.diagnostics:
@@ -1095,6 +1117,7 @@ class ExecutionEngine:
                         spread=book.spread if book else 0.0,
                         bin_ret_30s=sf.ret_30s or 0.0 if sf else 0.0,
                     )
+                    fill_payload["fill_timestamp"] = time.time()
                     self.log.log("FILL", **fill_payload)
                     fill_entry_style = fill_payload.get("entry_style", "UNKNOWN")
                 if self.diagnostics:
@@ -1137,6 +1160,7 @@ class ExecutionEngine:
                         position_shares_after=inv.shares if inv else 0.0,
                         realized_pnl=realized_this_fill,
                     )
+                    fill_payload["fill_timestamp"] = time.time()
                     self.log.log("FILL", **fill_payload)
                     fill_entry_style = fill_payload.get("entry_style", "UNKNOWN")
                 if self.diagnostics:

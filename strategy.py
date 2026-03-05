@@ -1,18 +1,18 @@
 """
-strategy.py – F247-style cadence scalper strategy.
+strategy.py – Wallet-copy microstructure scalper strategy.
 
-Core logic:
-  - 15-minute cadence scheduler (BUY early, SELL at ~minute 5)
-  - Direction selection via Binance 30s momentum
-  - Entry gating: spread percentile, risk checks, entry quality gates
-  - Entry pricing: bid-only by default, cross only on strong momentum
-  - Entry sizing: discrete USD ladder
-  - Exit logic: cost-basis TP/SL shaving
-  - Both-sides inventory (no forced neutralization)
+Core logic (reverse-engineered from target wallet):
+  - Entry ONLY when: spread_cents>=2, spread_pctl>=0.90, |ret_30s|>=0.0015,
+    orderbook_imbalance>=0.60
+  - Passive bids only (no crossing except extreme momentum)
+  - 2-level ladder: 62.5% @ best_bid, 37.5% @ best_bid - 0.01
+  - Crossing only when |ret_30s|>=0.003 AND spread_pctl>=0.95
+  - Max 3 open positions per market
+  - Immediate entry on signal (no cadence delay for buys)
+  - Exit logic: cost-basis TP/SL shaving (unchanged)
 """
 from __future__ import annotations
 
-import random
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -56,10 +56,18 @@ class TradeAction:
     ladder_id: str = ""           # unique id linking all levels of one ladder
     ladder_level_idx: int = -1    # 0-based index within the ladder (-1 = not a ladder)
     ladder_levels_total: int = 0  # total levels in this ladder (0 = not a ladder)
+    # -- Wallet-copy logging fields --
+    intent_timestamp: float = 0.0  # epoch when signal was detected
+    spread_cents: float = 0.0
+    spread_percentile: float = 0.0
+    return_5s: float = 0.0
+    return_30s: float = 0.0
+    orderbook_imbalance: float = 0.0
+    entry_style: str = ""          # "passive" or "cross"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 9.1a  Inventory Ladder Builder
+# 9.1a  Inventory Ladder Builder (2-level wallet style)
 # ═══════════════════════════════════════════════════════════════════════════
 def _clamp_to_tick(price: float) -> float:
     """Round price to nearest cent (Polymarket tick size)."""
@@ -72,7 +80,7 @@ def build_buy_ladder(
     desired_usd: float,
     entry_price: float,
 ) -> List[LadderLevel] | None:
-    """Build a 2-3 level passive buy ladder around the bid.
+    """Build a 2-level passive buy ladder around the bid.
 
     Returns None if laddering is disabled or spread gates fail,
     meaning the caller should fall back to a single order.
@@ -126,12 +134,7 @@ def build_buy_ladder(
 # 9.1  Cadence Scheduler
 # ═══════════════════════════════════════════════════════════════════════════
 def _seconds_from_quarter(now_utc: datetime) -> int:
-    """Seconds elapsed since the last 15-minute boundary in America/New_York.
-
-    The copied wallet's 15-minute cadence is aligned to ET clock boundaries.
-    Using UTC would cause drift and miss the real burst points.
-    Handles DST transitions automatically via zoneinfo.
-    """
+    """Seconds elapsed since the last 15-minute boundary in America/New_York."""
     now_et = now_utc.astimezone(_ET)
     total_sec = now_et.minute * 60 + now_et.second
     return total_sec % 900  # 900 = 15 * 60
@@ -142,18 +145,17 @@ def cadence_weight(cfg: Config, now_utc: datetime) -> tuple[float, float]:
 
     buy_weight:  0.0 to 1.0 (how aggressively to buy)
     sell_weight: 0.0 to 1.0 (how aggressively to sell/shave)
+
+    NOTE: For the wallet-copy strategy, buy_weight is always 1.0
+    (entries are signal-driven, not cadence-driven). Cadence only
+    controls sell timing.
     """
     sec = _seconds_from_quarter(now_utc)
 
-    # BUY weight
-    if sec < cfg.BUY_HEAVY_SEC:
-        buy_w = 1.0
-    elif sec < cfg.BUY_MED_SEC:
-        buy_w = 0.6
-    else:
-        buy_w = 0.15  # background level: can still buy but rarely
+    # BUY weight: always ready (wallet enters on signal, not cadence)
+    buy_w = 1.0
 
-    # SELL weight
+    # SELL weight (keep original cadence for exits)
     sell_w = 0.1  # background
     if cfg.SELL_START_SEC <= sec < cfg.SELL_END_SEC:
         sell_w = 1.0  # heavy sell at minute 5-6
@@ -175,10 +177,9 @@ def _pick_buy_direction(sf: SlugFeatures, cfg: Config) -> str | None:
     """
     ret = sf.ret_30s
     if ret is None:
-        # No Binance data: alternate or skip
         return None
 
-    # Volatility gate: skip slow-drift periods to reduce chop bleed
+    # Wallet threshold: only trade when momentum is strong
     if abs(ret) < cfg.BIN_RET30_THRESHOLD:
         return None
 
@@ -201,15 +202,33 @@ def _pick_buy_direction(sf: SlugFeatures, cfg: Config) -> str | None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 9.3  Entry Gating
+# 9.3  Entry Gating (wallet-copy microstructure conditions)
 # ═══════════════════════════════════════════════════════════════════════════
+def _compute_ob_imbalance(tf: TokenFeatures) -> float | None:
+    """Compute orderbook imbalance: bid_size / (bid_size + ask_size).
+    Returns None if sizes are unavailable."""
+    if tf.bid_size <= 0 and tf.ask_size <= 0:
+        return None
+    total = tf.bid_size + tf.ask_size
+    if total <= 0:
+        return None
+    return tf.bid_size / total
+
+
 def _entry_gated(tf: TokenFeatures, cfg: Config,
                  exposure_ok: bool, cash_ok: bool,
                  direction: str = "",
                  sec_from_q: int = 0,
                  inv: InventoryEntry | None = None,
                  entry_price: float = 0.0) -> tuple[bool, str, dict]:
-    """Check if entry is allowed.  Returns (allowed, reason_if_blocked, diagnostics)."""
+    """Check if entry is allowed.  Returns (allowed, reason_if_blocked, diagnostics).
+
+    Wallet-copy entry conditions (ALL must be true):
+      1. spread_cents >= 2
+      2. spread_percentile >= 0.90
+      3. abs(return_30s) >= 0.0015
+      4. orderbook_imbalance >= 0.60
+    """
     diag: dict = {}
 
     if not tf.has_book:
@@ -217,41 +236,51 @@ def _entry_gated(tf: TokenFeatures, cfg: Config,
 
     bin_ret_30s_raw = tf.ret_30s or 0
     bin_ret_30s = abs(bin_ret_30s_raw)
+    spread_cents = tf.spread * 100
 
-    # Volatility filter: skip entry when Binance isn't moving
-    if bin_ret_30s < cfg.VOL_MIN_RET_30S:
-        return False, f"low_vol(bin_ret_30s={bin_ret_30s:.6f}<{cfg.VOL_MIN_RET_30S})", diag
+    # -- Wallet condition 1: spread must be wide --
+    if spread_cents < cfg.ENTRY_MIN_SPREAD_CENTS:
+        return False, f"spread_gate(spread_cents={spread_cents:.1f}<{cfg.ENTRY_MIN_SPREAD_CENTS})", diag
+
+    # -- Wallet condition 2: spread percentile must be high --
     if tf.spread_pctl_60s < cfg.SPREAD_PCTL_MIN:
         return False, f"spread_pctl({tf.spread_pctl_60s:.2f}<{cfg.SPREAD_PCTL_MIN})", diag
+
+    # -- Sanity: spread not insanely wide --
     if tf.spread > cfg.SPREAD_MAX_SANE:
         return False, f"spread_too_wide({tf.spread:.4f}>{cfg.SPREAD_MAX_SANE})", diag
     if tf.spread <= 0:
         return False, "zero_spread", diag
+
+    # -- Wallet condition 3: momentum must be strong --
+    if bin_ret_30s < cfg.VOL_MIN_RET_30S:
+        return False, f"low_vol(bin_ret_30s={bin_ret_30s:.6f}<{cfg.VOL_MIN_RET_30S})", diag
+
+    # -- Wallet condition 4: orderbook imbalance --
+    ob_imbalance = _compute_ob_imbalance(tf)
+    if ob_imbalance is not None and ob_imbalance < cfg.OB_IMBALANCE_MIN:
+        return False, f"ob_imbalance({ob_imbalance:.3f}<{cfg.OB_IMBALANCE_MIN})", diag
+
+    # -- Risk gates --
     if not exposure_ok:
         return False, "exposure_cap", diag
     if not cash_ok:
         return False, "cash_reserve", diag
 
-    # -- Gate 3: Minimum spread (cents) --
-    spread_cents = tf.spread * 100
-    if spread_cents < cfg.ENTRY_MIN_SPREAD_CENTS:
-        return False, f"spread_gate(spread_cents={spread_cents:.1f}<{cfg.ENTRY_MIN_SPREAD_CENTS})", diag
-
-    # -- Gate 4: Momentum direction must match trade direction --
+    # -- Momentum direction must match trade direction --
     if direction and bin_ret_30s >= cfg.ENTRY_MIN_RET_30S:
         if direction == "Up" and bin_ret_30s_raw < 0:
             return False, f"momentum_gate(dir=Up,ret30={bin_ret_30s_raw:.6f})", diag
         if direction == "Down" and bin_ret_30s_raw > 0:
             return False, f"momentum_gate(dir=Down,ret30={bin_ret_30s_raw:.6f})", diag
 
-    # -- Gate 5: Prevent buying late in 15-min window --
+    # -- Prevent buying late in 15-min window --
     seconds_to_resolution = 900 - sec_from_q
     if seconds_to_resolution < (900 - cfg.ENTRY_LATE_CUTOFF_SEC):
         return False, f"late_entry_gate(sec_to_res={seconds_to_resolution})", diag
 
-    # -- Gate 1: Minimum edge before buying --
+    # -- Edge and price gates (when entry_price is known) --
     if entry_price > 0:
-        # Expected exit at best_bid
         edge_vs_cost = tf.best_bid - entry_price
         offset_from_bid = entry_price - tf.best_bid
         diag = {
@@ -260,15 +289,16 @@ def _entry_gated(tf: TokenFeatures, cfg: Config,
             "entry_offset_from_bid": round(offset_from_bid, 4),
             "entry_momentum": round(bin_ret_30s_raw, 6),
             "entry_seconds_to_resolution": seconds_to_resolution,
+            "ob_imbalance": round(ob_imbalance, 4) if ob_imbalance is not None else None,
         }
         if edge_vs_cost < cfg.ENTRY_MIN_EDGE_CENTS:
             return False, f"edge_gate(edge={edge_vs_cost:.4f}<{cfg.ENTRY_MIN_EDGE_CENTS})", diag
 
-        # -- Gate 2: Only buy near the bid --
+        # Only buy near the bid
         if offset_from_bid > cfg.ENTRY_MAX_OFFSET_FROM_BID:
             return False, f"bad_price(offset={offset_from_bid:.4f}>{cfg.ENTRY_MAX_OFFSET_FROM_BID})", diag
 
-        # -- Gate 6: Do not average up --
+        # Do not average up
         if inv is not None and inv.shares > 0 and inv.avg_cost > 0:
             if entry_price > inv.avg_cost + cfg.ENTRY_AVG_UP_TOLERANCE:
                 return False, f"bad_average(price={entry_price:.4f}>avg_cost={inv.avg_cost:.4f}+{cfg.ENTRY_AVG_UP_TOLERANCE})", diag
@@ -277,29 +307,25 @@ def _entry_gated(tf: TokenFeatures, cfg: Config,
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 9.4  Entry Pricing (Aggression)
+# 9.4  Entry Pricing (Wallet-copy: always passive, cross only extreme)
 # ═══════════════════════════════════════════════════════════════════════════
-def _entry_price(tf: TokenFeatures, cfg: Config) -> float:
-    """Determine limit buy price based on spread.
+def _entry_price(tf: TokenFeatures, cfg: Config) -> tuple[float, str]:
+    """Determine limit buy price.
 
-    Default: buy near the bid.  Only cross when strong momentum.
-    BUY price = min(best_bid + 0.005, mid - 0.005)
+    Wallet-copy rules:
+      - Default: passive at best_bid
+      - Cross ONLY when |ret_30s| >= 0.003 AND spread_pctl >= 0.95
+    Returns (price, entry_style).
     """
     bin_ret_30s = abs(tf.ret_30s or 0)
-    spread_cents = round(tf.spread * 100)  # integer cents
 
-    if spread_cents <= 1:
-        # Only cross if strong momentum AND random check passes
-        if bin_ret_30s > cfg.CROSS_MIN_RET_30S and random.random() < cfg.CROSS_PROB_1C:
-            return tf.best_ask  # cross (taker)
-        # Otherwise passive at bid
-        return tf.best_bid
-    else:
-        # Wider spread: buy near the bid
-        # Target: min(best_bid + 0.005, mid - 0.005) to stay near bid
-        target = min(tf.best_bid + 0.005, tf.mid - 0.005)
-        target = round(target, 2)
-        return max(tf.best_bid, min(target, tf.best_ask - 0.01))
+    # Cross only on extreme momentum + wide spread
+    if (bin_ret_30s >= cfg.CROSS_MIN_RET_30S
+            and tf.spread_pctl_60s >= cfg.CROSS_MIN_SPREAD_PCTL):
+        return tf.best_ask, "cross"
+
+    # Default: passive at best_bid
+    return tf.best_bid, "passive"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -372,7 +398,6 @@ def _exit_actions(cfg: Config, inv: InventoryEntry, tf: TokenFeatures,
             cadence_factor = sell_weight  # no floor — cadence controls TP sells
 
         frac = base_frac * cadence_factor
-        # Ensure at least SELL_MIN_SHARES via the clamp below (not via frac floor)
         shares = max(cfg.SELL_MIN_SHARES, round(inv.shares * frac))
         shares = min(shares, inv.shares)
         sell_price = tf.best_bid
@@ -409,7 +434,7 @@ def _exit_actions(cfg: Config, inv: InventoryEntry, tf: TokenFeatures,
 # Main Strategy Runner
 # ═══════════════════════════════════════════════════════════════════════════
 class Strategy:
-    """Runs the F247-style strategy each loop iteration."""
+    """Runs the wallet-copy strategy each loop iteration."""
 
     def __init__(self, cfg: Config, state: StateManager, logger: Logger):
         self.cfg = cfg
@@ -466,6 +491,7 @@ class Strategy:
         now_utc = datetime.now(timezone.utc)
         buy_weight, sell_weight = cadence_weight(self.cfg, now_utc)
         sec_from_q = _seconds_from_quarter(now_utc)
+        intent_ts = time.time()  # capture signal detection time
 
         actions: List[TradeAction] = []
 
@@ -488,13 +514,29 @@ class Strategy:
 
                 sell_action = _exit_actions(self.cfg, inv, tf, sell_weight)
                 if sell_action:
+                    # Add wallet-copy logging fields to sell actions
+                    sell_action.spread_cents = round(tf.spread * 100, 1)
+                    sell_action.spread_percentile = round(tf.spread_pctl_60s, 4)
+                    sell_action.return_5s = round(tf.ret_5s or 0, 8)
+                    sell_action.return_30s = round(tf.ret_30s or 0, 8)
+                    ob_imb = _compute_ob_imbalance(tf)
+                    sell_action.orderbook_imbalance = round(ob_imb, 4) if ob_imb is not None else 0.0
+                    sell_action.entry_style = "passive"
+                    sell_action.intent_timestamp = intent_ts
+
                     self.log.decision(
                         action="SELL", reason=sell_action.reason,
                         slug=slug, outcome=outcome, asset=sf.asset,
                         edge_vs_cost=round(tf.best_bid - inv.avg_cost, 4),
                         shares=sell_action.size_shares,
                         price=sell_action.price,
-                        spread_pctl_60s=round(tf.spread_pctl_60s, 4),
+                        spread_cents=sell_action.spread_cents,
+                        spread_percentile=sell_action.spread_percentile,
+                        return_5s=sell_action.return_5s,
+                        return_30s=sell_action.return_30s,
+                        orderbook_imbalance=sell_action.orderbook_imbalance,
+                        entry_style=sell_action.entry_style,
+                        intent_timestamp=intent_ts,
                         sell_weight=sell_weight,
                         sec_from_q=sec_from_q,
                         inventory_shares_before=round(inv.shares, 2),
@@ -504,12 +546,8 @@ class Strategy:
                     actions.append(sell_action)
 
             # ----------------------------------------------------------
-            # BUY pass: pick direction, check gates, size & price
+            # BUY pass: pick direction, check wallet-copy gates
             # ----------------------------------------------------------
-            # Only consider buying with meaningful buy weight
-            if buy_weight < 0.1:
-                continue
-
             direction = _pick_buy_direction(sf, self.cfg)
             if direction is None:
                 self.log.decision(
@@ -529,16 +567,16 @@ class Strategy:
 
             # Risk gate
             buy_ok, buy_reason = risk_allows_buy(slug, direction, desired_usd)
-            cash_ok = buy_ok  # risk check includes cash
+            cash_ok = buy_ok
             exposure_ok = buy_ok
 
-            # Compute price first so entry gates can evaluate edge
-            price = _entry_price(tf, self.cfg)
+            # Compute price and entry style
+            price, entry_style = _entry_price(tf, self.cfg)
 
             # Get existing inventory for avg-up check
             inv = self.state.get_inventory(slug, direction)
 
-            # Entry gate (with all quality gates)
+            # Entry gate (with all wallet-copy quality gates)
             allowed, gate_reason, diag = _entry_gated(
                 tf, self.cfg, exposure_ok, cash_ok,
                 direction=direction,
@@ -559,32 +597,33 @@ class Strategy:
                 )
                 continue
 
-            # -- Microstructure fields for ORDER_INTENT --
-            ret_120s_val = tf.ret_120s
+            # -- Microstructure fields for logging --
+            ret_5s_val = tf.ret_5s or 0
             ret_30s_val = tf.ret_30s or 0
+            ret_120s_val = tf.ret_120s
             ret_accel = None
-            book_imbalance01 = None
-            book_imbalance = None
+            ob_imbalance = _compute_ob_imbalance(tf)
+
             if ret_120s_val is not None:
                 ret_accel = round(ret_30s_val - ret_120s_val, 8)
-            if tf.bid_size > 0 and tf.ask_size > 0:
-                total_sz = tf.bid_size + tf.ask_size
-                book_imbalance01 = round(tf.bid_size / total_sz, 4)
-                book_imbalance = round(
-                    (tf.bid_size - tf.ask_size) / total_sz, 4
-                )
 
             micro = {}
             if ret_120s_val is not None:
                 micro["ret_120s"] = round(ret_120s_val, 8)
             if ret_accel is not None:
                 micro["ret_accel"] = ret_accel
-            if book_imbalance01 is not None:
-                micro["book_imbalance01"] = book_imbalance01
-            if book_imbalance is not None:
-                micro["book_imbalance"] = book_imbalance
+            if ob_imbalance is not None:
+                micro["book_imbalance01"] = round(ob_imbalance, 4)
+                micro["book_imbalance"] = round(
+                    (tf.bid_size - tf.ask_size) / (tf.bid_size + tf.ask_size), 4
+                ) if (tf.bid_size + tf.ask_size) > 0 else 0.0
 
-            # -- Try inventory laddering --
+            # Wallet-copy log fields
+            spread_cents_val = round(tf.spread * 100, 1)
+            spread_pctl_val = round(tf.spread_pctl_60s, 4)
+            ob_imb_val = round(ob_imbalance, 4) if ob_imbalance is not None else 0.0
+
+            # -- Try inventory laddering (wallet uses 2-level ladder) --
             ladder = build_buy_ladder(self.cfg, tf, desired_usd, price)
 
             if ladder is not None:
@@ -592,13 +631,14 @@ class Strategy:
                 lid = uuid.uuid4().hex[:12]
                 n_levels = len(ladder)
 
-                # Emit LADDER_INTENT
+                # Emit LADDER_INTENT with wallet-copy fields
                 ladder_desc = [
                     {"price": lv.price, "usd": lv.usd, "shares": lv.shares}
                     for lv in ladder
                 ]
-                reason = (f"LADDER_BUY(w={buy_weight:.2f},spd={tf.spread:.4f},"
-                          f"pctl={tf.spread_pctl_60s:.2f},ret30={ret_30s_val:.6f})")
+                reason = (f"LADDER_BUY(spd={tf.spread:.4f},"
+                          f"pctl={tf.spread_pctl_60s:.2f},ret30={ret_30s_val:.6f},"
+                          f"imb={ob_imb_val:.3f},style={entry_style})")
 
                 self.log.log(
                     "LADDER_INTENT",
@@ -607,8 +647,13 @@ class Strategy:
                     ladder_levels_total=n_levels,
                     levels=ladder_desc,
                     reason=reason,
-                    spread_cents=round(tf.spread * 100, 1),
-                    spread_pctl=round(tf.spread_pctl_60s, 3),
+                    spread_cents=spread_cents_val,
+                    spread_percentile=spread_pctl_val,
+                    return_5s=round(ret_5s_val, 8),
+                    return_30s=round(ret_30s_val, 8),
+                    orderbook_imbalance=ob_imb_val,
+                    entry_style=entry_style,
+                    intent_timestamp=intent_ts,
                     desired_usd=round(desired_usd, 2),
                     **micro,
                 )
@@ -624,9 +669,14 @@ class Strategy:
                         ladder_level_idx=i,
                         ladder_levels_total=n_levels,
                         buy_weight=buy_weight, sec_from_q=sec_from_q,
-                        spread=tf.spread,
-                        spread_pctl=tf.spread_pctl_60s,
-                        ret_30s=ret_30s_val,
+                        spread_cents=spread_cents_val,
+                        spread_percentile=spread_pctl_val,
+                        return_5s=round(ret_5s_val, 8),
+                        return_30s=round(ret_30s_val, 8),
+                        orderbook_imbalance=ob_imb_val,
+                        entry_style=entry_style,
+                        ladder_level=i,
+                        intent_timestamp=intent_ts,
                         **micro,
                         **diag,
                     )
@@ -646,6 +696,13 @@ class Strategy:
                         ladder_id=lid,
                         ladder_level_idx=i,
                         ladder_levels_total=n_levels,
+                        intent_timestamp=intent_ts,
+                        spread_cents=spread_cents_val,
+                        spread_percentile=spread_pctl_val,
+                        return_5s=round(ret_5s_val, 8),
+                        return_30s=round(ret_30s_val, 8),
+                        orderbook_imbalance=ob_imb_val,
+                        entry_style=entry_style,
                     ))
             else:
                 # -- Single order fallback (no ladder) --
@@ -660,19 +717,24 @@ class Strategy:
                 if diag.get("entry_edge") is not None:
                     self._entry_quality["edges_at_entry"].append(diag["entry_edge"])
 
-                reason = (f"BUY(w={buy_weight:.2f},spd={tf.spread:.4f},"
-                          f"pctl={tf.spread_pctl_60s:.2f},ret30={ret_30s_val:.6f})")
+                reason = (f"BUY(spd={tf.spread:.4f},"
+                          f"pctl={tf.spread_pctl_60s:.2f},ret30={ret_30s_val:.6f},"
+                          f"imb={ob_imb_val:.3f},style={entry_style})")
 
-                # Emit ORDER_INTENT with microstructure
+                # Emit ORDER_INTENT with wallet-copy fields
                 self.log.log(
                     "ORDER_INTENT",
                     slug=slug, outcome=direction, asset=sf.asset,
                     side="BUY", price=price,
                     shares=shares, usd=actual_usd,
                     buy_weight=buy_weight, sec_from_q=sec_from_q,
-                    spread=tf.spread,
-                    spread_pctl=tf.spread_pctl_60s,
-                    ret_30s=ret_30s_val,
+                    spread_cents=spread_cents_val,
+                    spread_percentile=spread_pctl_val,
+                    return_5s=round(ret_5s_val, 8),
+                    return_30s=round(ret_30s_val, 8),
+                    orderbook_imbalance=ob_imb_val,
+                    entry_style=entry_style,
+                    intent_timestamp=intent_ts,
                     **micro,
                     **diag,
                 )
@@ -682,8 +744,14 @@ class Strategy:
                     action="BUY", reason=reason,
                     slug=slug, outcome=direction, asset=sf.asset,
                     price=price, shares=shares, usd=actual_usd,
-                    spread=tf.spread, spread_pctl_60s=round(tf.spread_pctl_60s, 4),
-                    ret_30s=tf.ret_30s, buy_weight=buy_weight,
+                    spread_cents=spread_cents_val,
+                    spread_percentile=spread_pctl_val,
+                    return_5s=round(ret_5s_val, 8),
+                    return_30s=round(ret_30s_val, 8),
+                    orderbook_imbalance=ob_imb_val,
+                    entry_style=entry_style,
+                    intent_timestamp=intent_ts,
+                    buy_weight=buy_weight,
                     sec_from_q=sec_from_q,
                     **diag,
                 )
@@ -693,6 +761,13 @@ class Strategy:
                     token_id=tf.token_id, price=price,
                     size_shares=shares, size_usd=actual_usd,
                     reason=reason, urgency=buy_weight,
+                    intent_timestamp=intent_ts,
+                    spread_cents=spread_cents_val,
+                    spread_percentile=spread_pctl_val,
+                    return_5s=round(ret_5s_val, 8),
+                    return_30s=round(ret_30s_val, 8),
+                    orderbook_imbalance=ob_imb_val,
+                    entry_style=entry_style,
                 ))
 
         return actions
