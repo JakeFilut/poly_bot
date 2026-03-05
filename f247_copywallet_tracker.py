@@ -991,6 +991,7 @@ def db_init(conn: sqlite3.Connection):
         ("binance_ret_5s_at_trade", "TEXT DEFAULT ''"),
         ("binance_ret_30s_at_trade", "TEXT DEFAULT ''"),
         ("binance_ret_60s_at_trade", "TEXT DEFAULT ''"),
+        ("binance_momentum_missing", "TEXT DEFAULT ''"),
         # F) Latency
         ("local_received_ms", "TEXT DEFAULT ''"),
         ("api_to_local_delay_ms", "TEXT DEFAULT ''"),
@@ -1043,6 +1044,7 @@ _TRADE_INSERT_COLS = [
     "spread_rank_at_trade", "imbalance_rank_at_trade", "spread_percentile_60s_at_trade",
     "orderbook_imbalance_at_trade",
     "binance_ret_5s_at_trade", "binance_ret_30s_at_trade", "binance_ret_60s_at_trade",
+    "binance_momentum_missing",
     "local_received_ms", "api_to_local_delay_ms", "book_age_ms_at_trade", "binance_age_ms_at_trade",
 ]
 
@@ -1927,50 +1929,87 @@ def register_active_crypto(symbol: str):
 
 
 # -------------------- Binance momentum snapshot at trade time --------------------
-def _binance_closest_price(dq: deque, target_sec: int, max_delta: int = 2) -> Optional[float]:
-    """Find the Binance price closest to target_sec within ±max_delta seconds."""
-    best_entry = None
-    best_diff = max_delta + 1
+_binance_mom_total = 0
+_binance_mom_missing = 0
+
+
+def _binance_price_before(dq: deque, target_sec: int, max_delta: int = 10) -> Optional[float]:
+    """Find the Binance price at or just before target_sec, within max_delta seconds.
+
+    Prefers the closest entry at or before the target timestamp.  If nothing
+    exists before, falls back to the closest entry after (still within window).
+    """
+    best_before = None
+    best_before_diff = max_delta + 1
+    best_after = None
+    best_after_diff = max_delta + 1
+
     for entry in reversed(dq):
-        diff = abs(entry[0] - target_sec)
-        if diff < best_diff:
-            best_diff = diff
-            best_entry = entry
-        # Once we're past max_delta behind the target, stop searching
-        if entry[0] < target_sec - max_delta:
+        t, px = entry[0], entry[1]
+        diff = target_sec - t  # positive = entry is before target
+        if 0 <= diff <= max_delta:
+            if diff < best_before_diff:
+                best_before_diff = diff
+                best_before = px
+            # Found an entry at-or-before target; first one from reversed
+            # iteration that's within range is the closest, so break early.
             break
-    if best_entry is not None and best_diff <= max_delta:
-        return best_entry[1]
-    return None
+        elif diff < 0 and abs(diff) <= max_delta:
+            # Entry is after target
+            adiff = abs(diff)
+            if adiff < best_after_diff:
+                best_after_diff = adiff
+                best_after = px
+        if t < target_sec - max_delta:
+            break
+
+    return best_before if best_before is not None else best_after
 
 
 def compute_binance_momentum_at_trade(crypto: str, trade_ts: int) -> dict:
     """Compute Binance return snapshots at the exact trade moment.
 
     Returns binance_ret_5s, _30s, _60s as decimal returns (e.g. 0.0015 = 0.15%)
-    using the closest Binance tape entry within ±2s of trade_ts.
+    using the closest Binance tape entry at-or-before trade_ts within ±10s.
+    Also returns binance_momentum_missing = "true" if no current price found.
     """
-    r = {"binance_ret_5s_at_trade": "", "binance_ret_30s_at_trade": "",
-         "binance_ret_60s_at_trade": ""}
+    global _binance_mom_total, _binance_mom_missing
+    r: dict = {"binance_ret_5s_at_trade": "", "binance_ret_30s_at_trade": "",
+               "binance_ret_60s_at_trade": "", "binance_momentum_missing": ""}
     if not crypto:
         return r
     bdq = _binance_tape_mem.get(crypto)
     if not bdq or len(bdq) < 2:
+        _binance_mom_total += 1
+        _binance_mom_missing += 1
+        r["binance_momentum_missing"] = "true"
         return r
 
-    # Current price: closest to trade_ts within ±2s
-    cur_price = _binance_closest_price(bdq, trade_ts, max_delta=2)
+    _binance_mom_total += 1
+
+    # Current price: closest at-or-before trade_ts within ±10s
+    cur_price = _binance_price_before(bdq, trade_ts, max_delta=10)
     if cur_price is None or cur_price <= 0:
+        _binance_mom_missing += 1
+        r["binance_momentum_missing"] = "true"
         return r
 
     for label, lookback in [("binance_ret_5s_at_trade", 5),
                              ("binance_ret_30s_at_trade", 30),
                              ("binance_ret_60s_at_trade", 60)]:
-        past_price = _binance_closest_price(bdq, trade_ts - lookback, max_delta=2)
+        past_price = _binance_price_before(bdq, trade_ts - lookback, max_delta=10)
         if past_price is not None and past_price > 0:
             ret_decimal = (cur_price - past_price) / past_price
             r[label] = clean_number(ret_decimal)
     return r
+
+
+def get_binance_momentum_stats() -> Tuple[int, int, float]:
+    """Return (total, missing, pct_missing) for Binance momentum lookups."""
+    if _binance_mom_total == 0:
+        return 0, 0, 0.0
+    pct = _binance_mom_missing / _binance_mom_total * 100.0
+    return _binance_mom_total, _binance_mom_missing, pct
 
 
 # -------------------- Orderbook imbalance at trade time --------------------
@@ -3264,7 +3303,9 @@ def main():
             if now - last_export >= EXPORT_EVERY_SECONDS:
                 last_export = now
                 db_export_csv(conn, OUT_CSV)
-                print(f"  [export] wrote {OUT_CSV}  (total={total_trades} usdc=${total_usdc:.2f})")
+                bn_t, bn_m, bn_p = get_binance_momentum_stats()
+                bn_cov = f"  bn_cov={100.0 - bn_p:.0f}%" if bn_t > 0 else ""
+                print(f"  [export] wrote {OUT_CSV}  (total={total_trades} usdc=${total_usdc:.2f}{bn_cov})")
 
             # ---- rollups ----
             if now - last_roll >= ROLLUP_EVERY_SECONDS:
@@ -3340,6 +3381,11 @@ def main():
         if _jsonl_fh:
             _jsonl_fh.close()
         conn.close()
+    # Binance momentum coverage stats
+    bn_total, bn_missing, bn_pct = get_binance_momentum_stats()
+    if bn_total > 0:
+        print(f"  [binance momentum] {bn_total - bn_missing}/{bn_total} trades with data "
+              f"({100.0 - bn_pct:.1f}% coverage, {bn_missing} missing)")
     print(f"Stopped. {total_trades} trades tracked, ${total_usdc:.2f} USDC total.")
 
 

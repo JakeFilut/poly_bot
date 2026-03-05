@@ -249,7 +249,7 @@ class MarketReplayEngine:
                 idx = bdf["ts"].searchsorted(ts) - 1
                 if 0 <= idx < len(bdf):
                     binance_ts = float(bdf.iloc[idx]["ts"])
-                    if abs(binance_ts - ts) <= 2.0:  # align within ±2s
+                    if abs(binance_ts - ts) <= 10.0:  # align within ±10s
                         r5 = float(bdf.iloc[idx].get("ret_5s", 0))
                         r30 = float(bdf.iloc[idx].get("ret_30s", 0))
                         r60 = float(bdf.iloc[idx].get("ret_60s", 0))
