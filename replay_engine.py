@@ -1554,12 +1554,12 @@ def analyze_signal_distributions(wallet_trades: pd.DataFrame) -> pd.DataFrame:
 # ═══════════════════════════════════════════════════════════════════════════
 
 DEFAULT_SWEEP_RANGES = {
-    "entry_min_spread_pctl": np.arange(0.80, 0.96, 0.02),
-    "entry_min_spread_cents": [0.0, 1.0, 1.5, 2.0],
-    "entry_min_ret_30s": np.arange(0.0005, 0.0035, 0.0005),
-    "entry_min_imbalance": [0.45, 0.50, 0.55, 0.60, 0.65],
-    "spread_pctl_delta_min": [0.0, 0.02, 0.05, 0.10],
-    "ret_accel_min": [0.0, 0.0002, 0.0005, 0.001],
+    "entry_min_spread_pctl": [0.82, 0.88, 0.94],
+    "entry_min_spread_cents": [0.0, 1.0, 2.0],
+    "entry_min_ret_30s": [0.0005, 0.0015, 0.003],
+    "entry_min_imbalance": [0.45, 0.55, 0.65],
+    "spread_pctl_delta_min": [0.0, 0.05, 0.10],
+    "ret_accel_min": [0.0, 0.0005, 0.001],
     "entry_cooldown_sec": [0.0, 30.0, 60.0],
 }
 
@@ -1582,7 +1582,9 @@ def parameter_sweep(
     total = len(grid)
     print(f"\n  Parameter sweep: {total} combinations ...")
 
+    import time as _time
     results = []
+    t_start = _time.monotonic()
     for idx, combo in enumerate(grid):
         params = StrategyParams(**dict(zip(keys, combo)))
         decisions = run_replay(states, params)
@@ -1597,8 +1599,11 @@ def parameter_sweep(
         entry["lag_p90_ms"] = round(cr.entry_lag_p90 * 1000, 1) if not np.isnan(cr.entry_lag_p90) else "N/A"
         results.append(entry)
 
-        if (idx + 1) % max(1, total // 10) == 0:
-            print(f"    ... {idx + 1}/{total}")
+        done = idx + 1
+        if done % max(1, total // 20) == 0 or done == 5:
+            elapsed = _time.monotonic() - t_start
+            eta = elapsed / done * (total - done)
+            print(f"    ... {done}/{total}  ({elapsed:.0f}s elapsed, ~{eta:.0f}s remaining)")
 
     df = pd.DataFrame(results).sort_values("similarity", ascending=False).reset_index(drop=True)
     return df
