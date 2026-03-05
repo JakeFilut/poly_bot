@@ -107,6 +107,10 @@ class BinanceAPI:
     # ------------------------------------------------------------------
     # Returns computation
     # ------------------------------------------------------------------
+    def ret_5s(self, asset: str) -> float | None:
+        """5-second return for the asset (short-term momentum)."""
+        return self._ret(asset, 5.0)
+
     def ret_30s(self, asset: str) -> float | None:
         """30-second return for the asset."""
         return self._ret(asset, 30.0)
