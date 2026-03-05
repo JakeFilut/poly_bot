@@ -453,8 +453,8 @@ def fetch_orderbook(token_id: str) -> Optional[BookSnap]:
         bid_depth_tot = _levels_depth(bids, ORDERBOOK_TOTAL_DEPTH_LEVELS)
         ask_depth_tot = _levels_depth(asks, ORDERBOOK_TOTAL_DEPTH_LEVELS)
         imb = ""
-        if ask_depth_top > 0:
-            imb = clean_number(bid_depth_top / ask_depth_top)
+        if bid_depth_top + ask_depth_top > 0:
+            imb = clean_number(bid_depth_top / (bid_depth_top + ask_depth_top))
         snap = BookSnap(
             best_bid=best_bid,
             best_ask=best_ask,
@@ -1947,7 +1947,7 @@ def _binance_closest_price(dq: deque, target_sec: int, max_delta: int = 2) -> Op
 def compute_binance_momentum_at_trade(crypto: str, trade_ts: int) -> dict:
     """Compute Binance return snapshots at the exact trade moment.
 
-    Returns binance_ret_5s, _30s, _60s as percentage returns
+    Returns binance_ret_5s, _30s, _60s as decimal returns (e.g. 0.0015 = 0.15%)
     using the closest Binance tape entry within ±2s of trade_ts.
     """
     r = {"binance_ret_5s_at_trade": "", "binance_ret_30s_at_trade": "",
@@ -1968,8 +1968,8 @@ def compute_binance_momentum_at_trade(crypto: str, trade_ts: int) -> dict:
                              ("binance_ret_60s_at_trade", 60)]:
         past_price = _binance_closest_price(bdq, trade_ts - lookback, max_delta=2)
         if past_price is not None and past_price > 0:
-            ret_pct = (cur_price - past_price) / past_price * 100.0
-            r[label] = clean_number(ret_pct)
+            ret_decimal = (cur_price - past_price) / past_price
+            r[label] = clean_number(ret_decimal)
     return r
 
 
@@ -1979,32 +1979,29 @@ def compute_orderbook_imbalance_at_trade(token_id: str, trade_ts: int,
                                           snap_ask_depth: Optional[float]) -> str:
     """Compute raw orderbook imbalance = bid_size / (bid_size + ask_size).
 
-    Uses the book tape snapshot closest to trade_ts within ±2s if available,
-    otherwise falls back to the live snap bid/ask depth.
+    Uses the live snap bid/ask depth.  Result is guaranteed in [0, 1].
+    Logs a warning if inputs are negative (should never happen).
     """
-    # Try timestamp-aligned book tape first
-    if token_id:
-        bt_dq = _book_tape_mem.get(token_id)
-        if bt_dq and len(bt_dq) > 0:
-            best_entry = None
-            best_diff = 3  # > max_delta=2
-            for entry in reversed(bt_dq):
-                diff = abs(entry[0] - trade_ts)
-                if diff < best_diff:
-                    best_diff = diff
-                    best_entry = entry
-                if entry[0] < trade_ts - 2:
-                    break
-            # book tape entry: (t_sec, spread_f, imb_f, mid_f, micro_f)
-            # imb_f = bid_depth_topN / ask_depth_topN (ratio), not what we want
-            # We need bid_size / (bid_size + ask_size) — recompute from snap depths
-            pass  # fall through to snap-based computation
+    bid = max(0.0, snap_bid_depth) if snap_bid_depth is not None else None
+    ask = max(0.0, snap_ask_depth) if snap_ask_depth is not None else None
 
-    # Use live snap bid/ask depth
-    if snap_bid_depth is not None and snap_ask_depth is not None:
-        denom = snap_bid_depth + snap_ask_depth
-        if denom > 0:
-            return clean_number(snap_bid_depth / denom)
+    if bid is not None and ask is not None:
+        if snap_bid_depth < 0 or snap_ask_depth < 0:
+            import logging
+            logging.warning(
+                "Negative depth in imbalance: bid_depth=%.4f ask_depth=%.4f (token=%s ts=%d)",
+                snap_bid_depth, snap_ask_depth, token_id, trade_ts,
+            )
+        denom = max(1e-9, bid + ask)
+        imb = bid / denom
+        if imb < 0 or imb > 1:
+            import logging
+            logging.warning(
+                "Imbalance out of [0,1]: %.6f  bid=%.4f ask=%.4f (token=%s ts=%d)",
+                imb, bid, ask, token_id, trade_ts,
+            )
+            imb = max(0.0, min(1.0, imb))
+        return clean_number(imb)
     return ""
 
 
