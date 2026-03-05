@@ -6,14 +6,17 @@ Every log line is valid JSON with:
   - event: event type tag
   - payload: event-specific data
 
-Supports file output and periodic rollup summaries.
+Supports file output, periodic rollup summaries, decision throttling,
+and rotating file output.
 """
 from __future__ import annotations
 
 import json
 import sys
 import time
+from collections import defaultdict
 from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
 from typing import IO, Optional
 
 
@@ -25,13 +28,45 @@ class Logger:
     """Structured JSON logger.  Thread-unsafe (single bot loop)."""
 
     def __init__(self, log_file: str = "", rollup_sec: int = 60,
-                 run_id: str = ""):
+                 run_id: str = "",
+                 log_decisions: bool = False,
+                 decision_sample_every_n: int = 200,
+                 decision_min_interval_ms: int = 2000,
+                 rotate_max_bytes: int = 50_000_000,
+                 rotate_backup_count: int = 5):
         self._fh: Optional[IO] = None
+        self._rotating_handler: Optional[RotatingFileHandler] = None
         if log_file:
-            self._fh = open(log_file, "a", buffering=1)  # line-buffered
+            if rotate_max_bytes > 0:
+                self._rotating_handler = RotatingFileHandler(
+                    log_file,
+                    maxBytes=rotate_max_bytes,
+                    backupCount=rotate_backup_count,
+                    encoding="utf-8",
+                )
+            else:
+                self._fh = open(log_file, "a", buffering=1)  # line-buffered
         self._rollup_sec = rollup_sec
         self._last_rollup_ts = time.monotonic()
         self._run_id = run_id
+
+        # -- Decision throttling config --
+        self._log_decisions = log_decisions
+        self._decision_sample_n = decision_sample_every_n
+        self._decision_min_interval_ms = decision_min_interval_ms
+
+        # -- Decision throttling state --
+        # Per-(slug, reason) tick counter for sampling
+        self._decision_skip_counter: dict[str, int] = defaultdict(int)
+        # Per-(slug, reason) last log time (monotonic ms) for time-based throttle
+        self._decision_skip_last_log_ms: dict[str, float] = {}
+        # Per-(slug, reason) last reason for change detection
+        self._decision_last_reason: dict[str, str] = {}
+
+        # -- Decision rollup accumulators (reset each rollup) --
+        self._decision_action_counts: dict[str, int] = defaultdict(int)
+        self._decision_skip_reasons: dict[str, int] = defaultdict(int)
+        self._decision_asset_counts: dict[str, int] = defaultdict(int)
 
         # Rollup accumulators
         self._buy_count = 0
@@ -64,7 +99,11 @@ class Logger:
             record.update(kwargs)
         line = json.dumps(record, default=str)
         print(line, flush=True)
-        if self._fh:
+        if self._rotating_handler is not None:
+            self._rotating_handler.emit(
+                _make_log_record(line)
+            )
+        elif self._fh:
             self._fh.write(line + "\n")
 
     # ------------------------------------------------------------------
@@ -74,13 +113,67 @@ class Logger:
         self.log("FEATURE", **kw)
 
     def decision(self, action: str, reason: str, **kw):
+        # Always count for rollup (even when not logging the line)
+        self._decision_action_counts[action] += 1
+        if action == "SKIP":
+            self._decision_skip_reasons[reason] += 1
+        slug = kw.get("slug", "?")
+        asset = kw.get("asset", "?")
+        self._decision_asset_counts[f"{slug}:{asset}"] += 1
+
         if action == "BUY":
             self._buy_count += 1
         elif action == "SELL":
             self._sell_count += 1
         elif action == "SKIP":
             self._skip_count += 1
-        self.log("DECISION", action=action, reason=reason, **kw)
+
+        # -- Decide whether to actually emit the log line --
+        if action != "SKIP":
+            # Non-SKIP decisions always logged
+            self.log("DECISION", action=action, reason=reason, **kw)
+            return
+
+        # SKIP decisions: throttle unless LOG_DECISIONS is True
+        if self._log_decisions:
+            self.log("DECISION", action=action, reason=reason, **kw)
+            return
+
+        # Staleness SKIPs get special treatment (throttled to once per 2s per asset)
+        is_stale = reason in ("stale_book", "stale_binance", "stale_universe")
+
+        throttle_key = f"{slug}:{reason}"
+        now_ms = time.monotonic() * 1000.0
+
+        # Log if reason changed for this slug
+        prev_reason = self._decision_last_reason.get(slug)
+        self._decision_last_reason[slug] = reason
+        if prev_reason is not None and prev_reason != reason:
+            self.log("DECISION", action=action, reason=reason, **kw)
+            self._decision_skip_last_log_ms[throttle_key] = now_ms
+            self._decision_skip_counter[throttle_key] = 0
+            return
+
+        # Time-based throttle: log at most once per DECISION_LOG_MIN_INTERVAL_MS
+        last_log_ms = self._decision_skip_last_log_ms.get(throttle_key, 0.0)
+        interval = 2000 if is_stale else self._decision_min_interval_ms
+        if now_ms - last_log_ms >= interval:
+            suppressed = self._decision_skip_counter.get(throttle_key, 0)
+            if suppressed > 0:
+                kw["suppressed_since_last"] = suppressed
+            self.log("DECISION", action=action, reason=reason, **kw)
+            self._decision_skip_last_log_ms[throttle_key] = now_ms
+            self._decision_skip_counter[throttle_key] = 0
+            return
+
+        # Sample-based: log every N ticks
+        self._decision_skip_counter[throttle_key] += 1
+        if self._decision_skip_counter[throttle_key] >= self._decision_sample_n:
+            kw["sampled"] = True
+            kw["suppressed_since_last"] = self._decision_skip_counter[throttle_key]
+            self.log("DECISION", action=action, reason=reason, **kw)
+            self._decision_skip_counter[throttle_key] = 0
+            self._decision_skip_last_log_ms[throttle_key] = now_ms
 
     def order_place(self, **kw):
         self.log("ORDER_PLACE", **kw)
@@ -140,12 +233,51 @@ class Logger:
         self.log("ERROR", msg=msg, **kw)
 
     # ------------------------------------------------------------------
+    # Decision rollup (emitted alongside the periodic ROLLUP)
+    # ------------------------------------------------------------------
+    def maybe_decision_rollup(self, tick_metrics: dict | None = None) -> bool:
+        """Emit DECISION_ROLLUP if there are accumulated decision counts.
+        Called from the same place as maybe_rollup. Returns True if emitted."""
+        total = sum(self._decision_action_counts.values())
+        if total == 0:
+            return False
+
+        # Top skip reasons sorted by count descending
+        top_skip = sorted(
+            self._decision_skip_reasons.items(),
+            key=lambda kv: kv[1], reverse=True,
+        )[:10]
+
+        # Per-asset counts sorted by count descending
+        top_assets = sorted(
+            self._decision_asset_counts.items(),
+            key=lambda kv: kv[1], reverse=True,
+        )[:10]
+
+        payload: dict = {
+            "action_counts": dict(self._decision_action_counts),
+            "top_skip_reasons": {k: v for k, v in top_skip},
+            "top_asset_counts": {k: v for k, v in top_assets},
+        }
+        if tick_metrics:
+            payload.update(tick_metrics)
+
+        self.log("DECISION_ROLLUP", **payload)
+
+        # Reset
+        self._decision_action_counts.clear()
+        self._decision_skip_reasons.clear()
+        self._decision_asset_counts.clear()
+        return True
+
+    # ------------------------------------------------------------------
     # Periodic rollup
     # ------------------------------------------------------------------
     def maybe_rollup(self, inventory_snapshot: dict | None = None,
                      unrealized_usd: float = 0.0,
                      realized_usd: float = 0.0,
-                     mark_details: list[dict] | None = None) -> bool:
+                     mark_details: list[dict] | None = None,
+                     tick_metrics: dict | None = None) -> bool:
         """Emit a periodic rollup if interval has elapsed.  Returns True if emitted."""
         now = time.monotonic()
         if now - self._last_rollup_ts < self._rollup_sec:
@@ -177,6 +309,10 @@ class Logger:
         if mark_details:
             payload["mark_details"] = mark_details
         self.log("ROLLUP", **payload)
+
+        # Emit DECISION_ROLLUP alongside
+        self.maybe_decision_rollup(tick_metrics=tick_metrics)
+
         # Reset accumulators
         self._buy_count = 0
         self._sell_count = 0
@@ -224,6 +360,21 @@ class Logger:
     # Cleanup
     # ------------------------------------------------------------------
     def close(self):
+        if self._rotating_handler is not None:
+            self._rotating_handler.close()
+            self._rotating_handler = None
         if self._fh:
             self._fh.close()
             self._fh = None
+
+
+def _make_log_record(line: str):
+    """Create a minimal logging.LogRecord for the RotatingFileHandler."""
+    import logging
+    record = logging.LogRecord(
+        name="bot", level=logging.INFO, pathname="", lineno=0,
+        msg=line, args=(), exc_info=None,
+    )
+    # Override getMessage to return the raw JSON line (no formatting)
+    record.getMessage = lambda: line  # type: ignore[assignment]
+    return record

@@ -299,7 +299,7 @@ class StrategyEngine:
     # ------------------------------------------------------------------
     # Post-tick analytics (called by main loop after tick)
     # ------------------------------------------------------------------
-    def post_tick(self) -> None:
+    def post_tick(self, tick_metrics: dict | None = None) -> None:
         """Rollup logging, analytics, hourly PnL — called after tick()."""
         # Rollup logging
         unreal, mark_details = self._compute_unrealized_with_marks()
@@ -308,6 +308,7 @@ class StrategyEngine:
             unrealized_usd=unreal,
             realized_usd=self.state.realized_pnl,
             mark_details=mark_details,
+            tick_metrics=tick_metrics,
         )
 
         # Equity tracking
