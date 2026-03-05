@@ -92,6 +92,9 @@ class BotDecision:
     spread_percentile: float
     orderbook_imbalance: float
     binance_ret_30s: float
+    token_id: str = ""        # token_id for primary matching
+    binance_ret_120s: float = 0.0
+    spread_pctl_prev: float = 0.0
 
 
 @dataclass
@@ -395,6 +398,9 @@ class Strategy:
             spread_percentile=ms.spread_percentile,
             orderbook_imbalance=ms.orderbook_imbalance,
             binance_ret_30s=ms.binance_ret_30s,
+            token_id=ms.token_id,
+            binance_ret_120s=ms.binance_ret_120s,
+            spread_pctl_prev=ms.spread_pctl_prev,
         ), ""
 
     @staticmethod
@@ -410,7 +416,36 @@ class Strategy:
             spread_percentile=ms.spread_percentile,
             orderbook_imbalance=ms.orderbook_imbalance,
             binance_ret_30s=ms.binance_ret_30s,
+            token_id=ms.token_id,
+            binance_ret_120s=ms.binance_ret_120s,
+            spread_pctl_prev=ms.spread_pctl_prev,
         )
+
+    def evaluate_gate_detail(self, ms: MarketState) -> List[Tuple[str, float, float, bool]]:
+        """Return ALL gate checks as (gate_code, value, threshold, passed).
+
+        Unlike evaluate_market_state which short-circuits on first failure,
+        this evaluates every gate for full attribution.
+        """
+        p = self.params
+        results = []
+        results.append(("spread_cents", ms.spread_cents, p.entry_min_spread_cents,
+                         ms.spread_cents >= p.entry_min_spread_cents))
+        results.append(("spread_pctl", ms.spread_percentile, p.entry_min_spread_pctl,
+                         ms.spread_percentile >= p.entry_min_spread_pctl))
+        results.append(("|ret_30s|", abs(ms.binance_ret_30s), p.entry_min_ret_30s,
+                         abs(ms.binance_ret_30s) >= p.entry_min_ret_30s))
+        results.append(("imbalance", ms.orderbook_imbalance, p.entry_min_imbalance,
+                         ms.orderbook_imbalance >= p.entry_min_imbalance))
+        if p.spread_pctl_delta_min > 0:
+            pctl_delta = ms.spread_percentile - ms.spread_pctl_prev
+            results.append(("pctl_delta", pctl_delta, p.spread_pctl_delta_min,
+                             pctl_delta >= p.spread_pctl_delta_min))
+        if p.ret_accel_min > 0:
+            ret_accel = abs(ms.binance_ret_30s - ms.binance_ret_120s)
+            results.append(("ret_accel", ret_accel, p.ret_accel_min,
+                             ret_accel >= p.ret_accel_min))
+        return results
 
 
 COOLDOWN_SECONDS = 20  # suppress duplicate bot entries per market
@@ -419,20 +454,20 @@ COOLDOWN_SECONDS = 20  # suppress duplicate bot entries per market
 def run_replay(states: List[MarketState], params: StrategyParams) -> List[BotDecision]:
     """Run the strategy over all market states and return decisions.
 
-    Applies a per-(slug, outcome, side) cooldown: after the bot triggers an
-    entry, further entries for that triple are suppressed for
+    Applies a per-(slug, outcome) cooldown: after the bot triggers an entry,
+    further entries for that pair are suppressed for
     max(COOLDOWN_SECONDS, params.entry_cooldown_sec) to prevent overfitting.
     """
     strategy = Strategy(params)
     cooldown = max(COOLDOWN_SECONDS, params.entry_cooldown_sec)
-    last_entry_ts: Dict[Tuple[str, str, str], float] = {}  # (slug, outcome, side) -> epoch
+    last_entry_ts: Dict[Tuple[str, str], float] = {}  # (slug, outcome) -> epoch
     decisions: List[BotDecision] = []
 
     for ms in states:
         decision, _gate = strategy.evaluate_market_state(ms)
 
         if decision.action in ("BUY", "SELL"):
-            key = (ms.slug, ms.outcome, decision.action)
+            key = (ms.slug, ms.outcome)
             prev = last_entry_ts.get(key, 0.0)
             if ms.timestamp - prev < cooldown:
                 decision = Strategy._no_action(ms, "cooldown_active")
@@ -613,6 +648,9 @@ def _normalize_outcome(outcome: str) -> str:
 
     Polymarket crypto markets may label outcomes as Yes/No while the bot
     uses Up/Down (or vice-versa).  Canonicalise to Yes/No.
+
+    NOTE: outcome is a market property (which token), NOT trade direction.
+    Do NOT flip outcome based on BUY/SELL side.
     """
     s = outcome.strip().casefold()
     mapping = {
@@ -633,8 +671,7 @@ def _resolve_wallet_side(row: pd.Series) -> str:
 
 
 def _resolve_wallet_asset(row: pd.Series) -> str:
-    """Normalise wallet trade asset, preferring slug-derived asset."""
-    # Prefer deriving asset from slug to stay consistent with bot keys
+    """Normalise wallet trade asset, ALWAYS deriving from slug first."""
     slug = str(row.get("slug", "")) if "slug" in row.index else ""
     if slug:
         derived = asset_from_slug(slug)
@@ -655,15 +692,26 @@ def _resolve_wallet_slug(row: pd.Series) -> str:
 
 
 def _resolve_wallet_outcome(row: pd.Series) -> str:
-    """Normalise wallet trade outcome."""
+    """Normalise wallet trade outcome (market property, NOT direction)."""
     for col in ("outcome",):
         if col in row.index and pd.notna(row[col]):
             return _normalize_outcome(str(row[col]))
     return ""
 
 
+def _resolve_wallet_token_id(row: pd.Series) -> str:
+    """Extract token_id from wallet trade row."""
+    if "token_id" in row.index and pd.notna(row.get("token_id")):
+        return str(row["token_id"]).strip()
+    return ""
+
+
 def _make_decision_key(d) -> tuple:
-    """Build normalised matching key from a BotDecision."""
+    """Build normalised matching key from a BotDecision.
+
+    Uses token_id as primary key if available; falls back to
+    (asset, slug, outcome, side) tuple.
+    """
     slug_norm = d.slug.strip().casefold()
     # Always derive asset from slug to stay consistent with wallet keys
     derived_asset = asset_from_slug(slug_norm)
@@ -674,6 +722,68 @@ def _make_decision_key(d) -> tuple:
         _normalize_outcome(d.outcome),
         d.action.strip().upper(),
     )
+
+
+def _make_wallet_key(row: pd.Series) -> tuple:
+    """Build normalised matching key from a wallet trade row."""
+    return (
+        _resolve_wallet_asset(row),
+        _resolve_wallet_slug(row),
+        _resolve_wallet_outcome(row),
+        _resolve_wallet_side(row),
+    )
+
+
+def _build_token_id_index(
+    decisions: List[BotDecision],
+) -> Dict[str, List[float]]:
+    """Build token_id -> [timestamps] index for bot decisions."""
+    idx: Dict[str, List[float]] = defaultdict(list)
+    for d in decisions:
+        if d.action in ("BUY", "SELL") and d.token_id:
+            idx[d.token_id].append(d.timestamp)
+    return {k: sorted(v) for k, v in idx.items()}
+
+
+def _match_by_token_id_or_key(
+    wts: float,
+    w_token_id: str,
+    key: tuple,
+    bot_token_idx: Dict[str, np.ndarray],
+    bot_key_arrays: Dict[tuple, np.ndarray],
+    tolerance_sec: float,
+) -> Optional[float]:
+    """Try matching a wallet trade to a bot decision.
+
+    Priority: token_id match first, then (asset, slug, outcome, side) fallback.
+    Returns best lag (bot_ts - wallet_ts) or None if no match.
+    """
+    # 1) Try token_id match
+    if w_token_id:
+        arr = bot_token_idx.get(w_token_id)
+        if arr is not None and len(arr) > 0:
+            lag = _find_best_lag(arr, wts, tolerance_sec)
+            if lag is not None:
+                return lag
+
+    # 2) Fallback to key-based match
+    arr = bot_key_arrays.get(key)
+    if arr is not None and len(arr) > 0:
+        return _find_best_lag(arr, wts, tolerance_sec)
+
+    return None
+
+
+def _find_best_lag(arr: np.ndarray, target: float, tolerance: float) -> Optional[float]:
+    """Find best lag (arr[i] - target) within tolerance."""
+    idx = np.searchsorted(arr, target)
+    best_lag = None
+    for i in range(max(0, idx - 1), min(len(arr), idx + 2)):
+        lag = float(arr[i]) - target
+        if abs(lag) <= tolerance:
+            if best_lag is None or abs(lag) < abs(best_lag):
+                best_lag = lag
+    return best_lag
 
 
 def _nearest_ts(arr: np.ndarray, target: float) -> Optional[float]:
@@ -717,7 +827,6 @@ def compare_to_wallet(
         return ComparisonResult(0, 0, 0, 0, 0.0)
 
     # --- Build bot entry index keyed by (asset, slug, outcome, side) ---
-    # Using normalised 4-tuple keys to avoid slug/outcome/side mismatches
     bot_entries_by_key: Dict[Tuple[str, str, str, str], List[float]] = defaultdict(list)
     for d in decisions:
         if d.action in ("BUY", "SELL"):
@@ -726,6 +835,12 @@ def compare_to_wallet(
 
     bot_arrays: Dict[Tuple[str, str, str, str], np.ndarray] = {
         k: np.array(sorted(v)) for k, v in bot_entries_by_key.items()
+    }
+
+    # --- Build token_id index for primary matching ---
+    bot_token_raw = _build_token_id_index(decisions)
+    bot_token_idx: Dict[str, np.ndarray] = {
+        k: np.array(v) for k, v in bot_token_raw.items()
     }
 
     # --- Build ALL bot decision timestamps for proximity check ---
@@ -762,6 +877,16 @@ def compare_to_wallet(
 
         total += 1
         key = (w_asset, w_slug, w_outcome, w_side)
+
+        # Try token_id-primary match first, then fallback to key
+        best_lag = _match_by_token_id_or_key(
+            wts, w_token_id, key, bot_token_idx, bot_arrays, tolerance_sec,
+        )
+        if best_lag is not None:
+            matched += 1
+            entry_lags.append(best_lag)
+            continue
+
         arr = bot_arrays.get(key)
 
         if arr is None or len(arr) == 0:
@@ -813,37 +938,27 @@ def compare_to_wallet(
             if debug and len(debug_examples) < 5:
                 debug_examples.append({
                     "wallet_ts": float(wts), "side": w_side, "asset": w_asset,
-                    "slug": w_slug, "outcome": w_outcome,
+                    "slug": w_slug, "outcome": w_outcome, "token_id": w_token_id,
                     "reason": "no_bot_entry_for_key",
                     "nearest_any_bot_ts": _nearest_ts(all_bot_ts, float(wts)),
                 })
             continue
 
+        # Key exists but _match_by_token_id_or_key found no match within tolerance
+        nearest = float("inf")
         idx = np.searchsorted(arr, float(wts))
-        best_lag = None
         for i in range(max(0, idx - 1), min(len(arr), idx + 2)):
-            lag = float(arr[i]) - float(wts)
-            if abs(lag) <= tolerance_sec:
-                if best_lag is None or abs(lag) < abs(best_lag):
-                    best_lag = lag
-        if best_lag is not None:
-            matched += 1
-            entry_lags.append(best_lag)
-        else:
-            # Key exists but no timestamp match
-            nearest = float("inf")
-            for i in range(max(0, idx - 1), min(len(arr), idx + 2)):
-                d_lag = abs(float(arr[i]) - float(wts))
-                if d_lag < nearest:
-                    nearest = d_lag
-            mismatch_reasons[f"key_match_but_outside_tolerance (nearest {nearest:.1f}s)"] += 1
-            if debug and len(debug_examples) < 5:
-                debug_examples.append({
-                    "wallet_ts": float(wts), "side": w_side, "asset": w_asset,
-                    "slug": w_slug, "outcome": w_outcome,
-                    "reason": f"outside_tolerance (nearest={nearest:.1f}s)",
-                    "nearest_any_bot_ts": _nearest_ts(all_bot_ts, float(wts)),
-                })
+            d_lag = abs(float(arr[i]) - float(wts))
+            if d_lag < nearest:
+                nearest = d_lag
+        mismatch_reasons[f"key_match_but_outside_tolerance (nearest {nearest:.1f}s)"] += 1
+        if debug and len(debug_examples) < 5:
+            debug_examples.append({
+                "wallet_ts": float(wts), "side": w_side, "asset": w_asset,
+                "slug": w_slug, "outcome": w_outcome, "token_id": w_token_id,
+                "reason": f"outside_tolerance (nearest={nearest:.1f}s)",
+                "nearest_any_bot_ts": _nearest_ts(all_bot_ts, float(wts)),
+            })
 
     missed = total - matched
 
@@ -991,100 +1106,53 @@ def dump_missed_wallet_trades(
     params: StrategyParams,
     tolerance_sec: float = 3.0,
     max_rows: int = 50,
-) -> None:
-    """Print top N wallet trades that the bot MISSED (no matching bot entry).
+) -> Dict[str, int]:
+    """Print top N wallet trades that the bot MISSED, with gate-fail attribution.
 
-    For each missed trade, show: ts, slug, outcome, side, spread_cents, pctl,
-    imbalance, ret_30s at trade time, and which gate failed (or if bot didn't
-    evaluate that slug).
+    For each missed trade finds the nearest MarketState and shows EXACTLY which
+    gate(s) failed: gate_code, gate_value, gate_threshold.
+
+    Returns a dict of miss_reason -> count for use by recommend_config().
     """
+    miss_reasons: Dict[str, int] = defaultdict(int)
     if wallet_trades.empty or "ts" not in wallet_trades.columns or not decisions:
-        return
+        return dict(miss_reasons)
 
     strategy = Strategy(params)
 
-    # Build bot entries index
-    bot_entries_by_key: Dict[Tuple[str, str, str, str], np.ndarray] = {}
-    tmp: Dict[Tuple[str, str, str, str], List[float]] = defaultdict(list)
+    # Build bot entries index -- token_id primary, key fallback
+    bot_token_idx: Dict[str, np.ndarray] = {}
+    bot_key_arrays: Dict[tuple, np.ndarray] = {}
+    tmp_tok: Dict[str, List[float]] = defaultdict(list)
+    tmp_key: Dict[tuple, List[float]] = defaultdict(list)
     for d in decisions:
         if d.action in ("BUY", "SELL"):
+            if d.token_id:
+                tmp_tok[d.token_id].append(d.timestamp)
             key = _make_decision_key(d)
-            tmp[key].append(d.timestamp)
-    bot_entries_by_key = {k: np.array(sorted(v)) for k, v in tmp.items()}
+            tmp_key[key].append(d.timestamp)
+    bot_token_idx = {k: np.array(sorted(v)) for k, v in tmp_tok.items()}
+    bot_key_arrays = {k: np.array(sorted(v)) for k, v in tmp_key.items()}
 
-    # Build state lookup
+    # Build state lookup by (slug_casefold, outcome_norm) and by token_id
     state_ts = np.array([ms.timestamp for ms in states])
-    # Index states by (slug_casefold, outcome)
-    state_by_slug: Dict[str, List[int]] = defaultdict(list)
+    state_by_slug_outcome: Dict[Tuple[str, str], List[int]] = defaultdict(list)
+    state_by_token: Dict[str, List[int]] = defaultdict(list)
     for si, ms in enumerate(states):
-        state_by_slug[ms.slug.casefold()].append(si)
+        state_by_slug_outcome[(ms.slug.casefold(), _normalize_outcome(ms.outcome))].append(si)
+        if ms.token_id:
+            state_by_token[ms.token_id].append(si)
 
     wt = wallet_trades.sort_values("ts")
 
-    print(f"\n  {'═' * 110}")
-    print(f"  MISSED WALLET TRADES (top {max_rows})")
-    print(f"  {'═' * 110}")
-    print(f"  {'#':>3} {'ts':>14} {'Asset':>5} {'Side':>4} {'Slug':<35} {'Outcome':>7} "
-          f"{'spd_c':>6} {'pctl':>6} {'imbal':>6} {'|ret30|':>9} {'Gate Failed':<25}")
-    print(f"  {'─' * 110}")
+    print(f"\n  {'═' * 140}")
+    print(f"  MISSED WALLET TRADES (top {max_rows}) -- gate-fail attribution")
+    print(f"  {'═' * 140}")
+    print(f"  {'#':>3} {'ts':>14} {'Asset':>5} {'Side':>4} {'Slug':<30} {'Out':>4} "
+          f"{'Miss Reason':<70}")
+    print(f"  {'─' * 140}")
 
     missed_count = 0
-    for _, row in wt.iterrows():
-        wts = row.get("ts")
-        if pd.isna(wts):
-            continue
-        w_side = _resolve_wallet_side(row)
-        w_asset = _resolve_wallet_asset(row)
-        w_slug = _resolve_wallet_slug(row)
-        w_outcome = _resolve_wallet_outcome(row)
-        if not w_side:
-            continue
-
-        key = (w_asset, w_slug, w_outcome, w_side)
-        arr = bot_entries_by_key.get(key)
-        is_matched = False
-        if arr is not None and len(arr) > 0:
-            idx = np.searchsorted(arr, float(wts))
-            for i in range(max(0, idx - 1), min(len(arr), idx + 2)):
-                if abs(arr[i] - float(wts)) <= tolerance_sec:
-                    is_matched = True
-                    break
-        if is_matched:
-            continue
-
-        missed_count += 1
-        if missed_count > max_rows:
-            break
-
-        # Find nearest market state for this slug
-        best_ms = None
-        best_dt = float("inf")
-        slug_indices = state_by_slug.get(w_slug, [])
-        if slug_indices:
-            # Binary search approx
-            idx = np.searchsorted(state_ts, float(wts))
-            for si in range(max(0, idx - 20), min(len(states), idx + 20)):
-                if states[si].slug.casefold() != w_slug:
-                    continue
-                dt = abs(states[si].timestamp - float(wts))
-                if dt < best_dt:
-                    best_dt = dt
-                    best_ms = states[si]
-
-        if best_ms is not None and best_dt <= 30.0:
-            _dec, gate = strategy.evaluate_market_state(best_ms)
-            gate_str = gate if gate else "PASS (cooldown/key mismatch?)"
-            print(f"  {missed_count:>3} {float(wts):>14.1f} {w_asset:>5} {w_side:>4} "
-                  f"{w_slug:<35.35} {w_outcome:>7} "
-                  f"{best_ms.spread_cents:>6.1f} {best_ms.spread_percentile:>6.3f} "
-                  f"{best_ms.orderbook_imbalance:>6.3f} {abs(best_ms.binance_ret_30s):>9.6f} "
-                  f"{gate_str}")
-        else:
-            print(f"  {missed_count:>3} {float(wts):>14.1f} {w_asset:>5} {w_side:>4} "
-                  f"{w_slug:<35.35} {w_outcome:>7} "
-                  f"{'--':>6} {'--':>6} {'--':>6} {'--':>9} "
-                  f"no_snapshot_within_30s")
-
     total_missed = 0
     for _, row in wt.iterrows():
         wts = row.get("ts")
@@ -1094,39 +1162,107 @@ def dump_missed_wallet_trades(
         w_asset = _resolve_wallet_asset(row)
         w_slug = _resolve_wallet_slug(row)
         w_outcome = _resolve_wallet_outcome(row)
+        w_token_id = _resolve_wallet_token_id(row)
         if not w_side:
             continue
+
         key = (w_asset, w_slug, w_outcome, w_side)
-        arr = bot_entries_by_key.get(key)
-        is_matched = False
-        if arr is not None and len(arr) > 0:
-            idx = np.searchsorted(arr, float(wts))
-            for i in range(max(0, idx - 1), min(len(arr), idx + 2)):
-                if abs(arr[i] - float(wts)) <= tolerance_sec:
-                    is_matched = True
-                    break
-        if not is_matched:
-            total_missed += 1
+        lag = _match_by_token_id_or_key(
+            float(wts), w_token_id, key, bot_token_idx, bot_key_arrays, tolerance_sec
+        )
+        if lag is not None:
+            continue  # matched
+
+        total_missed += 1
+        missed_count += 1
+
+        # Find nearest market state for this (token_id or slug+outcome)
+        best_ms = None
+        best_dt = float("inf")
+        # Try token_id first
+        candidate_indices = []
+        if w_token_id and w_token_id in state_by_token:
+            candidate_indices = state_by_token[w_token_id]
+        if not candidate_indices:
+            candidate_indices = state_by_slug_outcome.get((w_slug, w_outcome), [])
+
+        if candidate_indices:
+            target = float(wts)
+            # Use binary search on state_ts then filter by candidates
+            idx = np.searchsorted(state_ts, target)
+            for si in range(max(0, idx - 30), min(len(states), idx + 30)):
+                if si not in candidate_indices and states[si].slug.casefold() != w_slug:
+                    continue
+                # Check token or slug+outcome match
+                ms = states[si]
+                ok = False
+                if w_token_id and ms.token_id == w_token_id:
+                    ok = True
+                elif ms.slug.casefold() == w_slug and _normalize_outcome(ms.outcome) == w_outcome:
+                    ok = True
+                if not ok:
+                    continue
+                dt = abs(ms.timestamp - target)
+                if dt < best_dt:
+                    best_dt = dt
+                    best_ms = ms
+
+        # Build miss reason string
+        if best_ms is None or best_dt > 30.0:
+            reason = "no_market_snapshot (no data within 30s)"
+            miss_reasons["no_snapshot"] += 1
+        else:
+            gate_details = strategy.evaluate_gate_detail(best_ms)
+            failed_gates = [(gc, val, thr) for gc, val, thr, passed in gate_details if not passed]
+            if failed_gates:
+                parts = []
+                for gc, val, thr in failed_gates:
+                    parts.append(f"missed_gate={gc} value={val:.6f} threshold={thr:.6f}")
+                    miss_reasons[gc] += 1
+                reason = " | ".join(parts)
+            else:
+                # All gates passed -- missed due to cooldown or key mismatch
+                reason = "all_gates_PASS (cooldown or key-mapping mismatch)"
+                miss_reasons["cooldown_or_key"] += 1
+
+        if missed_count <= max_rows:
+            print(f"  {missed_count:>3} {float(wts):>14.1f} {w_asset:>5} {w_side:>4} "
+                  f"{w_slug:<30.30} {w_outcome:>4} "
+                  f"{reason}")
+
+    # Summary by reason
     print(f"\n  Total missed: {total_missed}")
+    if miss_reasons:
+        print(f"  Miss breakdown:")
+        for reason, cnt in sorted(miss_reasons.items(), key=lambda x: -x[1]):
+            print(f"    {reason:<30} {cnt:>5} ({100*cnt/max(1,total_missed):.1f}%)")
+
+    return dict(miss_reasons)
 
 
 def dump_false_bot_entries(
     states: List[MarketState],
     wallet_trades: pd.DataFrame,
     decisions: List[BotDecision],
+    params: StrategyParams,
     tolerance_sec: float = 3.0,
     max_rows: int = 50,
 ) -> None:
-    """Print top N bot entries that had NO matching wallet trade (false entries).
+    """Print top N bot entries with NO matching wallet trade (false entries).
 
-    For each false entry, show: ts, slug, outcome, side, features at entry time,
-    plus nearest wallet trade within wider tolerance and delta seconds.
+    For each false entry shows which gates ALLOWED it (all passed) and the
+    feature values that caused it to fire, so users can tighten thresholds.
     """
     if wallet_trades.empty or "ts" not in wallet_trades.columns or not decisions:
         return
 
-    # Build wallet trade index
-    wallet_by_key: Dict[Tuple[str, str, str, str], List[float]] = defaultdict(list)
+    strategy = Strategy(params)
+
+    # Build wallet trade index -- token_id primary, key fallback
+    wallet_token_idx: Dict[str, np.ndarray] = {}
+    wallet_key_arrays: Dict[tuple, np.ndarray] = {}
+    tmp_tok: Dict[str, List[float]] = defaultdict(list)
+    tmp_key: Dict[tuple, List[float]] = defaultdict(list)
     wt = wallet_trades.copy()
     for _, row in wt.iterrows():
         wts = row.get("ts")
@@ -1136,69 +1272,107 @@ def dump_false_bot_entries(
         w_asset = _resolve_wallet_asset(row)
         w_slug = _resolve_wallet_slug(row)
         w_outcome = _resolve_wallet_outcome(row)
-        if w_side:
-            wallet_by_key[(w_asset, w_slug, w_outcome, w_side)].append(float(wts))
-    wallet_arrays: Dict[Tuple[str, str, str, str], np.ndarray] = {
-        k: np.array(sorted(v)) for k, v in wallet_by_key.items()
-    }
-    # Also build a flat array of all wallet trade timestamps for nearest search
+        w_token_id = _resolve_wallet_token_id(row)
+        if not w_side:
+            continue
+        if w_token_id:
+            tmp_tok[w_token_id].append(float(wts))
+        tmp_key[(w_asset, w_slug, w_outcome, w_side)].append(float(wts))
+    wallet_token_idx = {k: np.array(sorted(v)) for k, v in tmp_tok.items()}
+    wallet_key_arrays = {k: np.array(sorted(v)) for k, v in tmp_key.items()}
+
+    # Flat wallet ts for nearest search
     all_wallet_ts = np.array(sorted(
         float(row.get("ts")) for _, row in wt.iterrows()
         if not pd.isna(row.get("ts"))
     )) if not wt.empty else np.array([])
 
-    print(f"\n  {'═' * 130}")
+    print(f"\n  {'═' * 150}")
     print(f"  FALSE BOT ENTRIES (top {max_rows}) -- bot entry with no matching wallet trade")
-    print(f"  {'═' * 130}")
-    print(f"  {'#':>3} {'ts':>14} {'Asset':>5} {'Side':>4} {'Slug':<35} {'Outcome':>7} "
-          f"{'spd_c':>6} {'pctl':>6} {'imbal':>6} {'ret30':>9} "
-          f"{'nearest_w':>10} {'delta_s':>8}")
-    print(f"  {'─' * 130}")
+    print(f"  {'═' * 150}")
+    print(f"  {'#':>3} {'ts':>14} {'Asset':>5} {'Side':>4} {'Slug':<28} {'Out':>4} "
+          f"{'nearest_w':>10} {'Gates that ALLOWED entry (gate=value/threshold)':<75}")
+    print(f"  {'─' * 150}")
 
     false_count = 0
     total_false = 0
+    # Collect feature values for false entries to help with recommendations
+    false_features: List[List[Tuple[str, float, float, bool]]] = []
+
     for d in decisions:
         if d.action not in ("BUY", "SELL"):
             continue
+
         key = _make_decision_key(d)
-        warr = wallet_arrays.get(key)
-        is_matched = False
-        if warr is not None and len(warr) > 0:
-            idx = np.searchsorted(warr, d.timestamp)
-            for i in range(max(0, idx - 1), min(len(warr), idx + 2)):
-                if abs(warr[i] - d.timestamp) <= tolerance_sec:
-                    is_matched = True
-                    break
-        if is_matched:
-            continue
+        # Try token_id match, then key match
+        lag = None
+        if d.token_id:
+            warr = wallet_token_idx.get(d.token_id)
+            if warr is not None and len(warr) > 0:
+                lag = _find_best_lag(warr, d.timestamp, tolerance_sec)
+        if lag is None:
+            warr = wallet_key_arrays.get(key)
+            if warr is not None and len(warr) > 0:
+                lag = _find_best_lag(warr, d.timestamp, tolerance_sec)
+        if lag is not None:
+            continue  # matched
 
         total_false += 1
-        if total_false > max_rows:
-            continue  # keep counting
 
-        false_count += 1
+        # Build a MarketState-like view from the BotDecision fields for gate detail
+        ms_proxy = MarketState(
+            timestamp=d.timestamp, asset=d.asset, slug=d.slug,
+            outcome=d.outcome, token_id=d.token_id,
+            best_bid=0.0, best_ask=0.0,
+            spread_cents=d.spread_cents,
+            spread_percentile=d.spread_percentile,
+            orderbook_imbalance=d.orderbook_imbalance,
+            binance_ret_5s=0.0, binance_ret_30s=d.binance_ret_30s,
+            binance_ret_60s=0.0, binance_ret_120s=d.binance_ret_120s,
+            spread_pctl_prev=d.spread_pctl_prev,
+        )
+        gate_details = strategy.evaluate_gate_detail(ms_proxy)
+        false_features.append(gate_details)
 
-        # Find nearest wallet trade (any key) for context
-        nearest_wt_str = "--"
-        delta_str = "--"
-        if len(all_wallet_ts) > 0:
-            idx = np.searchsorted(all_wallet_ts, d.timestamp)
-            best_delta = float("inf")
-            for i in range(max(0, idx - 1), min(len(all_wallet_ts), idx + 2)):
-                dt = all_wallet_ts[i] - d.timestamp
-                if abs(dt) < abs(best_delta):
-                    best_delta = dt
-            if abs(best_delta) < 300:
-                nearest_wt_str = f"{best_delta:+.1f}s"
-                delta_str = f"{abs(best_delta):.1f}"
+        if total_false <= max_rows:
+            false_count += 1
 
-        print(f"  {false_count:>3} {d.timestamp:>14.1f} {d.asset:>5} {d.action:>4} "
-              f"{d.slug:<35.35} {d.outcome:>7} "
-              f"{d.spread_cents:>6.1f} {d.spread_percentile:>6.3f} "
-              f"{d.orderbook_imbalance:>6.3f} {d.binance_ret_30s:>9.6f} "
-              f"{nearest_wt_str:>10} {delta_str:>8}")
+            # Nearest wallet trade for context
+            nearest_wt_str = "--"
+            if len(all_wallet_ts) > 0:
+                idx = np.searchsorted(all_wallet_ts, d.timestamp)
+                best_delta = float("inf")
+                for i in range(max(0, idx - 1), min(len(all_wallet_ts), idx + 2)):
+                    dt = all_wallet_ts[i] - d.timestamp
+                    if abs(dt) < abs(best_delta):
+                        best_delta = dt
+                if abs(best_delta) < 300:
+                    nearest_wt_str = f"{best_delta:+.1f}s"
+
+            # Show all gates with their values
+            gate_parts = []
+            for gc, val, thr, passed in gate_details:
+                marker = "OK" if passed else "FAIL"
+                gate_parts.append(f"{gc}={val:.4f}/{thr:.4f}({marker})")
+            gate_str = " | ".join(gate_parts)
+
+            print(f"  {false_count:>3} {d.timestamp:>14.1f} {d.asset:>5} {d.action:>4} "
+                  f"{d.slug:<28.28} {d.outcome:>4} "
+                  f"{nearest_wt_str:>10} {gate_str}")
 
     print(f"\n  Total false bot entries: {total_false}")
+
+    # Summary: which gates are most permissive on false entries
+    if false_features:
+        print(f"\n  False-entry gate value distributions (what allowed them in):")
+        gate_vals: Dict[str, List[float]] = defaultdict(list)
+        for details in false_features:
+            for gc, val, _thr, _passed in details:
+                gate_vals[gc].append(val)
+        for gc, vals in sorted(gate_vals.items()):
+            varr = np.array(vals)
+            print(f"    {gc:<15} median={np.median(varr):.6f}  p10={np.percentile(varr,10):.6f}  "
+                  f"p90={np.percentile(varr,90):.6f}  (n={len(varr)})")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1605,6 +1779,99 @@ def find_data_dir() -> str:
     return candidates[0]
 
 
+def recommend_config(
+    signal_dist: pd.DataFrame,
+    miss_reasons: Dict[str, int],
+    params: StrategyParams,
+) -> None:
+    """Print a RECOMMENDED_CONFIG block based on wallet signal distributions
+    and missed-trade attribution.
+
+    Uses wallet entry quantiles to suggest gate thresholds that would have
+    captured more wallet trades while still filtering noise.
+    """
+    print(f"\n  {'═' * 80}")
+    print(f"  RECOMMENDED_CONFIG  (auto-suggested from wallet signal quantiles)")
+    print(f"  {'═' * 80}")
+
+    recs: List[Tuple[str, str, str]] = []  # (env_var, value, rationale)
+
+    # Map signal_dist metric names to gate params
+    # signal_dist index: "spread_cents_at_trade", "spread_percentile_at_trade",
+    #   "orderbook_imbalance_at_trade", "binance_ret_30s_at_trade (dec)"
+    metric_map = {
+        "spread_cents_at_trade": ("ENTRY_MIN_SPREAD_CENTS", "entry_min_spread_cents", "p25"),
+        "spread_percentile_at_trade": ("SPREAD_PCTL_MIN", "entry_min_spread_pctl", "p25"),
+        "orderbook_imbalance_at_trade": ("OB_IMBALANCE_MIN", "entry_min_imbalance", "p25"),
+        "binance_ret_30s_at_trade (dec)": ("VOL_MIN_RET_30S", "entry_min_ret_30s", "p25"),
+    }
+
+    if not signal_dist.empty:
+        for metric, (env_var, param_attr, quantile) in metric_map.items():
+            if metric not in signal_dist.index:
+                continue
+            row = signal_dist.loc[metric]
+            wallet_q = float(row[quantile])
+            current_val = getattr(params, param_attr)
+
+            # For |ret_30s|, use abs of the p25
+            if "ret_30s" in metric:
+                wallet_q = abs(wallet_q)
+
+            # Recommend the lower of current and wallet p25 (to capture more trades)
+            if wallet_q < current_val:
+                recs.append((env_var, f"{wallet_q:.6f}",
+                             f"wallet p25={wallet_q:.6f} < current={current_val:.6f}  "
+                             f"(lowering to capture more wallet trades)"))
+            else:
+                recs.append((env_var, f"{current_val:.6f}",
+                             f"current={current_val:.6f} already <= wallet p25={wallet_q:.6f}  "
+                             f"(keep current)"))
+
+    # Cooldown recommendation based on miss_reasons
+    cooldown_misses = miss_reasons.get("cooldown_or_key", 0)
+    total_misses = sum(miss_reasons.values())
+    if total_misses > 0 and cooldown_misses / max(1, total_misses) > 0.2:
+        new_cd = max(0, params.entry_cooldown_sec - 10)
+        recs.append(("ENTRY_COOLDOWN_SEC", f"{new_cd:.0f}",
+                     f"{cooldown_misses}/{total_misses} misses from cooldown/key  "
+                     f"(reduce cooldown from {params.entry_cooldown_sec:.0f}s)"))
+
+    # Gate-specific: if a gate causes >30% of misses, suggest lowering threshold
+    for gate_name, param_attr, env_var in [
+        ("spread_cents", "entry_min_spread_cents", "ENTRY_MIN_SPREAD_CENTS"),
+        ("spread_pctl", "entry_min_spread_pctl", "SPREAD_PCTL_MIN"),
+        ("|ret_30s|", "entry_min_ret_30s", "VOL_MIN_RET_30S"),
+        ("imbalance", "entry_min_imbalance", "OB_IMBALANCE_MIN"),
+    ]:
+        gate_misses = miss_reasons.get(gate_name, 0)
+        if total_misses > 0 and gate_misses / max(1, total_misses) > 0.3:
+            current = getattr(params, param_attr)
+            suggested = current * 0.8  # 20% lower
+            recs.append((env_var, f"{suggested:.6f}",
+                         f"gate '{gate_name}' blocked {gate_misses}/{total_misses} misses  "
+                         f"(reduce from {current:.6f} by ~20%)"))
+
+    if not recs:
+        print("  No recommendations available (insufficient data).")
+    else:
+        # Deduplicate by env_var, keeping the most aggressive recommendation
+        seen: Dict[str, Tuple[str, str]] = {}
+        for env_var, val, rationale in recs:
+            if env_var not in seen:
+                seen[env_var] = (val, rationale)
+            else:
+                # Keep the lower (more permissive) value
+                if float(val) < float(seen[env_var][0]):
+                    seen[env_var] = (val, rationale)
+
+        print(f"\n  # Paste into .env or export:")
+        for env_var, (val, rationale) in sorted(seen.items()):
+            print(f"  {env_var}={val}    # {rationale}")
+
+    print(f"  {'═' * 80}\n")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Market Replay & Strategy Comparison")
     parser.add_argument("--data-dir", type=str, default=None,
@@ -1678,12 +1945,12 @@ def main() -> None:
 
     # --- Step 5b: Debug dumps ---
     print("\n[5b/8] Generating debug dumps ...")
-    dump_missed_wallet_trades(
+    miss_reasons = dump_missed_wallet_trades(
         states, engine.wallet_trades, decisions, default_params,
         tolerance_sec=args.tolerance_sec, max_rows=50,
     )
     dump_false_bot_entries(
-        states, engine.wallet_trades, decisions,
+        states, engine.wallet_trades, decisions, default_params,
         tolerance_sec=args.tolerance_sec, max_rows=50,
     )
 
@@ -1691,16 +1958,20 @@ def main() -> None:
     print("\n[6/8] Analyzing signal distributions at wallet entry ...")
     signal_dist = analyze_signal_distributions(engine.wallet_trades)
 
+    # --- Step 6b: Auto-suggest config ---
+    print("\n[6b/9] Computing recommended config ...")
+    recommend_config(signal_dist, miss_reasons, default_params)
+
     # --- Step 7: Parameter optimization (optional) ---
     sweep_results = None
     if args.optimize:
-        print("\n[7/8] Running parameter sweep optimization ...")
+        print("\n[7/9] Running parameter sweep optimization ...")
         sweep_results = parameter_sweep(
             states, engine.wallet_trades,
             tolerance_sec=args.tolerance_sec, offset_sec=offset_sec,
         )
     else:
-        print("\n[7/8] Skipping parameter sweep (use --optimize to enable)")
+        print("\n[7/9] Skipping parameter sweep (use --optimize to enable)")
 
     # --- Step 8: Report ---
     print_report(comparison, signal_dist, sweep_results)
