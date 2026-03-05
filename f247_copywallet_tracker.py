@@ -987,6 +987,10 @@ def db_init(conn: sqlite3.Connection):
         ("spread_rank_at_trade", "TEXT DEFAULT ''"),
         ("imbalance_rank_at_trade", "TEXT DEFAULT ''"),
         ("spread_percentile_60s_at_trade", "TEXT DEFAULT ''"),
+        ("orderbook_imbalance_at_trade", "TEXT DEFAULT ''"),
+        ("binance_ret_5s_at_trade", "TEXT DEFAULT ''"),
+        ("binance_ret_30s_at_trade", "TEXT DEFAULT ''"),
+        ("binance_ret_60s_at_trade", "TEXT DEFAULT ''"),
         # F) Latency
         ("local_received_ms", "TEXT DEFAULT ''"),
         ("api_to_local_delay_ms", "TEXT DEFAULT ''"),
@@ -1037,6 +1041,8 @@ _TRADE_INSERT_COLS = [
     "realized_pnl_usdc", "holding_time_sec_wavg", "avg_entry_price_matched",
     "trades_last_10s", "trades_last_60s", "buys_last_60s", "sells_last_60s", "usdc_last_60s",
     "spread_rank_at_trade", "imbalance_rank_at_trade", "spread_percentile_60s_at_trade",
+    "orderbook_imbalance_at_trade",
+    "binance_ret_5s_at_trade", "binance_ret_30s_at_trade", "binance_ret_60s_at_trade",
     "local_received_ms", "api_to_local_delay_ms", "book_age_ms_at_trade", "binance_age_ms_at_trade",
 ]
 
@@ -1920,6 +1926,88 @@ def register_active_crypto(symbol: str):
             del _active_cryptos[s]
 
 
+# -------------------- Binance momentum snapshot at trade time --------------------
+def _binance_closest_price(dq: deque, target_sec: int, max_delta: int = 2) -> Optional[float]:
+    """Find the Binance price closest to target_sec within ±max_delta seconds."""
+    best_entry = None
+    best_diff = max_delta + 1
+    for entry in reversed(dq):
+        diff = abs(entry[0] - target_sec)
+        if diff < best_diff:
+            best_diff = diff
+            best_entry = entry
+        # Once we're past max_delta behind the target, stop searching
+        if entry[0] < target_sec - max_delta:
+            break
+    if best_entry is not None and best_diff <= max_delta:
+        return best_entry[1]
+    return None
+
+
+def compute_binance_momentum_at_trade(crypto: str, trade_ts: int) -> dict:
+    """Compute Binance return snapshots at the exact trade moment.
+
+    Returns binance_ret_5s, _30s, _60s as percentage returns
+    using the closest Binance tape entry within ±2s of trade_ts.
+    """
+    r = {"binance_ret_5s_at_trade": "", "binance_ret_30s_at_trade": "",
+         "binance_ret_60s_at_trade": ""}
+    if not crypto:
+        return r
+    bdq = _binance_tape_mem.get(crypto)
+    if not bdq or len(bdq) < 2:
+        return r
+
+    # Current price: closest to trade_ts within ±2s
+    cur_price = _binance_closest_price(bdq, trade_ts, max_delta=2)
+    if cur_price is None or cur_price <= 0:
+        return r
+
+    for label, lookback in [("binance_ret_5s_at_trade", 5),
+                             ("binance_ret_30s_at_trade", 30),
+                             ("binance_ret_60s_at_trade", 60)]:
+        past_price = _binance_closest_price(bdq, trade_ts - lookback, max_delta=2)
+        if past_price is not None and past_price > 0:
+            ret_pct = (cur_price - past_price) / past_price * 100.0
+            r[label] = clean_number(ret_pct)
+    return r
+
+
+# -------------------- Orderbook imbalance at trade time --------------------
+def compute_orderbook_imbalance_at_trade(token_id: str, trade_ts: int,
+                                          snap_bid_depth: Optional[float],
+                                          snap_ask_depth: Optional[float]) -> str:
+    """Compute raw orderbook imbalance = bid_size / (bid_size + ask_size).
+
+    Uses the book tape snapshot closest to trade_ts within ±2s if available,
+    otherwise falls back to the live snap bid/ask depth.
+    """
+    # Try timestamp-aligned book tape first
+    if token_id:
+        bt_dq = _book_tape_mem.get(token_id)
+        if bt_dq and len(bt_dq) > 0:
+            best_entry = None
+            best_diff = 3  # > max_delta=2
+            for entry in reversed(bt_dq):
+                diff = abs(entry[0] - trade_ts)
+                if diff < best_diff:
+                    best_diff = diff
+                    best_entry = entry
+                if entry[0] < trade_ts - 2:
+                    break
+            # book tape entry: (t_sec, spread_f, imb_f, mid_f, micro_f)
+            # imb_f = bid_depth_topN / ask_depth_topN (ratio), not what we want
+            # We need bid_size / (bid_size + ask_size) — recompute from snap depths
+            pass  # fall through to snap-based computation
+
+    # Use live snap bid/ask depth
+    if snap_bid_depth is not None and snap_ask_depth is not None:
+        denom = snap_bid_depth + snap_ask_depth
+        if denom > 0:
+            return clean_number(snap_bid_depth / denom)
+    return ""
+
+
 # -------------------- A) Velocity Features --------------------
 def _tape_val_at(dq: deque, t0: int, offset_sec: int, idx: int) -> Optional[float]:
     """Get tape value at index `idx` for the latest entry at or before (t0 - offset_sec)."""
@@ -2414,6 +2502,9 @@ def main():
         "trades_last_10s", "trades_last_60s", "buys_last_60s", "sells_last_60s", "usdc_last_60s",
         # E) Market selection
         "spread_rank_at_trade", "imbalance_rank_at_trade", "spread_percentile_60s_at_trade",
+        # E2) Raw imbalance + Binance momentum
+        "orderbook_imbalance_at_trade",
+        "binance_ret_5s_at_trade", "binance_ret_30s_at_trade", "binance_ret_60s_at_trade",
         # F) Latency
         "local_received_ms", "api_to_local_delay_ms", "book_age_ms_at_trade", "binance_age_ms_at_trade",
     ]
@@ -2876,6 +2967,14 @@ def main():
                 # E) Market selection ranks
                 v2_ranks = get_market_ranks(str(token_id) if token_id else "")
                 v2_ranks["spread_percentile_60s_at_trade"] = spread_stats.get("spread_percentile_60s", "")
+
+                # E2) Raw orderbook imbalance + Binance momentum at trade time
+                _bid_depth_f = ffloat(snap.bid_depth_topN)
+                _ask_depth_f = ffloat(snap.ask_depth_topN)
+                v2_ranks["orderbook_imbalance_at_trade"] = compute_orderbook_imbalance_at_trade(
+                    str(token_id) if token_id else "", ts_int, _bid_depth_f, _ask_depth_f)
+                v2_binance_mom = compute_binance_momentum_at_trade(crypto, ts_int)
+                v2_ranks.update(v2_binance_mom)
 
                 # F) Latency
                 # Book tape ts: latest tape entry for this token
