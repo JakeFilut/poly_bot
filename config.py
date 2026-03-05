@@ -78,6 +78,9 @@ class Config:
     BOOK_POLL_MS: int = 300       # Order-book refresh cadence (all tokens, concurrent)
     FILLS_POLL_MS: int = 1000     # Fill sync cadence (LIVE only)
     BOOK_MAX_STALE_MS: int = 5000 # Refuse order-book data older than this
+    BINANCE_MAX_STALE_MS: int = 3000   # Refuse Binance data older than this
+    UNIVERSE_MAX_STALE_MS: int = 300000 # Refuse universe older than 5 min
+    BOOK_MAX_INFLIGHT: int = 10   # Max concurrent order-book HTTP requests
 
     # -- Order management --
     MAX_OPEN_ORDERS_PER_MARKET: int = 2
@@ -238,6 +241,9 @@ def load_config() -> Config:
         BOOK_POLL_MS=_env_int("BOOK_POLL_MS", 300),
         FILLS_POLL_MS=_env_int("FILLS_POLL_MS", 1000),
         BOOK_MAX_STALE_MS=_env_int("BOOK_MAX_STALE_MS", 5000),
+        BINANCE_MAX_STALE_MS=_env_int("BINANCE_MAX_STALE_MS", 3000),
+        UNIVERSE_MAX_STALE_MS=_env_int("UNIVERSE_MAX_STALE_MS", 300000),
+        BOOK_MAX_INFLIGHT=_env_int("BOOK_MAX_INFLIGHT", 10),
         MAX_OPEN_ORDERS_PER_MARKET=_env_int("MAX_OPEN_ORDERS_PER_MARKET", 2),
         ORDER_TTL_MS=_env_int("ORDER_TTL_MS", 2500),
         MAX_ORDER_OPS_PER_LOOP=_env_int("MAX_ORDER_OPS_PER_LOOP", 20),

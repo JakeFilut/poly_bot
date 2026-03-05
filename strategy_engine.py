@@ -204,6 +204,52 @@ class StrategyEngine:
         # 1. Universe refresh + Binance refresh + fill sync:
         #    ALL handled by background_tasks.py — nothing to do here.
 
+        # ── HARD STALENESS GATES (no exceptions) ─────────────────────
+        now = time.time()
+
+        # Gate: universe must be fresh
+        universe_age_ms = (now - self.universe._last_refresh) * 1000
+        if universe_age_ms > self.cfg.UNIVERSE_MAX_STALE_MS:
+            self.log.decision(
+                action="SKIP", reason="stale_universe",
+                universe_age_ms=round(universe_age_ms, 1),
+                limit_ms=self.cfg.UNIVERSE_MAX_STALE_MS,
+            )
+            return
+
+        # Gate: Binance prices must be fresh
+        binance_age_ms = (
+            (now - self.binance._last_fetch_ts) * 1000
+            if self.binance._last_fetch_ts > 0 else 99999.0
+        )
+        if binance_age_ms > self.cfg.BINANCE_MAX_STALE_MS:
+            self.log.decision(
+                action="SKIP", reason="stale_binance",
+                binance_age_ms=round(binance_age_ms, 1),
+                limit_ms=self.cfg.BINANCE_MAX_STALE_MS,
+            )
+            return
+
+        # Gate: at least one order-book must be fresh
+        token_ids = self.universe.all_token_ids()
+        if token_ids:
+            fresh_count = 0
+            max_book_age_ms = 0.0
+            for tid in token_ids:
+                ts = self.features._book_cache_ts.get(tid, 0)
+                age = (now - ts) * 1000 if ts > 0 else 99999.0
+                max_book_age_ms = max(max_book_age_ms, age)
+                if age <= self.cfg.BOOK_MAX_STALE_MS:
+                    fresh_count += 1
+            if fresh_count == 0:
+                self.log.decision(
+                    action="SKIP", reason="stale_book",
+                    max_book_age_ms=round(max_book_age_ms, 1),
+                    limit_ms=self.cfg.BOOK_MAX_STALE_MS,
+                    tokens_checked=len(token_ids),
+                )
+                return
+
         # 2. Compute features for all active slugs (CPU only — reads cache)
         all_features = self.features.compute_all()
 

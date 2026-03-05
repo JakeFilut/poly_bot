@@ -45,6 +45,7 @@ import signal
 import time
 import uuid
 
+from background_tasks import heartbeats
 from config import load_config
 from logger import Logger, _utc_iso
 
@@ -131,6 +132,7 @@ class Bot:
         # -- Metrics --
         self._tick_metrics = TickMetrics()
         self._last_metrics_log = time.monotonic()
+        self._last_heartbeat_log = time.monotonic()
 
         # -- Background task handles --
         self._bg_tasks: list[asyncio.Task] = []
@@ -181,6 +183,7 @@ class Bot:
         # 4. Launch background fetch tasks
         from background_tasks import (
             poll_binance, poll_orderbooks, refresh_universe, sync_fills,
+            warm_connection,
         )
 
         self._bg_tasks = [
@@ -192,13 +195,18 @@ class Bot:
             asyncio.create_task(
                 poll_orderbooks(self.engine.features, self.engine.universe,
                                 self.engine.pm_api, self.log,
-                                interval_ms=self.cfg.BOOK_POLL_MS),
+                                interval_ms=self.cfg.BOOK_POLL_MS,
+                                max_inflight=self.cfg.BOOK_MAX_INFLIGHT),
                 name="poll_orderbooks",
             ),
             asyncio.create_task(
                 refresh_universe(self.engine, self.cfg, self.log,
                                  check_interval_sec=10.0),
                 name="refresh_universe",
+            ),
+            asyncio.create_task(
+                warm_connection(self.cfg, self.log, interval_sec=15.0),
+                name="warm_connection",
             ),
         ]
 
@@ -276,11 +284,18 @@ class Bot:
     # Metrics logging
     # ------------------------------------------------------------------
     def _maybe_log_metrics(self, now_mono: float) -> None:
+        # Heartbeat log every ~5s (separate from rollup metrics)
+        if now_mono - self._last_heartbeat_log >= 5.0:
+            self._last_heartbeat_log = now_mono
+            hb = heartbeats.snapshot()
+            hb["bg_tasks_alive"] = sum(1 for t in self._bg_tasks if not t.done())
+            self.log.log("HEARTBEAT", **hb)
+
         if now_mono - self._last_metrics_log < self.cfg.LOG_ROLLUP_SEC:
             return
         self._last_metrics_log = now_mono
 
-        # Snapshot ages
+        # Snapshot ages (detailed)
         book_ages = []
         for tid in self.engine.universe.all_token_ids():
             ts = self.engine.features._book_cache_ts.get(tid, 0)
@@ -295,6 +310,7 @@ class Bot:
         self.log.log(
             "LOOP_METRICS",
             **self._tick_metrics.snapshot(),
+            **heartbeats.snapshot(),
             avg_book_age_ms=round(avg_book_age, 1),
             max_book_age_ms=round(max_book_age, 1),
             binance_age_ms=round(binance_age, 1),
@@ -305,24 +321,44 @@ class Bot:
     # Shutdown
     # ------------------------------------------------------------------
     async def _shutdown(self) -> None:
-        """Cancel background tasks, close HTTP client, shutdown engine."""
+        """Cancel background tasks, close HTTP client, shutdown engine.
+
+        Order of operations matters for safety:
+          1. Stop decision loop (already done — we exited _decision_loop)
+          2. Cancel background tasks (no new data / no new fills)
+          3. Shutdown engine (cancels pending orders, flushes state)
+          4. Close HTTP client last (engine shutdown may need it)
+        """
         self.log.info("shutdown_begin")
 
-        # Cancel background tasks
+        # 1. Cancel background tasks
         for task in self._bg_tasks:
             task.cancel()
-        await asyncio.gather(*self._bg_tasks, return_exceptions=True)
+        results = await asyncio.gather(*self._bg_tasks, return_exceptions=True)
+        failed = [
+            (self._bg_tasks[i].get_name(), repr(r))
+            for i, r in enumerate(results)
+            if isinstance(r, Exception) and not isinstance(r, asyncio.CancelledError)
+        ]
         self.log.info("background_tasks_cancelled",
-                      count=len(self._bg_tasks))
+                      count=len(self._bg_tasks),
+                      failed=failed if failed else None)
 
-        # Stop wallet tracker (it's just an observer)
+        # 2. Stop wallet tracker (it's just an observer)
         if self._tracker is not None:
             self._tracker.stop()
 
-        # Shutdown strategy engine (cancels orders, flushes state)
+        # 3. Log pending order state before engine shutdown
+        pending_count = len(self.engine.execution.pending_orders) if hasattr(self.engine, 'execution') and hasattr(self.engine.execution, 'pending_orders') else 0
+        if pending_count > 0:
+            self.log.info("shutdown_pending_orders",
+                          count=pending_count,
+                          action="engine.shutdown will cancel_all")
+
+        # 4. Shutdown strategy engine (cancels orders, flushes state)
         self.engine.shutdown()
 
-        # Close the global HTTP client
+        # 5. Close the global HTTP client last
         from http_client import close_client
         await close_client()
         self.log.info("http2_client_closed")

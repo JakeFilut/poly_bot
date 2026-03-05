@@ -484,7 +484,13 @@ class PolymarketAPI:
     # Async methods — use the global httpx.AsyncClient (HTTP/2, pooled)
     # ==================================================================
     async def async_get_orderbook(self, token_id: str) -> BookSnapshot | None:
-        """Fetch orderbook using the shared async HTTP/2 client."""
+        """Fetch orderbook using the shared async HTTP/2 client.
+
+        NOTE: httpx.HTTPStatusError is intentionally NOT caught here so that
+        callers (e.g. background_tasks._fetch_and_cache_book) can inspect
+        the status code for per-token backoff on 429 / 5xx.
+        """
+        import httpx
         from http_client import get_client
         client = get_client()
 
@@ -497,6 +503,8 @@ class PolymarketAPI:
                 resp.raise_for_status()
                 data = resp.json()
                 break
+            except httpx.HTTPStatusError:
+                raise  # let caller handle 429/5xx backoff
             except Exception as e:
                 if attempt < self.cfg.RETRY_MAX:
                     await asyncio.sleep(self.cfg.RETRY_BACKOFF_BASE * (2 ** attempt))
