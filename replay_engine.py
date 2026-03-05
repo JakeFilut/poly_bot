@@ -367,6 +367,22 @@ def run_replay(states: List[MarketState], params: StrategyParams) -> List[BotDec
 # SECTION 3 -- WALLET COMPARISON
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _normalize_outcome(outcome: str) -> str:
+    """Normalise outcome string: casefold + map Yes/No <-> Up/Down.
+
+    Polymarket crypto markets may label outcomes as Yes/No while the bot
+    uses Up/Down (or vice-versa).  Canonicalise to Yes/No.
+    """
+    s = outcome.strip().casefold()
+    mapping = {
+        "up": "yes",
+        "down": "no",
+        "yes": "yes",
+        "no": "no",
+    }
+    return mapping.get(s, s)
+
+
 def _resolve_wallet_side(row: pd.Series) -> str:
     """Normalise wallet trade side to BUY / SELL."""
     for col in ("side", "action", "direction"):
@@ -387,8 +403,26 @@ def _resolve_wallet_slug(row: pd.Series) -> str:
     """Normalise wallet trade slug."""
     for col in ("slug",):
         if col in row.index and pd.notna(row[col]):
-            return str(row[col]).strip()
+            return str(row[col]).strip().casefold()
     return ""
+
+
+def _resolve_wallet_outcome(row: pd.Series) -> str:
+    """Normalise wallet trade outcome."""
+    for col in ("outcome",):
+        if col in row.index and pd.notna(row[col]):
+            return _normalize_outcome(str(row[col]))
+    return ""
+
+
+def _make_decision_key(d) -> tuple:
+    """Build normalised matching key from a BotDecision."""
+    return (
+        d.asset.strip().upper(),
+        d.slug.strip().casefold(),
+        _normalize_outcome(d.outcome),
+        d.action.strip().upper(),
+    )
 
 
 def _nearest_ts(arr: np.ndarray, target: float) -> Optional[float]:
@@ -428,19 +462,27 @@ def compare_to_wallet(
     if "ts" not in wt.columns:
         return ComparisonResult(0, 0, 0, 0, 0.0)
 
-    # --- Build bot entry index keyed by (asset, slug, side) ---
-    bot_entries_by_key: Dict[Tuple[str, str, str], List[float]] = defaultdict(list)
+    # --- Build bot entry index keyed by (asset, slug, outcome, side) ---
+    # Using normalised 4-tuple keys to avoid slug/outcome/side mismatches
+    bot_entries_by_key: Dict[Tuple[str, str, str, str], List[float]] = defaultdict(list)
     for d in decisions:
         if d.action in ("BUY", "SELL"):
-            key = (d.asset.upper(), d.slug, d.action)
+            key = _make_decision_key(d)
             bot_entries_by_key[key].append(d.timestamp)
 
-    bot_arrays: Dict[Tuple[str, str, str], np.ndarray] = {
+    bot_arrays: Dict[Tuple[str, str, str, str], np.ndarray] = {
         k: np.array(sorted(v)) for k, v in bot_entries_by_key.items()
     }
 
     # --- Build ALL bot decision timestamps for proximity check ---
-    all_bot_ts = np.array(sorted(d.timestamp for d in decisions))
+    all_bot_ts = np.array(sorted(d.timestamp for d in decisions if d.action in ("BUY", "SELL")))
+
+    # --- Build a time-sorted index of all bot entry decisions for debug dump ---
+    bot_entries_sorted: List[BotDecision] = sorted(
+        [d for d in decisions if d.action in ("BUY", "SELL")],
+        key=lambda d: d.timestamp,
+    )
+    bot_entry_ts_arr = np.array([d.timestamp for d in bot_entries_sorted]) if bot_entries_sorted else np.array([])
 
     # --- Walk wallet trades and attempt matching ---
     total = 0
@@ -448,6 +490,7 @@ def compare_to_wallet(
     entry_lags: List[float] = []
     mismatch_reasons: Dict[str, int] = defaultdict(int)
     debug_examples: List[dict] = []
+    wrong_key_examples: List[dict] = []  # detailed dump for wrong-key mismatches
 
     for _, row in wt.iterrows():
         wts = row.get("ts")
@@ -457,15 +500,17 @@ def compare_to_wallet(
         w_side = _resolve_wallet_side(row)
         w_asset = _resolve_wallet_asset(row)
         w_slug = _resolve_wallet_slug(row)
+        w_outcome = _resolve_wallet_outcome(row)
+        w_token_id = str(row.get("token_id", "")) if "token_id" in row.index else ""
         if not w_side:
             continue
 
         total += 1
-        key = (w_asset, w_slug, w_side)
+        key = (w_asset, w_slug, w_outcome, w_side)
         arr = bot_arrays.get(key)
 
         if arr is None or len(arr) == 0:
-            # Check if ANY bot decision exists within tolerance (ignoring side/slug)
+            # Check if ANY bot entry exists within tolerance (ignoring key)
             if len(all_bot_ts) > 0:
                 idx_any = np.searchsorted(all_bot_ts, float(wts))
                 nearest_lag = float("inf")
@@ -475,6 +520,36 @@ def compare_to_wallet(
                         nearest_lag = lag
                 if nearest_lag <= tolerance_sec:
                     mismatch_reasons["no_bot_entry_for_key (but bot decision within tolerance)"] += 1
+                    # --- Collect wrong-key debug examples ---
+                    if len(wrong_key_examples) < 50:
+                        # Find all bot entries within tolerance window
+                        nearby_bot_decisions = []
+                        lo = np.searchsorted(bot_entry_ts_arr, float(wts) - tolerance_sec)
+                        hi = np.searchsorted(bot_entry_ts_arr, float(wts) + tolerance_sec, side="right")
+                        for bi in range(lo, min(hi, len(bot_entries_sorted))):
+                            bd = bot_entries_sorted[bi]
+                            bkey = _make_decision_key(bd)
+                            nearby_bot_decisions.append({
+                                "snapshot_ts": bd.timestamp,
+                                "bot_key": bkey,
+                                "action": bd.action,
+                                "asset": bd.asset,
+                                "slug_raw": bd.slug,
+                                "outcome_raw": bd.outcome,
+                                "side_raw": bd.action,
+                            })
+                        wrong_key_examples.append({
+                            "wallet_ts": float(wts),
+                            "wallet_key": key,
+                            "wallet_side": w_side,
+                            "wallet_asset": w_asset,
+                            "wallet_slug_raw": str(row.get("slug", "")) if "slug" in row.index else "",
+                            "wallet_outcome_raw": str(row.get("outcome", "")) if "outcome" in row.index else "",
+                            "wallet_token_id": w_token_id,
+                            "wallet_slug_norm": w_slug,
+                            "wallet_outcome_norm": w_outcome,
+                            "nearby_bot_decisions": nearby_bot_decisions,
+                        })
                 else:
                     mismatch_reasons[f"no_bot_entry_for_key (nearest bot decision {nearest_lag:.1f}s away)"] += 1
             else:
@@ -483,7 +558,8 @@ def compare_to_wallet(
             if debug and len(debug_examples) < 5:
                 debug_examples.append({
                     "wallet_ts": float(wts), "side": w_side, "asset": w_asset,
-                    "slug": w_slug, "reason": "no_bot_entry_for_key",
+                    "slug": w_slug, "outcome": w_outcome,
+                    "reason": "no_bot_entry_for_key",
                     "nearest_any_bot_ts": _nearest_ts(all_bot_ts, float(wts)),
                 })
             continue
@@ -509,7 +585,8 @@ def compare_to_wallet(
             if debug and len(debug_examples) < 5:
                 debug_examples.append({
                     "wallet_ts": float(wts), "side": w_side, "asset": w_asset,
-                    "slug": w_slug, "reason": f"outside_tolerance (nearest={nearest:.1f}s)",
+                    "slug": w_slug, "outcome": w_outcome,
+                    "reason": f"outside_tolerance (nearest={nearest:.1f}s)",
                     "nearest_any_bot_ts": _nearest_ts(all_bot_ts, float(wts)),
                 })
 
@@ -531,6 +608,44 @@ def compare_to_wallet(
         print(f"\n    Wallet trades with NO bot decision within {tolerance_sec}s (any key): {no_nearby}")
         print(f"    Wallet trades with bot decision within {tolerance_sec}s but wrong key:  {nearby_but_wrong}")
 
+    # --- Wrong-key debug dump (first 50) ---
+    if wrong_key_examples:
+        print(f"\n  {'═' * 70}")
+        print(f"  WRONG-KEY MISMATCH DEBUG DUMP  (first {len(wrong_key_examples)} of "
+              f"{mismatch_reasons.get('no_bot_entry_for_key (but bot decision within tolerance)', 0)})")
+        print(f"  {'═' * 70}")
+        for i, ex in enumerate(wrong_key_examples):
+            print(f"\n  ── Mismatch #{i + 1} ──")
+            print(f"  WALLET:")
+            print(f"    trade_ts       = {ex['wallet_ts']:.3f}")
+            print(f"    slug (raw)     = {ex['wallet_slug_raw']!r}")
+            print(f"    outcome (raw)  = {ex['wallet_outcome_raw']!r}")
+            print(f"    side           = {ex['wallet_side']!r}")
+            print(f"    token_id       = {ex['wallet_token_id']!r}")
+            print(f"    normalized_wallet_key = {ex['wallet_key']}")
+            print(f"  NEAREST BOT ENTRIES (within {tolerance_sec}s):")
+            if not ex["nearby_bot_decisions"]:
+                print(f"    (none found)")
+            for bd in ex["nearby_bot_decisions"]:
+                delta = bd["snapshot_ts"] - ex["wallet_ts"]
+                print(f"    snapshot_ts    = {bd['snapshot_ts']:.3f}  (delta={delta:+.3f}s)")
+                print(f"      slug (raw)   = {bd['slug_raw']!r}")
+                print(f"      outcome (raw)= {bd['outcome_raw']!r}")
+                print(f"      action       = {bd['action']!r}")
+                print(f"      normalized_bot_key = {bd['bot_key']}")
+                # Show per-field comparison
+                wk = ex["wallet_key"]
+                bk = bd["bot_key"]
+                diffs = []
+                labels = ("asset", "slug", "outcome", "side")
+                for li, lb in enumerate(labels):
+                    if wk[li] != bk[li]:
+                        diffs.append(f"{lb}: wallet={wk[li]!r} vs bot={bk[li]!r}")
+                if diffs:
+                    print(f"      KEY DIFFS: {'; '.join(diffs)}")
+                else:
+                    print(f"      KEY DIFFS: (none -- keys match, possible timestamp issue)")
+
     if debug and debug_examples:
         print(f"\n  {'─' * 60}")
         print("  DEBUG -- Example unmatched wallet trades")
@@ -538,11 +653,28 @@ def compare_to_wallet(
         for ex in debug_examples:
             nearest_str = f"{ex['nearest_any_bot_ts']:.3f}" if ex['nearest_any_bot_ts'] is not None else "N/A"
             lag_str = f"{abs(ex['nearest_any_bot_ts'] - ex['wallet_ts']):.1f}s" if ex['nearest_any_bot_ts'] is not None else "N/A"
-            print(f"    wallet_ts={ex['wallet_ts']:.3f}  {ex['side']:>4} {ex['asset']:>4} slug={ex['slug']}")
+            print(f"    wallet_ts={ex['wallet_ts']:.3f}  {ex['side']:>4} {ex['asset']:>4} slug={ex['slug']} outcome={ex['outcome']}")
             print(f"      reason: {ex['reason']}  |  nearest_any_bot_ts={nearest_str} ({lag_str} away)")
 
+    # --- Print all unique bot entry keys for cross-reference ---
+    if wrong_key_examples:
+        print(f"\n  {'─' * 60}")
+        print("  ALL UNIQUE BOT ENTRY KEYS (normalised)")
+        print(f"  {'─' * 60}")
+        unique_bot_keys = sorted(set(bot_entries_by_key.keys()))
+        for bk in unique_bot_keys[:50]:
+            print(f"    {bk}  ({len(bot_entries_by_key[bk])} entries)")
+        if len(unique_bot_keys) > 50:
+            print(f"    ... and {len(unique_bot_keys) - 50} more")
+        print(f"\n  ALL UNIQUE WALLET KEYS (normalised, from mismatched trades)")
+        unique_wallet_keys = sorted(set(ex["wallet_key"] for ex in wrong_key_examples))
+        for wk in unique_wallet_keys[:50]:
+            print(f"    {wk}")
+        if len(unique_wallet_keys) > 50:
+            print(f"    ... and {len(unique_wallet_keys) - 50} more")
+
     # --- False entries: bot entries with no matching wallet trade ---
-    wallet_by_key: Dict[Tuple[str, str, str], List[float]] = defaultdict(list)
+    wallet_by_key: Dict[Tuple[str, str, str, str], List[float]] = defaultdict(list)
     for _, row in wt.iterrows():
         wts = row.get("ts")
         if pd.isna(wts):
@@ -550,10 +682,11 @@ def compare_to_wallet(
         w_side = _resolve_wallet_side(row)
         w_asset = _resolve_wallet_asset(row)
         w_slug = _resolve_wallet_slug(row)
+        w_outcome = _resolve_wallet_outcome(row)
         if w_side:
-            wallet_by_key[(w_asset, w_slug, w_side)].append(float(wts))
+            wallet_by_key[(w_asset, w_slug, w_outcome, w_side)].append(float(wts))
 
-    wallet_arrays: Dict[Tuple[str, str, str], np.ndarray] = {
+    wallet_arrays: Dict[Tuple[str, str, str, str], np.ndarray] = {
         k: np.array(sorted(v)) for k, v in wallet_by_key.items()
     }
 
@@ -561,7 +694,7 @@ def compare_to_wallet(
     for d in decisions:
         if d.action not in ("BUY", "SELL"):
             continue
-        key = (d.asset.upper(), d.slug, d.action)
+        key = _make_decision_key(d)
         warr = wallet_arrays.get(key)
         if warr is None or len(warr) == 0:
             bot_false += 1
