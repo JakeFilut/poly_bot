@@ -232,9 +232,13 @@ class MarketReplayEngine:
             best_bid = float(row.get("bestBid", 0))
             best_ask = float(row.get("bestAsk", 0))
             spread = float(row.get("spread", 0))
-            spread_cents = spread * 100 if spread < 1.0 else spread  # handle both formats
+            spread_cents = round((best_ask - best_bid) * 100, 1) if best_ask > 0 and best_bid > 0 else (spread * 100 if spread < 1.0 else spread)
             spread_pctl = float(row.get("spread_percentile_60s", 0))
-            imbalance = float(row.get("imbalance_topN", 0.5))
+
+            # Compute imbalance as bid/(bid+ask), guaranteed [0,1]
+            bid_depth = max(0.0, float(row.get("bid_depth_topN", 0)))
+            ask_depth = max(0.0, float(row.get("ask_depth_topN", 0)))
+            imbalance = bid_depth / max(1e-9, bid_depth + ask_depth) if (bid_depth + ask_depth) > 0 else 0.5
 
             # Look up Binance returns at this timestamp
             r5 = r30 = r60 = 0.0
@@ -244,9 +248,11 @@ class MarketReplayEngine:
             if not bdf.empty:
                 idx = bdf["ts"].searchsorted(ts) - 1
                 if 0 <= idx < len(bdf):
-                    r5 = float(bdf.iloc[idx].get("ret_5s", 0))
-                    r30 = float(bdf.iloc[idx].get("ret_30s", 0))
-                    r60 = float(bdf.iloc[idx].get("ret_60s", 0))
+                    binance_ts = float(bdf.iloc[idx]["ts"])
+                    if abs(binance_ts - ts) <= 10.0:  # align within ±10s
+                        r5 = float(bdf.iloc[idx].get("ret_5s", 0))
+                        r30 = float(bdf.iloc[idx].get("ret_30s", 0))
+                        r60 = float(bdf.iloc[idx].get("ret_60s", 0))
 
             states.append(MarketState(
                 timestamp=ts,
@@ -377,6 +383,14 @@ def _resolve_wallet_asset(row: pd.Series) -> str:
     return ""
 
 
+def _resolve_wallet_slug(row: pd.Series) -> str:
+    """Normalise wallet trade slug."""
+    for col in ("slug",):
+        if col in row.index and pd.notna(row[col]):
+            return str(row[col]).strip()
+    return ""
+
+
 def compare_to_wallet(
     decisions: List[BotDecision],
     wallet_trades: pd.DataFrame,
@@ -388,8 +402,11 @@ def compare_to_wallet(
       1. Timestamp within +/- tolerance_sec
       2. Same trade direction (BUY == BUY, SELL == SELL)
       3. Same asset (BTC == BTC, etc.)
+      4. Same slug (market identifier)
 
-    Also computes entry_lag_seconds = bot_ts - wallet_ts for every match.
+    For each wallet trade, the closest bot decision in time (within tolerance)
+    with matching (asset, slug, side) is selected.  Lag is computed from the
+    original (non-rounded) timestamps.
     """
     if wallet_trades.empty or not decisions:
         return ComparisonResult(0, 0, 0, 0, 0.0)
@@ -398,15 +415,14 @@ def compare_to_wallet(
     if "ts" not in wt.columns:
         return ComparisonResult(0, 0, 0, 0, 0.0)
 
-    # --- Build bot entry index keyed by (asset, side) ---
-    # Each value is a sorted array of timestamps for that group.
-    bot_entries_by_key: Dict[Tuple[str, str], List[float]] = defaultdict(list)
+    # --- Build bot entry index keyed by (asset, slug, side) ---
+    bot_entries_by_key: Dict[Tuple[str, str, str], List[float]] = defaultdict(list)
     for d in decisions:
         if d.action in ("BUY", "SELL"):
-            key = (d.asset.upper(), d.action)
+            key = (d.asset.upper(), d.slug, d.action)
             bot_entries_by_key[key].append(d.timestamp)
 
-    bot_arrays: Dict[Tuple[str, str], np.ndarray] = {
+    bot_arrays: Dict[Tuple[str, str, str], np.ndarray] = {
         k: np.array(sorted(v)) for k, v in bot_entries_by_key.items()
     }
 
@@ -422,19 +438,20 @@ def compare_to_wallet(
 
         w_side = _resolve_wallet_side(row)
         w_asset = _resolve_wallet_asset(row)
+        w_slug = _resolve_wallet_slug(row)
         if not w_side:
             continue
 
         total += 1
-        key = (w_asset, w_side)
+        key = (w_asset, w_slug, w_side)
         arr = bot_arrays.get(key)
         if arr is None or len(arr) == 0:
             continue
 
-        idx = np.searchsorted(arr, wts)
+        idx = np.searchsorted(arr, float(wts))
         best_lag = None
         for i in range(max(0, idx - 1), min(len(arr), idx + 2)):
-            lag = arr[i] - wts
+            lag = float(arr[i]) - float(wts)
             if abs(lag) <= tolerance_sec:
                 if best_lag is None or abs(lag) < abs(best_lag):
                     best_lag = lag
@@ -445,18 +462,18 @@ def compare_to_wallet(
     missed = total - matched
 
     # --- False entries: bot entries with no matching wallet trade ---
-    # Build wallet index keyed by (asset, side) for reverse lookup.
-    wallet_by_key: Dict[Tuple[str, str], np.ndarray] = defaultdict(list)
+    wallet_by_key: Dict[Tuple[str, str, str], List[float]] = defaultdict(list)
     for _, row in wt.iterrows():
         wts = row.get("ts")
         if pd.isna(wts):
             continue
         w_side = _resolve_wallet_side(row)
         w_asset = _resolve_wallet_asset(row)
+        w_slug = _resolve_wallet_slug(row)
         if w_side:
-            wallet_by_key[(w_asset, w_side)].append(float(wts))
+            wallet_by_key[(w_asset, w_slug, w_side)].append(float(wts))
 
-    wallet_arrays: Dict[Tuple[str, str], np.ndarray] = {
+    wallet_arrays: Dict[Tuple[str, str, str], np.ndarray] = {
         k: np.array(sorted(v)) for k, v in wallet_by_key.items()
     }
 
@@ -464,7 +481,7 @@ def compare_to_wallet(
     for d in decisions:
         if d.action not in ("BUY", "SELL"):
             continue
-        key = (d.asset.upper(), d.action)
+        key = (d.asset.upper(), d.slug, d.action)
         warr = wallet_arrays.get(key)
         if warr is None or len(warr) == 0:
             bot_false += 1
@@ -480,7 +497,7 @@ def compare_to_wallet(
 
     similarity = matched / total if total > 0 else 0.0
 
-    # --- Latency stats ---
+    # --- Latency stats (ms precision) ---
     lag_median = float(np.median(entry_lags)) if entry_lags else 0.0
     lag_p90 = float(np.percentile(entry_lags, 90)) if entry_lags else 0.0
 
@@ -507,10 +524,10 @@ def analyze_signal_distributions(wallet_trades: pd.DataFrame) -> pd.DataFrame:
     feature_cols = {
         "spread_cents_at_trade": ["spread", "spread_cents"],
         "spread_percentile_at_trade": ["spread_percentile_60s", "spread_percentile_60s_at_trade"],
-        "orderbook_imbalance_at_trade": ["imbalance_topN", "orderbook_imbalance_at_trade"],
-        "binance_ret_5s_at_trade": ["binance_ret_5s_at_trade", "ret_5s"],
-        "binance_ret_30s_at_trade": ["binance_ret_30s_at_trade", "ret_30s"],
-        "binance_ret_60s_at_trade": ["binance_ret_60s_at_trade", "ret_60s"],
+        "orderbook_imbalance_at_trade": ["orderbook_imbalance_at_trade", "imbalance_topN"],
+        "binance_ret_5s_at_trade (dec)": ["binance_ret_5s_at_trade", "ret_5s"],
+        "binance_ret_30s_at_trade (dec)": ["binance_ret_30s_at_trade", "ret_30s"],
+        "binance_ret_60s_at_trade (dec)": ["binance_ret_60s_at_trade", "ret_60s"],
     }
 
     rows = []
@@ -524,9 +541,24 @@ def analyze_signal_distributions(wallet_trades: pd.DataFrame) -> pd.DataFrame:
             continue
 
         vals = pd.to_numeric(wallet_trades[col], errors="coerce").dropna()
+
         # Convert spread from decimal to cents if needed
         if "spread_cents" in label and col == "spread":
             vals = vals * 100
+
+        # Recompute imbalance as bid/(bid+ask) from raw depths if available
+        if "imbalance" in label and col == "imbalance_topN":
+            if "bid_depth_topN" in wallet_trades.columns and "ask_depth_topN" in wallet_trades.columns:
+                bid_d = pd.to_numeric(wallet_trades["bid_depth_topN"], errors="coerce").clip(lower=0).fillna(0)
+                ask_d = pd.to_numeric(wallet_trades["ask_depth_topN"], errors="coerce").clip(lower=0).fillna(0)
+                denom = (bid_d + ask_d).replace(0, np.nan)
+                vals = (bid_d / denom).dropna()
+
+        # Convert percent returns to decimal if values look like percents
+        # (abs median > 0.1 means likely percent-scaled)
+        if "ret_" in label and not vals.empty:
+            if vals.abs().median() > 0.1:
+                vals = vals / 100.0
 
         if vals.empty:
             continue
@@ -582,8 +614,8 @@ def parameter_sweep(
         entry["matched"] = cr.wallet_trades_matched
         entry["missed"] = cr.wallet_trades_missed
         entry["false_entries"] = cr.bot_false_entries
-        entry["lag_median"] = round(cr.entry_lag_median, 3)
-        entry["lag_p90"] = round(cr.entry_lag_p90, 3)
+        entry["lag_median_ms"] = round(cr.entry_lag_median * 1000, 1)
+        entry["lag_p90_ms"] = round(cr.entry_lag_p90 * 1000, 1)
         results.append(entry)
 
         if (idx + 1) % max(1, total // 10) == 0:
@@ -613,8 +645,8 @@ def print_report(
     print(f"  Bot false entries:     {comparison.bot_false_entries}")
     print(f"  Similarity score:      {comparison.similarity_score:.4f}")
     print(f"\n  Entry lag (bot - wallet):")
-    print(f"    median:  {comparison.entry_lag_median:+.3f}s")
-    print(f"    p90:     {comparison.entry_lag_p90:+.3f}s")
+    print(f"    median:  {comparison.entry_lag_median * 1000:+.1f}ms  ({comparison.entry_lag_median:+.4f}s)")
+    print(f"    p90:     {comparison.entry_lag_p90 * 1000:+.1f}ms  ({comparison.entry_lag_p90:+.4f}s)")
 
     if not signal_dist.empty:
         print(f"\n{'─' * 70}")
@@ -672,8 +704,8 @@ def generate_charts(
     # 2-4. Distribution histograms at wallet entry
     dist_features = {
         "spread": (["spread", "spread_cents"], "Spread (cents) at Wallet Entry"),
-        "imbalance": (["imbalance_topN", "orderbook_imbalance_at_trade"], "Imbalance at Wallet Entry"),
-        "momentum": (["binance_ret_30s_at_trade", "ret_30s"], "Binance ret_30s at Wallet Entry"),
+        "imbalance": (["orderbook_imbalance_at_trade", "imbalance_topN"], "Imbalance bid/(bid+ask) at Wallet Entry"),
+        "momentum": (["binance_ret_30s_at_trade", "ret_30s"], "Binance ret_30s (decimal) at Wallet Entry"),
     }
 
     if not wallet_trades.empty:
@@ -689,6 +721,16 @@ def generate_charts(
             vals = pd.to_numeric(wallet_trades[col], errors="coerce").dropna()
             if "spread" in fname and col == "spread":
                 vals = vals * 100
+            # Recompute imbalance from raw depths
+            if "imbalance" in fname and col == "imbalance_topN":
+                if "bid_depth_topN" in wallet_trades.columns and "ask_depth_topN" in wallet_trades.columns:
+                    bid_d = pd.to_numeric(wallet_trades["bid_depth_topN"], errors="coerce").clip(lower=0).fillna(0)
+                    ask_d = pd.to_numeric(wallet_trades["ask_depth_topN"], errors="coerce").clip(lower=0).fillna(0)
+                    denom = (bid_d + ask_d).replace(0, np.nan)
+                    vals = (bid_d / denom).dropna()
+            # Convert percent returns to decimal
+            if "momentum" in fname and not vals.empty and vals.abs().median() > 0.1:
+                vals = vals / 100.0
 
             if vals.empty:
                 continue
@@ -762,7 +804,7 @@ def main() -> None:
     print("\n[4/6] Comparing to wallet trades ...")
     comparison = compare_to_wallet(decisions, engine.wallet_trades, args.tolerance)
     print(f"  Similarity score: {comparison.similarity_score:.4f}")
-    print(f"  Entry lag median: {comparison.entry_lag_median:+.3f}s  |  p90: {comparison.entry_lag_p90:+.3f}s")
+    print(f"  Entry lag median: {comparison.entry_lag_median * 1000:+.1f}ms  |  p90: {comparison.entry_lag_p90 * 1000:+.1f}ms")
 
     # --- Step 5: Signal distribution analysis ---
     print("\n[5/6] Analyzing signal distributions at wallet entry ...")
