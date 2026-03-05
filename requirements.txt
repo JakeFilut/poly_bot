@@ -3,7 +3,10 @@
 # Polymarket CLOB SDK (order signing, placement)
 py-clob-client>=0.4.0
 
-# HTTP requests (Gamma API, Binance API, CLOB REST)
+# HTTP/2 async client with connection pooling (replaces per-request requests.get)
+httpx[http2]>=0.27.0
+
+# HTTP requests (legacy: still used by py-clob-client internally)
 requests>=2.31.0
 
 # Environment variables (optional: load .env file)

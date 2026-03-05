@@ -1,24 +1,29 @@
 #!/usr/bin/env python3
 """
-main.py – Orchestrator for the Polymarket scalper.
+main.py – Async orchestrator for the Polymarket scalper.
 
-ARCHITECTURE:
-  Two completely isolated modules run concurrently:
+ARCHITECTURE (hot-snapshot model):
 
-  A) StrategyEngine (strategy_engine.py)
-     - Generates trade signals, places orders, manages inventory/PnL/risk
-     - The ONLY module that may place orders or mutate trading state
+  Background fetch tasks (async, continuous):
+    1. poll_binance        – Binance spot prices every ~500ms
+    2. poll_orderbooks     – CLOB order-books every ~300ms (all tokens, concurrent)
+    3. refresh_universe    – Market discovery every ~10s (only fetches when stale)
+    4. sync_fills          – LIVE fill reconciliation every ~1s
 
-  B) WalletTracker (wallet_tracker.py)
-     - Polls the F247 wallet, logs trades to CSV/JSONL
-     - Read-only observer — CANNOT place orders, modify inventory,
-       or influence trade decisions
+  Decision loop (sync, fast, 5–20ms tick):
+    - Reads ONLY in-memory snapshots (no HTTP awaits)
+    - Computes features (CPU)
+    - Runs strategy (CPU)
+    - Executes actions (DRY_RUN: instant mock; LIVE: py-clob-client)
 
-  SAFETY RULES:
-    - No imports from wallet_tracker into strategy_engine
-    - No imports from strategy_engine into wallet_tracker
-    - Zero shared execution path
-    - Only shared components: logging utilities, read-only config
+  Wallet tracker (isolated daemon thread):
+    - Unchanged: polls F247 wallet, logs to CSV/JSONL
+    - Zero shared execution path with trading engine
+
+  Metrics:
+    - Loop tick time: p50 / p95 / p99
+    - Snapshot age: binance, order-books
+    - Logged every LOG_ROLLUP_SEC
 
 Usage:
     # DRY_RUN (default)
@@ -32,19 +37,64 @@ See RUNBOOK section at bottom for systemd example.
 """
 from __future__ import annotations
 
+import asyncio
+import bisect
 import os
 import random
 import signal
 import time
 import uuid
 
+from background_tasks import heartbeats
 from config import load_config
 from logger import Logger, _utc_iso
 
 
+# ──────────────────────────────────────────────────────────────────────
+# Tick-time metrics (lock-free, fixed-size ring)
+# ──────────────────────────────────────────────────────────────────────
+class TickMetrics:
+    """Lightweight rolling percentile tracker for loop tick times."""
+
+    def __init__(self, window: int = 500):
+        self._window = window
+        self._times: list[float] = []   # sorted insert for percentiles
+        self._raw: list[float] = []     # insertion-order ring
+        self._idx = 0
+
+    def record(self, elapsed_ms: float) -> None:
+        if len(self._raw) < self._window:
+            self._raw.append(elapsed_ms)
+            bisect.insort(self._times, elapsed_ms)
+        else:
+            # evict oldest
+            old = self._raw[self._idx]
+            pos = bisect.bisect_left(self._times, old)
+            if pos < len(self._times) and self._times[pos] == old:
+                self._times.pop(pos)
+            bisect.insort(self._times, elapsed_ms)
+            self._raw[self._idx] = elapsed_ms
+            self._idx = (self._idx + 1) % self._window
+
+    def percentile(self, p: float) -> float:
+        if not self._times:
+            return 0.0
+        idx = int(len(self._times) * p)
+        idx = min(idx, len(self._times) - 1)
+        return self._times[idx]
+
+    def snapshot(self) -> dict:
+        return {
+            "tick_p50_ms": round(self.percentile(0.50), 3),
+            "tick_p95_ms": round(self.percentile(0.95), 3),
+            "tick_p99_ms": round(self.percentile(0.99), 3),
+            "tick_count": len(self._raw),
+        }
+
+
 class Bot:
-    """Thin orchestrator: runs StrategyEngine and WalletTracker
-    concurrently but with ZERO shared execution path."""
+    """Async orchestrator: runs background fetch tasks + fast decision loop
+    + wallet tracker (isolated thread)."""
 
     def __init__(self):
         # -- Config (read-only, shared) --
@@ -66,14 +116,12 @@ class Bot:
         self.engine = StrategyEngine(self.cfg, self.log)
 
         # ── Module B: Wallet Tracker (read-only observer) ────────────
-        # Imported here — wallet_tracker.py wraps f247_copywallet_tracker.
-        # It runs in a daemon thread with NO access to StrategyEngine.
         self._tracker = None
         if self.cfg.TRACK_F247_WALLET:
             from wallet_tracker import WalletTracker
             self._tracker = WalletTracker(
-                log_fn=self.log.info,  # simple log function, no state leak
-                bot_logger=self.log,   # for COPYWALLET_FILL events
+                log_fn=self.log.info,
+                bot_logger=self.log,
                 diag_callback=self.engine.diagnostics.on_copywallet_fill,
             )
 
@@ -81,42 +129,118 @@ class Bot:
         self._running = True
         self._last_state_flush = time.monotonic()
 
-        # -- Register signal handlers --
-        signal.signal(signal.SIGINT, self._handle_signal)
-        signal.signal(signal.SIGTERM, self._handle_signal)
+        # -- Metrics --
+        self._tick_metrics = TickMetrics()
+        self._last_metrics_log = time.monotonic()
+        self._last_heartbeat_log = time.monotonic()
+
+        # -- Background task handles --
+        self._bg_tasks: list[asyncio.Task] = []
 
         self.log.info(
             "bot_startup",
             run_id=self._run_id,
             start_ts_utc=_utc_iso(),
+            architecture="hot_snapshot_async",
             strategy_engine="strategy_engine.StrategyEngine",
             wallet_tracker="wallet_tracker.WalletTracker" if self._tracker else "disabled",
             isolation="ENFORCED — zero shared execution path",
         )
 
     # ------------------------------------------------------------------
-    # Signal handling
+    # Signal handling (asyncio-compatible)
     # ------------------------------------------------------------------
-    def _handle_signal(self, signum, frame):
+    def _install_signal_handlers(self, loop: asyncio.AbstractEventLoop) -> None:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, self._handle_signal, sig)
+
+    def _handle_signal(self, signum) -> None:
         sig_name = signal.Signals(signum).name
         self.log.info(f"signal_received: {sig_name}, shutting down gracefully")
         self._running = False
 
     # ------------------------------------------------------------------
-    # Main loop
+    # Main async entry point
     # ------------------------------------------------------------------
-    def run(self) -> None:
-        """Run strategy engine + wallet tracker concurrently."""
-        # 1. Strategy engine startup sync
+    async def run(self) -> None:
+        """Start background tasks, warm caches, then run the fast decision loop."""
+        loop = asyncio.get_running_loop()
+        self._install_signal_handlers(loop)
+
+        # 1. Initialise the global HTTP/2 client
+        from http_client import init_client
+        await init_client()
+        self.log.info("http2_client_initialised",
+                      max_connections=100, max_keepalive=20)
+
+        # 2. Async warmup: universe + Binance + order-books concurrently
+        from background_tasks import warmup
+        await warmup(self.engine, self.log)
+
+        # 3. Sync startup (LIVE reconciliation, cash, baselines)
         self.engine.startup_sync()
 
-        # 2. Start wallet tracker (isolated daemon thread)
+        # 4. Launch background fetch tasks
+        from background_tasks import (
+            poll_binance, poll_orderbooks, refresh_universe, sync_fills,
+            warm_connection,
+        )
+
+        self._bg_tasks = [
+            asyncio.create_task(
+                poll_binance(self.engine.binance, self.cfg, self.log,
+                             interval_ms=self.cfg.BINANCE_POLL_MS),
+                name="poll_binance",
+            ),
+            asyncio.create_task(
+                poll_orderbooks(self.engine.features, self.engine.universe,
+                                self.engine.pm_api, self.log,
+                                interval_ms=self.cfg.BOOK_POLL_MS,
+                                max_inflight=self.cfg.BOOK_MAX_INFLIGHT),
+                name="poll_orderbooks",
+            ),
+            asyncio.create_task(
+                refresh_universe(self.engine, self.cfg, self.log,
+                                 check_interval_sec=10.0),
+                name="refresh_universe",
+            ),
+            asyncio.create_task(
+                warm_connection(self.cfg, self.log, interval_sec=15.0),
+                name="warm_connection",
+            ),
+        ]
+
+        if self.cfg.MODE == "LIVE":
+            self._bg_tasks.append(
+                asyncio.create_task(
+                    sync_fills(self.engine, self.log,
+                               interval_ms=self.cfg.FILLS_POLL_MS),
+                    name="sync_fills",
+                )
+            )
+
+        # 5. Start wallet tracker (isolated daemon thread)
         if self._tracker is not None:
             self._tracker.start()
 
         self.log.info("main_loop_started", mode=self.cfg.MODE,
-                      target_loop_ms=self.cfg.TARGET_LOOP_MS)
+                      target_loop_ms=self.cfg.TARGET_LOOP_MS,
+                      bg_tasks=[t.get_name() for t in self._bg_tasks])
 
+        # 6. Fast decision loop
+        await self._decision_loop()
+
+        # 7. Graceful shutdown
+        await self._shutdown()
+
+    # ------------------------------------------------------------------
+    # Decision loop (reads in-memory snapshots only)
+    # ------------------------------------------------------------------
+    async def _decision_loop(self) -> None:
+        """Tight loop: read cached data → compute features → strategy → execute.
+
+        Target tick time: 5–20ms.  No HTTP awaits in this path.
+        """
         loop_count = 0
         target_sec = self.cfg.TARGET_LOOP_MS / 1000.0
 
@@ -124,7 +248,7 @@ class Bot:
             loop_start = time.monotonic()
             loop_count += 1
 
-            # ── Strategy engine tick (the ONLY trading path) ─────────
+            # ── Strategy engine tick (CPU only) ──────────────────────
             try:
                 self.engine.tick(loop_count)
                 self.engine.risk.clear_errors()
@@ -135,7 +259,7 @@ class Bot:
                 self.log.error(f"tick_error: {e}", loop=loop_count)
                 self.engine.risk.record_error()
 
-            # State flush
+            # State flush (periodic)
             now_mono = time.monotonic()
             if now_mono - self._last_state_flush > self.cfg.STATE_FLUSH_SEC:
                 self.engine.flush_state()
@@ -144,221 +268,100 @@ class Bot:
             # Post-tick analytics (rollups, hourly PnL, diagnostics)
             self.engine.post_tick()
 
-            # Sleep to maintain target loop rate
-            elapsed = time.monotonic() - loop_start
-            sleep_time = target_sec - elapsed
+            # Record tick time & maybe log metrics
+            elapsed_ms = (time.monotonic() - loop_start) * 1000.0
+            self._tick_metrics.record(elapsed_ms)
+            self._maybe_log_metrics(now_mono)
+
+            # Yield to event loop — lets background tasks run
+            sleep_time = target_sec - (time.monotonic() - loop_start)
             if sleep_time > 0:
-                time.sleep(sleep_time)
-
-        # Graceful shutdown
-        self._shutdown()
-
-    def _tick(self, loop_count: int) -> None:
-        """One iteration of the main loop."""
-        # 1. Refresh universe periodically
-        if self.universe.needs_refresh():
-            self.universe.refresh()
-
-        # 2. Binance price update
-        self.binance.refresh_all()
-
-        # 3. Compute features for all active slugs
-        all_features = self.features.compute_all()
-
-        # 4. Sync fills (LIVE mode) – track sell PnL for entry quality
-        pnl_before = self.state.realized_pnl
-        fill_count = self.execution.sync_fills()
-        if fill_count > 0:
-            self.log.info("fills_synced", count=fill_count)
-            pnl_delta = self.state.realized_pnl - pnl_before
-            if pnl_delta != 0:
-                self.strategy.record_sell_pnl(pnl_delta)
-
-        # 5. Run strategy to generate actions
-        actions = self.strategy.generate_actions(
-            all_features=all_features,
-            risk_allows_buy=self.risk.allows_buy,
-            risk_allows_sell=self.risk.allows_sell,
-        )
-
-        # 6. Execute actions – track sell PnL for entry quality
-        pnl_before = self.state.realized_pnl
-        if actions:
-            self.execution.execute_actions(actions)
-        pnl_delta = self.state.realized_pnl - pnl_before
-        if pnl_delta != 0:
-            self.strategy.record_sell_pnl(pnl_delta)
-
-        # 7. Update cash estimate after fills
-        if self.cfg.MODE == "DRY_RUN":
-            # In DRY_RUN, cash = initial - exposure
-            exposure = self.state.total_exposure_usd()
-            self.risk.update_cash(
-                self.cfg.MAX_TOTAL_EXPOSURE_USD * 2 - exposure
-            )
+                await asyncio.sleep(sleep_time)
+            else:
+                await asyncio.sleep(0)  # yield anyway
 
     # ------------------------------------------------------------------
-    # Mark-to-market helpers
+    # Metrics logging
     # ------------------------------------------------------------------
-    def _get_mark_for_token(self, token_id: str) -> tuple[float, str]:
-        """Return (mark_price, mark_source) for a token.
+    def _maybe_log_metrics(self, now_mono: float) -> None:
+        # Heartbeat log every ~5s (separate from rollup metrics)
+        if now_mono - self._last_heartbeat_log >= 5.0:
+            self._last_heartbeat_log = now_mono
+            hb = heartbeats.snapshot()
+            hb["bg_tasks_alive"] = sum(1 for t in self._bg_tasks if not t.done())
+            self.log.log("HEARTBEAT", **hb)
 
-        Hierarchy:
-          1. mid_book    – both bids & asks present → (best_bid+best_ask)/2
-          2. bid_only    – only bids present → best_bid
-          3. ask_only    – only asks present → best_ask
-          4. last_mid_cache – previous valid mid stored in _last_valid_mid
-          5. missing_zero – no data at all → 0.0  (do NOT assume 0.50)
-        """
-        book = self.features._book_cache.get(token_id)
-        if book is not None:
-            has_bids = len(book.bids) > 0
-            has_asks = len(book.asks) > 0
-            if has_bids and has_asks:
-                mid = (book.best_bid + book.best_ask) / 2
-                self._last_valid_mid[token_id] = mid
-                return mid, "mid_book"
-            if has_bids:
-                self._last_valid_mid[token_id] = book.best_bid
-                return book.best_bid, "bid_only"
-            if has_asks:
-                return book.best_ask, "ask_only"
-
-        # Fallback: last known valid mid
-        cached_mid = self._last_valid_mid.get(token_id)
-        if cached_mid is not None:
-            return cached_mid, "last_mid_cache"
-
-        # Nothing available → contribute 0
-        return 0.0, "missing_zero"
-
-    def _compute_unrealized_with_marks(self) -> tuple[float, list[dict]]:
-        """Compute total unrealized PnL and per-token mark details.
-
-        Returns (total_unrealized_usd, [mark_detail_per_position]).
-        """
-        fee_bps = self.cfg.SIM_FEE_BPS
-        fee_rate = fee_bps / 10_000.0 if fee_bps > 0 else 0.0
-        total = 0.0
-        marks: list[dict] = []
-
-        for (slug, outcome), inv in self.state.inventory.items():
-            if inv.shares <= 0:
-                continue
-            pair = self.universe.get_pair(slug)
-            if pair is None:
-                continue
-            token_id = pair.up_token_id if outcome == "Up" else pair.down_token_id
-            mark, source = self._get_mark_for_token(token_id)
-            pnl = inv.shares * (mark - inv.avg_cost)
-            if fee_rate > 0 and mark > 0:
-                pnl -= fee_rate * inv.shares * (mark + inv.avg_cost)
-            total += pnl
-            marks.append({
-                "position": f"{slug}:{outcome}",
-                "shares": round(inv.shares, 2),
-                "avg_cost": round(inv.avg_cost, 4),
-                "mark": round(mark, 4),
-                "mark_source": source,
-                "unrealized": round(pnl, 4),
-            })
-
-        return total, marks
-
-    def _estimate_unrealized(self) -> float:
-        """Rough unrealized P&L estimate based on actual market prices."""
-        total, _ = self._compute_unrealized_with_marks()
-        return total
-
-    # ------------------------------------------------------------------
-    # Conservative mark-to-market (best_bid for longs)
-    # ------------------------------------------------------------------
-    def _estimate_unrealized_conservative(self) -> float:
-        """Mark-to-market using actual prices. Applies SIM_FEE_BPS if configured."""
-        return self._estimate_unrealized()
-
-    # ------------------------------------------------------------------
-    # Hourly PnL tracking
-    # ------------------------------------------------------------------
-    def _get_current_hour_utc(self) -> datetime:
-        """Return the current hour boundary (truncated to hour)."""
-        now = datetime.now(timezone.utc)
-        return now.replace(minute=0, second=0, microsecond=0)
-
-    def _check_hourly_pnl(self) -> None:
-        """Emit HOURLY_PNL event if an hour boundary has been crossed."""
-        now_hour = self._get_current_hour_utc()
-        if now_hour <= self._current_hour_utc:
+        if now_mono - self._last_metrics_log < self.cfg.LOG_ROLLUP_SEC:
             return
+        self._last_metrics_log = now_mono
 
-        # Hour boundary crossed — compute metrics for the completed hour
-        unrealized_end, mark_details = self._compute_unrealized_with_marks()
-        realized_this_hour = self.state.realized_pnl - self._hourly_realized_start
-        net_pnl = realized_this_hour + (unrealized_end - self._hourly_unrealized_start)
+        # Snapshot ages (detailed)
+        book_ages = []
+        for tid in self.engine.universe.all_token_ids():
+            ts = self.engine.features._book_cache_ts.get(tid, 0)
+            if ts > 0:
+                book_ages.append((time.time() - ts) * 1000)
+        avg_book_age = (sum(book_ages) / len(book_ages)) if book_ages else -1
+        max_book_age = max(book_ages) if book_ages else -1
 
-        # Fill stats from logger
-        fill_stats = self.log.get_and_reset_hourly_fills()
+        bin_ts = self.engine.binance._last_fetch_ts
+        binance_age = (time.time() - bin_ts) * 1000 if bin_ts > 0 else -1
 
-        # Top positions
-        inv_snap = self.state.inventory_snapshot()
-        sorted_inv = sorted(
-            inv_snap.items(),
-            key=lambda kv: kv[1].get("usd_value", 0),
-            reverse=True,
-        )[:5]
-        top_positions = [{"position": k, **v} for k, v in sorted_inv]
-
-        # Inventory notional at end
-        inv_notional = sum(v.get("usd_value", 0) for v in inv_snap.values())
-
-        # ET time for the completed hour
-        hour_et = self._current_hour_utc.astimezone(self._et)
-
-        self.log.hourly_pnl(
-            hour_start_utc=self._current_hour_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            hour_start_et=hour_et.strftime("%Y-%m-%d %H:%M ET"),
-            realized_usd=round(realized_this_hour, 4),
-            unrealized_start_usd=round(self._hourly_unrealized_start, 4),
-            unrealized_end_usd=round(unrealized_end, 4),
-            net_pnl_usd=round(net_pnl, 4),
-            inventory_notional_end_usd=round(inv_notional, 4),
-            top_positions=top_positions,
-            mark_details=mark_details,
-            **fill_stats,
+        self.log.log(
+            "LOOP_METRICS",
+            **self._tick_metrics.snapshot(),
+            **heartbeats.snapshot(),
+            avg_book_age_ms=round(avg_book_age, 1),
+            max_book_age_ms=round(max_book_age, 1),
+            binance_age_ms=round(binance_age, 1),
+            bg_tasks_alive=sum(1 for t in self._bg_tasks if not t.done()),
         )
-
-        # Entry quality report
-        eq = self.strategy.get_and_reset_entry_quality()
-        self.log.entry_quality_report(
-            hour_start_utc=self._current_hour_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            hour_start_et=hour_et.strftime("%Y-%m-%d %H:%M ET"),
-            avg_buy_price=eq["avg_buy_price"],
-            avg_edge_at_entry=eq["avg_edge_at_entry"],
-            total_buys=eq["total_buys"],
-            total_sells=eq["total_sells"],
-            profit_per_sell=eq["profit_per_sell"],
-            skips_by_gate=eq["skips_by_gate"],
-            total_skipped=eq["total_skipped"],
-        )
-
-        # Reset for next hour
-        self._current_hour_utc = now_hour
-        self._hourly_unrealized_start = unrealized_end
-        self._hourly_realized_start = self.state.realized_pnl
 
     # ------------------------------------------------------------------
     # Shutdown
     # ------------------------------------------------------------------
-    def _shutdown(self) -> None:
-        """Graceful shutdown: stop tracker, then strategy engine."""
+    async def _shutdown(self) -> None:
+        """Cancel background tasks, close HTTP client, shutdown engine.
+
+        Order of operations matters for safety:
+          1. Stop decision loop (already done — we exited _decision_loop)
+          2. Cancel background tasks (no new data / no new fills)
+          3. Shutdown engine (cancels pending orders, flushes state)
+          4. Close HTTP client last (engine shutdown may need it)
+        """
         self.log.info("shutdown_begin")
 
-        # Stop wallet tracker FIRST (it's just an observer)
+        # 1. Cancel background tasks
+        for task in self._bg_tasks:
+            task.cancel()
+        results = await asyncio.gather(*self._bg_tasks, return_exceptions=True)
+        failed = [
+            (self._bg_tasks[i].get_name(), repr(r))
+            for i, r in enumerate(results)
+            if isinstance(r, Exception) and not isinstance(r, asyncio.CancelledError)
+        ]
+        self.log.info("background_tasks_cancelled",
+                      count=len(self._bg_tasks),
+                      failed=failed if failed else None)
+
+        # 2. Stop wallet tracker (it's just an observer)
         if self._tracker is not None:
             self._tracker.stop()
 
-        # Shutdown strategy engine (cancels orders, flushes state)
+        # 3. Log pending order state before engine shutdown
+        pending_count = len(self.engine.execution.pending_orders) if hasattr(self.engine, 'execution') and hasattr(self.engine.execution, 'pending_orders') else 0
+        if pending_count > 0:
+            self.log.info("shutdown_pending_orders",
+                          count=pending_count,
+                          action="engine.shutdown will cancel_all")
+
+        # 4. Shutdown strategy engine (cancels orders, flushes state)
         self.engine.shutdown()
+
+        # 5. Close the global HTTP client last
+        from http_client import close_client
+        await close_client()
+        self.log.info("http2_client_closed")
 
         self.log.info("shutdown_complete")
         self.log.close()
@@ -373,7 +376,7 @@ def main():
         print(f"[INIT] RANDOM_SEED={seed_val} — deterministic RNG enabled")
 
     bot = Bot()
-    bot.run()
+    asyncio.run(bot.run())
 
 
 if __name__ == "__main__":
@@ -438,19 +441,24 @@ if __name__ == "__main__":
 #     MODE                          DRY_RUN or LIVE
 #     MAX_TOTAL_EXPOSURE_USD        Total position cap (default 1500)
 #     MAX_POSITION_USD_PER_OUTCOME  Per-outcome cap (default 150)
-#     TARGET_LOOP_MS                Main loop interval (default 500)
+#     TARGET_LOOP_MS                Decision loop interval (default 10)
 #     ORDER_TTL_MS                  Cancel stale orders after (default 2500)
 #     SPREAD_PCTL_MIN               Min spread percentile to trade (default 0.75)
 #     CLIP_UNIT_USD                 Base order size (default 1.10)
 #     LOG_FILE                      Path to log file (empty = stdout only)
+#     BINANCE_POLL_MS               Binance refresh interval (default 500)
+#     BOOK_POLL_MS                  Order-book refresh interval (default 300)
 #
 # 6. Monitoring:
 #     - Watch stdout/journalctl for structured JSON logs
+#     - LOOP_METRICS events show tick p50/p95/p99, snapshot ages
 #     - ROLLUP events every 60s show buy/sell counts, exposure, top positions
 #     - DECISION events show every trade/skip with full reasoning
 #     - API_ERROR events track connectivity issues
 #
-# 7. Architecture:
-#     - strategy_engine.py: ALL trading logic (signals, orders, inventory, PnL)
-#     - wallet_tracker.py: Read-only F247 wallet observer (CSV/JSONL logs)
-#     - ZERO shared execution path between the two modules
+# 7. Architecture (hot-snapshot model):
+#     - background_tasks.py: Async tasks that continuously fetch data
+#     - http_client.py: Global HTTP/2 client with connection pooling
+#     - strategy_engine.py: ALL trading logic (reads snapshots, no HTTP)
+#     - wallet_tracker.py: Read-only F247 wallet observer (daemon thread)
+#     - ZERO shared execution path between trading engine and wallet tracker

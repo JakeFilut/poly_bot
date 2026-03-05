@@ -7,9 +7,12 @@ STRICT filtering:
   - Market must be in the CURRENT active hour (start <= now < end)
   - Exactly 1 market per symbol at a time
   - No 15-minute, no future, no expired, no resolved markets
+
+Provides both sync (legacy refresh) and async_refresh for background use.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import time
@@ -510,6 +513,186 @@ class MarketUniverse:
     def get_removed_token_ids(self) -> List[str]:
         """Return token IDs removed in the last refresh (for cache purging)."""
         return getattr(self, "_last_removed_token_ids", [])
+
+    # ==================================================================
+    # Async refresh — uses async API methods, same filter logic
+    # ==================================================================
+    async def async_refresh(self) -> int:
+        """Async version of refresh() using the shared httpx client.
+
+        Fetches markets concurrently per-asset, then applies the same
+        strict filter + dedup pipeline as the sync version.
+        """
+        now_utc = datetime.now(timezone.utc)
+        debug = getattr(self.cfg, "UNIVERSE_DEBUG", False)
+
+        # Concurrent per-asset fetch
+        async def _fetch_asset(prefix: str, asset_name: str):
+            try:
+                batch, diag = await self.api.async_search_markets_by_slug_prefix(
+                    prefix, now_utc=now_utc,
+                )
+            except Exception as e:
+                self.log.api_error(
+                    fn="async_universe_refresh_search",
+                    slug_prefix=prefix, asset=asset_name, error=str(e),
+                )
+                batch = []
+                diag = {"error": str(e)}
+            self.log.info(
+                "universe_debug_fetch",
+                asset=asset_name,
+                slug_prefix=prefix,
+                strategy=diag.get("strategy", "?"),
+                endpoint=diag.get("endpoint", "?"),
+                params=diag.get("params", {}),
+                now_utc=now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                pages_fetched=diag.get("pages_fetched", 0),
+                total_fetched=diag.get("total_fetched", 0),
+                prefix_matched=diag.get("prefix_matched", 0),
+                slugs_first_50=diag.get("all_slugs", [])[:50],
+            )
+            return asset_name, batch
+
+        tasks = []
+        for prefix, asset_name in _SLUG_PREFIX_TO_ASSET.items():
+            if asset_name not in self.cfg.ASSETS:
+                continue
+            tasks.append(_fetch_asset(prefix, asset_name))
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        raw_markets: List[dict] = []
+        per_asset_raw: Dict[str, List[dict]] = {}
+        for r in results:
+            if isinstance(r, Exception):
+                continue
+            asset_name, batch = r
+            per_asset_raw[asset_name] = batch
+            raw_markets.extend(batch)
+
+        # Phase 1: strict filter (reuse sync method)
+        candidates: List[TokenPair] = []
+        rejections: List[dict] = []
+        for m in raw_markets:
+            slug = m.get("slug", "") or m.get("question_id", "") or ""
+            question = m.get("question", "") or m.get("title", "") or ""
+            result = self._strict_filter(m, slug, question, now_utc)
+            if result["pass"]:
+                candidates.append(result["pair"])
+            else:
+                rejections.append({"slug": slug[:80], "reason": result["reason"]})
+
+        if debug and rejections:
+            reason_counts: Dict[str, int] = {}
+            reason_samples: Dict[str, List[str]] = {}
+            for r in rejections:
+                reason_counts[r["reason"]] = reason_counts.get(r["reason"], 0) + 1
+                if r["reason"] not in reason_samples:
+                    reason_samples[r["reason"]] = []
+                if len(reason_samples[r["reason"]]) < 3:
+                    reason_samples[r["reason"]].append(r["slug"])
+            self.log.info(
+                "universe_rejections_summary",
+                total_rejected=len(rejections),
+                by_reason={k: {"count": v, "samples": reason_samples.get(k, [])}
+                           for k, v in reason_counts.items()},
+            )
+
+        # Phase 2: per-symbol dedup (same logic as sync)
+        best_per_asset: Dict[str, TokenPair] = {}
+        all_per_asset: Dict[str, List[TokenPair]] = {}
+        for pair in candidates:
+            all_per_asset.setdefault(pair.asset, []).append(pair)
+
+        for asset, asset_pairs in all_per_asset.items():
+            if len(asset_pairs) > 1:
+                asset_pairs.sort(
+                    key=lambda p: p.end_date_utc or datetime.max.replace(tzinfo=timezone.utc),
+                )
+                kept = asset_pairs[0]
+                self.log.warn(
+                    f"GUARDRAIL: {asset} has {len(asset_pairs)} qualifying markets, "
+                    f"keeping ending-soonest only",
+                    asset=asset, kept_slug=kept.slug,
+                    kept_end=kept.end_date_utc.strftime("%Y-%m-%dT%H:%M:%SZ") if kept.end_date_utc else "?",
+                    rejected_slugs=[p.slug for p in asset_pairs[1:]],
+                )
+                best_per_asset[asset] = kept
+            else:
+                best_per_asset[asset] = asset_pairs[0]
+
+        # Phase 3: hard guardrail
+        if len(best_per_asset) > 4:
+            self.log.error(
+                f"GUARDRAIL: {len(best_per_asset)} active markets (max 4). Refusing to trade.",
+                active_count=len(best_per_asset),
+            )
+            self.pairs = {}
+            self.token_lookup = {}
+            self._last_refresh = time.time()
+            self._last_removed_token_ids = []
+            return 0
+
+        # Phase 4: build final universe
+        new_pairs: Dict[str, TokenPair] = {}
+        new_lookup: Dict[str, Tuple[str, str]] = {}
+        for pair in best_per_asset.values():
+            new_pairs[pair.slug] = pair
+            new_lookup[pair.up_token_id] = (pair.slug, "Up")
+            new_lookup[pair.down_token_id] = (pair.slug, "Down")
+
+        added = set(new_pairs) - set(self.pairs)
+        removed = set(self.pairs) - set(new_pairs)
+
+        removed_token_ids: List[str] = []
+        for slug in removed:
+            old_pair = self.pairs.get(slug)
+            if old_pair:
+                removed_token_ids.append(old_pair.up_token_id)
+                removed_token_ids.append(old_pair.down_token_id)
+
+        if removed or added:
+            self.log.info(
+                "UNIVERSE_ROLLOVER",
+                now_utc=now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                from_slugs=sorted(removed), to_slugs=sorted(added),
+                removed_count=len(removed), added_count=len(added),
+                removed_token_ids=[t[:16] + "..." for t in removed_token_ids],
+            )
+
+        self.pairs = new_pairs
+        self.token_lookup = new_lookup
+        self._last_refresh = time.time()
+
+        final_universe = []
+        for pair in self.pairs.values():
+            start_iso = pair.start_date_utc.strftime("%Y-%m-%dT%H:%M:%SZ") if pair.start_date_utc else None
+            end_iso = pair.end_date_utc.strftime("%Y-%m-%dT%H:%M:%SZ") if pair.end_date_utc else None
+            final_universe.append({
+                "asset": pair.asset, "slug": pair.slug,
+                "start_utc": start_iso, "end_utc": end_iso,
+                "duration_min": pair.duration_minutes,
+            })
+        final_universe.sort(key=lambda x: x["asset"])
+
+        self.log.info(
+            "TRADABLE_UNIVERSE",
+            now_utc=now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            count=len(self.pairs), markets=final_universe,
+        )
+        self.log.info(
+            "universe_refreshed",
+            raw_count=len(raw_markets),
+            per_asset_raw_counts={a: len(b) for a, b in per_asset_raw.items()},
+            candidates_passed=len(candidates),
+            total_rejected=len(rejections),
+            active=len(self.pairs),
+            added=len(added), removed=len(removed),
+        )
+
+        self._last_removed_token_ids = removed_token_ids
+        return len(self.pairs)
 
 
 # ------------------------------------------------------------------

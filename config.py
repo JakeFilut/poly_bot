@@ -71,7 +71,16 @@ class Config:
     ASSETS: List[str] = field(default_factory=lambda: ["BTC", "ETH", "SOL", "XRP"])
 
     # -- Loop timing --
-    TARGET_LOOP_MS: int = 500
+    TARGET_LOOP_MS: int = 10  # decision loop tick (ms); was 500 before hot-snapshot arch
+
+    # -- Background task intervals (ms) --
+    BINANCE_POLL_MS: int = 500    # Binance price refresh cadence
+    BOOK_POLL_MS: int = 300       # Order-book refresh cadence (all tokens, concurrent)
+    FILLS_POLL_MS: int = 1000     # Fill sync cadence (LIVE only)
+    BOOK_MAX_STALE_MS: int = 5000 # Refuse order-book data older than this
+    BINANCE_MAX_STALE_MS: int = 3000   # Refuse Binance data older than this
+    UNIVERSE_MAX_STALE_MS: int = 300000 # Refuse universe older than 5 min
+    BOOK_MAX_INFLIGHT: int = 10   # Max concurrent order-book HTTP requests
 
     # -- Order management --
     MAX_OPEN_ORDERS_PER_MARKET: int = 2
@@ -227,7 +236,14 @@ def load_config() -> Config:
         GAMMA_API_URL=_env("GAMMA_API_URL", "https://gamma-api.polymarket.com"),
         MAX_ACTIVE_SLUGS=_env_int("MAX_ACTIVE_SLUGS", 60),
         ASSETS=_env("ASSETS", "BTC,ETH,SOL,XRP").split(","),
-        TARGET_LOOP_MS=_env_int("TARGET_LOOP_MS", 500),
+        TARGET_LOOP_MS=_env_int("TARGET_LOOP_MS", 10),
+        BINANCE_POLL_MS=_env_int("BINANCE_POLL_MS", 500),
+        BOOK_POLL_MS=_env_int("BOOK_POLL_MS", 300),
+        FILLS_POLL_MS=_env_int("FILLS_POLL_MS", 1000),
+        BOOK_MAX_STALE_MS=_env_int("BOOK_MAX_STALE_MS", 5000),
+        BINANCE_MAX_STALE_MS=_env_int("BINANCE_MAX_STALE_MS", 3000),
+        UNIVERSE_MAX_STALE_MS=_env_int("UNIVERSE_MAX_STALE_MS", 300000),
+        BOOK_MAX_INFLIGHT=_env_int("BOOK_MAX_INFLIGHT", 10),
         MAX_OPEN_ORDERS_PER_MARKET=_env_int("MAX_OPEN_ORDERS_PER_MARKET", 2),
         ORDER_TTL_MS=_env_int("ORDER_TTL_MS", 2500),
         MAX_ORDER_OPS_PER_LOOP=_env_int("MAX_ORDER_OPS_PER_LOOP", 20),
@@ -325,8 +341,8 @@ def _validate(cfg: Config) -> None:
         errors.append("MAX_TOTAL_EXPOSURE_USD must be > 0")
     if cfg.MAX_POSITION_USD_PER_OUTCOME <= 0:
         errors.append("MAX_POSITION_USD_PER_OUTCOME must be > 0")
-    if cfg.TARGET_LOOP_MS < 100:
-        errors.append("TARGET_LOOP_MS must be >= 100")
+    if cfg.TARGET_LOOP_MS < 1:
+        errors.append("TARGET_LOOP_MS must be >= 1")
     if not (0.0 <= cfg.SPREAD_PCTL_MIN <= 1.0):
         errors.append("SPREAD_PCTL_MIN must be in [0, 1]")
     if cfg.TP_CENTS_MIN > cfg.TP_CENTS_TARGET:

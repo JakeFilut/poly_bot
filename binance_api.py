@@ -4,6 +4,9 @@ binance_api.py – Binance spot price feed with rolling tape for momentum signal
 Maintains a short rolling tape per symbol for computing returns:
   - ret_30s  = (px_now / px_30s_ago) - 1
   - ret_120s = (px_now / px_120s_ago) - 1
+
+Provides both sync (legacy) and async methods.  Async methods use the
+global httpx.AsyncClient from http_client.py for HTTP/2 connection reuse.
 """
 from __future__ import annotations
 
@@ -140,3 +143,36 @@ class BinanceAPI:
 
     def last_price(self, asset: str) -> float | None:
         return self._last_prices.get(asset)
+
+    # ==================================================================
+    # Async methods — use the global httpx.AsyncClient (HTTP/2, pooled)
+    # ==================================================================
+    async def async_refresh_all(self) -> Dict[str, float]:
+        """Fetch prices for all configured assets using the shared async client."""
+        from http_client import get_client
+        client = get_client()
+        now = time.time()
+        prices: Dict[str, float] = {}
+
+        try:
+            resp = await client.get(
+                f"{self._base_url}/api/v3/ticker/price",
+                timeout=5.0,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            price_map = {item["symbol"]: float(item["price"]) for item in data}
+
+            for asset in self.cfg.ASSETS:
+                symbol = _BINANCE_PAIRS.get(asset)
+                if symbol and symbol in price_map:
+                    px = price_map[symbol]
+                    self._record(asset, px)
+                    prices[asset] = px
+
+            self._last_fetch_ts = now
+        except Exception as e:
+            self.log.api_error(fn="async_binance_refresh_all", error=str(e))
+            prices = dict(self._last_prices)
+
+        return prices
