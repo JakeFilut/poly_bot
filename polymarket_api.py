@@ -2,9 +2,13 @@
 polymarket_api.py – Polymarket CLOB interface with retries and idempotency.
 
 All prices are in the range 0.00–1.00 (i.e. cents expressed as a fraction).
+
+Provides both sync (legacy) and async methods.  Async methods use the
+global httpx.AsyncClient from http_client.py for HTTP/2 connection reuse.
 """
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
 from dataclasses import dataclass
@@ -475,3 +479,201 @@ class PolymarketAPI:
         if self._clob and hasattr(self._clob, "headers"):
             return dict(self._clob.headers)
         return {}
+
+    # ==================================================================
+    # Async methods — use the global httpx.AsyncClient (HTTP/2, pooled)
+    # ==================================================================
+    async def async_get_orderbook(self, token_id: str) -> BookSnapshot | None:
+        """Fetch orderbook using the shared async HTTP/2 client."""
+        from http_client import get_client
+        client = get_client()
+
+        for attempt in range(self.cfg.RETRY_MAX + 1):
+            try:
+                resp = await client.get(
+                    f"{self.cfg.CLOB_API_URL}/book",
+                    params={"token_id": token_id},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                break
+            except Exception as e:
+                if attempt < self.cfg.RETRY_MAX:
+                    await asyncio.sleep(self.cfg.RETRY_BACKOFF_BASE * (2 ** attempt))
+                else:
+                    return None
+        else:
+            return None
+
+        bids = [BookLevel(float(b["price"]), float(b["size"]))
+                for b in data.get("bids", [])]
+        asks = [BookLevel(float(a["price"]), float(a["size"]))
+                for a in data.get("asks", [])]
+        bids.sort(key=lambda x: x.price, reverse=True)
+        asks.sort(key=lambda x: x.price)
+
+        best_bid = bids[0].price if bids else 0.0
+        best_ask = asks[0].price if asks else 1.0
+        bid_size = bids[0].size if bids else 0.0
+        ask_size = asks[0].size if asks else 0.0
+        mid = (best_bid + best_ask) / 2 if bids and asks else 0.5
+        spread = best_ask - best_bid if bids and asks else 1.0
+
+        return BookSnapshot(
+            bids=bids, asks=asks,
+            best_bid=best_bid, best_ask=best_ask,
+            bid_size=bid_size, ask_size=ask_size,
+            mid=mid, spread=spread,
+            ts=time.time(),
+        )
+
+    async def async_get_markets(self, tag_id: int = 21,
+                                active_only: bool = True) -> List[dict]:
+        """Fetch markets from Gamma API using the shared async client."""
+        from http_client import get_client
+        client = get_client()
+
+        params: dict = {
+            "tag_id": tag_id,
+            "closed": "false",
+            "limit": 200,
+            "order": "volume24hr",
+            "ascending": "false",
+        }
+        if active_only:
+            params["active"] = "true"
+
+        for attempt in range(self.cfg.RETRY_MAX + 1):
+            try:
+                resp = await client.get(
+                    f"{self.cfg.GAMMA_API_URL}/markets",
+                    params=params,
+                    timeout=10.0,
+                )
+                resp.raise_for_status()
+                return resp.json()
+            except Exception as e:
+                if attempt < self.cfg.RETRY_MAX:
+                    await asyncio.sleep(self.cfg.RETRY_BACKOFF_BASE * (2 ** attempt))
+                else:
+                    self.log.api_error(
+                        fn="async_get_markets", attempt=attempt + 1,
+                        error=str(e), exhausted=True,
+                    )
+                    raise
+        return []
+
+    async def async_search_markets_by_slug_prefix(
+        self,
+        slug_prefix: str,
+        now_utc: "datetime | None" = None,
+        *,
+        active_only: bool = True,
+        max_pages: int = 5,
+        page_size: int = 100,
+    ) -> Tuple[List[dict], dict]:
+        """Async version of search_markets_by_slug_prefix using httpx."""
+        from datetime import datetime, timedelta, timezone
+        from http_client import get_client
+
+        client = get_client()
+        if now_utc is None:
+            now_utc = datetime.now(timezone.utc)
+
+        diag: dict = {
+            "slug_prefix": slug_prefix,
+            "strategy": "",
+            "endpoint": f"{self.cfg.GAMMA_API_URL}/markets",
+            "params": {},
+            "pages_fetched": 0,
+            "total_fetched": 0,
+            "prefix_matched": 0,
+            "all_slugs": [],
+        }
+
+        async def _page_through(base_params: dict) -> Tuple[List[dict], List[str]]:
+            matched: List[dict] = []
+            all_slugs: List[str] = []
+            for page in range(max_pages):
+                params = dict(base_params)
+                params["offset"] = page * page_size
+                for attempt in range(self.cfg.RETRY_MAX + 1):
+                    try:
+                        resp = await client.get(
+                            f"{self.cfg.GAMMA_API_URL}/markets",
+                            params=params,
+                            timeout=10.0,
+                        )
+                        resp.raise_for_status()
+                        batch = resp.json()
+                        break
+                    except Exception:
+                        if attempt < self.cfg.RETRY_MAX:
+                            await asyncio.sleep(
+                                self.cfg.RETRY_BACKOFF_BASE * (2 ** attempt))
+                        else:
+                            batch = []
+                if not isinstance(batch, list):
+                    batch = []
+                diag["pages_fetched"] += 1
+                diag["total_fetched"] += len(batch)
+                for m in batch:
+                    slug = m.get("slug", "") or ""
+                    all_slugs.append(slug)
+                    if slug.startswith(slug_prefix):
+                        matched.append(m)
+                if len(batch) < page_size:
+                    break
+            return matched, all_slugs
+
+        # Strategy 1: time-window
+        end_min = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+        end_max = (now_utc + timedelta(minutes=65)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        narrow_params = {
+            "tag_id": 21, "closed": "false", "limit": page_size,
+            "end_date_min": end_min, "end_date_max": end_max,
+        }
+        if active_only:
+            narrow_params["active"] = "true"
+        diag["strategy"] = "time_window"
+        diag["params"] = dict(narrow_params)
+
+        matched, all_slugs = await _page_through(narrow_params)
+        diag["all_slugs"] = all_slugs
+        diag["prefix_matched"] = len(matched)
+        if matched:
+            return matched, diag
+
+        # Strategy 2: broad fallback
+        diag["strategy"] = "broad_fallback"
+        diag["pages_fetched"] = 0
+        diag["total_fetched"] = 0
+        broad_params = {"tag_id": 21, "closed": "false", "limit": page_size}
+        if active_only:
+            broad_params["active"] = "true"
+        diag["params"] = dict(broad_params)
+
+        matched, all_slugs = await _page_through(broad_params)
+        diag["all_slugs"] = all_slugs
+        diag["prefix_matched"] = len(matched)
+        return matched, diag
+
+    async def async_get_balances(self) -> Dict[str, float]:
+        """Async version of get_balances using httpx."""
+        if self.cfg.MODE == "DRY_RUN":
+            return {}
+        from http_client import get_client
+        client = get_client()
+        try:
+            resp = await client.get(
+                f"{self.cfg.CLOB_API_URL}/balances",
+                headers=self._auth_headers(),
+                timeout=10.0,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return {item["asset_id"]: float(item["balance"])
+                    for item in data if float(item.get("balance", 0)) > 0}
+        except Exception as e:
+            self.log.api_error(fn="async_get_balances", error=str(e))
+            return {}

@@ -68,16 +68,18 @@ class FeatureEngine:
     """Computes features for all active slugs. Called each loop iteration."""
 
     def __init__(self, state: StateManager, api: PolymarketAPI,
-                 binance: BinanceAPI, universe: MarketUniverse):
+                 binance: BinanceAPI, universe: MarketUniverse,
+                 book_max_stale_ms: int = 5000):
         self._state = state
         self._api = api
         self._binance = binance
         self._universe = universe
 
         # Cache: token_id -> last BookSnapshot
+        # Populated by background_tasks.poll_orderbooks(); read-only in tick.
         self._book_cache: Dict[str, BookSnapshot] = {}
         self._book_cache_ts: Dict[str, float] = {}
-        self._book_cache_ttl = 0.5  # 500ms
+        self._book_max_stale_sec = book_max_stale_ms / 1000.0
 
         # Last computed features (for analytics lookups)
         self._last_features: Dict[str, "SlugFeatures"] = {}
@@ -140,15 +142,18 @@ class FeatureEngine:
         return tf
 
     def _get_book_cached(self, token_id: str, now: float) -> BookSnapshot | None:
-        """Get orderbook with TTL cache."""
-        cached_ts = self._book_cache_ts.get(token_id, 0)
-        if now - cached_ts < self._book_cache_ttl:
-            return self._book_cache.get(token_id)
+        """Read order-book from cache.  Background tasks keep it warm.
 
-        book = self._api.get_orderbook(token_id)
-        if book is not None:
-            self._book_cache[token_id] = book
-            self._book_cache_ts[token_id] = now
+        No HTTP calls happen here — the decision loop must never block on
+        network I/O.  If the cached data is older than _book_max_stale_sec
+        it is treated as missing so the strategy skips the token.
+        """
+        book = self._book_cache.get(token_id)
+        if book is None:
+            return None
+        age = now - self._book_cache_ts.get(token_id, 0)
+        if age > self._book_max_stale_sec:
+            return None  # too stale — refuse
         return book
 
     def _spread_percentile(self, token_id: str, current_spread: float,

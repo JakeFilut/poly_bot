@@ -94,7 +94,10 @@ class StrategyEngine:
 
         # -- Subsystems --
         self.universe = MarketUniverse(cfg, self.pm_api, log)
-        self.features = FeatureEngine(self.state, self.pm_api, self.binance, self.universe)
+        self.features = FeatureEngine(
+            self.state, self.pm_api, self.binance, self.universe,
+            book_max_stale_ms=cfg.BOOK_MAX_STALE_MS,
+        )
         self.risk = RiskManager(cfg, self.state, log)
         self.strategy = Strategy(cfg, self.state, log)
         self.execution = ExecutionEngine(cfg, self.pm_api, self.state, log)
@@ -143,27 +146,25 @@ class StrategyEngine:
     # Startup
     # ------------------------------------------------------------------
     def startup_sync(self) -> None:
-        """Sync state with exchange on startup."""
+        """Sync state with exchange on startup.
+
+        NOTE: Universe refresh and Binance price fetch are now handled
+        by the async warmup in background_tasks.py.  This method only
+        does the parts that must be synchronous (LIVE reconciliation,
+        cash estimate, hourly baselines).
+        """
         self.log.info("strategy_engine_startup_sync_begin")
 
-        # 1. Refresh universe
-        self.universe.refresh()
+        # 1. Universe + Binance: populated by async warmup before this runs
 
-        # 2. Binance prices
-        prices = self.binance.refresh_all()
-        self.log.info("binance_prices_loaded", prices=prices)
-
-        # 3. LIVE mode: reconcile open orders
+        # 2. LIVE mode: reconcile open orders
         if self.cfg.MODE == "LIVE":
             self._sync_live_state()
 
-        # 4. Cash estimate
-        if self.cfg.MODE == "DRY_RUN":
-            self.risk.update_cash(self.cfg.MAX_TOTAL_EXPOSURE_USD * 2)
-        else:
-            self.risk.update_cash(self.cfg.MAX_TOTAL_EXPOSURE_USD * 2)
+        # 3. Cash estimate
+        self.risk.update_cash(self.cfg.MAX_TOTAL_EXPOSURE_USD * 2)
 
-        # Initialize hourly PnL baselines
+        # 4. Initialize hourly PnL baselines
         self._hourly_unrealized_start = self._estimate_unrealized_conservative()
         self._hourly_realized_start = self.state.realized_pnl
 
@@ -194,36 +195,19 @@ class StrategyEngine:
     # Tick (one iteration of the trading loop)
     # ------------------------------------------------------------------
     def tick(self, loop_count: int) -> None:
-        """One iteration of the strategy + execution loop."""
-        # 1. Refresh universe: forced rollover at hour boundary OR periodic
-        now_utc = datetime.now(timezone.utc)
-        rollover = self.universe.needs_rollover(now_utc)
-        if rollover or self.universe.needs_refresh():
-            if rollover:
-                self.log.info(
-                    "universe_rollover_triggered",
-                    now_utc=now_utc.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
-                    earliest_end=self.universe.earliest_end_utc().strftime(
-                        "%Y-%m-%dT%H:%M:%SZ") if self.universe.earliest_end_utc() else "?",
-                    active_slugs=self.universe.active_slugs(),
-                )
-            self.universe.refresh()
-            removed_tids = self.universe.get_removed_token_ids()
-            if removed_tids:
-                self._purge_stale_caches(removed_tids)
+        """One iteration of the strategy + execution loop.
 
-        # 2. Binance price update
-        self.binance.refresh_all()
+        NO NETWORK I/O happens here.  Background tasks keep the caches
+        warm (order-books, Binance prices, universe, fills).  This tick
+        only reads in-memory snapshots, runs the strategy, and executes.
+        """
+        # 1. Universe refresh + Binance refresh + fill sync:
+        #    ALL handled by background_tasks.py — nothing to do here.
 
-        # 3. Compute features for all active slugs
+        # 2. Compute features for all active slugs (CPU only — reads cache)
         all_features = self.features.compute_all()
 
-        # 4. Sync fills (LIVE mode)
-        fill_count = self.execution.sync_fills()
-        if fill_count > 0:
-            self.log.info("fills_synced", count=fill_count)
-
-        # 4b. LIVE risk guard
+        # 3. LIVE risk guard (CPU only)
         if self.live_risk is not None:
             unreal_for_risk = self._estimate_unrealized()
             self.live_risk.update_equity(
@@ -241,14 +225,14 @@ class StrategyEngine:
                         )
                 return
 
-        # 5. Strategy → actions
+        # 4. Strategy → actions (CPU only)
         actions = self.strategy.generate_actions(
             all_features=all_features,
             risk_allows_buy=self.risk.allows_buy,
             risk_allows_sell=self.risk.allows_sell,
         )
 
-        # 6. Execute
+        # 5. Execute (DRY_RUN: instant mock; LIVE: HTTP via py-clob-client)
         if actions:
             from strategy import cadence_weight, _seconds_from_quarter
             now_utc = datetime.now(timezone.utc)
@@ -259,7 +243,7 @@ class StrategyEngine:
             }
             self.execution.execute_actions(actions)
 
-        # 7. Cash estimate
+        # 6. Cash estimate (CPU only)
         if self.cfg.MODE == "DRY_RUN":
             exposure = self.state.total_exposure_usd()
             self.risk.update_cash(
