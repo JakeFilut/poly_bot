@@ -78,6 +78,8 @@ class ComparisonResult:
     wallet_trades_missed: int
     bot_false_entries: int
     similarity_score: float
+    entry_lag_median: float = 0.0   # median (bot_ts - wallet_ts) for matched trades
+    entry_lag_p90: float = 0.0      # p90 entry lag
 
 
 @dataclass
@@ -325,15 +327,55 @@ class Strategy:
         )
 
 
+COOLDOWN_SECONDS = 20  # suppress duplicate bot entries per market
+
+
 def run_replay(states: List[MarketState], params: StrategyParams) -> List[BotDecision]:
-    """Run the strategy over all market states and return decisions."""
+    """Run the strategy over all market states and return decisions.
+
+    Applies a per-market cooldown: after the bot triggers an entry for a
+    (slug, outcome) pair, further entries for that pair are suppressed for
+    COOLDOWN_SECONDS to prevent overfitting during parameter sweeps.
+    """
     strategy = Strategy(params)
-    return [strategy.evaluate_market_state(s) for s in states]
+    last_entry_ts: Dict[Tuple[str, str], float] = {}  # (slug, outcome) -> epoch
+    decisions: List[BotDecision] = []
+
+    for ms in states:
+        decision = strategy.evaluate_market_state(ms)
+
+        if decision.action in ("BUY", "SELL"):
+            key = (ms.slug, ms.outcome)
+            prev = last_entry_ts.get(key, 0.0)
+            if ms.timestamp - prev < COOLDOWN_SECONDS:
+                decision = Strategy._no_action(ms, "cooldown_active")
+            else:
+                last_entry_ts[key] = ms.timestamp
+
+        decisions.append(decision)
+
+    return decisions
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # SECTION 3 -- WALLET COMPARISON
 # ═══════════════════════════════════════════════════════════════════════════
+
+def _resolve_wallet_side(row: pd.Series) -> str:
+    """Normalise wallet trade side to BUY / SELL."""
+    for col in ("side", "action", "direction"):
+        if col in row.index and pd.notna(row[col]):
+            return str(row[col]).strip().upper()
+    return ""
+
+
+def _resolve_wallet_asset(row: pd.Series) -> str:
+    """Normalise wallet trade asset."""
+    for col in ("crypto", "asset"):
+        if col in row.index and pd.notna(row[col]):
+            return str(row[col]).strip().upper()
+    return ""
+
 
 def compare_to_wallet(
     decisions: List[BotDecision],
@@ -342,47 +384,95 @@ def compare_to_wallet(
 ) -> ComparisonResult:
     """Compare bot decisions against wallet trades.
 
-    A wallet trade is 'matched' if the bot produced a BUY or SELL within
-    +/- tolerance_sec of the wallet trade timestamp.
+    Matching requires:
+      1. Timestamp within +/- tolerance_sec
+      2. Same trade direction (BUY == BUY, SELL == SELL)
+      3. Same asset (BTC == BTC, etc.)
+
+    Also computes entry_lag_seconds = bot_ts - wallet_ts for every match.
     """
     if wallet_trades.empty or not decisions:
         return ComparisonResult(0, 0, 0, 0, 0.0)
-
-    # Collect timestamps where bot triggered an entry
-    bot_entry_ts = np.array(
-        sorted(d.timestamp for d in decisions if d.action in ("BUY", "SELL"))
-    )
 
     wt = wallet_trades.copy()
     if "ts" not in wt.columns:
         return ComparisonResult(0, 0, 0, 0, 0.0)
 
-    wallet_ts = wt["ts"].dropna().sort_values().values
-    total = len(wallet_ts)
-    matched = 0
+    # --- Build bot entry index keyed by (asset, side) ---
+    # Each value is a sorted array of timestamps for that group.
+    bot_entries_by_key: Dict[Tuple[str, str], List[float]] = defaultdict(list)
+    for d in decisions:
+        if d.action in ("BUY", "SELL"):
+            key = (d.asset.upper(), d.action)
+            bot_entries_by_key[key].append(d.timestamp)
 
-    for wts in wallet_ts:
-        if len(bot_entry_ts) == 0:
-            break
-        # Check if any bot entry falls within the tolerance window
-        idx = np.searchsorted(bot_entry_ts, wts)
-        found = False
-        for i in range(max(0, idx - 1), min(len(bot_entry_ts), idx + 2)):
-            if abs(bot_entry_ts[i] - wts) <= tolerance_sec:
-                found = True
-                break
-        if found:
+    bot_arrays: Dict[Tuple[str, str], np.ndarray] = {
+        k: np.array(sorted(v)) for k, v in bot_entries_by_key.items()
+    }
+
+    # --- Walk wallet trades and attempt matching ---
+    total = 0
+    matched = 0
+    entry_lags: List[float] = []
+
+    for _, row in wt.iterrows():
+        wts = row.get("ts")
+        if pd.isna(wts):
+            continue
+
+        w_side = _resolve_wallet_side(row)
+        w_asset = _resolve_wallet_asset(row)
+        if not w_side:
+            continue
+
+        total += 1
+        key = (w_asset, w_side)
+        arr = bot_arrays.get(key)
+        if arr is None or len(arr) == 0:
+            continue
+
+        idx = np.searchsorted(arr, wts)
+        best_lag = None
+        for i in range(max(0, idx - 1), min(len(arr), idx + 2)):
+            lag = arr[i] - wts
+            if abs(lag) <= tolerance_sec:
+                if best_lag is None or abs(lag) < abs(best_lag):
+                    best_lag = lag
+        if best_lag is not None:
             matched += 1
+            entry_lags.append(best_lag)
 
     missed = total - matched
 
-    # False entries: bot entries that don't match any wallet trade
+    # --- False entries: bot entries with no matching wallet trade ---
+    # Build wallet index keyed by (asset, side) for reverse lookup.
+    wallet_by_key: Dict[Tuple[str, str], np.ndarray] = defaultdict(list)
+    for _, row in wt.iterrows():
+        wts = row.get("ts")
+        if pd.isna(wts):
+            continue
+        w_side = _resolve_wallet_side(row)
+        w_asset = _resolve_wallet_asset(row)
+        if w_side:
+            wallet_by_key[(w_asset, w_side)].append(float(wts))
+
+    wallet_arrays: Dict[Tuple[str, str], np.ndarray] = {
+        k: np.array(sorted(v)) for k, v in wallet_by_key.items()
+    }
+
     bot_false = 0
-    for bt in bot_entry_ts:
-        idx = np.searchsorted(wallet_ts, bt)
+    for d in decisions:
+        if d.action not in ("BUY", "SELL"):
+            continue
+        key = (d.asset.upper(), d.action)
+        warr = wallet_arrays.get(key)
+        if warr is None or len(warr) == 0:
+            bot_false += 1
+            continue
+        idx = np.searchsorted(warr, d.timestamp)
         found = False
-        for i in range(max(0, idx - 1), min(len(wallet_ts), idx + 2)):
-            if abs(wallet_ts[i] - bt) <= tolerance_sec:
+        for i in range(max(0, idx - 1), min(len(warr), idx + 2)):
+            if abs(warr[i] - d.timestamp) <= tolerance_sec:
                 found = True
                 break
         if not found:
@@ -390,12 +480,18 @@ def compare_to_wallet(
 
     similarity = matched / total if total > 0 else 0.0
 
+    # --- Latency stats ---
+    lag_median = float(np.median(entry_lags)) if entry_lags else 0.0
+    lag_p90 = float(np.percentile(entry_lags, 90)) if entry_lags else 0.0
+
     return ComparisonResult(
         wallet_trades_total=total,
         wallet_trades_matched=matched,
         wallet_trades_missed=missed,
         bot_false_entries=bot_false,
         similarity_score=similarity,
+        entry_lag_median=lag_median,
+        entry_lag_p90=lag_p90,
     )
 
 
@@ -486,6 +582,8 @@ def parameter_sweep(
         entry["matched"] = cr.wallet_trades_matched
         entry["missed"] = cr.wallet_trades_missed
         entry["false_entries"] = cr.bot_false_entries
+        entry["lag_median"] = round(cr.entry_lag_median, 3)
+        entry["lag_p90"] = round(cr.entry_lag_p90, 3)
         results.append(entry)
 
         if (idx + 1) % max(1, total // 10) == 0:
@@ -514,6 +612,9 @@ def print_report(
     print(f"  Wallet trades missed:  {comparison.wallet_trades_missed}")
     print(f"  Bot false entries:     {comparison.bot_false_entries}")
     print(f"  Similarity score:      {comparison.similarity_score:.4f}")
+    print(f"\n  Entry lag (bot - wallet):")
+    print(f"    median:  {comparison.entry_lag_median:+.3f}s")
+    print(f"    p90:     {comparison.entry_lag_p90:+.3f}s")
 
     if not signal_dist.empty:
         print(f"\n{'─' * 70}")
@@ -661,6 +762,7 @@ def main() -> None:
     print("\n[4/6] Comparing to wallet trades ...")
     comparison = compare_to_wallet(decisions, engine.wallet_trades, args.tolerance)
     print(f"  Similarity score: {comparison.similarity_score:.4f}")
+    print(f"  Entry lag median: {comparison.entry_lag_median:+.3f}s  |  p90: {comparison.entry_lag_p90:+.3f}s")
 
     # --- Step 5: Signal distribution analysis ---
     print("\n[5/6] Analyzing signal distributions at wallet entry ...")
