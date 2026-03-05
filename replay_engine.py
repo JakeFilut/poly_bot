@@ -19,6 +19,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import re
+
 import numpy as np
 import pandas as pd
 
@@ -36,6 +38,26 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════════════════════
 # SECTION 1 -- DATA STRUCTURES
 # ═══════════════════════════════════════════════════════════════════════════
+
+_SLUG_ASSET_PATTERNS = [
+    (re.compile(r"\bbitcoin\b", re.I), "BTC"),
+    (re.compile(r"\bethereum\b", re.I), "ETH"),
+    (re.compile(r"\bsolana\b", re.I), "SOL"),
+    (re.compile(r"\bxrp\b", re.I), "XRP"),
+]
+
+
+def asset_from_slug(slug: str) -> str:
+    """Derive crypto asset ticker from a Polymarket slug string.
+
+    E.g. 'bitcoin-up-or-down-...' -> 'BTC', 'xrp-up-or-down-...' -> 'XRP'.
+    Returns '' if no known asset is found.
+    """
+    for pat, ticker in _SLUG_ASSET_PATTERNS:
+        if pat.search(slug):
+            return ticker
+    return ""
+
 
 @dataclass
 class MarketState:
@@ -227,7 +249,11 @@ class MarketReplayEngine:
             slug = str(row.get("slug", ""))
             outcome = str(row.get("outcome", ""))
             token_id = str(row.get("token_id", ""))
-            asset = str(row.get(asset_col, "BTC")) if asset_col else "BTC"
+            # Always derive asset from slug to avoid wrong-asset bugs
+            asset = asset_from_slug(slug)
+            if not asset:
+                # Fallback to CSV column only if slug doesn't contain a known asset
+                asset = str(row.get(asset_col, "BTC")) if asset_col else "BTC"
 
             best_bid = float(row.get("bestBid", 0))
             best_ask = float(row.get("bestAsk", 0))
@@ -364,6 +390,181 @@ def run_replay(states: List[MarketState], params: StrategyParams) -> List[BotDec
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# SECTION 2b -- BOT ENTRY DIAGNOSTICS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def diagnose_no_entries(
+    states: List[MarketState],
+    wallet_trades: pd.DataFrame,
+    params: StrategyParams,
+    tolerance_sec: float = 10.0,
+) -> None:
+    """Explain WHY the bot produced no/few entries.
+
+    Prints:
+      - Snapshot counts per asset
+      - Gate failure breakdown (which gate blocked the most)
+      - First 20 wallet trades' market conditions at trade time + which gate fails
+    """
+    print(f"\n  {'═' * 70}")
+    print("  BOT ENTRY DIAGNOSTICS -- Why did the bot produce no entries?")
+    print(f"  {'═' * 70}")
+
+    # --- 1) Snapshot counts per asset ---
+    asset_counts: Dict[str, int] = defaultdict(int)
+    for ms in states:
+        asset_counts[ms.asset] += 1
+    print(f"\n  Snapshots per asset:")
+    for asset in sorted(asset_counts):
+        print(f"    {asset:>4}: {asset_counts[asset]:>8,}")
+    print(f"    {'TOTAL':>4}: {len(states):>8,}")
+
+    # --- 2) Gate failure breakdown across ALL snapshots ---
+    gate_fail_counts: Dict[str, int] = defaultdict(int)
+    gate_pass_count = 0
+    for ms in states:
+        if ms.spread_cents < params.entry_min_spread_cents:
+            gate_fail_counts["spread_cents_gate"] += 1
+            continue
+        if ms.spread_percentile < params.entry_min_spread_pctl:
+            gate_fail_counts["spread_pctl_gate"] += 1
+            continue
+        if abs(ms.binance_ret_30s) < params.entry_min_ret_30s:
+            gate_fail_counts["ret_30s_gate"] += 1
+            continue
+        if ms.orderbook_imbalance < params.entry_min_imbalance:
+            gate_fail_counts["imbalance_gate"] += 1
+            continue
+        gate_pass_count += 1
+
+    print(f"\n  Gate failure breakdown (sequential, first-fail):")
+    print(f"    {'Gate':<25} {'Blocked':>10}  {'Pct':>7}")
+    total_snap = len(states)
+    for gate in ["spread_cents_gate", "spread_pctl_gate", "ret_30s_gate", "imbalance_gate"]:
+        cnt = gate_fail_counts.get(gate, 0)
+        pct = 100.0 * cnt / total_snap if total_snap else 0
+        print(f"    {gate:<25} {cnt:>10,}  {pct:>6.1f}%")
+    pct_pass = 100.0 * gate_pass_count / total_snap if total_snap else 0
+    print(f"    {'ALL_GATES_PASSED':<25} {gate_pass_count:>10,}  {pct_pass:>6.1f}%")
+
+    # --- 2b) Gate failures per asset ---
+    asset_gate_fails: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    asset_gate_pass: Dict[str, int] = defaultdict(int)
+    for ms in states:
+        a = ms.asset
+        if ms.spread_cents < params.entry_min_spread_cents:
+            asset_gate_fails[a]["spread_cents_gate"] += 1
+            continue
+        if ms.spread_percentile < params.entry_min_spread_pctl:
+            asset_gate_fails[a]["spread_pctl_gate"] += 1
+            continue
+        if abs(ms.binance_ret_30s) < params.entry_min_ret_30s:
+            asset_gate_fails[a]["ret_30s_gate"] += 1
+            continue
+        if ms.orderbook_imbalance < params.entry_min_imbalance:
+            asset_gate_fails[a]["imbalance_gate"] += 1
+            continue
+        asset_gate_pass[a] += 1
+
+    print(f"\n  Gate failures per asset:")
+    for asset in sorted(set(list(asset_gate_fails.keys()) + list(asset_gate_pass.keys()))):
+        total_a = asset_counts.get(asset, 0)
+        passed = asset_gate_pass.get(asset, 0)
+        print(f"    {asset}: total={total_a}, passed={passed}", end="")
+        fails = asset_gate_fails.get(asset, {})
+        if fails:
+            parts = [f"{g}={c}" for g, c in sorted(fails.items(), key=lambda x: -x[1])]
+            print(f", blocked: {', '.join(parts)}")
+        else:
+            print()
+
+    # --- 3) Current param thresholds vs units ---
+    print(f"\n  Current strategy thresholds:")
+    print(f"    entry_min_spread_cents  = {params.entry_min_spread_cents}  (cents)")
+    print(f"    entry_min_spread_pctl   = {params.entry_min_spread_pctl}  (0-1 fractional)")
+    print(f"    entry_min_ret_30s       = {params.entry_min_ret_30s}  (decimal, 0.001 = 0.1%)")
+    print(f"    entry_min_imbalance     = {params.entry_min_imbalance}  (0-1 fractional)")
+
+    # --- 3b) Verify units: check if ret_30s values look like percent vs decimal ---
+    ret_vals = [abs(ms.binance_ret_30s) for ms in states if ms.binance_ret_30s != 0.0]
+    if ret_vals:
+        med_ret = float(np.median(ret_vals))
+        max_ret = float(np.max(ret_vals))
+        print(f"\n  binance_ret_30s unit check:")
+        print(f"    median(|ret_30s|) = {med_ret:.6f}")
+        print(f"    max(|ret_30s|)    = {max_ret:.6f}")
+        if med_ret > 0.1:
+            print(f"    WARNING: median > 0.1 suggests PERCENT units, but thresholds are DECIMAL.")
+            print(f"    If data is in percent, divide by 100 or multiply thresholds by 100.")
+        else:
+            print(f"    OK: values look like decimal (0.001 = 0.1%). Thresholds are consistent.")
+
+    # --- 4) First 20 wallet trades: show conditions + which gate fails ---
+    if wallet_trades.empty or "ts" not in wallet_trades.columns:
+        print(f"\n  No wallet trades to analyze.")
+        return
+
+    wt = wallet_trades.sort_values("ts").head(20)
+    # Build a time-sorted index of states for quick lookup
+    state_ts = np.array([ms.timestamp for ms in states])
+    state_by_idx = states
+
+    print(f"\n  First {len(wt)} wallet trades -- market conditions & gate analysis:")
+    print(f"  {'─' * 100}")
+    print(f"  {'#':>3} {'Asset':>5} {'Side':>4} {'spread_c':>9} {'spd_pctl':>9} "
+          f"{'|ret_30s|':>10} {'imbal':>7} {'Gate Result':<30}")
+    print(f"  {'─' * 100}")
+
+    for i, (_, row) in enumerate(wt.iterrows()):
+        wts = row.get("ts")
+        if pd.isna(wts):
+            continue
+        w_side = _resolve_wallet_side(row)
+        w_slug = _resolve_wallet_slug(row)
+        w_asset = _resolve_wallet_asset(row)
+
+        # Find nearest market state snapshot
+        idx = np.searchsorted(state_ts, float(wts))
+        best_ms = None
+        best_dt = float("inf")
+        for si in range(max(0, idx - 5), min(len(states), idx + 5)):
+            dt = abs(state_ts[si] - float(wts))
+            # Also require same slug for relevance
+            if dt < best_dt and states[si].slug.casefold() == w_slug:
+                best_dt = dt
+                best_ms = states[si]
+
+        if best_ms is None:
+            # Try without slug filter
+            for si in range(max(0, idx - 5), min(len(states), idx + 5)):
+                dt = abs(state_ts[si] - float(wts))
+                if dt < best_dt:
+                    best_dt = dt
+                    best_ms = states[si]
+
+        if best_ms is None or best_dt > tolerance_sec:
+            print(f"  {i+1:>3} {w_asset:>5} {w_side:>4}   (no snapshot within {tolerance_sec}s)")
+            continue
+
+        ms = best_ms
+        abs_ret = abs(ms.binance_ret_30s)
+
+        # Determine which gate fails
+        gate_result = "PASS"
+        if ms.spread_cents < params.entry_min_spread_cents:
+            gate_result = f"FAIL: spread_cents ({ms.spread_cents:.1f} < {params.entry_min_spread_cents})"
+        elif ms.spread_percentile < params.entry_min_spread_pctl:
+            gate_result = f"FAIL: spread_pctl ({ms.spread_percentile:.3f} < {params.entry_min_spread_pctl})"
+        elif abs_ret < params.entry_min_ret_30s:
+            gate_result = f"FAIL: ret_30s ({abs_ret:.6f} < {params.entry_min_ret_30s})"
+        elif ms.orderbook_imbalance < params.entry_min_imbalance:
+            gate_result = f"FAIL: imbalance ({ms.orderbook_imbalance:.3f} < {params.entry_min_imbalance})"
+
+        print(f"  {i+1:>3} {w_asset:>5} {w_side:>4} {ms.spread_cents:>9.1f} {ms.spread_percentile:>9.3f} "
+              f"{abs_ret:>10.6f} {ms.orderbook_imbalance:>7.3f} {gate_result}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # SECTION 3 -- WALLET COMPARISON
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -392,7 +593,13 @@ def _resolve_wallet_side(row: pd.Series) -> str:
 
 
 def _resolve_wallet_asset(row: pd.Series) -> str:
-    """Normalise wallet trade asset."""
+    """Normalise wallet trade asset, preferring slug-derived asset."""
+    # Prefer deriving asset from slug to stay consistent with bot keys
+    slug = str(row.get("slug", "")) if "slug" in row.index else ""
+    if slug:
+        derived = asset_from_slug(slug)
+        if derived:
+            return derived
     for col in ("crypto", "asset"):
         if col in row.index and pd.notna(row[col]):
             return str(row[col]).strip().upper()
@@ -417,9 +624,13 @@ def _resolve_wallet_outcome(row: pd.Series) -> str:
 
 def _make_decision_key(d) -> tuple:
     """Build normalised matching key from a BotDecision."""
+    slug_norm = d.slug.strip().casefold()
+    # Always derive asset from slug to stay consistent with wallet keys
+    derived_asset = asset_from_slug(slug_norm)
+    asset = derived_asset if derived_asset else d.asset.strip().upper()
     return (
-        d.asset.strip().upper(),
-        d.slug.strip().casefold(),
+        asset,
+        slug_norm,
         _normalize_outcome(d.outcome),
         d.action.strip().upper(),
     )
@@ -878,6 +1089,36 @@ def print_report(
         top = sweep_results.head(10)
         print(top.to_string(index=False))
 
+    # --- Summary: baseline vs best sweep ---
+    print(f"\n{'═' * 70}")
+    print("  FINAL SUMMARY")
+    print(f"{'═' * 70}")
+    print(f"\n  BASELINE (default params):")
+    print(f"    similarity  = {comparison.similarity_score:.4f}")
+    print(f"    matched     = {comparison.wallet_trades_matched}")
+    print(f"    missed      = {comparison.wallet_trades_missed}")
+    print(f"    false       = {comparison.bot_false_entries}")
+    if not np.isnan(comparison.entry_lag_median):
+        print(f"    lag median  = {comparison.entry_lag_median * 1000:+.1f}ms")
+
+    if sweep_results is not None and not sweep_results.empty:
+        best = sweep_results.iloc[0]
+        print(f"\n  BEST SWEEP:")
+        print(f"    similarity  = {best['similarity']:.4f}")
+        print(f"    matched     = {int(best['matched'])}")
+        print(f"    missed      = {int(best['missed'])}")
+        print(f"    false       = {int(best['false_entries'])}")
+        # Print the parameter values
+        param_cols = [c for c in sweep_results.columns
+                      if c not in ("similarity", "matched", "missed", "false_entries",
+                                   "lag_median_ms", "lag_p90_ms")]
+        params_str = ", ".join(f"{c}={best[c]}" for c in param_cols)
+        print(f"    params      = {params_str}")
+        if best.get("lag_median_ms") != "N/A":
+            print(f"    lag median  = {best['lag_median_ms']}ms")
+    else:
+        print(f"\n  BEST SWEEP: (not run -- use --optimize)")
+
     print("\n" + "=" * 70)
 
 
@@ -1018,6 +1259,10 @@ def main() -> None:
     decisions = run_replay(states, default_params)
     entry_count = sum(1 for d in decisions if d.action in ("BUY", "SELL"))
     print(f"  Total decisions: {len(decisions):,}  |  Entries: {entry_count:,}")
+
+    # --- Step 3b: Diagnose why bot may produce no entries ---
+    print("\n[3b/6] Diagnosing bot entry gate failures ...")
+    diagnose_no_entries(states, engine.wallet_trades, default_params, tolerance_sec=args.tolerance_sec)
 
     # --- Step 4: Compare to wallet trades ---
     print("\n[4/6] Comparing to wallet trades ...")
