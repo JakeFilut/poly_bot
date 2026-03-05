@@ -78,8 +78,8 @@ class ComparisonResult:
     wallet_trades_missed: int
     bot_false_entries: int
     similarity_score: float
-    entry_lag_median: float = 0.0   # median (bot_ts - wallet_ts) for matched trades
-    entry_lag_p90: float = 0.0      # p90 entry lag
+    entry_lag_median: float = float("nan")  # median (bot_ts - wallet_ts) for matched trades
+    entry_lag_p90: float = float("nan")    # p90 entry lag
 
 
 @dataclass
@@ -391,10 +391,23 @@ def _resolve_wallet_slug(row: pd.Series) -> str:
     return ""
 
 
+def _nearest_ts(arr: np.ndarray, target: float) -> Optional[float]:
+    """Return the nearest timestamp in arr to target, or None if arr is empty."""
+    if len(arr) == 0:
+        return None
+    idx = np.searchsorted(arr, target)
+    best = None
+    for i in range(max(0, idx - 1), min(len(arr), idx + 2)):
+        if best is None or abs(arr[i] - target) < abs(best - target):
+            best = float(arr[i])
+    return best
+
+
 def compare_to_wallet(
     decisions: List[BotDecision],
     wallet_trades: pd.DataFrame,
     tolerance_sec: float = 3.0,
+    debug: bool = False,
 ) -> ComparisonResult:
     """Compare bot decisions against wallet trades.
 
@@ -426,10 +439,15 @@ def compare_to_wallet(
         k: np.array(sorted(v)) for k, v in bot_entries_by_key.items()
     }
 
+    # --- Build ALL bot decision timestamps for proximity check ---
+    all_bot_ts = np.array(sorted(d.timestamp for d in decisions))
+
     # --- Walk wallet trades and attempt matching ---
     total = 0
     matched = 0
     entry_lags: List[float] = []
+    mismatch_reasons: Dict[str, int] = defaultdict(int)
+    debug_examples: List[dict] = []
 
     for _, row in wt.iterrows():
         wts = row.get("ts")
@@ -445,7 +463,29 @@ def compare_to_wallet(
         total += 1
         key = (w_asset, w_slug, w_side)
         arr = bot_arrays.get(key)
+
         if arr is None or len(arr) == 0:
+            # Check if ANY bot decision exists within tolerance (ignoring side/slug)
+            if len(all_bot_ts) > 0:
+                idx_any = np.searchsorted(all_bot_ts, float(wts))
+                nearest_lag = float("inf")
+                for i in range(max(0, idx_any - 1), min(len(all_bot_ts), idx_any + 2)):
+                    lag = abs(all_bot_ts[i] - float(wts))
+                    if lag < nearest_lag:
+                        nearest_lag = lag
+                if nearest_lag <= tolerance_sec:
+                    mismatch_reasons["no_bot_entry_for_key (but bot decision within tolerance)"] += 1
+                else:
+                    mismatch_reasons[f"no_bot_entry_for_key (nearest bot decision {nearest_lag:.1f}s away)"] += 1
+            else:
+                mismatch_reasons["no_bot_entries_at_all"] += 1
+
+            if debug and len(debug_examples) < 5:
+                debug_examples.append({
+                    "wallet_ts": float(wts), "side": w_side, "asset": w_asset,
+                    "slug": w_slug, "reason": "no_bot_entry_for_key",
+                    "nearest_any_bot_ts": _nearest_ts(all_bot_ts, float(wts)),
+                })
             continue
 
         idx = np.searchsorted(arr, float(wts))
@@ -458,8 +498,48 @@ def compare_to_wallet(
         if best_lag is not None:
             matched += 1
             entry_lags.append(best_lag)
+        else:
+            # Key exists but no timestamp match
+            nearest = float("inf")
+            for i in range(max(0, idx - 1), min(len(arr), idx + 2)):
+                d_lag = abs(float(arr[i]) - float(wts))
+                if d_lag < nearest:
+                    nearest = d_lag
+            mismatch_reasons[f"key_match_but_outside_tolerance (nearest {nearest:.1f}s)"] += 1
+            if debug and len(debug_examples) < 5:
+                debug_examples.append({
+                    "wallet_ts": float(wts), "side": w_side, "asset": w_asset,
+                    "slug": w_slug, "reason": f"outside_tolerance (nearest={nearest:.1f}s)",
+                    "nearest_any_bot_ts": _nearest_ts(all_bot_ts, float(wts)),
+                })
 
     missed = total - matched
+
+    # --- Matching diagnostics ---
+    if mismatch_reasons:
+        print(f"\n  {'─' * 60}")
+        print("  MATCHING DIAGNOSTICS -- Top 10 mismatch reasons")
+        print(f"  {'─' * 60}")
+        sorted_reasons = sorted(mismatch_reasons.items(), key=lambda x: -x[1])
+        for reason, count in sorted_reasons[:10]:
+            print(f"    {count:>5}  {reason}")
+        # Count wallet trades with no bot decision within tolerance at all
+        no_nearby = sum(v for k, v in mismatch_reasons.items()
+                        if "nearest bot decision" in k and "away" in k)
+        nearby_but_wrong = sum(v for k, v in mismatch_reasons.items()
+                               if "but bot decision within tolerance" in k)
+        print(f"\n    Wallet trades with NO bot decision within {tolerance_sec}s (any key): {no_nearby}")
+        print(f"    Wallet trades with bot decision within {tolerance_sec}s but wrong key:  {nearby_but_wrong}")
+
+    if debug and debug_examples:
+        print(f"\n  {'─' * 60}")
+        print("  DEBUG -- Example unmatched wallet trades")
+        print(f"  {'─' * 60}")
+        for ex in debug_examples:
+            nearest_str = f"{ex['nearest_any_bot_ts']:.3f}" if ex['nearest_any_bot_ts'] is not None else "N/A"
+            lag_str = f"{abs(ex['nearest_any_bot_ts'] - ex['wallet_ts']):.1f}s" if ex['nearest_any_bot_ts'] is not None else "N/A"
+            print(f"    wallet_ts={ex['wallet_ts']:.3f}  {ex['side']:>4} {ex['asset']:>4} slug={ex['slug']}")
+            print(f"      reason: {ex['reason']}  |  nearest_any_bot_ts={nearest_str} ({lag_str} away)")
 
     # --- False entries: bot entries with no matching wallet trade ---
     wallet_by_key: Dict[Tuple[str, str, str], List[float]] = defaultdict(list)
@@ -498,8 +578,8 @@ def compare_to_wallet(
     similarity = matched / total if total > 0 else 0.0
 
     # --- Latency stats (ms precision) ---
-    lag_median = float(np.median(entry_lags)) if entry_lags else 0.0
-    lag_p90 = float(np.percentile(entry_lags, 90)) if entry_lags else 0.0
+    lag_median = float(np.median(entry_lags)) if entry_lags else float("nan")
+    lag_p90 = float(np.percentile(entry_lags, 90)) if entry_lags else float("nan")
 
     return ComparisonResult(
         wallet_trades_total=total,
@@ -580,9 +660,9 @@ def analyze_signal_distributions(wallet_trades: pd.DataFrame) -> pd.DataFrame:
 
 DEFAULT_SWEEP_RANGES = {
     "entry_min_spread_pctl": np.arange(0.80, 0.96, 0.02),
-    "entry_min_spread_cents": [2.0],  # keep fixed
+    "entry_min_spread_cents": [0.0, 1.0, 1.5, 2.0],
     "entry_min_ret_30s": np.arange(0.0005, 0.0035, 0.0005),
-    "entry_min_imbalance": np.arange(0.55, 0.76, 0.05),
+    "entry_min_imbalance": [0.45, 0.50, 0.55, 0.60, 0.65],
 }
 
 
@@ -614,8 +694,8 @@ def parameter_sweep(
         entry["matched"] = cr.wallet_trades_matched
         entry["missed"] = cr.wallet_trades_missed
         entry["false_entries"] = cr.bot_false_entries
-        entry["lag_median_ms"] = round(cr.entry_lag_median * 1000, 1)
-        entry["lag_p90_ms"] = round(cr.entry_lag_p90 * 1000, 1)
+        entry["lag_median_ms"] = round(cr.entry_lag_median * 1000, 1) if not np.isnan(cr.entry_lag_median) else "N/A"
+        entry["lag_p90_ms"] = round(cr.entry_lag_p90 * 1000, 1) if not np.isnan(cr.entry_lag_p90) else "N/A"
         results.append(entry)
 
         if (idx + 1) % max(1, total // 10) == 0:
@@ -645,8 +725,12 @@ def print_report(
     print(f"  Bot false entries:     {comparison.bot_false_entries}")
     print(f"  Similarity score:      {comparison.similarity_score:.4f}")
     print(f"\n  Entry lag (bot - wallet):")
-    print(f"    median:  {comparison.entry_lag_median * 1000:+.1f}ms  ({comparison.entry_lag_median:+.4f}s)")
-    print(f"    p90:     {comparison.entry_lag_p90 * 1000:+.1f}ms  ({comparison.entry_lag_p90:+.4f}s)")
+    if comparison.wallet_trades_matched == 0 or np.isnan(comparison.entry_lag_median):
+        print(f"    median:  N/A  (no matched trades)")
+        print(f"    p90:     N/A")
+    else:
+        print(f"    median:  {comparison.entry_lag_median * 1000:+.1f}ms  ({comparison.entry_lag_median:+.4f}s)")
+        print(f"    p90:     {comparison.entry_lag_p90 * 1000:+.1f}ms  ({comparison.entry_lag_p90:+.4f}s)")
 
     if not signal_dist.empty:
         print(f"\n{'─' * 70}")
@@ -774,8 +858,10 @@ def main() -> None:
                         help="Run parameter sweep optimization")
     parser.add_argument("--no-charts", action="store_true",
                         help="Skip chart generation")
-    parser.add_argument("--tolerance", type=float, default=3.0,
+    parser.add_argument("--tolerance-sec", type=float, default=3.0,
                         help="Matching tolerance in seconds (default: 3.0)")
+    parser.add_argument("--debug", action="store_true",
+                        help="Print debug examples of unmatched wallet trades")
     args = parser.parse_args()
 
     data_dir = args.data_dir or find_data_dir()
@@ -802,9 +888,12 @@ def main() -> None:
 
     # --- Step 4: Compare to wallet trades ---
     print("\n[4/6] Comparing to wallet trades ...")
-    comparison = compare_to_wallet(decisions, engine.wallet_trades, args.tolerance)
+    comparison = compare_to_wallet(decisions, engine.wallet_trades, args.tolerance_sec, debug=args.debug)
     print(f"  Similarity score: {comparison.similarity_score:.4f}")
-    print(f"  Entry lag median: {comparison.entry_lag_median * 1000:+.1f}ms  |  p90: {comparison.entry_lag_p90 * 1000:+.1f}ms")
+    if comparison.wallet_trades_matched == 0 or np.isnan(comparison.entry_lag_median):
+        print(f"  Entry lag median: N/A  |  p90: N/A  (no matched trades)")
+    else:
+        print(f"  Entry lag median: {comparison.entry_lag_median * 1000:+.1f}ms  |  p90: {comparison.entry_lag_p90 * 1000:+.1f}ms")
 
     # --- Step 5: Signal distribution analysis ---
     print("\n[5/6] Analyzing signal distributions at wallet entry ...")
@@ -814,7 +903,7 @@ def main() -> None:
     sweep_results = None
     if args.optimize:
         print("\n[6/6] Running parameter sweep optimization ...")
-        sweep_results = parameter_sweep(states, engine.wallet_trades, tolerance_sec=args.tolerance)
+        sweep_results = parameter_sweep(states, engine.wallet_trades, tolerance_sec=args.tolerance_sec)
     else:
         print("\n[6/6] Skipping parameter sweep (use --optimize to enable)")
 
