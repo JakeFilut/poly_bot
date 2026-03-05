@@ -108,6 +108,11 @@ class Bot:
             log_file=self.cfg.LOG_FILE,
             rollup_sec=self.cfg.LOG_ROLLUP_SEC,
             run_id=self._run_id,
+            log_decisions=self.cfg.LOG_DECISIONS,
+            decision_sample_every_n=self.cfg.DECISION_LOG_SAMPLE_EVERY_N,
+            decision_min_interval_ms=self.cfg.DECISION_LOG_MIN_INTERVAL_MS,
+            rotate_max_bytes=self.cfg.LOG_ROTATE_MAX_BYTES,
+            rotate_backup_count=self.cfg.LOG_ROTATE_BACKUP_COUNT,
         )
         self.log.log_config(self.cfg.redacted_dict())
 
@@ -266,7 +271,7 @@ class Bot:
                 self._last_state_flush = now_mono
 
             # Post-tick analytics (rollups, hourly PnL, diagnostics)
-            self.engine.post_tick()
+            self.engine.post_tick(tick_metrics=self._tick_metrics.snapshot())
 
             # Record tick time & maybe log metrics
             elapsed_ms = (time.monotonic() - loop_start) * 1000.0
@@ -284,11 +289,30 @@ class Bot:
     # Metrics logging
     # ------------------------------------------------------------------
     def _maybe_log_metrics(self, now_mono: float) -> None:
-        # Heartbeat log every ~5s (separate from rollup metrics)
-        if now_mono - self._last_heartbeat_log >= 5.0:
+        # Heartbeat log (configurable interval, default 5s)
+        hb_interval_sec = self.cfg.HEARTBEAT_LOG_MS / 1000.0
+        if now_mono - self._last_heartbeat_log >= hb_interval_sec:
             self._last_heartbeat_log = now_mono
             hb = heartbeats.snapshot()
             hb["bg_tasks_alive"] = sum(1 for t in self._bg_tasks if not t.done())
+
+            # Summarise orderbook ages: count stale, min/median/max
+            book_ages = []
+            now_wall = time.time()
+            for tid in self.engine.universe.all_token_ids():
+                ts = self.engine.features._book_cache_ts.get(tid, 0)
+                if ts > 0:
+                    book_ages.append((now_wall - ts) * 1000)
+            if book_ages:
+                book_ages.sort()
+                n = len(book_ages)
+                hb["book_age_min_ms"] = round(book_ages[0], 1)
+                hb["book_age_median_ms"] = round(book_ages[n // 2], 1)
+                hb["book_age_max_ms"] = round(book_ages[-1], 1)
+                stale_count = sum(1 for a in book_ages if a > self.cfg.BOOK_MAX_STALE_MS)
+                hb["stale_tokens"] = stale_count
+                hb["total_tokens"] = n
+
             self.log.log("HEARTBEAT", **hb)
 
         if now_mono - self._last_metrics_log < self.cfg.LOG_ROLLUP_SEC:

@@ -180,6 +180,18 @@ class Config:
     LOG_ROLLUP_SEC: int = 60
     DEBUG_LOG_ORDERS: bool = False  # Emit DRY_RUN_ORDER events (verbose; off by default)
 
+    # -- Decision log throttling --
+    LOG_DECISIONS: bool = False  # If True, log every DECISION tick (old behaviour)
+    DECISION_LOG_SAMPLE_EVERY_N: int = 200  # Log 1 out of N SKIP ticks per asset
+    DECISION_LOG_MIN_INTERVAL_MS: int = 2000  # Time-based throttle per (slug, reason)
+
+    # -- Heartbeat --
+    HEARTBEAT_LOG_MS: int = 5000  # Heartbeat log interval (ms)
+
+    # -- Log rotation --
+    LOG_ROTATE_MAX_BYTES: int = 50_000_000  # 50 MB per log file
+    LOG_ROTATE_BACKUP_COUNT: int = 5  # Keep 5 rotated backups
+
     # -- LIVE risk controls (only enforced when MODE=LIVE) --
     LIVE_MAX_CAPITAL_USD: float = 400.0          # Max deployed cost basis + pending buys
     MAX_DAILY_LOSS_USD: float = 100.0            # Hard daily kill switch threshold
@@ -311,6 +323,12 @@ def load_config() -> Config:
         SIM_FEE_BPS=_env_float("SIM_FEE_BPS", 0.0),
         TRACK_F247_WALLET=_env_bool("TRACK_F247_WALLET", True),
         DEBUG_LOG_ORDERS=_env_bool("DEBUG_LOG_ORDERS", False),
+        LOG_DECISIONS=_env_bool("LOG_DECISIONS", False),
+        DECISION_LOG_SAMPLE_EVERY_N=_env_int("DECISION_LOG_SAMPLE_EVERY_N", 200),
+        DECISION_LOG_MIN_INTERVAL_MS=_env_int("DECISION_LOG_MIN_INTERVAL_MS", 2000),
+        HEARTBEAT_LOG_MS=_env_int("HEARTBEAT_LOG_MS", 5000),
+        LOG_ROTATE_MAX_BYTES=_env_int("LOG_ROTATE_MAX_BYTES", 50_000_000),
+        LOG_ROTATE_BACKUP_COUNT=_env_int("LOG_ROTATE_BACKUP_COUNT", 5),
     )
     _validate(cfg)
     # Ensure log/state directories exist
