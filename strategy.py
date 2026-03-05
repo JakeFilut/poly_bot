@@ -24,6 +24,16 @@ from features import SlugFeatures, TokenFeatures
 from logger import Logger
 from state import InventoryEntry, StateManager
 
+# ---------------------------------------------------------------------------
+# Ladder level descriptor (internal)
+# ---------------------------------------------------------------------------
+@dataclass
+class LadderLevel:
+    """One level of a BUY inventory ladder."""
+    price: float
+    usd: float
+    shares: int
+
 _ET = ZoneInfo("America/New_York")
 
 
@@ -42,6 +52,70 @@ class TradeAction:
     size_usd: float     # notional USD
     reason: str         # human-readable reason for logging
     urgency: float = 0.5  # 0=low, 1=high (for execution priority)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 9.1a  Inventory Ladder Builder
+# ═══════════════════════════════════════════════════════════════════════════
+def _clamp_to_tick(price: float) -> float:
+    """Round price to nearest cent (Polymarket tick size)."""
+    return round(price, 2)
+
+
+def build_buy_ladder(
+    cfg: Config,
+    tf: TokenFeatures,
+    desired_usd: float,
+    entry_price: float,
+) -> List[LadderLevel] | None:
+    """Build a 2-3 level passive buy ladder around the bid.
+
+    Returns None if laddering is disabled or spread gates fail,
+    meaning the caller should fall back to a single order.
+    """
+    if cfg.LADDER_LEVELS <= 0:
+        return None
+
+    spread_cents = tf.spread * 100
+    if spread_cents < cfg.LADDER_ONLY_IF_SPREAD_CENTS_GTE:
+        return None
+    if tf.spread_pctl_60s < cfg.LADDER_ONLY_IF_SPREAD_PCTL_GTE:
+        return None
+
+    # Base price: ensure passive (at or below best_bid)
+    base_price = min(entry_price, tf.best_bid)
+
+    # Floor: don't bid more than LADDER_LEVEL_CAP_BPS_FROM_MID below mid
+    floor_price = tf.mid - cfg.LADDER_LEVEL_CAP_BPS_FROM_MID * tf.mid / 10_000
+    floor_price = max(cfg.PRICE_MIN, floor_price)
+
+    step = cfg.LADDER_STEP_CENTS / 100.0  # convert cents to dollars
+
+    levels: List[LadderLevel] = []
+    for i in range(cfg.LADDER_LEVELS):
+        if i >= len(cfg.LADDER_SPLIT):
+            break
+
+        raw_price = base_price - i * step
+        price = _clamp_to_tick(raw_price)
+
+        # Clamp: not below floor, not below PRICE_MIN, not above best_bid
+        price = max(price, cfg.PRICE_MIN)
+        price = max(price, _clamp_to_tick(floor_price))
+        price = min(price, tf.best_bid)
+
+        level_usd = desired_usd * cfg.LADDER_SPLIT[i]
+        shares = int(level_usd / price) if price > 0 else 0
+
+        if shares < 1:
+            continue
+
+        levels.append(LadderLevel(price=price, usd=round(level_usd, 4), shares=shares))
+
+    if not levels:
+        return None
+
+    return levels
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -481,36 +555,123 @@ class Strategy:
                 )
                 continue
 
-            shares = _usd_to_shares(desired_usd, price)
-            if shares < 1:
-                continue
+            # -- Microstructure fields for ORDER_INTENT --
+            ret_120s_val = tf.ret_120s
+            ret_30s_val = tf.ret_30s or 0
+            ret_accel = None
+            book_imbalance = None
+            if ret_120s_val is not None:
+                ret_accel = round(ret_30s_val - ret_120s_val, 8)
+            if tf.bid_size > 0 and tf.ask_size > 0:
+                book_imbalance = round(
+                    tf.bid_size / (tf.bid_size + tf.ask_size), 4
+                )
 
-            actual_usd = shares * price
+            micro = {}
+            if ret_120s_val is not None:
+                micro["ret_120s"] = round(ret_120s_val, 8)
+            if ret_accel is not None:
+                micro["ret_accel"] = ret_accel
+            if book_imbalance is not None:
+                micro["book_imbalance"] = book_imbalance
 
-            # Track entry quality
-            self._entry_quality["buy_prices"].append(price)
-            if diag.get("entry_edge") is not None:
-                self._entry_quality["edges_at_entry"].append(diag["entry_edge"])
+            # -- Try inventory laddering --
+            ladder = build_buy_ladder(self.cfg, tf, desired_usd, price)
 
-            reason = (f"BUY(w={buy_weight:.2f},spd={tf.spread:.4f},"
-                      f"pctl={tf.spread_pctl_60s:.2f},ret30={tf.ret_30s or 0:.6f})")
+            if ladder is not None:
+                # Emit LADDER_INTENT
+                ladder_desc = [
+                    {"price": lv.price, "usd": lv.usd, "shares": lv.shares}
+                    for lv in ladder
+                ]
+                reason = (f"LADDER_BUY(w={buy_weight:.2f},spd={tf.spread:.4f},"
+                          f"pctl={tf.spread_pctl_60s:.2f},ret30={ret_30s_val:.6f})")
 
-            inv_before = self.state.get_inventory(slug, direction)
-            self.log.decision(
-                action="BUY", reason=reason,
-                slug=slug, outcome=direction, asset=sf.asset,
-                price=price, shares=shares, usd=actual_usd,
-                spread=tf.spread, spread_pctl_60s=round(tf.spread_pctl_60s, 4),
-                ret_30s=tf.ret_30s, buy_weight=buy_weight,
-                sec_from_q=sec_from_q,
-                **diag,
-            )
+                self.log.log(
+                    "LADDER_INTENT",
+                    slug=slug, outcome=direction, asset=sf.asset,
+                    levels=ladder_desc,
+                    reason=reason,
+                    spread_cents=round(tf.spread * 100, 1),
+                    spread_pctl=round(tf.spread_pctl_60s, 3),
+                    desired_usd=round(desired_usd, 2),
+                    **micro,
+                )
 
-            actions.append(TradeAction(
-                action="BUY", slug=slug, outcome=direction,
-                token_id=tf.token_id, price=price,
-                size_shares=shares, size_usd=actual_usd,
-                reason=reason, urgency=buy_weight,
-            ))
+                # Emit ORDER_INTENT for each level
+                for lvl in ladder:
+                    self.log.log(
+                        "ORDER_INTENT",
+                        slug=slug, outcome=direction, asset=sf.asset,
+                        side="BUY", price=lvl.price,
+                        shares=lvl.shares, usd=lvl.usd,
+                        buy_weight=buy_weight, sec_from_q=sec_from_q,
+                        spread=tf.spread,
+                        spread_pctl=tf.spread_pctl_60s,
+                        ret_30s=ret_30s_val,
+                        **micro,
+                        **diag,
+                    )
+
+                # Track entry quality (use level0 price)
+                self._entry_quality["buy_prices"].append(ladder[0].price)
+                if diag.get("entry_edge") is not None:
+                    self._entry_quality["edges_at_entry"].append(diag["entry_edge"])
+
+                # Produce one TradeAction per ladder level
+                for lvl in ladder:
+                    actions.append(TradeAction(
+                        action="BUY", slug=slug, outcome=direction,
+                        token_id=tf.token_id, price=lvl.price,
+                        size_shares=lvl.shares, size_usd=lvl.usd,
+                        reason=reason, urgency=buy_weight,
+                    ))
+            else:
+                # -- Single order fallback (no ladder) --
+                shares = _usd_to_shares(desired_usd, price)
+                if shares < 1:
+                    continue
+
+                actual_usd = shares * price
+
+                # Track entry quality
+                self._entry_quality["buy_prices"].append(price)
+                if diag.get("entry_edge") is not None:
+                    self._entry_quality["edges_at_entry"].append(diag["entry_edge"])
+
+                reason = (f"BUY(w={buy_weight:.2f},spd={tf.spread:.4f},"
+                          f"pctl={tf.spread_pctl_60s:.2f},ret30={ret_30s_val:.6f})")
+
+                # Emit ORDER_INTENT with microstructure
+                self.log.log(
+                    "ORDER_INTENT",
+                    slug=slug, outcome=direction, asset=sf.asset,
+                    side="BUY", price=price,
+                    shares=shares, usd=actual_usd,
+                    buy_weight=buy_weight, sec_from_q=sec_from_q,
+                    spread=tf.spread,
+                    spread_pctl=tf.spread_pctl_60s,
+                    ret_30s=ret_30s_val,
+                    **micro,
+                    **diag,
+                )
+
+                inv_before = self.state.get_inventory(slug, direction)
+                self.log.decision(
+                    action="BUY", reason=reason,
+                    slug=slug, outcome=direction, asset=sf.asset,
+                    price=price, shares=shares, usd=actual_usd,
+                    spread=tf.spread, spread_pctl_60s=round(tf.spread_pctl_60s, 4),
+                    ret_30s=tf.ret_30s, buy_weight=buy_weight,
+                    sec_from_q=sec_from_q,
+                    **diag,
+                )
+
+                actions.append(TradeAction(
+                    action="BUY", slug=slug, outcome=direction,
+                    token_id=tf.token_id, price=price,
+                    size_shares=shares, size_usd=actual_usd,
+                    reason=reason, urgency=buy_weight,
+                ))
 
         return actions

@@ -107,6 +107,15 @@ class Config:
     CLIP_UNIT_USD: float = 1.10
     CLIP_LADDER_MULTS: List[int] = field(default_factory=lambda: [1, 3, 8, 10, 12])
 
+    # -- Inventory laddering (BUY side) --
+    LADDER_LEVELS: int = 3                       # 0 disables laddering
+    LADDER_STEP_CENTS: float = 1.0               # spacing between levels (1 cent)
+    LADDER_SPLIT: List[float] = field(default_factory=lambda: [0.5, 0.3, 0.2])
+    LADDER_MAX_TOTAL_ORDERS_PER_TOKEN: int = 3   # safety: max open BUY orders per (slug,outcome)
+    LADDER_ONLY_IF_SPREAD_CENTS_GTE: float = 2.0 # only ladder when spread >= 2c
+    LADDER_ONLY_IF_SPREAD_PCTL_GTE: float = 0.85 # optional additional selectivity
+    LADDER_LEVEL_CAP_BPS_FROM_MID: float = 150.0 # don't bid too far below mid
+
     # -- Order precision (Polymarket rules) --
     PRICE_MIN: float = 0.01
     PRICE_MAX: float = 0.99
@@ -239,6 +248,13 @@ def load_config() -> Config:
         SELL_MIN_SHARES=_env_float("SELL_MIN_SHARES", 5.0),
         CLIP_UNIT_USD=_env_float("CLIP_UNIT_USD", 1.10),
         CLIP_LADDER_MULTS=_env_list_int("CLIP_LADDER_MULTS", [1, 3, 8, 10, 12]),
+        LADDER_LEVELS=_env_int("LADDER_LEVELS", 3),
+        LADDER_STEP_CENTS=_env_float("LADDER_STEP_CENTS", 1.0),
+        LADDER_SPLIT=_env_list_float("LADDER_SPLIT", [0.5, 0.3, 0.2]),
+        LADDER_MAX_TOTAL_ORDERS_PER_TOKEN=_env_int("LADDER_MAX_TOTAL_ORDERS_PER_TOKEN", 3),
+        LADDER_ONLY_IF_SPREAD_CENTS_GTE=_env_float("LADDER_ONLY_IF_SPREAD_CENTS_GTE", 2.0),
+        LADDER_ONLY_IF_SPREAD_PCTL_GTE=_env_float("LADDER_ONLY_IF_SPREAD_PCTL_GTE", 0.85),
+        LADDER_LEVEL_CAP_BPS_FROM_MID=_env_float("LADDER_LEVEL_CAP_BPS_FROM_MID", 150.0),
         CROSS_PROB_1C=_env_float("CROSS_PROB_1C", 0.10),
         CROSS_MIN_RET_30S=_env_float("CROSS_MIN_RET_30S", 0.0008),
         ENTRY_MIN_EDGE_CENTS=_env_float("ENTRY_MIN_EDGE_CENTS", 0.03),
@@ -317,6 +333,14 @@ def _validate(cfg: Config) -> None:
         errors.append("TP_CENTS_MIN must be <= TP_CENTS_TARGET")
     if cfg.TP_CENTS_TARGET > cfg.TP_CENTS_MAX:
         errors.append("TP_CENTS_TARGET must be <= TP_CENTS_MAX")
+
+    # Ladder validation
+    if cfg.LADDER_LEVELS > 0:
+        if len(cfg.LADDER_SPLIT) != cfg.LADDER_LEVELS:
+            errors.append(f"LADDER_SPLIT length ({len(cfg.LADDER_SPLIT)}) must equal LADDER_LEVELS ({cfg.LADDER_LEVELS})")
+        split_sum = sum(cfg.LADDER_SPLIT)
+        if abs(split_sum - 1.0) > 0.01:
+            errors.append(f"LADDER_SPLIT must sum to ~1.0, got {split_sum:.4f}")
 
     if errors:
         for e in errors:

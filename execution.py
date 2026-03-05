@@ -63,6 +63,9 @@ class ExecutionEngine:
         # Diagnostics tracker (set externally after construction)
         self.diagnostics: Optional[Diagnostics] = None
 
+        # Risk manager reference (set externally for ladder per-level checks)
+        self._risk_checker = None  # type: Optional[object]
+
         # Self-test: force-fill counter (decremented on each forced fill)
         self._selftest_remaining: int = 0
 
@@ -94,10 +97,43 @@ class ExecutionEngine:
                 break
             self._execute_one(action)
 
-        for action in buys:
-            if self._ops_this_tick >= self.cfg.MAX_ORDER_OPS_PER_LOOP:
-                break
-            self._execute_one(action)
+        # Group buys by (slug, outcome) for ladder cap enforcement
+        from collections import defaultdict as _dd
+        buy_groups: Dict[Tuple[str, str], List[TradeAction]] = _dd(list)
+        for a in buys:
+            buy_groups[(a.slug, a.outcome)].append(a)
+
+        for key, group in buy_groups.items():
+            for action in group:
+                if self._ops_this_tick >= self.cfg.MAX_ORDER_OPS_PER_LOOP:
+                    break
+                # Enforce LADDER_MAX_TOTAL_ORDERS_PER_TOKEN
+                open_buys = sum(
+                    1 for o in self.state.open_orders.values()
+                    if o.slug == key[0] and o.outcome == key[1] and o.side == "BUY"
+                )
+                if open_buys >= self.cfg.LADDER_MAX_TOTAL_ORDERS_PER_TOKEN:
+                    self.log.decision(
+                        action="SKIP", reason="ladder_max_orders_per_token",
+                        slug=action.slug, outcome=action.outcome,
+                        open_buys=open_buys,
+                        cap=self.cfg.LADDER_MAX_TOTAL_ORDERS_PER_TOKEN,
+                    )
+                    break  # skip remaining deeper levels
+                # Risk check per level
+                if self._risk_checker is not None:
+                    ok, reason = self._risk_checker.allows_buy(
+                        action.slug, action.outcome, action.size_usd
+                    )
+                    if not ok:
+                        self.log.decision(
+                            action="SKIP", reason=f"ladder_risk_block({reason})",
+                            slug=action.slug, outcome=action.outcome,
+                            level_usd=action.size_usd,
+                            level_price=action.price,
+                        )
+                        break  # don't cascade to deeper levels
+                self._execute_one(action)
 
     def _execute_one(self, action: TradeAction) -> None:
         """Execute a single trade action."""
@@ -116,12 +152,18 @@ class ExecutionEngine:
             return
 
         # Check open order limit for this token
+        # For BUYs, use the higher of MAX_OPEN_ORDERS_PER_MARKET and
+        # LADDER_MAX_TOTAL_ORDERS_PER_TOKEN so laddered orders aren't blocked.
         existing = self.state.get_orders_for_token(token_id)
-        if len(existing) >= self.cfg.MAX_OPEN_ORDERS_PER_MARKET:
+        effective_cap = self.cfg.MAX_OPEN_ORDERS_PER_MARKET
+        if action.action == "BUY":
+            effective_cap = max(effective_cap, self.cfg.LADDER_MAX_TOTAL_ORDERS_PER_TOKEN)
+        if len(existing) >= effective_cap:
             self.log.decision(
                 action="SKIP", reason="max_open_orders",
                 slug=action.slug, outcome=action.outcome,
                 existing_orders=len(existing),
+                cap=effective_cap,
             )
             return
 
