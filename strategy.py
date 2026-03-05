@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import random
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
@@ -52,6 +53,9 @@ class TradeAction:
     size_usd: float     # notional USD
     reason: str         # human-readable reason for logging
     urgency: float = 0.5  # 0=low, 1=high (for execution priority)
+    ladder_id: str = ""           # unique id linking all levels of one ladder
+    ladder_level_idx: int = -1    # 0-based index within the ladder (-1 = not a ladder)
+    ladder_levels_total: int = 0  # total levels in this ladder (0 = not a ladder)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -559,12 +563,15 @@ class Strategy:
             ret_120s_val = tf.ret_120s
             ret_30s_val = tf.ret_30s or 0
             ret_accel = None
+            book_imbalance01 = None
             book_imbalance = None
             if ret_120s_val is not None:
                 ret_accel = round(ret_30s_val - ret_120s_val, 8)
             if tf.bid_size > 0 and tf.ask_size > 0:
+                total_sz = tf.bid_size + tf.ask_size
+                book_imbalance01 = round(tf.bid_size / total_sz, 4)
                 book_imbalance = round(
-                    tf.bid_size / (tf.bid_size + tf.ask_size), 4
+                    (tf.bid_size - tf.ask_size) / total_sz, 4
                 )
 
             micro = {}
@@ -572,6 +579,8 @@ class Strategy:
                 micro["ret_120s"] = round(ret_120s_val, 8)
             if ret_accel is not None:
                 micro["ret_accel"] = ret_accel
+            if book_imbalance01 is not None:
+                micro["book_imbalance01"] = book_imbalance01
             if book_imbalance is not None:
                 micro["book_imbalance"] = book_imbalance
 
@@ -579,6 +588,10 @@ class Strategy:
             ladder = build_buy_ladder(self.cfg, tf, desired_usd, price)
 
             if ladder is not None:
+                # Generate unique ladder_id to link all levels
+                lid = uuid.uuid4().hex[:12]
+                n_levels = len(ladder)
+
                 # Emit LADDER_INTENT
                 ladder_desc = [
                     {"price": lv.price, "usd": lv.usd, "shares": lv.shares}
@@ -590,6 +603,8 @@ class Strategy:
                 self.log.log(
                     "LADDER_INTENT",
                     slug=slug, outcome=direction, asset=sf.asset,
+                    ladder_id=lid,
+                    ladder_levels_total=n_levels,
                     levels=ladder_desc,
                     reason=reason,
                     spread_cents=round(tf.spread * 100, 1),
@@ -599,12 +614,15 @@ class Strategy:
                 )
 
                 # Emit ORDER_INTENT for each level
-                for lvl in ladder:
+                for i, lvl in enumerate(ladder):
                     self.log.log(
                         "ORDER_INTENT",
                         slug=slug, outcome=direction, asset=sf.asset,
                         side="BUY", price=lvl.price,
                         shares=lvl.shares, usd=lvl.usd,
+                        ladder_id=lid,
+                        ladder_level_idx=i,
+                        ladder_levels_total=n_levels,
                         buy_weight=buy_weight, sec_from_q=sec_from_q,
                         spread=tf.spread,
                         spread_pctl=tf.spread_pctl_60s,
@@ -619,12 +637,15 @@ class Strategy:
                     self._entry_quality["edges_at_entry"].append(diag["entry_edge"])
 
                 # Produce one TradeAction per ladder level
-                for lvl in ladder:
+                for i, lvl in enumerate(ladder):
                     actions.append(TradeAction(
                         action="BUY", slug=slug, outcome=direction,
                         token_id=tf.token_id, price=lvl.price,
                         size_shares=lvl.shares, size_usd=lvl.usd,
                         reason=reason, urgency=buy_weight,
+                        ladder_id=lid,
+                        ladder_level_idx=i,
+                        ladder_levels_total=n_levels,
                     ))
             else:
                 # -- Single order fallback (no ladder) --

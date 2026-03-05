@@ -402,7 +402,13 @@ class ExecutionEngine:
                 inventory_shares_before=inv_shares_before,
                 avg_cost_before=avg_cost_before,
             )
-            self.log.log("ORDER_INTENT", **self.analytics.intent_dict(intent_meta))
+            _intent_payload = self.analytics.intent_dict(intent_meta)
+            # Propagate ladder fields from TradeAction
+            if action.ladder_id:
+                _intent_payload["ladder_id"] = action.ladder_id
+                _intent_payload["ladder_level_idx"] = action.ladder_level_idx
+                _intent_payload["ladder_levels_total"] = action.ladder_levels_total
+            self.log.log("ORDER_INTENT", **_intent_payload)
 
         # Diagnostics: order intent
         if self.diagnostics:
@@ -466,6 +472,11 @@ class ExecutionEngine:
                 posted_price=action.price, posted_shares=action.size_shares,
                 api_response=result,
             )
+            # Propagate ladder fields from TradeAction
+            if action.ladder_id:
+                placed_payload["ladder_id"] = action.ladder_id
+                placed_payload["ladder_level_idx"] = action.ladder_level_idx
+                placed_payload["ladder_levels_total"] = action.ladder_levels_total
             self.log.log("ORDER_PLACED", **placed_payload)
 
         # Diagnostics: order placed
