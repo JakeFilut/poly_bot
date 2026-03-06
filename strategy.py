@@ -1,9 +1,10 @@
 """
 strategy.py – Wallet-copy microstructure scalper strategy.
 
-Core logic (reverse-engineered from target wallet):
-  - Entry ONLY when: spread_cents>=2, spread_pctl>=0.90, |ret_30s|>=0.0015,
-    orderbook_imbalance>=0.60
+Core logic (tuned from market replay analysis):
+  - Entry when: spread_cents>=1, spread_pctl>=0.80, imbalance>=0.42
+  - Momentum gate disabled (wallet enters at ret_30s median=0.0)
+  - Direction: cascade ret_30s → ret_5s → ret_120s → orderbook imbalance
   - Passive bids only (no crossing except extreme momentum)
   - 2-level ladder: 62.5% @ best_bid, 37.5% @ best_bid - 0.01
   - Crossing only when |ret_30s|>=0.003 AND spread_pctl>=0.95
@@ -173,6 +174,8 @@ def cadence_weight(cfg: Config, now_utc: datetime) -> tuple[float, float]:
 def _pick_buy_direction(sf: SlugFeatures, cfg: Config) -> str | None:
     """Pick 'Up' or 'Down' for a BUY based on Binance momentum.
 
+    Falls back to shorter/longer timeframes or orderbook imbalance
+    when ret_30s is zero (wallet enters without momentum).
     Returns None if no valid direction (both sides unusable).
     """
     ret = sf.ret_30s
@@ -180,12 +183,37 @@ def _pick_buy_direction(sf: SlugFeatures, cfg: Config) -> str | None:
         return None
 
     # Use ENTRY_MIN_ABS_RET_30S as the direction-picking threshold
-    # When set to 0.0, any non-zero momentum picks direction; 0 momentum = no entry
     threshold = cfg.ENTRY_MIN_ABS_RET_30S
     if threshold > 0 and abs(ret) < threshold:
-        return None
+        ret = 0  # treat sub-threshold as zero, try fallbacks below
+
+    # Cascade: ret_30s → ret_5s → ret_120s → orderbook imbalance
     if ret == 0:
-        return None
+        # Try shorter timeframe
+        if sf.ret_5s is not None and sf.ret_5s != 0:
+            ret = sf.ret_5s
+        # Try longer timeframe
+        elif sf.ret_120s is not None and sf.ret_120s != 0:
+            ret = sf.ret_120s
+        # Fallback: use orderbook imbalance to pick direction
+        else:
+            up_tf = sf.up
+            down_tf = sf.down
+            if up_tf and up_tf.has_book and down_tf and down_tf.has_book:
+                up_imb = up_tf.bid_size / max(1, up_tf.bid_size + up_tf.ask_size)
+                down_imb = down_tf.bid_size / max(1, down_tf.bid_size + down_tf.ask_size)
+                if up_imb > down_imb:
+                    ret = 0.0001  # synthetic positive → Up
+                elif down_imb > up_imb:
+                    ret = -0.0001  # synthetic negative → Down
+                else:
+                    return None  # perfectly balanced, no signal
+            elif up_tf and up_tf.has_book:
+                ret = 0.0001  # only Up side available
+            elif down_tf and down_tf.has_book:
+                ret = -0.0001  # only Down side available
+            else:
+                return None
 
     if ret > 0:
         preferred = "Up"
@@ -305,12 +333,9 @@ def _entry_gated(tf: TokenFeatures, cfg: Config,
     if not cash_ok:
         return False, "cash_reserve", diag
 
-    # -- Momentum direction must match trade direction --
-    if direction and bin_ret_30s >= cfg.ENTRY_MIN_ABS_RET_30S and bin_ret_30s > 0:
-        if direction == "Up" and bin_ret_30s_raw < 0:
-            return False, f"momentum_gate(dir=Up,ret30={bin_ret_30s_raw:.6f})", diag
-        if direction == "Down" and bin_ret_30s_raw > 0:
-            return False, f"momentum_gate(dir=Down,ret30={bin_ret_30s_raw:.6f})", diag
+    # -- Momentum direction check removed: direction is already picked by
+    #    _pick_buy_direction() which cascades ret_30s → ret_5s → ret_120s → imbalance.
+    #    Re-checking here was redundant and blocked entries when momentum was near zero. --
 
     # -- Prevent buying late in 15-min window --
     seconds_to_resolution = 900 - sec_from_q
