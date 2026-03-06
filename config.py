@@ -93,16 +93,16 @@ class Config:
     MIN_CASH_USD: float = 50.0
 
     # -- Spread / gating --
-    SPREAD_PCTL_MIN: float = 0.90
+    SPREAD_PCTL_MIN: float = 0.80     # lowered from 0.90; wallet p25=83%
     SPREAD_MAX_SANE: float = 0.10  # 10 cents (wallet trades wide spreads)
-    BIN_RET30_THRESHOLD: float = 0.0015
+    BIN_RET30_THRESHOLD: float = 0.0
 
     # -- Volatility filter (entry gate) --
-    VOL_MIN_RET_30S: float = 0.0015   # min |bin_ret_30s| to allow entry (wallet threshold)
-    VOL_MIN_RET_120S: float = 0.0006  # min |bin_ret_120s| second gate (0.06%)
+    VOL_MIN_RET_30S: float = 0.0      # disabled; wallet median ret_30s=0.0
+    VOL_MIN_RET_120S: float = 0.0     # disabled; wallet doesn't require momentum
 
     # -- Orderbook imbalance gate --
-    OB_IMBALANCE_MIN: float = 0.60    # min bid_size/(bid_size+ask_size) for entry
+    OB_IMBALANCE_MIN: float = 0.42    # lowered from 0.60; wallet p25=0.432
 
     # -- Take-profit / stop-loss (in cents i.e. 0.06 = 6¢) --
     TP_CENTS_MIN: float = 0.10
@@ -143,16 +143,16 @@ class Config:
     ENTRY_MIN_EDGE_BPS: float = 300.0    # 3% edge vs cost (informational)
     ENTRY_MAX_OFFSET_FROM_BID: float = 0.01  # max entry price above best_bid
     ENTRY_MIN_SPREAD_CENTS: float = 1.0  # min spread (cents) to allow entry
-    ENTRY_MIN_SPREAD_PCTL: float = 0.90  # min spread percentile to allow entry
-    ENTRY_PREFER_SPREAD_PCTL: float = 0.94  # preferred spread pctl (soft bonus)
-    ENTRY_MIN_ABS_RET_30S: float = 0.0001  # min |bin_ret_30s| for momentum gate (lowered per replay data)
-    ENTRY_MIN_RET_30S: float = 0.0015    # legacy alias (unused if ENTRY_MIN_ABS_RET_30S is set)
+    ENTRY_MIN_SPREAD_PCTL: float = 0.80  # lowered from 0.90; wallet p25=83%
+    ENTRY_PREFER_SPREAD_PCTL: float = 0.90  # preferred spread pctl (soft bonus)
+    ENTRY_MIN_ABS_RET_30S: float = 0.0    # disabled; wallet median ret_30s=0.0 (enters without momentum)
+    ENTRY_MIN_RET_30S: float = 0.0        # legacy alias (disabled)
     ENTRY_LATE_CUTOFF_SEC: int = 720     # skip entry if < 180s to end of 15-min window
     ENTRY_AVG_UP_TOLERANCE: float = 0.01 # reject buy if price > avg_cost + this
 
     # -- Directional imbalance gate --
-    ENTRY_MIN_IMBALANCE: float = 0.45    # soft imbalance gate threshold
-    ENTRY_IMBALANCE_DIRECTIONAL: bool = True  # if True, imbalance is direction-aware
+    ENTRY_MIN_IMBALANCE: float = 0.42    # lowered from 0.45; wallet p25=0.432
+    ENTRY_IMBALANCE_DIRECTIONAL: bool = False  # disabled; wallet doesn't filter directionally
     ENTRY_IMBALANCE_ENABLED: bool = True  # set False to disable imbalance gate entirely
 
     # -- Cadence (15-min) --
@@ -174,7 +174,7 @@ class Config:
     STATE_FLUSH_SEC: int = 10
 
     # -- Per-token cooldown (after a fill, wait before placing another order) --
-    PER_TOKEN_COOLDOWN_SEC: float = 3.0  # seconds after fill before new order
+    PER_TOKEN_COOLDOWN_SEC: float = 2.0  # seconds after fill before new order (lowered from 3.0)
     MIN_CANCEL_REPLACE_INTERVAL_SEC: float = 0.5  # min time between cancel/replace ops
     MAX_CANCEL_REPLACE_PER_SEC: int = 4  # global cap on cancel/replace ops per second
     MIN_PRICE_CHANGE_FOR_REPLACE: float = 0.01  # 1¢ minimum price change to justify replace
@@ -274,12 +274,12 @@ def load_config() -> Config:
         MAX_POSITION_USD_PER_OUTCOME=_env_float("MAX_POSITION_USD_PER_OUTCOME", 150.0),
         MAX_TOTAL_EXPOSURE_USD=_env_float("MAX_TOTAL_EXPOSURE_USD", 1500.0),
         MIN_CASH_USD=_env_float("MIN_CASH_USD", 50.0),
-        SPREAD_PCTL_MIN=_env_float("SPREAD_PCTL_MIN", 0.90),
+        SPREAD_PCTL_MIN=_env_float("SPREAD_PCTL_MIN", 0.80),
         SPREAD_MAX_SANE=_env_float("SPREAD_MAX_SANE", 0.10),
-        BIN_RET30_THRESHOLD=_env_float("BIN_RET30_THRESHOLD", 0.0015),
-        VOL_MIN_RET_30S=_env_float("VOL_MIN_RET_30S", 0.0015),
-        OB_IMBALANCE_MIN=_env_float("OB_IMBALANCE_MIN", 0.60),
-        VOL_MIN_RET_120S=_env_float("VOL_MIN_RET_120S", 0.0006),
+        BIN_RET30_THRESHOLD=_env_float("BIN_RET30_THRESHOLD", 0.0),
+        VOL_MIN_RET_30S=_env_float("VOL_MIN_RET_30S", 0.0),
+        OB_IMBALANCE_MIN=_env_float("OB_IMBALANCE_MIN", 0.42),
+        VOL_MIN_RET_120S=_env_float("VOL_MIN_RET_120S", 0.0),
         TP_CENTS_MIN=_env_float("TP_CENTS_MIN", 0.10),
         TP_CENTS_TARGET=_env_float("TP_CENTS_TARGET", 0.14),
         TP_CENTS_MAX=_env_float("TP_CENTS_MAX", 0.22),
@@ -303,14 +303,14 @@ def load_config() -> Config:
         ENTRY_MIN_EDGE_BPS=_env_float("ENTRY_MIN_EDGE_BPS", 300.0),
         ENTRY_MAX_OFFSET_FROM_BID=_env_float("ENTRY_MAX_OFFSET_FROM_BID", 0.01),
         ENTRY_MIN_SPREAD_CENTS=_env_float("ENTRY_MIN_SPREAD_CENTS", 1.0),
-        ENTRY_MIN_SPREAD_PCTL=_env_float("ENTRY_MIN_SPREAD_PCTL", 0.90),
-        ENTRY_PREFER_SPREAD_PCTL=_env_float("ENTRY_PREFER_SPREAD_PCTL", 0.94),
-        ENTRY_MIN_ABS_RET_30S=_env_float("ENTRY_MIN_ABS_RET_30S", 0.0001),
-        ENTRY_MIN_RET_30S=_env_float("ENTRY_MIN_RET_30S", 0.0015),
+        ENTRY_MIN_SPREAD_PCTL=_env_float("ENTRY_MIN_SPREAD_PCTL", 0.80),
+        ENTRY_PREFER_SPREAD_PCTL=_env_float("ENTRY_PREFER_SPREAD_PCTL", 0.90),
+        ENTRY_MIN_ABS_RET_30S=_env_float("ENTRY_MIN_ABS_RET_30S", 0.0),
+        ENTRY_MIN_RET_30S=_env_float("ENTRY_MIN_RET_30S", 0.0),
         ENTRY_LATE_CUTOFF_SEC=_env_int("ENTRY_LATE_CUTOFF_SEC", 720),
         ENTRY_AVG_UP_TOLERANCE=_env_float("ENTRY_AVG_UP_TOLERANCE", 0.01),
-        ENTRY_MIN_IMBALANCE=_env_float("ENTRY_MIN_IMBALANCE", 0.45),
-        ENTRY_IMBALANCE_DIRECTIONAL=_env_bool("ENTRY_IMBALANCE_DIRECTIONAL", True),
+        ENTRY_MIN_IMBALANCE=_env_float("ENTRY_MIN_IMBALANCE", 0.42),
+        ENTRY_IMBALANCE_DIRECTIONAL=_env_bool("ENTRY_IMBALANCE_DIRECTIONAL", False),
         ENTRY_IMBALANCE_ENABLED=_env_bool("ENTRY_IMBALANCE_ENABLED", True),
         BUY_HEAVY_SEC=_env_int("BUY_HEAVY_SEC", 60),
         BUY_MED_SEC=_env_int("BUY_MED_SEC", 120),
@@ -324,7 +324,7 @@ def load_config() -> Config:
         UNIVERSE_DEBUG=_env_bool("UNIVERSE_DEBUG", False),
         STATE_DB_PATH=_env("STATE_DB_PATH", "/home/ubuntu/github/logs/poly_bot/state.db"),
         STATE_FLUSH_SEC=_env_int("STATE_FLUSH_SEC", 10),
-        PER_TOKEN_COOLDOWN_SEC=_env_float("PER_TOKEN_COOLDOWN_SEC", 3.0),
+        PER_TOKEN_COOLDOWN_SEC=_env_float("PER_TOKEN_COOLDOWN_SEC", 2.0),
         MIN_CANCEL_REPLACE_INTERVAL_SEC=_env_float("MIN_CANCEL_REPLACE_INTERVAL_SEC", 0.5),
         MAX_CANCEL_REPLACE_PER_SEC=_env_int("MAX_CANCEL_REPLACE_PER_SEC", 4),
         MIN_PRICE_CHANGE_FOR_REPLACE=_env_float("MIN_PRICE_CHANGE_FOR_REPLACE", 0.01),

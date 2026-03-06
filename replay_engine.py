@@ -131,12 +131,12 @@ class StrategyParams:
     Defaults are set to the BEST SWEEP params discovered during optimization
     so the baseline comparison is meaningful (not zero matches).
     """
-    entry_min_spread_pctl: float = 0.94
+    entry_min_spread_pctl: float = 0.80
     entry_min_spread_cents: float = 1.0
-    entry_min_ret_30s: float = 0.0001
-    entry_min_imbalance: float = 0.45
+    entry_min_ret_30s: float = 0.0
+    entry_min_imbalance: float = 0.42
     # -- Directional imbalance --
-    imbalance_directional: bool = True  # if True, imbalance check is direction-aware
+    imbalance_directional: bool = False  # wallet doesn't strongly filter on directional imbalance
     # -- One-shot conditions --
     spread_pctl_delta_min: float = 0.0      # pctl_now - pctl_60s_ago >= this
     ret_accel_min: float = 0.0              # |ret_30s - ret_120s| >= this
@@ -543,7 +543,7 @@ class Strategy:
         return results
 
 
-COOLDOWN_SECONDS = 20  # suppress duplicate bot entries per market
+COOLDOWN_SECONDS = 5  # suppress duplicate bot entries per market (lowered from 20; wallet re-enters same market quickly)
 
 
 def run_replay(states: List[MarketState], params: StrategyParams) -> List[BotDecision]:
@@ -1649,23 +1649,26 @@ def analyze_signal_distributions(wallet_trades: pd.DataFrame) -> pd.DataFrame:
 # ═══════════════════════════════════════════════════════════════════════════
 
 DEFAULT_SWEEP_RANGES = {
-    "entry_min_spread_pctl": [0.82, 0.88, 0.94],
-    "entry_min_spread_cents": [0.0, 1.0, 2.0],
-    "entry_min_ret_30s": [0.0005, 0.0015, 0.003],
-    "entry_min_imbalance": [0.45, 0.55, 0.65],
+    "entry_min_spread_pctl": [0.75, 0.80, 0.85, 0.90],
+    "entry_min_spread_cents": [0.5, 1.0, 2.0],
+    "entry_min_ret_30s": [0.0, 0.0005, 0.0015],
+    "entry_min_imbalance": [0.0, 0.40, 0.45, 0.55],
     "spread_pctl_delta_min": [0.0, 0.05, 0.10],
     "ret_accel_min": [0.0, 0.0005, 0.001],
-    "entry_cooldown_sec": [0.0, 30.0, 60.0],
+    "entry_cooldown_sec": [0.0, 5.0, 15.0],
 }
 
-# Focused sweep ranges based on replay analysis showing wallet doesn't need
-# strong Binance momentum — spread state matters more
+# Focused sweep ranges based on replay analysis:
+#   - wallet ret_30s median=0.0 → momentum not needed
+#   - wallet spread_pctl p25=83% → need to test lower pctl values
+#   - wallet imbalance p25=0.432 → need lower imbalance thresholds
+#   - wallet doesn't use directional imbalance strongly
 FOCUSED_SWEEP_RANGES = {
-    "entry_min_ret_30s": [0.0, 0.0001, 0.0002, 0.0003],
-    "entry_min_spread_pctl": [0.88, 0.90, 0.92, 0.94],
-    "entry_min_spread_cents": [1.0],
-    "entry_min_imbalance": [0.45, 0.48, 0.50],
-    "imbalance_directional": [True, False],
+    "entry_min_ret_30s": [0.0],
+    "entry_min_spread_pctl": [0.75, 0.80, 0.83, 0.86, 0.90],
+    "entry_min_spread_cents": [0.5, 1.0],
+    "entry_min_imbalance": [0.0, 0.40, 0.42, 0.45],
+    "imbalance_directional": [False],
 }
 
 
