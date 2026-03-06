@@ -1536,6 +1536,505 @@ def dump_false_bot_entries(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# SECTION 3b2 -- DEEP DIAGNOSTICS: direction, matched-vs-false features,
+#                per-slug breakdown, cooldown impact, time-in-window
+# ═══════════════════════════════════════════════════════════════════════════
+
+def deep_diagnostics(
+    states: List[MarketState],
+    wallet_trades: pd.DataFrame,
+    decisions: List[BotDecision],
+    params: StrategyParams,
+    tolerance_sec: float = 3.0,
+    offset_sec: float = 0.0,
+) -> None:
+    """Run comprehensive diagnostics to understand WHY similarity is low.
+
+    Prints:
+      A) Direction correctness: does the bot pick the same outcome as wallet?
+      B) Matched vs false entry feature distributions (what separates them)
+      C) Per-slug breakdown (which markets have worst false entry rates)
+      D) Cooldown impact (how many would-be matches were suppressed)
+      E) Time-in-window analysis (when in 15-min window does wallet vs bot enter)
+      F) Wallet-side analysis (BUY vs SELL breakdown of missed trades)
+      G) Feature distributions of MISSED trades vs ALL wallet trades
+    """
+    if wallet_trades.empty or "ts" not in wallet_trades.columns or not decisions:
+        print("\n  No data for deep diagnostics.")
+        return
+
+    print(f"\n{'═' * 100}")
+    print("  DEEP DIAGNOSTICS -- Understanding the similarity gap")
+    print(f"{'═' * 100}")
+
+    strategy = Strategy(params)
+    wt = wallet_trades.copy()
+
+    # Build bot entry structures
+    bot_entries = [d for d in decisions if d.action in ("BUY", "SELL")]
+    bot_token_raw = _build_token_id_index(decisions)
+    bot_token_idx = {k: np.array(v) for k, v in bot_token_raw.items()}
+    tmp_key: Dict[tuple, List[float]] = defaultdict(list)
+    for d in decisions:
+        if d.action in ("BUY", "SELL"):
+            tmp_key[_make_decision_key(d)].append(d.timestamp)
+    bot_key_arrays = {k: np.array(sorted(v)) for k, v in tmp_key.items()}
+
+    # Build wallet structures
+    wallet_token_raw: Dict[str, List[float]] = defaultdict(list)
+    wallet_key_raw: Dict[tuple, List[float]] = defaultdict(list)
+    for _, row in wt.iterrows():
+        wts = row.get("ts")
+        if pd.isna(wts):
+            continue
+        w_side = _resolve_wallet_side(row)
+        w_token_id = _resolve_wallet_token_id(row)
+        if not w_side:
+            continue
+        if w_side == "SELL":
+            continue
+        key = _make_wallet_key(row)
+        if w_token_id:
+            wallet_token_raw[w_token_id].append(float(wts) + offset_sec)
+        wallet_key_raw[key].append(float(wts) + offset_sec)
+    wallet_token_idx = {k: np.array(sorted(v)) for k, v in wallet_token_raw.items()}
+    wallet_key_arrays = {k: np.array(sorted(v)) for k, v in wallet_key_raw.items()}
+
+    # Build state lookup
+    state_ts = np.array([ms.timestamp for ms in states])
+
+    # ── A) DIRECTION CORRECTNESS ──────────────────────────────────────────
+    print(f"\n  {'─' * 90}")
+    print("  A) DIRECTION CORRECTNESS -- Does the bot pick the same outcome as the wallet?")
+    print(f"  {'─' * 90}")
+
+    direction_correct = 0
+    direction_wrong = 0
+    direction_no_signal = 0
+    direction_wrong_examples: List[dict] = []
+
+    for _, row in wt.iterrows():
+        wts = row.get("ts")
+        if pd.isna(wts):
+            continue
+        w_side = _resolve_wallet_side(row)
+        if w_side != "BUY":
+            continue
+        w_outcome = _resolve_wallet_outcome(row)
+        w_slug = _resolve_wallet_slug(row)
+        w_token_id = _resolve_wallet_token_id(row)
+        if not w_outcome:
+            continue
+
+        # Find nearest market state for this trade
+        target = float(wts)
+        idx = np.searchsorted(state_ts, target)
+        best_ms = None
+        best_dt = float("inf")
+        for si in range(max(0, idx - 10), min(len(states), idx + 10)):
+            ms = states[si]
+            if ms.token_id and w_token_id and ms.token_id == w_token_id:
+                dt = abs(ms.timestamp - target)
+                if dt < best_dt:
+                    best_dt = dt
+                    best_ms = ms
+            elif ms.slug.casefold() == w_slug and _normalize_outcome(ms.outcome) == w_outcome:
+                dt = abs(ms.timestamp - target)
+                if dt < best_dt:
+                    best_dt = dt
+                    best_ms = ms
+        if best_ms is None or best_dt > 10.0:
+            continue
+
+        # What direction does the bot pick?
+        bot_direction = _pick_direction_cascade(best_ms)
+        wallet_outcome_norm = w_outcome  # already normalized
+
+        # Map bot direction to normalized outcome
+        if bot_direction is None:
+            direction_no_signal += 1
+        else:
+            bot_outcome_norm = _normalize_outcome(bot_direction)
+            if bot_outcome_norm == wallet_outcome_norm:
+                direction_correct += 1
+            else:
+                direction_wrong += 1
+                if len(direction_wrong_examples) < 10:
+                    direction_wrong_examples.append({
+                        "ts": target,
+                        "wallet_outcome": wallet_outcome_norm,
+                        "bot_direction": bot_direction,
+                        "ret_30s": best_ms.binance_ret_30s,
+                        "ret_5s": best_ms.binance_ret_5s,
+                        "ret_120s": best_ms.binance_ret_120s,
+                        "imbalance": best_ms.orderbook_imbalance,
+                        "asset": best_ms.asset,
+                    })
+
+    total_dir = direction_correct + direction_wrong + direction_no_signal
+    if total_dir > 0:
+        print(f"    Direction CORRECT:   {direction_correct:>6} ({100*direction_correct/total_dir:.1f}%)")
+        print(f"    Direction WRONG:     {direction_wrong:>6} ({100*direction_wrong/total_dir:.1f}%)")
+        print(f"    No signal:          {direction_no_signal:>6} ({100*direction_no_signal/total_dir:.1f}%)")
+        print(f"    Total wallet BUYs:  {total_dir:>6}")
+        if direction_wrong > 0 and direction_wrong_examples:
+            print(f"\n    First {len(direction_wrong_examples)} wrong-direction examples:")
+            print(f"    {'ts':>14} {'Asset':>5} {'Wallet':>7} {'Bot':>5} {'ret_30s':>10} {'ret_5s':>10} {'ret_120s':>10} {'imbal':>7}")
+            for ex in direction_wrong_examples:
+                print(f"    {ex['ts']:>14.1f} {ex['asset']:>5} {ex['wallet_outcome']:>7} {ex['bot_direction']:>5} "
+                      f"{ex['ret_30s']:>10.6f} {ex['ret_5s']:>10.6f} {ex['ret_120s']:>10.6f} {ex['imbalance']:>7.3f}")
+
+    # ── B) MATCHED vs FALSE ENTRY FEATURE DISTRIBUTIONS ───────────────────
+    print(f"\n  {'─' * 90}")
+    print("  B) MATCHED vs FALSE entry feature distributions")
+    print(f"  {'─' * 90}")
+
+    matched_feats = {"spread_cents": [], "spread_pctl": [], "|ret_30s|": [],
+                     "imbalance": [], "hour_et": [], "sec_from_quarter": []}
+    false_feats = {"spread_cents": [], "spread_pctl": [], "|ret_30s|": [],
+                   "imbalance": [], "hour_et": [], "sec_from_quarter": []}
+
+    for d in bot_entries:
+        key = _make_decision_key(d)
+        # Check if matched
+        lag = None
+        if d.token_id:
+            warr = wallet_token_idx.get(d.token_id)
+            if warr is not None and len(warr) > 0:
+                lag = _find_best_lag(warr, d.timestamp, tolerance_sec)
+        if lag is None:
+            warr = wallet_key_arrays.get(key)
+            if warr is not None and len(warr) > 0:
+                lag = _find_best_lag(warr, d.timestamp, tolerance_sec)
+
+        target = matched_feats if lag is not None else false_feats
+        target["spread_cents"].append(d.spread_cents)
+        target["spread_pctl"].append(d.spread_percentile)
+        target["|ret_30s|"].append(abs(d.binance_ret_30s))
+        target["imbalance"].append(d.orderbook_imbalance)
+        # Compute hour from timestamp
+        try:
+            dt_utc = datetime.fromtimestamp(d.timestamp, tz=timezone.utc)
+            target["hour_et"].append(dt_utc.astimezone(_ET).hour)
+        except (OSError, OverflowError, ValueError):
+            pass
+        target["sec_from_quarter"].append(d.sec_from_quarter_et)
+
+    print(f"\n    Matched bot entries: {len(matched_feats['spread_cents'])}")
+    print(f"    False bot entries:   {len(false_feats['spread_cents'])}")
+
+    print(f"\n    {'Feature':<20} {'Matched median':>16} {'False median':>14} {'Matched p25':>13} {'False p25':>11} {'Matched p75':>13} {'False p75':>11}")
+    print(f"    {'─' * 98}")
+    for feat in ["spread_cents", "spread_pctl", "|ret_30s|", "imbalance", "sec_from_quarter"]:
+        m_vals = np.array(matched_feats[feat]) if matched_feats[feat] else np.array([0])
+        f_vals = np.array(false_feats[feat]) if false_feats[feat] else np.array([0])
+        print(f"    {feat:<20} {np.median(m_vals):>16.6f} {np.median(f_vals):>14.6f} "
+              f"{np.percentile(m_vals, 25):>13.6f} {np.percentile(f_vals, 25):>11.6f} "
+              f"{np.percentile(m_vals, 75):>13.6f} {np.percentile(f_vals, 75):>11.6f}")
+
+    # Hour distribution comparison
+    if matched_feats["hour_et"] and false_feats["hour_et"]:
+        print(f"\n    Hour distribution (matched vs false entry rate):")
+        m_hours = np.array(matched_feats["hour_et"])
+        f_hours = np.array(false_feats["hour_et"])
+        print(f"    {'Hour':>6} {'Matched':>9} {'False':>9} {'False/Match ratio':>18}")
+        for h in range(24):
+            mc = np.sum(m_hours == h)
+            fc = np.sum(f_hours == h)
+            if mc > 0 or fc > 0:
+                ratio = f"{fc/max(1,mc):.1f}x" if mc > 0 else "inf"
+                print(f"    {h:>6} {mc:>9} {fc:>9} {ratio:>18}")
+
+    # ── C) PER-SLUG BREAKDOWN ─────────────────────────────────────────────
+    print(f"\n  {'─' * 90}")
+    print("  C) PER-SLUG BREAKDOWN -- Which specific markets have worst false entry rates?")
+    print(f"  {'─' * 90}")
+
+    slug_matched: Dict[str, int] = defaultdict(int)
+    slug_false: Dict[str, int] = defaultdict(int)
+    slug_missed: Dict[str, int] = defaultdict(int)
+
+    # Count matched/false for bot entries
+    for d in bot_entries:
+        key = _make_decision_key(d)
+        slug_norm = d.slug.strip().casefold()
+        lag = None
+        if d.token_id:
+            warr = wallet_token_idx.get(d.token_id)
+            if warr is not None and len(warr) > 0:
+                lag = _find_best_lag(warr, d.timestamp, tolerance_sec)
+        if lag is None:
+            warr = wallet_key_arrays.get(key)
+            if warr is not None and len(warr) > 0:
+                lag = _find_best_lag(warr, d.timestamp, tolerance_sec)
+        if lag is not None:
+            slug_matched[slug_norm] += 1
+        else:
+            slug_false[slug_norm] += 1
+
+    # Count missed wallet trades
+    for _, row in wt.iterrows():
+        wts = row.get("ts")
+        if pd.isna(wts):
+            continue
+        w_side = _resolve_wallet_side(row)
+        if w_side != "BUY":
+            continue
+        w_slug = _resolve_wallet_slug(row)
+        w_token_id = _resolve_wallet_token_id(row)
+        key = _make_wallet_key(row)
+        wts_adj = float(wts) + offset_sec
+        lag = _match_by_token_id_or_key(
+            wts_adj, w_token_id, key, bot_token_idx, bot_key_arrays, tolerance_sec,
+        )
+        if lag is None:
+            slug_missed[w_slug] += 1
+
+    all_slugs = sorted(set(list(slug_matched.keys()) + list(slug_false.keys()) + list(slug_missed.keys())))
+    print(f"\n    {'Slug':<55} {'Matched':>8} {'False':>8} {'Missed':>8} {'F/M ratio':>10}")
+    print(f"    {'─' * 89}")
+    # Sort by false count descending
+    slug_data = [(s, slug_matched.get(s, 0), slug_false.get(s, 0), slug_missed.get(s, 0)) for s in all_slugs]
+    slug_data.sort(key=lambda x: -x[2])
+    for slug, mc, fc, mi in slug_data[:30]:
+        ratio = f"{fc/max(1,mc):.1f}x" if mc > 0 else ("inf" if fc > 0 else "--")
+        print(f"    {slug:<55.55} {mc:>8} {fc:>8} {mi:>8} {ratio:>10}")
+    if len(slug_data) > 30:
+        print(f"    ... and {len(slug_data) - 30} more slugs")
+
+    # ── D) COOLDOWN IMPACT ANALYSIS ───────────────────────────────────────
+    print(f"\n  {'─' * 90}")
+    print("  D) COOLDOWN IMPACT -- How many entries were suppressed, and would they have matched?")
+    print(f"  {'─' * 90}")
+
+    # Re-run replay WITHOUT cooldown to see what cooldown suppresses
+    no_cd_params = StrategyParams(
+        entry_min_spread_pctl=params.entry_min_spread_pctl,
+        entry_min_spread_cents=params.entry_min_spread_cents,
+        entry_min_ret_30s=params.entry_min_ret_30s,
+        entry_min_imbalance=params.entry_min_imbalance,
+        imbalance_directional=params.imbalance_directional,
+        quiet_hours_et=params.quiet_hours_et,
+        entry_cooldown_sec=0.0,  # No cooldown
+    )
+    no_cd_decisions = run_replay(states, no_cd_params)
+    no_cd_entries = sum(1 for d in no_cd_decisions if d.action in ("BUY", "SELL"))
+    cd_entries = len(bot_entries)
+    suppressed = no_cd_entries - cd_entries
+
+    # Compare matches with vs without cooldown
+    no_cd_cr = compare_to_wallet(no_cd_decisions, wt, tolerance_sec, offset_sec=offset_sec)
+
+    print(f"    With cooldown ({params.entry_cooldown_sec}s):    entries={cd_entries:>7,}  matched={sum(1 for d in bot_entries if True):>6}")
+    print(f"    Without cooldown:         entries={no_cd_entries:>7,}")
+    print(f"    Suppressed by cooldown:   {suppressed:>7,} entries")
+    print(f"    Match comparison:")
+    print(f"      WITH cooldown:    similarity={0:.4f}  matched=~{len(matched_feats['spread_cents'])}  false=~{len(false_feats['spread_cents'])}")
+    print(f"      WITHOUT cooldown: similarity={no_cd_cr.similarity_score:.4f}  matched={no_cd_cr.wallet_trades_matched}  false={no_cd_cr.bot_false_entries}")
+    gained = no_cd_cr.wallet_trades_matched - len(matched_feats['spread_cents'])
+    print(f"    Cooldown costs ~{max(0,gained)} matches but saves {suppressed - max(0,gained)} false entries")
+
+    # ── E) TIME-IN-WINDOW ANALYSIS ────────────────────────────────────────
+    print(f"\n  {'─' * 90}")
+    print("  E) TIME-IN-WINDOW -- When in the 15-min window does the wallet vs bot enter?")
+    print(f"  {'─' * 90}")
+
+    wallet_sfq: List[int] = []
+    for _, row in wt.iterrows():
+        wts = row.get("ts")
+        if pd.isna(wts):
+            continue
+        w_side = _resolve_wallet_side(row)
+        if w_side != "BUY":
+            continue
+        try:
+            dt_utc = datetime.fromtimestamp(float(wts), tz=timezone.utc)
+            dt_et = dt_utc.astimezone(_ET)
+            sfq = (dt_et.minute * 60 + dt_et.second) % 900
+            wallet_sfq.append(sfq)
+        except (OSError, OverflowError, ValueError):
+            pass
+
+    bot_sfq: List[int] = [d.sec_from_quarter_et for d in bot_entries]
+
+    if wallet_sfq and bot_sfq:
+        w_arr = np.array(wallet_sfq)
+        b_arr = np.array(bot_sfq)
+        # Bucket into 3-minute bins
+        bins = list(range(0, 901, 180))
+        print(f"\n    {'Window (sec)':>14} {'Wallet BUYs':>12} {'Bot entries':>12} {'Wallet%':>8} {'Bot%':>6}")
+        print(f"    {'─' * 52}")
+        for i in range(len(bins) - 1):
+            lo, hi = bins[i], bins[i+1]
+            wc = np.sum((w_arr >= lo) & (w_arr < hi))
+            bc = np.sum((b_arr >= lo) & (b_arr < hi))
+            wp = 100 * wc / len(w_arr) if len(w_arr) > 0 else 0
+            bp = 100 * bc / len(b_arr) if len(b_arr) > 0 else 0
+            print(f"    {lo:>4}-{hi:>4}s       {wc:>12} {bc:>12} {wp:>7.1f}% {bp:>5.1f}%")
+
+        print(f"\n    Wallet median sec_from_quarter: {np.median(w_arr):.0f}s")
+        print(f"    Bot median sec_from_quarter:    {np.median(b_arr):.0f}s")
+
+    # ── F) WALLET SELL TRADES (potential missed signals) ──────────────────
+    print(f"\n  {'─' * 90}")
+    print("  F) WALLET TRADE SIDE BREAKDOWN")
+    print(f"  {'─' * 90}")
+
+    buy_count = 0
+    sell_count = 0
+    for _, row in wt.iterrows():
+        w_side = _resolve_wallet_side(row)
+        if w_side == "BUY":
+            buy_count += 1
+        elif w_side == "SELL":
+            sell_count += 1
+
+    print(f"    Total wallet BUYs:   {buy_count:>6}")
+    print(f"    Total wallet SELLs:  {sell_count:>6}")
+    print(f"    (Replay only models BUYs -- SELLs are excluded from similarity)")
+
+    # ── G) MISSED TRADE FEATURE DISTRIBUTIONS ─────────────────────────────
+    print(f"\n  {'─' * 90}")
+    print("  G) MISSED TRADES -- feature distributions at wallet entry time")
+    print(f"  {'─' * 90}")
+    print("  (Compares features of MATCHED wallet trades vs MISSED wallet trades)")
+
+    matched_wallet_feats: Dict[str, List[float]] = defaultdict(list)
+    missed_wallet_feats: Dict[str, List[float]] = defaultdict(list)
+
+    feat_col_map = {
+        "spread_cents": ["spread", "spread_cents"],
+        "spread_pctl": ["spread_percentile_60s", "spread_percentile_60s_at_trade"],
+        "imbalance": ["orderbook_imbalance_at_trade", "imbalance_topN"],
+        "|ret_30s|": ["binance_ret_30s_at_trade", "ret_30s"],
+        "|ret_5s|": ["binance_ret_5s_at_trade", "ret_5s"],
+    }
+
+    # Resolve columns
+    resolved_cols: Dict[str, Optional[str]] = {}
+    for feat, candidates in feat_col_map.items():
+        resolved_cols[feat] = None
+        for c in candidates:
+            if c in wt.columns:
+                resolved_cols[feat] = c
+                break
+
+    for _, row in wt.iterrows():
+        wts = row.get("ts")
+        if pd.isna(wts):
+            continue
+        w_side = _resolve_wallet_side(row)
+        if w_side != "BUY":
+            continue
+        w_token_id = _resolve_wallet_token_id(row)
+        key = _make_wallet_key(row)
+        wts_adj = float(wts) + offset_sec
+        lag = _match_by_token_id_or_key(
+            wts_adj, w_token_id, key, bot_token_idx, bot_key_arrays, tolerance_sec,
+        )
+        target = matched_wallet_feats if lag is not None else missed_wallet_feats
+
+        for feat, col in resolved_cols.items():
+            if col is None:
+                continue
+            val = row.get(col)
+            if pd.notna(val):
+                v = float(val)
+                if "spread_cents" == feat and col == "spread":
+                    v *= 100
+                if "ret_" in feat:
+                    v = abs(v)
+                    if v > 0.1:  # likely percent
+                        v /= 100
+                target[feat].append(v)
+
+    if matched_wallet_feats or missed_wallet_feats:
+        print(f"\n    Matched wallet trades: {len(next(iter(matched_wallet_feats.values()), []))}")
+        print(f"    Missed wallet trades:  {len(next(iter(missed_wallet_feats.values()), []))}")
+        print(f"\n    {'Feature':<15} {'Match med':>11} {'Miss med':>10} {'Match p25':>11} {'Miss p25':>10} {'Match p75':>11} {'Miss p75':>10}")
+        print(f"    {'─' * 78}")
+        for feat in ["spread_cents", "spread_pctl", "imbalance", "|ret_30s|", "|ret_5s|"]:
+            m_vals = np.array(matched_wallet_feats.get(feat, [0]))
+            mi_vals = np.array(missed_wallet_feats.get(feat, [0]))
+            if len(m_vals) == 0:
+                m_vals = np.array([0])
+            if len(mi_vals) == 0:
+                mi_vals = np.array([0])
+            print(f"    {feat:<15} {np.median(m_vals):>11.6f} {np.median(mi_vals):>10.6f} "
+                  f"{np.percentile(m_vals, 25):>11.6f} {np.percentile(mi_vals, 25):>10.6f} "
+                  f"{np.percentile(m_vals, 75):>11.6f} {np.percentile(mi_vals, 75):>10.6f}")
+
+    # ── H) ASSET-SPECIFIC GATE FAILURE BREAKDOWN ──────────────────────────
+    print(f"\n  {'─' * 90}")
+    print("  H) ASSET-SPECIFIC missed-trade gate failures")
+    print(f"  {'─' * 90}")
+
+    asset_miss_gates: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    asset_miss_totals: Dict[str, int] = defaultdict(int)
+
+    for _, row in wt.iterrows():
+        wts = row.get("ts")
+        if pd.isna(wts):
+            continue
+        w_side = _resolve_wallet_side(row)
+        if w_side != "BUY":
+            continue
+        w_asset = _resolve_wallet_asset(row)
+        w_slug = _resolve_wallet_slug(row)
+        w_outcome = _resolve_wallet_outcome(row)
+        w_token_id = _resolve_wallet_token_id(row)
+        key = _make_wallet_key(row)
+        wts_adj = float(wts) + offset_sec
+        lag = _match_by_token_id_or_key(
+            wts_adj, w_token_id, key, bot_token_idx, bot_key_arrays, tolerance_sec,
+        )
+        if lag is not None:
+            continue  # matched
+
+        asset_miss_totals[w_asset] += 1
+
+        # Find nearest market state
+        target_ts = float(wts)
+        idx = np.searchsorted(state_ts, target_ts)
+        best_ms = None
+        best_dt = float("inf")
+        for si in range(max(0, idx - 20), min(len(states), idx + 20)):
+            ms = states[si]
+            ok = False
+            if w_token_id and ms.token_id == w_token_id:
+                ok = True
+            elif ms.slug.casefold() == w_slug and _normalize_outcome(ms.outcome) == w_outcome:
+                ok = True
+            if ok:
+                dt = abs(ms.timestamp - target_ts)
+                if dt < best_dt:
+                    best_dt = dt
+                    best_ms = ms
+
+        if best_ms is None or best_dt > 30.0:
+            asset_miss_gates[w_asset]["no_snapshot"] += 1
+        else:
+            gate_details = strategy.evaluate_gate_detail(best_ms)
+            failed = [gc for gc, val, thr, passed in gate_details if not passed]
+            if failed:
+                for gc in failed:
+                    asset_miss_gates[w_asset][gc] += 1
+            else:
+                asset_miss_gates[w_asset]["cooldown_or_key"] += 1
+
+    for asset in sorted(asset_miss_totals.keys()):
+        total = asset_miss_totals[asset]
+        gates = asset_miss_gates[asset]
+        print(f"\n    {asset}: {total} missed trades")
+        for gate, cnt in sorted(gates.items(), key=lambda x: -x[1]):
+            print(f"      {gate:<25} {cnt:>5} ({100*cnt/max(1,total):.1f}%)")
+
+    print(f"\n{'═' * 100}")
+    print("  END DEEP DIAGNOSTICS")
+    print(f"{'═' * 100}\n")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # SECTION 3c -- TIMESTAMP LAG INVESTIGATION & AUTO-FIT OFFSET
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -2255,6 +2754,8 @@ def main() -> None:
                         help="Manual timestamp offset (auto-fit if not provided)")
     parser.add_argument("--focused-sweep", action="store_true",
                         help="Run focused sweep (momentum + spread + imbalance grid)")
+    parser.add_argument("--no-deep-diag", action="store_true",
+                        help="Skip deep diagnostics (saves time)")
     args = parser.parse_args()
 
     data_dir = args.data_dir or find_data_dir()
@@ -2322,6 +2823,16 @@ def main() -> None:
         states, engine.wallet_trades, decisions, default_params,
         tolerance_sec=args.tolerance_sec, max_rows=50,
     )
+
+    # --- Step 5c: Deep diagnostics ---
+    if not args.no_deep_diag:
+        print("\n[5c/8] Running deep diagnostics ...")
+        deep_diagnostics(
+            states, engine.wallet_trades, decisions, default_params,
+            tolerance_sec=args.tolerance_sec, offset_sec=offset_sec,
+        )
+    else:
+        print("\n[5c/8] Skipping deep diagnostics (--no-deep-diag)")
 
     # --- Step 6: Signal distribution analysis ---
     print("\n[6/8] Analyzing signal distributions at wallet entry ...")
