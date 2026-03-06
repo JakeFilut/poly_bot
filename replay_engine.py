@@ -120,7 +120,9 @@ class ComparisonResult:
     wallet_trades_matched: int
     wallet_trades_missed: int
     bot_false_entries: int
-    similarity_score: float
+    similarity_score: float          # F1 score (harmonic mean of precision & recall)
+    precision: float = 0.0           # matched / (matched + false)
+    recall: float = 0.0              # matched / total_wallet_trades
     entry_lag_median: float = float("nan")  # median (bot_ts - wallet_ts) for matched trades
     entry_lag_p90: float = float("nan")    # p90 entry lag
 
@@ -143,6 +145,11 @@ class StrategyParams:
     entry_cooldown_sec: float = 5.0         # per (slug, outcome, side) cooldown (matches live)
     # -- Time-of-day filter --
     quiet_hours_et: tuple = (3, 5, 7, 8)   # hours in ET to suppress entries (<16% match rate)
+    # -- Time-to-resolution filter --
+    entry_max_seconds_to_resolution: float = 0.0  # 0=disabled; skip entries when >N seconds remain
+    entry_min_seconds_to_resolution: float = 0.0  # 0=disabled; skip entries when <N seconds remain
+    # -- 60s return filter --
+    entry_min_ret_60s: float = 0.0         # 0=disabled; require |ret_60s| >= threshold
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -500,6 +507,18 @@ class Strategy:
             if ret_accel < p.ret_accel_min:
                 return self._no_action(ms, "ret_accel below threshold"), "ret_accel"
 
+        # --- Gate: seconds to resolution ---
+        if p.entry_max_seconds_to_resolution > 0 and ms.seconds_to_resolution > p.entry_max_seconds_to_resolution:
+            return self._no_action(ms, f"too_far_from_resolution({ms.seconds_to_resolution}s)"), "sec_to_resolution"
+        if p.entry_min_seconds_to_resolution > 0 and ms.seconds_to_resolution < p.entry_min_seconds_to_resolution:
+            return self._no_action(ms, f"too_close_to_resolution({ms.seconds_to_resolution}s)"), "sec_to_resolution"
+        accepted_reasons.append("resolution_window_ok")
+
+        # --- Gate: 60s return magnitude ---
+        if p.entry_min_ret_60s > 0 and abs(ms.binance_ret_60s) < p.entry_min_ret_60s:
+            return self._no_action(ms, "ret_60s below threshold"), "ret_60s"
+        accepted_reasons.append("ret_60s_ok")
+
         accepted_reasons.append("time_window_ok")
 
         # All gates passed -- pick direction via momentum cascade
@@ -596,6 +615,24 @@ class Strategy:
             ret_accel = abs(ms.binance_ret_30s - ms.binance_ret_120s)
             results.append(("ret_accel", ret_accel, p.ret_accel_min,
                              ret_accel >= p.ret_accel_min))
+
+        # seconds_to_resolution gates
+        if p.entry_max_seconds_to_resolution > 0:
+            results.append(("max_sec_to_res", float(ms.seconds_to_resolution),
+                             p.entry_max_seconds_to_resolution,
+                             ms.seconds_to_resolution <= p.entry_max_seconds_to_resolution))
+        if p.entry_min_seconds_to_resolution > 0:
+            results.append(("min_sec_to_res", float(ms.seconds_to_resolution),
+                             p.entry_min_seconds_to_resolution,
+                             ms.seconds_to_resolution >= p.entry_min_seconds_to_resolution))
+
+        # 60s return gate
+        if p.entry_min_ret_60s > 0:
+            results.append(("|ret_60s|", abs(ms.binance_ret_60s), p.entry_min_ret_60s,
+                             abs(ms.binance_ret_60s) >= p.entry_min_ret_60s))
+        else:
+            results.append(("|ret_60s|", abs(ms.binance_ret_60s), 0.0, True))
+
         return results
 
 
@@ -1238,7 +1275,14 @@ def compare_to_wallet(
         if not found:
             bot_false += 1
 
-    similarity = matched / total if total > 0 else 0.0
+    # F1 score: harmonic mean of precision and recall
+    recall = matched / total if total > 0 else 0.0
+    bot_total = matched + bot_false
+    precision = matched / bot_total if bot_total > 0 else 0.0
+    if precision + recall > 0:
+        similarity = 2 * precision * recall / (precision + recall)
+    else:
+        similarity = 0.0
 
     # --- Latency stats (ms precision) ---
     lag_median = float(np.median(entry_lags)) if entry_lags else float("nan")
@@ -1250,6 +1294,8 @@ def compare_to_wallet(
         wallet_trades_missed=missed,
         bot_false_entries=bot_false,
         similarity_score=similarity,
+        precision=precision,
+        recall=recall,
         entry_lag_median=lag_median,
         entry_lag_p90=lag_p90,
     )
@@ -2220,6 +2266,10 @@ DEFAULT_SWEEP_RANGES = {
     "spread_pctl_delta_min": [0.0, 0.05, 0.10],
     "ret_accel_min": [0.0, 0.0005, 0.001],
     "entry_cooldown_sec": [0.0, 5.0, 15.0],
+    "entry_max_seconds_to_resolution": [0.0, 600],
+    "entry_min_seconds_to_resolution": [0.0, 60],
+    "entry_min_ret_60s": [0.0, 0.0005],
+    "tolerance_sec": [3.0, 5.0, 7.0],
 }
 
 # Focused sweep ranges based on replay analysis:
@@ -2236,6 +2286,13 @@ FOCUSED_SWEEP_RANGES = {
     "imbalance_directional": [False],
     "quiet_hours_et": [(), (3, 5, 7, 8)],
     "entry_cooldown_sec": [5.0, 10.0],
+    # New gates: time-to-resolution window
+    "entry_max_seconds_to_resolution": [0.0, 600, 450],     # 0=disabled, 10min, 7.5min
+    "entry_min_seconds_to_resolution": [0.0, 60, 120],      # 0=disabled, 1min, 2min
+    # New gate: 60s return magnitude
+    "entry_min_ret_60s": [0.0, 0.0003, 0.0007],             # 0=disabled, small, medium
+    # Comparison tolerance (not a strategy param)
+    "tolerance_sec": [3.0, 5.0, 7.0],
 }
 
 
@@ -2252,40 +2309,49 @@ def parameter_sweep(
     """
     ranges = sweep_ranges or DEFAULT_SWEEP_RANGES
 
+    # Separate tolerance_sec from strategy params (it's a comparison param, not a gate)
+    tolerance_values = ranges.pop("tolerance_sec", [tolerance_sec])
+    if not isinstance(tolerance_values, list):
+        tolerance_values = [tolerance_values]
+
     keys = list(ranges.keys())
-    grid = list(itertools.product(*(ranges[k] for k in keys)))
-    total = len(grid)
-    print(f"\n  Parameter sweep: {total} combinations ...")
+    strategy_grid = list(itertools.product(*(ranges[k] for k in keys)))
+    # Full grid = strategy combos × tolerance values
+    total = len(strategy_grid) * len(tolerance_values)
+    print(f"\n  Parameter sweep: {total} combinations ({len(strategy_grid)} strategy × {len(tolerance_values)} tolerance) ...")
 
     import time as _time
     results = []
     t_start = _time.monotonic()
-    for idx, combo in enumerate(grid):
+    done = 0
+    for combo in strategy_grid:
         params = StrategyParams(**dict(zip(keys, combo)))
         decisions = run_replay(states, params)
-        cr = compare_to_wallet(decisions, wallet_trades, tolerance_sec, offset_sec=offset_sec)
+        for tol in tolerance_values:
+            cr = compare_to_wallet(decisions, wallet_trades, tol, offset_sec=offset_sec)
 
-        entry = {}
-        for k, v in zip(keys, combo):
-            if isinstance(v, bool):
-                entry[k] = v
-            elif isinstance(v, (tuple, list)):
-                entry[k] = str(v)
-            else:
-                entry[k] = round(float(v), 6)
-        entry["similarity"] = round(cr.similarity_score, 4)
-        entry["matched"] = cr.wallet_trades_matched
-        entry["missed"] = cr.wallet_trades_missed
-        entry["false_entries"] = cr.bot_false_entries
-        entry["lag_median_ms"] = round(cr.entry_lag_median * 1000, 1) if not np.isnan(cr.entry_lag_median) else "N/A"
-        entry["lag_p90_ms"] = round(cr.entry_lag_p90 * 1000, 1) if not np.isnan(cr.entry_lag_p90) else "N/A"
-        results.append(entry)
+            entry = {}
+            for k, v in zip(keys, combo):
+                if isinstance(v, bool):
+                    entry[k] = v
+                elif isinstance(v, (tuple, list)):
+                    entry[k] = str(v)
+                else:
+                    entry[k] = round(float(v), 6)
+            entry["tolerance_sec"] = tol
+            entry["similarity"] = round(cr.similarity_score, 4)
+            entry["matched"] = cr.wallet_trades_matched
+            entry["missed"] = cr.wallet_trades_missed
+            entry["false_entries"] = cr.bot_false_entries
+            entry["lag_median_ms"] = round(cr.entry_lag_median * 1000, 1) if not np.isnan(cr.entry_lag_median) else "N/A"
+            entry["lag_p90_ms"] = round(cr.entry_lag_p90 * 1000, 1) if not np.isnan(cr.entry_lag_p90) else "N/A"
+            results.append(entry)
 
-        done = idx + 1
-        if done % max(1, total // 20) == 0 or done == 5:
-            elapsed = _time.monotonic() - t_start
-            eta = elapsed / done * (total - done)
-            print(f"    ... {done}/{total}  ({elapsed:.0f}s elapsed, ~{eta:.0f}s remaining)")
+            done += 1
+            if done % max(1, total // 20) == 0 or done == 5:
+                elapsed = _time.monotonic() - t_start
+                eta = elapsed / done * (total - done)
+                print(f"    ... {done}/{total}  ({elapsed:.0f}s elapsed, ~{eta:.0f}s remaining)")
 
     df = pd.DataFrame(results).sort_values("similarity", ascending=False).reset_index(drop=True)
     return df
@@ -2309,7 +2375,9 @@ def print_report(
     print(f"  Wallet trades matched: {comparison.wallet_trades_matched}")
     print(f"  Wallet trades missed:  {comparison.wallet_trades_missed}")
     print(f"  Bot false entries:     {comparison.bot_false_entries}")
-    print(f"  Similarity score:      {comparison.similarity_score:.4f}")
+    print(f"  Precision:             {comparison.precision:.4f}  (matched / (matched + false))")
+    print(f"  Recall:                {comparison.recall:.4f}  (matched / wallet_total)")
+    print(f"  F1 score:              {comparison.similarity_score:.4f}  (harmonic mean)")
     print(f"\n  Entry lag (bot - wallet):")
     if comparison.wallet_trades_matched == 0 or np.isnan(comparison.entry_lag_median):
         print(f"    median:  N/A  (no matched trades)")
@@ -2326,7 +2394,7 @@ def print_report(
 
     if sweep_results is not None and not sweep_results.empty:
         print(f"\n{'─' * 70}")
-        print("  TOP 10 PARAMETER SETS (by similarity)")
+        print("  TOP 10 PARAMETER SETS (by F1 score)")
         print(f"{'─' * 70}")
         top = sweep_results.head(10)
         print(top.to_string(index=False))
@@ -2336,7 +2404,9 @@ def print_report(
     print("  FINAL SUMMARY")
     print(f"{'═' * 70}")
     print(f"\n  BASELINE (default params):")
-    print(f"    similarity  = {comparison.similarity_score:.4f}")
+    print(f"    F1 score    = {comparison.similarity_score:.4f}")
+    print(f"    precision   = {comparison.precision:.4f}")
+    print(f"    recall      = {comparison.recall:.4f}")
     print(f"    matched     = {comparison.wallet_trades_matched}")
     print(f"    missed      = {comparison.wallet_trades_missed}")
     print(f"    false       = {comparison.bot_false_entries}")
@@ -2346,7 +2416,7 @@ def print_report(
     if sweep_results is not None and not sweep_results.empty:
         best = sweep_results.iloc[0]
         print(f"\n  BEST SWEEP:")
-        print(f"    similarity  = {best['similarity']:.4f}")
+        print(f"    F1 score    = {best['similarity']:.4f}")
         print(f"    matched     = {int(best['matched'])}")
         print(f"    missed      = {int(best['missed'])}")
         print(f"    false       = {int(best['false_entries'])}")
@@ -2805,7 +2875,7 @@ def main() -> None:
         decisions, engine.wallet_trades, args.tolerance_sec,
         debug=args.debug, offset_sec=offset_sec,
     )
-    print(f"  Similarity score: {comparison.similarity_score:.4f}")
+    print(f"  F1 score: {comparison.similarity_score:.4f}  (precision={comparison.precision:.4f}, recall={comparison.recall:.4f})")
     if comparison.wallet_trades_matched == 0 or np.isnan(comparison.entry_lag_median):
         print(f"  Entry lag median: N/A  |  p90: N/A  (no matched trades)")
     else:
