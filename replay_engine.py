@@ -198,9 +198,9 @@ class MarketReplayEngine:
                     break
 
     def build_binance_returns(self) -> Dict[str, pd.DataFrame]:
-        """Pre-compute rolling Binance returns per symbol.
+        """Pre-compute rolling Binance returns per symbol (vectorized).
 
-        Returns dict: symbol -> DataFrame with columns [ts, price, ret_5s, ret_30s, ret_60s].
+        Returns dict: symbol -> DataFrame with columns [ts, price, ret_5s, ret_30s, ret_60s, ret_120s].
         """
         result: Dict[str, pd.DataFrame] = {}
         if self.binance_tape.empty:
@@ -215,51 +215,33 @@ class MarketReplayEngine:
             if g.empty:
                 continue
 
-            # Approximate returns using time-based lookback on 1Hz tape
-            g = g.set_index("ts")
-            prices = g["price"]
+            # Vectorized returns using merge_asof for time-based lookback
+            # For ~1Hz data, shift(N) approximates N-second lookback
+            ts_arr = g["ts"].values
+            px_arr = g["price"].values
 
-            ret_5 = []
-            ret_30 = []
-            ret_60 = []
-            ret_120 = []
-            ts_list = prices.index.values
+            # Build a lookup: for each target lag, find the closest index
+            # via searchsorted (vectorized)
+            for lag, col, tol in [(5, "ret_5s", 1.5), (30, "ret_30s", 2.0),
+                                   (60, "ret_60s", 2.0), (120, "ret_120s", 2.0)]:
+                target_ts = ts_arr - lag
+                idx = np.searchsorted(ts_arr, target_ts, side="right") - 1
+                idx = np.clip(idx, 0, len(ts_arr) - 1)
+                past_ts = ts_arr[idx]
+                past_px = px_arr[idx]
+                dt = np.abs(past_ts - target_ts)
+                valid = (dt <= tol) & (past_px > 0)
+                ret = np.where(valid, px_arr / past_px - 1, 0.0)
+                g[col] = ret
 
-            for i, t in enumerate(ts_list):
-                px = prices.iloc[i]
-
-                # 5s lookback
-                mask_5 = ts_list[max(0, i - 10):i + 1]
-                past_5 = [prices.loc[tt] for tt in mask_5 if t - tt >= 4.5 and t - tt <= 6.0]
-                ret_5.append((px / past_5[0] - 1) if past_5 else 0.0)
-
-                # 30s lookback
-                mask_30 = ts_list[max(0, i - 40):i + 1]
-                past_30 = [prices.loc[tt] for tt in mask_30 if t - tt >= 28.0 and t - tt <= 32.0]
-                ret_30.append((px / past_30[0] - 1) if past_30 else 0.0)
-
-                # 60s lookback
-                mask_60 = ts_list[max(0, i - 70):i + 1]
-                past_60 = [prices.loc[tt] for tt in mask_60 if t - tt >= 58.0 and t - tt <= 62.0]
-                ret_60.append((px / past_60[0] - 1) if past_60 else 0.0)
-
-                # 120s lookback
-                mask_120 = ts_list[max(0, i - 140):i + 1]
-                past_120 = [prices.loc[tt] for tt in mask_120 if t - tt >= 118.0 and t - tt <= 122.0]
-                ret_120.append((px / past_120[0] - 1) if past_120 else 0.0)
-
-            g["ret_5s"] = ret_5
-            g["ret_30s"] = ret_30
-            g["ret_60s"] = ret_60
-            g["ret_120s"] = ret_120
-            g = g.reset_index()
             result[str(sym)] = g
 
         return result
 
     def generate_market_states(self) -> List[MarketState]:
         """Walk through the book tape chronologically, enriching each
-        snapshot with Binance returns to produce MarketState objects."""
+        snapshot with Binance returns to produce MarketState objects.
+        Vectorized for performance on large datasets."""
         if self.book_tape.empty:
             print("  No book_tape data -- cannot generate market states.")
             return []
@@ -267,96 +249,131 @@ class MarketReplayEngine:
         # Pre-compute binance returns
         binance_rets = self.build_binance_returns()
 
-        # Determine column mappings for book_tape
+        # Prepare book_tape
         bt = self.book_tape.sort_values("ts").copy()
-        states: List[MarketState] = []
+        bt = bt[bt["ts"].notna() & (bt["ts"] != 0)].copy()
+        if bt.empty:
+            print("  No valid book_tape rows after filtering.")
+            return []
 
-        # Map crypto asset from slug/token_id if available
-        asset_col = None
+        # --- Vectorized column preparation ---
+
+        # Slugs, outcomes, token_ids
+        slugs = bt["slug"].fillna("").astype(str).values
+        outcomes = bt["outcome"].fillna("").astype(str).values if "outcome" in bt.columns else np.full(len(bt), "")
+        token_ids = bt["token_id"].fillna("").astype(str).values if "token_id" in bt.columns else np.full(len(bt), "")
+
+        # Derive assets from slugs (vectorized via map)
+        asset_col_name = None
         for c in ["crypto", "asset"]:
             if c in bt.columns:
-                asset_col = c
+                asset_col_name = c
                 break
+        assets = np.array([asset_from_slug(s) for s in slugs])
+        # Fallback for empty assets
+        if asset_col_name:
+            fallback = bt[asset_col_name].fillna("BTC").astype(str).values
+        else:
+            fallback = np.full(len(bt), "BTC")
+        empty_mask = assets == ""
+        assets[empty_mask] = fallback[empty_mask]
 
-        for _, row in bt.iterrows():
-            ts = row.get("ts", 0.0)
-            if pd.isna(ts) or ts == 0:
+        # Spread calculations (vectorized)
+        best_bids = pd.to_numeric(bt.get("bestBid", pd.Series(0, index=bt.index)), errors="coerce").fillna(0).values
+        best_asks = pd.to_numeric(bt.get("bestAsk", pd.Series(0, index=bt.index)), errors="coerce").fillna(0).values
+        raw_spread = pd.to_numeric(bt.get("spread", pd.Series(0, index=bt.index)), errors="coerce").fillna(0).values
+
+        valid_ba = (best_asks > 0) & (best_bids > 0)
+        spread_cents = np.where(valid_ba,
+                                np.round((best_asks - best_bids) * 100, 1),
+                                np.where(raw_spread < 1.0, raw_spread * 100, raw_spread))
+
+        spread_pctls = pd.to_numeric(bt.get("spread_percentile_60s", pd.Series(0, index=bt.index)), errors="coerce").fillna(0).values
+
+        # Imbalance (vectorized)
+        bid_depth = np.maximum(0.0, pd.to_numeric(bt.get("bid_depth_topN", pd.Series(0, index=bt.index)), errors="coerce").fillna(0).values)
+        ask_depth = np.maximum(0.0, pd.to_numeric(bt.get("ask_depth_topN", pd.Series(0, index=bt.index)), errors="coerce").fillna(0).values)
+        total_depth = bid_depth + ask_depth
+        imbalances = np.where(total_depth > 0, bid_depth / np.maximum(1e-9, total_depth), 0.5)
+
+        # Timestamps
+        ts_arr = bt["ts"].values.astype(np.float64)
+
+        # --- Binance return lookups (vectorized per asset) ---
+        r5_arr = np.zeros(len(bt))
+        r30_arr = np.zeros(len(bt))
+        r60_arr = np.zeros(len(bt))
+        r120_arr = np.zeros(len(bt))
+
+        unique_assets = np.unique(assets)
+        for ua in unique_assets:
+            if not ua:
+                continue
+            sym_key = ua + "USDT"
+            bdf = binance_rets.get(sym_key) or binance_rets.get(ua)
+            if bdf is None or bdf.empty:
                 continue
 
-            slug = str(row.get("slug", ""))
-            outcome = str(row.get("outcome", ""))
-            token_id = str(row.get("token_id", ""))
-            # Always derive asset from slug to avoid wrong-asset bugs
-            asset = asset_from_slug(slug)
-            if not asset:
-                # Fallback to CSV column only if slug doesn't contain a known asset
-                asset = str(row.get(asset_col, "BTC")) if asset_col else "BTC"
+            mask = assets == ua
+            asset_ts = ts_arr[mask]
+            b_ts = bdf["ts"].values
+            b_r5 = bdf["ret_5s"].values if "ret_5s" in bdf.columns else np.zeros(len(bdf))
+            b_r30 = bdf["ret_30s"].values if "ret_30s" in bdf.columns else np.zeros(len(bdf))
+            b_r60 = bdf["ret_60s"].values if "ret_60s" in bdf.columns else np.zeros(len(bdf))
+            b_r120 = bdf["ret_120s"].values if "ret_120s" in bdf.columns else np.zeros(len(bdf))
 
-            best_bid = float(row.get("bestBid", 0))
-            best_ask = float(row.get("bestAsk", 0))
-            spread = float(row.get("spread", 0))
-            spread_cents = round((best_ask - best_bid) * 100, 1) if best_ask > 0 and best_bid > 0 else (spread * 100 if spread < 1.0 else spread)
-            spread_pctl = float(row.get("spread_percentile_60s", 0))
+            idx = np.searchsorted(b_ts, asset_ts, side="right") - 1
+            idx = np.clip(idx, 0, len(b_ts) - 1)
+            aligned_ts = b_ts[idx]
+            within_tol = np.abs(aligned_ts - asset_ts) <= 10.0
 
-            # Compute imbalance as bid/(bid+ask), guaranteed [0,1]
-            bid_depth = max(0.0, float(row.get("bid_depth_topN", 0)))
-            ask_depth = max(0.0, float(row.get("ask_depth_topN", 0)))
-            imbalance = bid_depth / max(1e-9, bid_depth + ask_depth) if (bid_depth + ask_depth) > 0 else 0.5
+            r5_arr[mask] = np.where(within_tol, b_r5[idx], 0.0)
+            r30_arr[mask] = np.where(within_tol, b_r30[idx], 0.0)
+            r60_arr[mask] = np.where(within_tol, b_r60[idx], 0.0)
+            r120_arr[mask] = np.where(within_tol, b_r120[idx], 0.0)
 
-            # Look up Binance returns at this timestamp
-            r5 = r30 = r60 = r120 = 0.0
-            sym_key = asset + "USDT" if asset else None
-            # Try exact symbol match first, then asset name
-            bdf = binance_rets.get(sym_key) or binance_rets.get(asset, pd.DataFrame())
-            if not bdf.empty:
-                idx = bdf["ts"].searchsorted(ts) - 1
-                if 0 <= idx < len(bdf):
-                    binance_ts = float(bdf.iloc[idx]["ts"])
-                    if abs(binance_ts - ts) <= 10.0:  # align within ±10s
-                        r5 = float(bdf.iloc[idx].get("ret_5s", 0))
-                        r30 = float(bdf.iloc[idx].get("ret_30s", 0))
-                        r60 = float(bdf.iloc[idx].get("ret_60s", 0))
-                        r120 = float(bdf.iloc[idx].get("ret_120s", 0))
+        # --- Timing-inside-window features (vectorized) ---
+        # Convert epoch seconds to ET minute/second
+        ts_dt = pd.to_datetime(ts_arr, unit="s", utc=True).tz_convert(_ET)
+        minutes = ts_dt.minute.values.astype(np.int32)
+        seconds = ts_dt.second.values.astype(np.int32)
+        total_sec = minutes * 60 + seconds
+        sfq_arr = total_sec % 900
+        sfh_arr = total_sec
+        str_arr = 900 - sfq_arr
 
-            # Compute timing-inside-window features
-            try:
-                dt_utc = datetime.fromtimestamp(ts, tz=timezone.utc)
-                dt_et = dt_utc.astimezone(_ET)
-                total_sec = dt_et.minute * 60 + dt_et.second
-                sfq = total_sec % 900
-                sfh = total_sec
-                str_ = 900 - sfq
-            except (OSError, OverflowError, ValueError):
-                sfq = sfh = 0
-                str_ = 900
+        # --- Market type from slug (vectorized) ---
+        slugs_lower = np.char.lower(slugs.astype(str))
+        is_hourly = np.char.find(slugs_lower, "hourly") >= 0
+        is_1hour = np.char.find(slugs_lower, "1-hour") >= 0
+        is_15 = np.char.find(slugs_lower, "15") >= 0
+        is_fifteen = np.char.find(slugs_lower, "fifteen") >= 0
+        mtypes = np.where(is_hourly | is_1hour, "hourly",
+                          np.where(is_15 | is_fifteen, "15m", ""))
 
-            # Derive market type from slug
-            mtype = ""
-            slug_lower = slug.lower()
-            if "hourly" in slug_lower or "1-hour" in slug_lower:
-                mtype = "hourly"
-            elif "15" in slug_lower or "fifteen" in slug_lower:
-                mtype = "15m"
-
+        # --- Build MarketState list ---
+        print(f"  Building {len(bt):,} MarketState objects ...")
+        states: List[MarketState] = []
+        for i in range(len(bt)):
             states.append(MarketState(
-                timestamp=ts,
-                asset=asset,
-                slug=slug,
-                outcome=outcome,
-                token_id=token_id,
-                best_bid=best_bid,
-                best_ask=best_ask,
-                spread_cents=spread_cents,
-                spread_percentile=spread_pctl,
-                orderbook_imbalance=imbalance,
-                binance_ret_5s=r5,
-                binance_ret_30s=r30,
-                binance_ret_60s=r60,
-                binance_ret_120s=r120,
-                sec_from_quarter_et=sfq,
-                sec_from_hour_et=sfh,
-                seconds_to_resolution=str_,
-                market_type=mtype,
+                timestamp=ts_arr[i],
+                asset=assets[i],
+                slug=slugs[i],
+                outcome=outcomes[i],
+                token_id=token_ids[i],
+                best_bid=best_bids[i],
+                best_ask=best_asks[i],
+                spread_cents=float(spread_cents[i]),
+                spread_percentile=float(spread_pctls[i]),
+                orderbook_imbalance=float(imbalances[i]),
+                binance_ret_5s=float(r5_arr[i]),
+                binance_ret_30s=float(r30_arr[i]),
+                binance_ret_60s=float(r60_arr[i]),
+                binance_ret_120s=float(r120_arr[i]),
+                sec_from_quarter_et=int(sfq_arr[i]),
+                sec_from_hour_et=int(sfh_arr[i]),
+                seconds_to_resolution=int(str_arr[i]),
+                market_type=str(mtypes[i]),
             ))
 
         # Backfill spread_pctl_prev: for each (slug, outcome) track pctl ~60s ago
