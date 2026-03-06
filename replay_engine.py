@@ -404,6 +404,42 @@ class MarketReplayEngine:
 # SECTION 2 -- BOT DECISION REPLAY (Strategy Evaluator)
 # ═══════════════════════════════════════════════════════════════════════════
 
+
+def _pick_direction_cascade(ms: MarketState) -> Optional[str]:
+    """Pick preferred outcome ('Up' or 'Down') using momentum cascade.
+
+    Mirrors the live strategy's _pick_buy_direction():
+      ret_30s → ret_5s → ret_120s → orderbook imbalance.
+    Returns None if no signal at all.
+    """
+    # Primary: 30s return
+    if ms.binance_ret_30s > 0:
+        return "Up"
+    if ms.binance_ret_30s < 0:
+        return "Down"
+
+    # Fallback 1: 5s return
+    if ms.binance_ret_5s > 0:
+        return "Up"
+    if ms.binance_ret_5s < 0:
+        return "Down"
+
+    # Fallback 2: 120s return
+    if ms.binance_ret_120s > 0:
+        return "Up"
+    if ms.binance_ret_120s < 0:
+        return "Down"
+
+    # Fallback 3: orderbook imbalance (>0.5 means bids dominate → Up)
+    if ms.orderbook_imbalance > 0.5:
+        return "Up"
+    if ms.orderbook_imbalance < 0.5:
+        return "Down"
+
+    # Perfectly balanced -- no signal
+    return None
+
+
 class Strategy:
     """Simplified strategy that mirrors the live bot's entry gates."""
 
@@ -433,8 +469,8 @@ class Strategy:
 
         # --- Directional imbalance gate ---
         if p.imbalance_directional:
-            # Direction from momentum
-            direction = "Up" if ms.binance_ret_30s > 0 else "Down"
+            # Direction from momentum cascade (consistent with entry direction)
+            direction = _pick_direction_cascade(ms) or "Up"
             if direction == "Up" and ms.orderbook_imbalance < p.entry_min_imbalance:
                 return self._no_action(ms, "imbalance_dir below threshold (Up)"), "imbalance"
             if direction == "Down" and ms.orderbook_imbalance > (1.0 - p.entry_min_imbalance):
@@ -458,8 +494,18 @@ class Strategy:
 
         accepted_reasons.append("time_window_ok")
 
-        # All gates passed -- direction from momentum
-        action = "BUY" if ms.binance_ret_30s > 0 else "SELL"
+        # All gates passed -- pick direction via momentum cascade
+        # (mirrors live _pick_buy_direction: ret_30s → ret_5s → ret_120s → imbalance)
+        preferred_outcome = _pick_direction_cascade(ms)
+        if preferred_outcome is None:
+            return self._no_action(ms, "no_direction_signal"), "direction"
+
+        # Only enter on the outcome matching the chosen direction
+        if ms.outcome != preferred_outcome:
+            return self._no_action(ms, f"wrong_outcome({ms.outcome}!={preferred_outcome})"), "direction"
+
+        # Wallet-copy: entries are always BUYs (buying outcome tokens)
+        action = "BUY"
 
         return BotDecision(
             timestamp=ms.timestamp,
@@ -520,7 +566,7 @@ class Strategy:
 
         # Directional imbalance check
         if p.imbalance_directional:
-            direction = "Up" if ms.binance_ret_30s > 0 else "Down"
+            direction = _pick_direction_cascade(ms) or "Up"
             if direction == "Up":
                 results.append(("imbalance_dir", ms.orderbook_imbalance, p.entry_min_imbalance,
                                  ms.orderbook_imbalance >= p.entry_min_imbalance))
@@ -899,6 +945,7 @@ def compare_to_wallet(
     tolerance_sec: float = 3.0,
     debug: bool = False,
     offset_sec: float = 0.0,
+    buy_only: bool = True,
 ) -> ComparisonResult:
     """Compare bot decisions against wallet trades.
 
@@ -913,6 +960,8 @@ def compare_to_wallet(
     original (non-rounded) timestamps.
 
     offset_sec: added to wallet timestamps before matching (auto-fit alignment).
+    buy_only: if True, exclude wallet SELL trades from comparison (replay only
+              models entries/BUYs, so SELL trades can never match).
     """
     if wallet_trades.empty or not decisions:
         return ComparisonResult(0, 0, 0, 0, 0.0)
@@ -968,6 +1017,9 @@ def compare_to_wallet(
         w_outcome = _resolve_wallet_outcome(row)
         w_token_id = str(row.get("token_id", "")) if "token_id" in row.index else ""
         if not w_side:
+            continue
+        # Skip wallet SELL trades: replay only models entries (BUYs)
+        if buy_only and w_side == "SELL":
             continue
 
         total += 1
@@ -1148,8 +1200,11 @@ def compare_to_wallet(
         w_asset = _resolve_wallet_asset(row)
         w_slug = _resolve_wallet_slug(row)
         w_outcome = _resolve_wallet_outcome(row)
-        if w_side:
-            wallet_by_key[(w_asset, w_slug, w_outcome, w_side)].append(float(wts))
+        if not w_side:
+            continue
+        if buy_only and w_side == "SELL":
+            continue
+        wallet_by_key[(w_asset, w_slug, w_outcome, w_side)].append(float(wts))
 
     wallet_arrays: Dict[Tuple[str, str, str, str], np.ndarray] = {
         k: np.array(sorted(v)) for k, v in wallet_by_key.items()
