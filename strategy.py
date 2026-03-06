@@ -1,15 +1,17 @@
 """
 strategy.py – Wallet-copy microstructure scalper strategy.
 
-Core logic (tuned from market replay analysis):
-  - Entry when: spread_cents>=1, spread_pctl>=0.80, imbalance>=0.42
-  - Momentum gate disabled (wallet enters at ret_30s median=0.0)
+Core logic (tightened entry filters):
+  - Entry when: spread_cents>=1.5, spread_pctl>=0.85, imbalance>=0.50
+  - Momentum gate: |ret_30s| >= 0.0002 (2 bps minimum)
+  - Directional imbalance: enabled (imbalance must agree with trade direction)
+  - Book depth gate: bid+ask >= 50 shares, bid >= 20 shares
   - Direction: cascade ret_30s → ret_5s → ret_120s → orderbook imbalance
   - Passive bids only (no crossing except extreme momentum)
   - 2-level ladder: 62.5% @ best_bid, 37.5% @ best_bid - 0.01
   - Crossing only when |ret_30s|>=0.003 AND spread_pctl>=0.95
-  - Max 3 open positions per market
-  - Immediate entry on signal (no cadence delay for buys)
+  - Late entry cutoff: 10 min into window (was 12)
+  - Edge gate: 4¢ minimum (was 3¢)
   - Exit logic: cost-basis TP/SL shaving (unchanged)
 """
 from __future__ import annotations
@@ -269,10 +271,13 @@ def _entry_gated(tf: TokenFeatures, cfg: Config,
     """Check if entry is allowed.  Returns (allowed, reason_if_blocked, diagnostics).
 
     Entry conditions (all must be true):
-      1. spread_cents >= ENTRY_MIN_SPREAD_CENTS (default 1.0)
-      2. spread_percentile >= ENTRY_MIN_SPREAD_PCTL (default 0.90)
-      3. abs(return_30s) >= ENTRY_MIN_ABS_RET_30S (default 0.0001, allows 0.0 for test mode)
-      4. directional imbalance gate (soft, configurable)
+      1. spread_cents >= ENTRY_MIN_SPREAD_CENTS (default 1.5)
+      2. spread_percentile >= ENTRY_MIN_SPREAD_PCTL (default 0.85)
+      3. abs(return_30s) >= ENTRY_MIN_ABS_RET_30S (default 0.0002)
+      4. directional imbalance gate (enabled by default)
+      5. book depth >= ENTRY_MIN_BOOK_DEPTH (default 50 shares)
+      6. bid size >= ENTRY_MIN_BID_SIZE (default 20 shares)
+      7. momentum acceleration gate (optional)
     """
     diag: dict = {}
     accepted_reasons: list = []
@@ -305,13 +310,12 @@ def _entry_gated(tf: TokenFeatures, cfg: Config,
     if tf.spread <= 0:
         return False, "zero_spread", diag
 
-    # -- Condition 3: momentum gate (lowered threshold) --
-    # ENTRY_MIN_ABS_RET_30S=0.0 is valid (disables momentum gate entirely)
+    # -- Condition 3: momentum gate --
     if cfg.ENTRY_MIN_ABS_RET_30S > 0 and bin_ret_30s < cfg.ENTRY_MIN_ABS_RET_30S:
         return False, f"low_momentum(bin_ret_30s={bin_ret_30s:.6f}<{cfg.ENTRY_MIN_ABS_RET_30S})", diag
     accepted_reasons.append("momentum_ok")
 
-    # -- Condition 4: directional imbalance gate (soft, configurable) --
+    # -- Condition 4: directional imbalance gate --
     ob_imbalance = _compute_ob_imbalance(tf)
     if cfg.ENTRY_IMBALANCE_ENABLED and ob_imbalance is not None:
         if cfg.ENTRY_IMBALANCE_DIRECTIONAL and direction:
@@ -327,15 +331,30 @@ def _entry_gated(tf: TokenFeatures, cfg: Config,
                 return False, f"ob_imbalance({ob_imbalance:.3f}<{cfg.ENTRY_MIN_IMBALANCE})", diag
         accepted_reasons.append("imbalance_ok")
 
+    # -- Condition 5: book depth gate (reject thin books) --
+    total_depth = tf.bid_size + tf.ask_size
+    if total_depth < cfg.ENTRY_MIN_BOOK_DEPTH:
+        return False, f"thin_book(depth={total_depth:.0f}<{cfg.ENTRY_MIN_BOOK_DEPTH})", diag
+    if tf.bid_size < cfg.ENTRY_MIN_BID_SIZE:
+        return False, f"thin_bids(bid_size={tf.bid_size:.0f}<{cfg.ENTRY_MIN_BID_SIZE})", diag
+    accepted_reasons.append("book_depth_ok")
+
+    # -- Condition 6: momentum acceleration gate (optional) --
+    if cfg.ENTRY_MIN_RET_ACCEL > 0:
+        ret_120s = tf.ret_120s or 0
+        ret_accel = bin_ret_30s_raw - ret_120s
+        # For Up direction, require positive acceleration; for Down, negative
+        if direction == "Up" and ret_accel < cfg.ENTRY_MIN_RET_ACCEL:
+            return False, f"low_accel(Up,accel={ret_accel:.6f}<{cfg.ENTRY_MIN_RET_ACCEL})", diag
+        if direction == "Down" and (-ret_accel) < cfg.ENTRY_MIN_RET_ACCEL:
+            return False, f"low_accel(Down,accel={-ret_accel:.6f}<{cfg.ENTRY_MIN_RET_ACCEL})", diag
+        accepted_reasons.append("accel_ok")
+
     # -- Risk gates --
     if not exposure_ok:
         return False, "exposure_cap", diag
     if not cash_ok:
         return False, "cash_reserve", diag
-
-    # -- Momentum direction check removed: direction is already picked by
-    #    _pick_buy_direction() which cascades ret_30s → ret_5s → ret_120s → imbalance.
-    #    Re-checking here was redundant and blocked entries when momentum was near zero. --
 
     # -- Prevent buying late in 15-min window --
     seconds_to_resolution = 900 - sec_from_q
