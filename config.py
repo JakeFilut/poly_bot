@@ -142,10 +142,18 @@ class Config:
     ENTRY_MIN_EDGE_CENTS: float = 0.03   # require at least 3¢ expected edge
     ENTRY_MIN_EDGE_BPS: float = 300.0    # 3% edge vs cost (informational)
     ENTRY_MAX_OFFSET_FROM_BID: float = 0.01  # max entry price above best_bid
-    ENTRY_MIN_SPREAD_CENTS: float = 2.0  # min spread (cents) to allow entry (wallet threshold)
-    ENTRY_MIN_RET_30S: float = 0.0015    # min |bin_ret_30s| for momentum gate (wallet threshold)
+    ENTRY_MIN_SPREAD_CENTS: float = 1.0  # min spread (cents) to allow entry
+    ENTRY_MIN_SPREAD_PCTL: float = 0.90  # min spread percentile to allow entry
+    ENTRY_PREFER_SPREAD_PCTL: float = 0.94  # preferred spread pctl (soft bonus)
+    ENTRY_MIN_ABS_RET_30S: float = 0.0001  # min |bin_ret_30s| for momentum gate (lowered per replay data)
+    ENTRY_MIN_RET_30S: float = 0.0015    # legacy alias (unused if ENTRY_MIN_ABS_RET_30S is set)
     ENTRY_LATE_CUTOFF_SEC: int = 720     # skip entry if < 180s to end of 15-min window
     ENTRY_AVG_UP_TOLERANCE: float = 0.01 # reject buy if price > avg_cost + this
+
+    # -- Directional imbalance gate --
+    ENTRY_MIN_IMBALANCE: float = 0.45    # soft imbalance gate threshold
+    ENTRY_IMBALANCE_DIRECTIONAL: bool = True  # if True, imbalance is direction-aware
+    ENTRY_IMBALANCE_ENABLED: bool = True  # set False to disable imbalance gate entirely
 
     # -- Cadence (15-min) --
     BUY_HEAVY_SEC: int = 60  # first N seconds: heavy buy
@@ -294,10 +302,16 @@ def load_config() -> Config:
         ENTRY_MIN_EDGE_CENTS=_env_float("ENTRY_MIN_EDGE_CENTS", 0.03),
         ENTRY_MIN_EDGE_BPS=_env_float("ENTRY_MIN_EDGE_BPS", 300.0),
         ENTRY_MAX_OFFSET_FROM_BID=_env_float("ENTRY_MAX_OFFSET_FROM_BID", 0.01),
-        ENTRY_MIN_SPREAD_CENTS=_env_float("ENTRY_MIN_SPREAD_CENTS", 2.0),
+        ENTRY_MIN_SPREAD_CENTS=_env_float("ENTRY_MIN_SPREAD_CENTS", 1.0),
+        ENTRY_MIN_SPREAD_PCTL=_env_float("ENTRY_MIN_SPREAD_PCTL", 0.90),
+        ENTRY_PREFER_SPREAD_PCTL=_env_float("ENTRY_PREFER_SPREAD_PCTL", 0.94),
+        ENTRY_MIN_ABS_RET_30S=_env_float("ENTRY_MIN_ABS_RET_30S", 0.0001),
         ENTRY_MIN_RET_30S=_env_float("ENTRY_MIN_RET_30S", 0.0015),
         ENTRY_LATE_CUTOFF_SEC=_env_int("ENTRY_LATE_CUTOFF_SEC", 720),
         ENTRY_AVG_UP_TOLERANCE=_env_float("ENTRY_AVG_UP_TOLERANCE", 0.01),
+        ENTRY_MIN_IMBALANCE=_env_float("ENTRY_MIN_IMBALANCE", 0.45),
+        ENTRY_IMBALANCE_DIRECTIONAL=_env_bool("ENTRY_IMBALANCE_DIRECTIONAL", True),
+        ENTRY_IMBALANCE_ENABLED=_env_bool("ENTRY_IMBALANCE_ENABLED", True),
         BUY_HEAVY_SEC=_env_int("BUY_HEAVY_SEC", 60),
         BUY_MED_SEC=_env_int("BUY_MED_SEC", 120),
         SELL_START_SEC=_env_int("SELL_START_SEC", 300),
