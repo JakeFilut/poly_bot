@@ -85,6 +85,7 @@ class MarketState:
     sec_from_quarter_et: int = 0
     sec_from_hour_et: int = 0
     seconds_to_resolution: int = 900
+    hour_et: int = 0              # hour of day in ET (0-23) for quiet-hour gate
     # Market type (derived from slug)
     market_type: str = ""     # "hourly" or "15m" or ""
 
@@ -128,19 +129,20 @@ class ComparisonResult:
 class StrategyParams:
     """Tunable strategy parameters for the sweep.
 
-    Defaults are set to the BEST SWEEP params discovered during optimization
-    so the baseline comparison is meaningful (not zero matches).
+    Defaults aligned to wallet signal distributions from replay analysis.
     """
-    entry_min_spread_pctl: float = 0.80
-    entry_min_spread_cents: float = 1.0
-    entry_min_ret_30s: float = 0.0
-    entry_min_imbalance: float = 0.42
+    entry_min_spread_pctl: float = 0.85
+    entry_min_spread_cents: float = 1.0     # wallet median spread=1¢
+    entry_min_ret_30s: float = 0.0          # disabled: wallet median ret_30s=0.0
+    entry_min_imbalance: float = 0.42       # wallet p25=0.432
     # -- Directional imbalance --
-    imbalance_directional: bool = False  # wallet doesn't strongly filter on directional imbalance
+    imbalance_directional: bool = False     # wallet doesn't strongly filter on directional imbalance
     # -- One-shot conditions --
     spread_pctl_delta_min: float = 0.0      # pctl_now - pctl_60s_ago >= this
     ret_accel_min: float = 0.0              # |ret_30s - ret_120s| >= this
-    entry_cooldown_sec: float = 0.0         # per (slug, outcome, side) cooldown
+    entry_cooldown_sec: float = 5.0         # per (slug, outcome, side) cooldown (matches live)
+    # -- Time-of-day filter --
+    quiet_hours_et: tuple = (3, 5, 7, 8)   # hours in ET to suppress entries (<16% match rate)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -341,6 +343,7 @@ class MarketReplayEngine:
         sfq_arr = total_sec % 900
         sfh_arr = total_sec
         str_arr = 900 - sfq_arr
+        hour_et_arr = ts_dt.hour.values.astype(np.int32)
 
         # --- Market type from slug (vectorized) ---
         slugs_lower = np.char.lower(slugs.astype(str))
@@ -373,6 +376,7 @@ class MarketReplayEngine:
                 sec_from_quarter_et=int(sfq_arr[i]),
                 sec_from_hour_et=int(sfh_arr[i]),
                 seconds_to_resolution=int(str_arr[i]),
+                hour_et=int(hour_et_arr[i]),
                 market_type=str(mtypes[i]),
             ))
 
@@ -453,6 +457,10 @@ class Strategy:
         """
         p = self.params
         accepted_reasons: List[str] = []
+
+        # --- Gate 0: quiet hours ---
+        if p.quiet_hours_et and ms.hour_et in p.quiet_hours_et:
+            return self._no_action(ms, f"quiet_hour(hour_et={ms.hour_et})"), "quiet_hour"
 
         # --- Gate checks ---
         if ms.spread_cents < p.entry_min_spread_cents:
@@ -554,6 +562,8 @@ class Strategy:
         """
         p = self.params
         results = []
+        quiet_ok = not p.quiet_hours_et or ms.hour_et not in p.quiet_hours_et
+        results.append(("quiet_hour", float(ms.hour_et), 0.0, quiet_ok))
         results.append(("spread_cents", ms.spread_cents, p.entry_min_spread_cents,
                          ms.spread_cents >= p.entry_min_spread_cents))
         results.append(("spread_pctl", ms.spread_percentile, p.entry_min_spread_pctl,
@@ -1718,12 +1728,15 @@ DEFAULT_SWEEP_RANGES = {
 #   - wallet spread_pctl p25=83% → need to test lower pctl values
 #   - wallet imbalance p25=0.432 → need lower imbalance thresholds
 #   - wallet doesn't use directional imbalance strongly
+#   - hours 3,5,7,8 ET have <16% match rate → quiet hours help
 FOCUSED_SWEEP_RANGES = {
     "entry_min_ret_30s": [0.0],
-    "entry_min_spread_pctl": [0.75, 0.80, 0.83, 0.86, 0.90],
+    "entry_min_spread_pctl": [0.80, 0.85, 0.90],
     "entry_min_spread_cents": [0.5, 1.0],
     "entry_min_imbalance": [0.0, 0.40, 0.42, 0.45],
     "imbalance_directional": [False],
+    "quiet_hours_et": [(), (3, 5, 7, 8)],
+    "entry_cooldown_sec": [5.0, 10.0],
 }
 
 
@@ -1757,6 +1770,8 @@ def parameter_sweep(
         for k, v in zip(keys, combo):
             if isinstance(v, bool):
                 entry[k] = v
+            elif isinstance(v, (tuple, list)):
+                entry[k] = str(v)
             else:
                 entry[k] = round(float(v), 6)
         entry["similarity"] = round(cr.similarity_score, 4)

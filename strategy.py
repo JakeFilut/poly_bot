@@ -1,17 +1,19 @@
 """
 strategy.py – Wallet-copy microstructure scalper strategy.
 
-Core logic (tightened entry filters):
-  - Entry when: spread_cents>=1.5, spread_pctl>=0.85, imbalance>=0.50
-  - Momentum gate: |ret_30s| >= 0.0002 (2 bps minimum)
-  - Directional imbalance: enabled (imbalance must agree with trade direction)
+Core logic (replay-aligned entry filters):
+  - Entry when: spread_cents>=1.0, spread_pctl>=0.85, imbalance>=0.42
+  - Momentum gate: disabled (wallet median ret_30s=0.0)
+  - Imbalance: non-directional, threshold 0.42 (wallet p25=0.432)
+  - Quiet hours: skip hours 3,5,7,8 ET (<16% match rate in replay)
   - Book depth gate: bid+ask >= 50 shares, bid >= 20 shares
   - Direction: cascade ret_30s → ret_5s → ret_120s → orderbook imbalance
   - Passive bids only (no crossing except extreme momentum)
   - 2-level ladder: 62.5% @ best_bid, 37.5% @ best_bid - 0.01
   - Crossing only when |ret_30s|>=0.003 AND spread_pctl>=0.95
-  - Late entry cutoff: 10 min into window (was 12)
-  - Edge gate: 4¢ minimum (was 3¢)
+  - Late entry cutoff: 10 min into window
+  - Edge gate: 4¢ minimum
+  - Per-token cooldown: 5s (matches replay cooldown)
   - Exit logic: cost-basis TP/SL shaving (unchanged)
 """
 from __future__ import annotations
@@ -267,14 +269,16 @@ def _entry_gated(tf: TokenFeatures, cfg: Config,
                  direction: str = "",
                  sec_from_q: int = 0,
                  inv: InventoryEntry | None = None,
-                 entry_price: float = 0.0) -> tuple[bool, str, dict]:
+                 entry_price: float = 0.0,
+                 now_utc: datetime | None = None) -> tuple[bool, str, dict]:
     """Check if entry is allowed.  Returns (allowed, reason_if_blocked, diagnostics).
 
     Entry conditions (all must be true):
-      1. spread_cents >= ENTRY_MIN_SPREAD_CENTS (default 1.5)
+      0. Not in a quiet hour (ET)
+      1. spread_cents >= ENTRY_MIN_SPREAD_CENTS (default 1.0)
       2. spread_percentile >= ENTRY_MIN_SPREAD_PCTL (default 0.85)
-      3. abs(return_30s) >= ENTRY_MIN_ABS_RET_30S (default 0.0002)
-      4. directional imbalance gate (enabled by default)
+      3. abs(return_30s) >= ENTRY_MIN_ABS_RET_30S (default 0.0, disabled)
+      4. imbalance gate (non-directional by default)
       5. book depth >= ENTRY_MIN_BOOK_DEPTH (default 50 shares)
       6. bid size >= ENTRY_MIN_BID_SIZE (default 20 shares)
       7. momentum acceleration gate (optional)
@@ -284,6 +288,13 @@ def _entry_gated(tf: TokenFeatures, cfg: Config,
 
     if not tf.has_book:
         return False, "no_book", diag
+
+    # -- Condition 0: time-of-day quiet hours --
+    if cfg.ENTRY_QUIET_HOURS_ET:
+        _now = now_utc or datetime.now(timezone.utc)
+        hour_et = _now.astimezone(_ET).hour
+        if hour_et in cfg.ENTRY_QUIET_HOURS_ET:
+            return False, f"quiet_hour(hour_et={hour_et})", diag
 
     bin_ret_30s_raw = tf.ret_30s or 0
     bin_ret_30s = abs(bin_ret_30s_raw)
@@ -668,6 +679,7 @@ class Strategy:
                 sec_from_q=sec_from_q,
                 inv=inv,
                 entry_price=price,
+                now_utc=now_utc,
             )
             if not allowed:
                 reason_code = gate_reason.split("(")[0] if gate_reason else buy_reason
