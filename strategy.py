@@ -179,8 +179,12 @@ def _pick_buy_direction(sf: SlugFeatures, cfg: Config) -> str | None:
     if ret is None:
         return None
 
-    # Wallet threshold: only trade when momentum is strong
-    if abs(ret) < cfg.BIN_RET30_THRESHOLD:
+    # Use ENTRY_MIN_ABS_RET_30S as the direction-picking threshold
+    # When set to 0.0, any non-zero momentum picks direction; 0 momentum = no entry
+    threshold = cfg.ENTRY_MIN_ABS_RET_30S
+    if threshold > 0 and abs(ret) < threshold:
+        return None
+    if ret == 0:
         return None
 
     if ret > 0:
@@ -215,6 +219,19 @@ def _compute_ob_imbalance(tf: TokenFeatures) -> float | None:
     return tf.bid_size / total
 
 
+def _compute_timing_features(now_utc: datetime, sec_from_q: int) -> dict:
+    """Compute timing-inside-window features for entry logging."""
+    now_et = now_utc.astimezone(_ET)
+    sec_from_quarter_et = sec_from_q
+    sec_from_hour_et = now_et.minute * 60 + now_et.second
+    seconds_to_resolution = 900 - sec_from_q
+    return {
+        "sec_from_quarter_et": sec_from_quarter_et,
+        "sec_from_hour_et": sec_from_hour_et,
+        "seconds_to_resolution": seconds_to_resolution,
+    }
+
+
 def _entry_gated(tf: TokenFeatures, cfg: Config,
                  exposure_ok: bool, cash_ok: bool,
                  direction: str = "",
@@ -223,13 +240,14 @@ def _entry_gated(tf: TokenFeatures, cfg: Config,
                  entry_price: float = 0.0) -> tuple[bool, str, dict]:
     """Check if entry is allowed.  Returns (allowed, reason_if_blocked, diagnostics).
 
-    Wallet-copy entry conditions (ALL must be true):
-      1. spread_cents >= 2
-      2. spread_percentile >= 0.90
-      3. abs(return_30s) >= 0.0015
-      4. orderbook_imbalance >= 0.60
+    Entry conditions (all must be true):
+      1. spread_cents >= ENTRY_MIN_SPREAD_CENTS (default 1.0)
+      2. spread_percentile >= ENTRY_MIN_SPREAD_PCTL (default 0.90)
+      3. abs(return_30s) >= ENTRY_MIN_ABS_RET_30S (default 0.0001, allows 0.0 for test mode)
+      4. directional imbalance gate (soft, configurable)
     """
     diag: dict = {}
+    accepted_reasons: list = []
 
     if not tf.has_book:
         return False, "no_book", diag
@@ -238,13 +256,20 @@ def _entry_gated(tf: TokenFeatures, cfg: Config,
     bin_ret_30s = abs(bin_ret_30s_raw)
     spread_cents = tf.spread * 100
 
-    # -- Wallet condition 1: spread must be wide --
+    # -- Condition 1: spread must be wide enough --
     if spread_cents < cfg.ENTRY_MIN_SPREAD_CENTS:
         return False, f"spread_gate(spread_cents={spread_cents:.1f}<{cfg.ENTRY_MIN_SPREAD_CENTS})", diag
+    accepted_reasons.append("spread_cents_ok")
 
-    # -- Wallet condition 2: spread percentile must be high --
-    if tf.spread_pctl_60s < cfg.SPREAD_PCTL_MIN:
-        return False, f"spread_pctl({tf.spread_pctl_60s:.2f}<{cfg.SPREAD_PCTL_MIN})", diag
+    # -- Condition 2: spread percentile must be high --
+    entry_spread_pctl = cfg.ENTRY_MIN_SPREAD_PCTL
+    if tf.spread_pctl_60s < entry_spread_pctl:
+        return False, f"spread_pctl({tf.spread_pctl_60s:.2f}<{entry_spread_pctl})", diag
+    accepted_reasons.append("spread_pctl_ok")
+
+    # -- Soft bonus: preferred spread percentile --
+    if tf.spread_pctl_60s >= cfg.ENTRY_PREFER_SPREAD_PCTL:
+        accepted_reasons.append("spread_pctl_preferred")
 
     # -- Sanity: spread not insanely wide --
     if tf.spread > cfg.SPREAD_MAX_SANE:
@@ -252,14 +277,27 @@ def _entry_gated(tf: TokenFeatures, cfg: Config,
     if tf.spread <= 0:
         return False, "zero_spread", diag
 
-    # -- Wallet condition 3: momentum must be strong --
-    if bin_ret_30s < cfg.VOL_MIN_RET_30S:
-        return False, f"low_vol(bin_ret_30s={bin_ret_30s:.6f}<{cfg.VOL_MIN_RET_30S})", diag
+    # -- Condition 3: momentum gate (lowered threshold) --
+    # ENTRY_MIN_ABS_RET_30S=0.0 is valid (disables momentum gate entirely)
+    if cfg.ENTRY_MIN_ABS_RET_30S > 0 and bin_ret_30s < cfg.ENTRY_MIN_ABS_RET_30S:
+        return False, f"low_momentum(bin_ret_30s={bin_ret_30s:.6f}<{cfg.ENTRY_MIN_ABS_RET_30S})", diag
+    accepted_reasons.append("momentum_ok")
 
-    # -- Wallet condition 4: orderbook imbalance --
+    # -- Condition 4: directional imbalance gate (soft, configurable) --
     ob_imbalance = _compute_ob_imbalance(tf)
-    if ob_imbalance is not None and ob_imbalance < cfg.OB_IMBALANCE_MIN:
-        return False, f"ob_imbalance({ob_imbalance:.3f}<{cfg.OB_IMBALANCE_MIN})", diag
+    if cfg.ENTRY_IMBALANCE_ENABLED and ob_imbalance is not None:
+        if cfg.ENTRY_IMBALANCE_DIRECTIONAL and direction:
+            # Directional: buying Up requires imbalance >= threshold (bids dominant)
+            #              buying Down requires imbalance <= (1 - threshold) (asks dominant)
+            if direction == "Up" and ob_imbalance < cfg.ENTRY_MIN_IMBALANCE:
+                return False, f"imbalance_dir(Up,imb={ob_imbalance:.3f}<{cfg.ENTRY_MIN_IMBALANCE})", diag
+            if direction == "Down" and ob_imbalance > (1.0 - cfg.ENTRY_MIN_IMBALANCE):
+                return False, f"imbalance_dir(Down,imb={ob_imbalance:.3f}>{1.0 - cfg.ENTRY_MIN_IMBALANCE:.3f})", diag
+        else:
+            # Non-directional: simple minimum
+            if ob_imbalance < cfg.ENTRY_MIN_IMBALANCE:
+                return False, f"ob_imbalance({ob_imbalance:.3f}<{cfg.ENTRY_MIN_IMBALANCE})", diag
+        accepted_reasons.append("imbalance_ok")
 
     # -- Risk gates --
     if not exposure_ok:
@@ -268,7 +306,7 @@ def _entry_gated(tf: TokenFeatures, cfg: Config,
         return False, "cash_reserve", diag
 
     # -- Momentum direction must match trade direction --
-    if direction and bin_ret_30s >= cfg.ENTRY_MIN_RET_30S:
+    if direction and bin_ret_30s >= cfg.ENTRY_MIN_ABS_RET_30S and bin_ret_30s > 0:
         if direction == "Up" and bin_ret_30s_raw < 0:
             return False, f"momentum_gate(dir=Up,ret30={bin_ret_30s_raw:.6f})", diag
         if direction == "Down" and bin_ret_30s_raw > 0:
@@ -278,6 +316,7 @@ def _entry_gated(tf: TokenFeatures, cfg: Config,
     seconds_to_resolution = 900 - sec_from_q
     if seconds_to_resolution < (900 - cfg.ENTRY_LATE_CUTOFF_SEC):
         return False, f"late_entry_gate(sec_to_res={seconds_to_resolution})", diag
+    accepted_reasons.append("time_window_ok")
 
     # -- Edge and price gates (when entry_price is known) --
     if entry_price > 0:
@@ -303,6 +342,7 @@ def _entry_gated(tf: TokenFeatures, cfg: Config,
             if entry_price > inv.avg_cost + cfg.ENTRY_AVG_UP_TOLERANCE:
                 return False, f"bad_average(price={entry_price:.4f}>avg_cost={inv.avg_cost:.4f}+{cfg.ENTRY_AVG_UP_TOLERANCE})", diag
 
+    diag["accepted_reason_codes"] = accepted_reasons
     return True, "", diag
 
 
@@ -492,6 +532,7 @@ class Strategy:
         buy_weight, sell_weight = cadence_weight(self.cfg, now_utc)
         sec_from_q = _seconds_from_quarter(now_utc)
         intent_ts = time.time()  # capture signal detection time
+        timing_features = _compute_timing_features(now_utc, sec_from_q)
 
         actions: List[TradeAction] = []
 
@@ -655,6 +696,8 @@ class Strategy:
                     entry_style=entry_style,
                     intent_timestamp=intent_ts,
                     desired_usd=round(desired_usd, 2),
+                    accepted_reason_codes=diag.get("accepted_reason_codes", []),
+                    **timing_features,
                     **micro,
                 )
 
@@ -677,8 +720,9 @@ class Strategy:
                         entry_style=entry_style,
                         ladder_level=i,
                         intent_timestamp=intent_ts,
+                        accepted_reason_codes=diag.get("accepted_reason_codes", []),
+                        **timing_features,
                         **micro,
-                        **diag,
                     )
 
                 # Track entry quality (use level0 price)
@@ -735,8 +779,9 @@ class Strategy:
                     orderbook_imbalance=ob_imb_val,
                     entry_style=entry_style,
                     intent_timestamp=intent_ts,
+                    accepted_reason_codes=diag.get("accepted_reason_codes", []),
+                    **timing_features,
                     **micro,
-                    **diag,
                 )
 
                 inv_before = self.state.get_inventory(slug, direction)
@@ -753,7 +798,8 @@ class Strategy:
                     intent_timestamp=intent_ts,
                     buy_weight=buy_weight,
                     sec_from_q=sec_from_q,
-                    **diag,
+                    accepted_reason_codes=diag.get("accepted_reason_codes", []),
+                    **timing_features,
                 )
 
                 actions.append(TradeAction(

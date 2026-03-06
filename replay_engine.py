@@ -20,9 +20,13 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import re
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
+
+_ET = ZoneInfo("America/New_York")
 
 # ---------------------------------------------------------------------------
 # Try importing matplotlib -- optional for charts
@@ -77,6 +81,12 @@ class MarketState:
     binance_ret_60s: float
     binance_ret_120s: float = 0.0   # 120s return for ret_accel
     spread_pctl_prev: float = 0.0   # spread_pctl ~60s ago for delta
+    # Timing-inside-window features
+    sec_from_quarter_et: int = 0
+    sec_from_hour_et: int = 0
+    seconds_to_resolution: int = 900
+    # Market type (derived from slug)
+    market_type: str = ""     # "hourly" or "15m" or ""
 
 
 @dataclass
@@ -95,6 +105,11 @@ class BotDecision:
     token_id: str = ""        # token_id for primary matching
     binance_ret_120s: float = 0.0
     spread_pctl_prev: float = 0.0
+    accepted_reason_codes: List[str] = field(default_factory=list)
+    sec_from_quarter_et: int = 0
+    sec_from_hour_et: int = 0
+    seconds_to_resolution: int = 900
+    market_type: str = ""
 
 
 @dataclass
@@ -118,9 +133,11 @@ class StrategyParams:
     """
     entry_min_spread_pctl: float = 0.94
     entry_min_spread_cents: float = 1.0
-    entry_min_ret_30s: float = 0.0005
+    entry_min_ret_30s: float = 0.0001
     entry_min_imbalance: float = 0.45
-    # -- New one-shot conditions (task 4) --
+    # -- Directional imbalance --
+    imbalance_directional: bool = True  # if True, imbalance check is direction-aware
+    # -- One-shot conditions --
     spread_pctl_delta_min: float = 0.0      # pctl_now - pctl_60s_ago >= this
     ret_accel_min: float = 0.0              # |ret_30s - ret_120s| >= this
     entry_cooldown_sec: float = 0.0         # per (slug, outcome, side) cooldown
@@ -301,6 +318,26 @@ class MarketReplayEngine:
                         r60 = float(bdf.iloc[idx].get("ret_60s", 0))
                         r120 = float(bdf.iloc[idx].get("ret_120s", 0))
 
+            # Compute timing-inside-window features
+            try:
+                dt_utc = datetime.fromtimestamp(ts, tz=timezone.utc)
+                dt_et = dt_utc.astimezone(_ET)
+                total_sec = dt_et.minute * 60 + dt_et.second
+                sfq = total_sec % 900
+                sfh = total_sec
+                str_ = 900 - sfq
+            except (OSError, OverflowError, ValueError):
+                sfq = sfh = 0
+                str_ = 900
+
+            # Derive market type from slug
+            mtype = ""
+            slug_lower = slug.lower()
+            if "hourly" in slug_lower or "1-hour" in slug_lower:
+                mtype = "hourly"
+            elif "15" in slug_lower or "fifteen" in slug_lower:
+                mtype = "15m"
+
             states.append(MarketState(
                 timestamp=ts,
                 asset=asset,
@@ -316,6 +353,10 @@ class MarketReplayEngine:
                 binance_ret_30s=r30,
                 binance_ret_60s=r60,
                 binance_ret_120s=r120,
+                sec_from_quarter_et=sfq,
+                sec_from_hour_et=sfh,
+                seconds_to_resolution=str_,
+                market_type=mtype,
             ))
 
         # Backfill spread_pctl_prev: for each (slug, outcome) track pctl ~60s ago
@@ -358,19 +399,33 @@ class Strategy:
         gate_that_failed is '' if all gates pass, otherwise the name of the first failing gate.
         """
         p = self.params
+        accepted_reasons: List[str] = []
 
         # --- Gate checks ---
         if ms.spread_cents < p.entry_min_spread_cents:
             return self._no_action(ms, "spread_cents below threshold"), "spread_cents"
+        accepted_reasons.append("spread_cents_ok")
 
         if ms.spread_percentile < p.entry_min_spread_pctl:
             return self._no_action(ms, "spread_pctl below threshold"), "spread_pctl"
+        accepted_reasons.append("spread_pctl_ok")
 
-        if abs(ms.binance_ret_30s) < p.entry_min_ret_30s:
+        if p.entry_min_ret_30s > 0 and abs(ms.binance_ret_30s) < p.entry_min_ret_30s:
             return self._no_action(ms, "ret_30s below threshold"), "ret_30s"
+        accepted_reasons.append("momentum_ok")
 
-        if ms.orderbook_imbalance < p.entry_min_imbalance:
-            return self._no_action(ms, "imbalance below threshold"), "imbalance"
+        # --- Directional imbalance gate ---
+        if p.imbalance_directional:
+            # Direction from momentum
+            direction = "Up" if ms.binance_ret_30s > 0 else "Down"
+            if direction == "Up" and ms.orderbook_imbalance < p.entry_min_imbalance:
+                return self._no_action(ms, "imbalance_dir below threshold (Up)"), "imbalance"
+            if direction == "Down" and ms.orderbook_imbalance > (1.0 - p.entry_min_imbalance):
+                return self._no_action(ms, "imbalance_dir above threshold (Down)"), "imbalance"
+        else:
+            if ms.orderbook_imbalance < p.entry_min_imbalance:
+                return self._no_action(ms, "imbalance below threshold"), "imbalance"
+        accepted_reasons.append("imbalance_ok")
 
         # --- New condition: spread percentile delta ---
         if p.spread_pctl_delta_min > 0:
@@ -383,6 +438,8 @@ class Strategy:
             ret_accel = abs(ms.binance_ret_30s - ms.binance_ret_120s)
             if ret_accel < p.ret_accel_min:
                 return self._no_action(ms, "ret_accel below threshold"), "ret_accel"
+
+        accepted_reasons.append("time_window_ok")
 
         # All gates passed -- direction from momentum
         action = "BUY" if ms.binance_ret_30s > 0 else "SELL"
@@ -401,6 +458,11 @@ class Strategy:
             token_id=ms.token_id,
             binance_ret_120s=ms.binance_ret_120s,
             spread_pctl_prev=ms.spread_pctl_prev,
+            accepted_reason_codes=accepted_reasons,
+            sec_from_quarter_et=ms.sec_from_quarter_et,
+            sec_from_hour_et=ms.sec_from_hour_et,
+            seconds_to_resolution=ms.seconds_to_resolution,
+            market_type=ms.market_type,
         ), ""
 
     @staticmethod
@@ -433,10 +495,26 @@ class Strategy:
                          ms.spread_cents >= p.entry_min_spread_cents))
         results.append(("spread_pctl", ms.spread_percentile, p.entry_min_spread_pctl,
                          ms.spread_percentile >= p.entry_min_spread_pctl))
-        results.append(("|ret_30s|", abs(ms.binance_ret_30s), p.entry_min_ret_30s,
-                         abs(ms.binance_ret_30s) >= p.entry_min_ret_30s))
-        results.append(("imbalance", ms.orderbook_imbalance, p.entry_min_imbalance,
-                         ms.orderbook_imbalance >= p.entry_min_imbalance))
+        if p.entry_min_ret_30s > 0:
+            results.append(("|ret_30s|", abs(ms.binance_ret_30s), p.entry_min_ret_30s,
+                             abs(ms.binance_ret_30s) >= p.entry_min_ret_30s))
+        else:
+            results.append(("|ret_30s|", abs(ms.binance_ret_30s), 0.0, True))
+
+        # Directional imbalance check
+        if p.imbalance_directional:
+            direction = "Up" if ms.binance_ret_30s > 0 else "Down"
+            if direction == "Up":
+                results.append(("imbalance_dir", ms.orderbook_imbalance, p.entry_min_imbalance,
+                                 ms.orderbook_imbalance >= p.entry_min_imbalance))
+            else:
+                effective_thr = 1.0 - p.entry_min_imbalance
+                results.append(("imbalance_dir", ms.orderbook_imbalance, effective_thr,
+                                 ms.orderbook_imbalance <= effective_thr))
+        else:
+            results.append(("imbalance", ms.orderbook_imbalance, p.entry_min_imbalance,
+                             ms.orderbook_imbalance >= p.entry_min_imbalance))
+
         if p.spread_pctl_delta_min > 0:
             pctl_delta = ms.spread_percentile - ms.spread_pctl_prev
             results.append(("pctl_delta", pctl_delta, p.spread_pctl_delta_min,
@@ -1563,6 +1641,16 @@ DEFAULT_SWEEP_RANGES = {
     "entry_cooldown_sec": [0.0, 30.0, 60.0],
 }
 
+# Focused sweep ranges based on replay analysis showing wallet doesn't need
+# strong Binance momentum — spread state matters more
+FOCUSED_SWEEP_RANGES = {
+    "entry_min_ret_30s": [0.0, 0.0001, 0.0002, 0.0003],
+    "entry_min_spread_pctl": [0.88, 0.90, 0.92, 0.94],
+    "entry_min_spread_cents": [1.0],
+    "entry_min_imbalance": [0.45, 0.48, 0.50],
+    "imbalance_directional": [True, False],
+}
+
 
 def parameter_sweep(
     states: List[MarketState],
@@ -1590,7 +1678,12 @@ def parameter_sweep(
         decisions = run_replay(states, params)
         cr = compare_to_wallet(decisions, wallet_trades, tolerance_sec, offset_sec=offset_sec)
 
-        entry = {k: round(float(v), 6) for k, v in zip(keys, combo)}
+        entry = {}
+        for k, v in zip(keys, combo):
+            if isinstance(v, bool):
+                entry[k] = v
+            else:
+                entry[k] = round(float(v), 6)
         entry["similarity"] = round(cr.similarity_score, 4)
         entry["matched"] = cr.wallet_trades_matched
         entry["missed"] = cr.wallet_trades_missed
@@ -1770,6 +1863,185 @@ def generate_charts(
 # SECTION 8 -- MAIN ENTRY POINT
 # ═══════════════════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 8b -- DETAILED BREAKDOWN REPORT
+# ═══════════════════════════════════════════════════════════════════════════
+
+def print_breakdown_report(
+    decisions: List[BotDecision],
+    wallet_trades: pd.DataFrame,
+    states: List[MarketState],
+    params: StrategyParams,
+    tolerance_sec: float = 3.0,
+    offset_sec: float = 0.0,
+) -> None:
+    """Print detailed breakdown report by hour, asset, and market type.
+
+    Sections:
+      - match/miss/false rate by hour of day (ET)
+      - similarity by asset (BTC/ETH/SOL/XRP)
+      - similarity by market type (hourly vs 15m)
+    """
+    if wallet_trades.empty or "ts" not in wallet_trades.columns or not decisions:
+        print("\n  No data for breakdown report.")
+        return
+
+    wt = wallet_trades.copy()
+    bot_entries = [d for d in decisions if d.action in ("BUY", "SELL")]
+
+    # Build bot entry lookup structures
+    bot_token_raw = _build_token_id_index(decisions)
+    bot_token_idx = {k: np.array(v) for k, v in bot_token_raw.items()}
+    tmp_key: Dict[tuple, List[float]] = defaultdict(list)
+    for d in decisions:
+        if d.action in ("BUY", "SELL"):
+            tmp_key[_make_decision_key(d)].append(d.timestamp)
+    bot_key_arrays = {k: np.array(sorted(v)) for k, v in tmp_key.items()}
+
+    # Classify each wallet trade: matched or missed, by hour/asset/market_type
+    hour_stats: Dict[int, Dict[str, int]] = defaultdict(lambda: {"matched": 0, "missed": 0})
+    asset_stats: Dict[str, Dict[str, int]] = defaultdict(lambda: {"matched": 0, "missed": 0, "total": 0})
+    mtype_stats: Dict[str, Dict[str, int]] = defaultdict(lambda: {"matched": 0, "missed": 0, "total": 0})
+
+    for _, row in wt.iterrows():
+        wts = row.get("ts")
+        if pd.isna(wts):
+            continue
+        wts_adj = float(wts) + offset_sec
+        w_side = _resolve_wallet_side(row)
+        w_asset = _resolve_wallet_asset(row)
+        w_slug = _resolve_wallet_slug(row)
+        w_outcome = _resolve_wallet_outcome(row)
+        w_token_id = _resolve_wallet_token_id(row)
+        if not w_side:
+            continue
+
+        key = (w_asset, w_slug, w_outcome, w_side)
+        lag = _match_by_token_id_or_key(
+            wts_adj, w_token_id, key, bot_token_idx, bot_key_arrays, tolerance_sec,
+        )
+        is_matched = lag is not None
+
+        # Hour (ET)
+        try:
+            dt_utc = datetime.fromtimestamp(float(wts), tz=timezone.utc)
+            hour_et = dt_utc.astimezone(_ET).hour
+        except (OSError, OverflowError, ValueError):
+            hour_et = -1
+
+        if is_matched:
+            hour_stats[hour_et]["matched"] += 1
+        else:
+            hour_stats[hour_et]["missed"] += 1
+
+        # Asset
+        asset_stats[w_asset]["total"] += 1
+        if is_matched:
+            asset_stats[w_asset]["matched"] += 1
+        else:
+            asset_stats[w_asset]["missed"] += 1
+
+        # Market type
+        slug_lower = w_slug.lower()
+        if "hourly" in slug_lower or "1-hour" in slug_lower:
+            mtype = "hourly"
+        elif "15" in slug_lower or "fifteen" in slug_lower:
+            mtype = "15m"
+        else:
+            mtype = "other"
+        mtype_stats[mtype]["total"] += 1
+        if is_matched:
+            mtype_stats[mtype]["matched"] += 1
+        else:
+            mtype_stats[mtype]["missed"] += 1
+
+    # False bot entries by hour
+    wallet_token_idx_r: Dict[str, np.ndarray] = {}
+    wallet_key_arrays_r: Dict[tuple, np.ndarray] = {}
+    tmp_tok2: Dict[str, List[float]] = defaultdict(list)
+    tmp_key2: Dict[tuple, List[float]] = defaultdict(list)
+    for _, row in wt.iterrows():
+        wts = row.get("ts")
+        if pd.isna(wts):
+            continue
+        w_side = _resolve_wallet_side(row)
+        w_asset = _resolve_wallet_asset(row)
+        w_slug = _resolve_wallet_slug(row)
+        w_outcome = _resolve_wallet_outcome(row)
+        w_token_id = _resolve_wallet_token_id(row)
+        if not w_side:
+            continue
+        if w_token_id:
+            tmp_tok2[w_token_id].append(float(wts) + offset_sec)
+        tmp_key2[(w_asset, w_slug, w_outcome, w_side)].append(float(wts) + offset_sec)
+    wallet_token_idx_r = {k: np.array(sorted(v)) for k, v in tmp_tok2.items()}
+    wallet_key_arrays_r = {k: np.array(sorted(v)) for k, v in tmp_key2.items()}
+
+    hour_false: Dict[int, int] = defaultdict(int)
+    for d in bot_entries:
+        key = _make_decision_key(d)
+        lag = None
+        if d.token_id:
+            warr = wallet_token_idx_r.get(d.token_id)
+            if warr is not None and len(warr) > 0:
+                lag = _find_best_lag(warr, d.timestamp, tolerance_sec)
+        if lag is None:
+            warr = wallet_key_arrays_r.get(key)
+            if warr is not None and len(warr) > 0:
+                lag = _find_best_lag(warr, d.timestamp, tolerance_sec)
+        if lag is None:
+            try:
+                dt_utc = datetime.fromtimestamp(d.timestamp, tz=timezone.utc)
+                hour_et = dt_utc.astimezone(_ET).hour
+            except (OSError, OverflowError, ValueError):
+                hour_et = -1
+            hour_false[hour_et] += 1
+
+    # --- Print report ---
+    print(f"\n{'═' * 80}")
+    print("  BREAKDOWN REPORT")
+    print(f"{'═' * 80}")
+
+    # By hour
+    print(f"\n  {'─' * 70}")
+    print("  MATCH / MISS / FALSE RATE BY HOUR (ET)")
+    print(f"  {'─' * 70}")
+    print(f"  {'Hour':>6} {'Matched':>9} {'Missed':>9} {'False':>9} {'Match%':>8}")
+    print(f"  {'─' * 50}")
+    for h in range(24):
+        m = hour_stats[h]["matched"]
+        mi = hour_stats[h]["missed"]
+        f = hour_false.get(h, 0)
+        total_h = m + mi
+        pct = f"{100 * m / total_h:.1f}%" if total_h > 0 else "N/A"
+        if total_h > 0 or f > 0:
+            print(f"  {h:>6} {m:>9} {mi:>9} {f:>9} {pct:>8}")
+
+    # By asset
+    print(f"\n  {'─' * 70}")
+    print("  SIMILARITY BY ASSET")
+    print(f"  {'─' * 70}")
+    print(f"  {'Asset':>6} {'Matched':>9} {'Missed':>9} {'Total':>9} {'Similarity':>11}")
+    print(f"  {'─' * 50}")
+    for asset in sorted(asset_stats.keys()):
+        s = asset_stats[asset]
+        sim = s["matched"] / s["total"] if s["total"] > 0 else 0
+        print(f"  {asset:>6} {s['matched']:>9} {s['missed']:>9} {s['total']:>9} {sim:>11.4f}")
+
+    # By market type
+    print(f"\n  {'─' * 70}")
+    print("  SIMILARITY BY MARKET TYPE")
+    print(f"  {'─' * 70}")
+    print(f"  {'Type':>8} {'Matched':>9} {'Missed':>9} {'Total':>9} {'Similarity':>11}")
+    print(f"  {'─' * 50}")
+    for mtype in sorted(mtype_stats.keys()):
+        s = mtype_stats[mtype]
+        sim = s["matched"] / s["total"] if s["total"] > 0 else 0
+        print(f"  {mtype:>8} {s['matched']:>9} {s['missed']:>9} {s['total']:>9} {sim:>11.4f}")
+
+    print(f"\n{'═' * 80}")
+
+
 def find_data_dir() -> str:
     """Try common locations for the CSV log files."""
     candidates = [
@@ -1891,6 +2163,8 @@ def main() -> None:
                         help="Print debug examples of unmatched wallet trades")
     parser.add_argument("--offset-sec", type=float, default=None,
                         help="Manual timestamp offset (auto-fit if not provided)")
+    parser.add_argument("--focused-sweep", action="store_true",
+                        help="Run focused sweep (momentum + spread + imbalance grid)")
     args = parser.parse_args()
 
     data_dir = args.data_dir or find_data_dir()
@@ -1975,11 +2249,25 @@ def main() -> None:
             states, engine.wallet_trades,
             tolerance_sec=args.tolerance_sec, offset_sec=offset_sec,
         )
+    elif getattr(args, 'focused_sweep', False):
+        print("\n[7/9] Running FOCUSED parameter sweep ...")
+        sweep_results = parameter_sweep(
+            states, engine.wallet_trades,
+            sweep_ranges=FOCUSED_SWEEP_RANGES,
+            tolerance_sec=args.tolerance_sec, offset_sec=offset_sec,
+        )
     else:
-        print("\n[7/9] Skipping parameter sweep (use --optimize to enable)")
+        print("\n[7/9] Skipping parameter sweep (use --optimize or --focused-sweep)")
 
     # --- Step 8: Report ---
     print_report(comparison, signal_dist, sweep_results)
+
+    # --- Step 8b: Breakdown report ---
+    print("\n[8b] Generating breakdown report (by hour, asset, market type) ...")
+    print_breakdown_report(
+        decisions, engine.wallet_trades, states, default_params,
+        tolerance_sec=args.tolerance_sec, offset_sec=offset_sec,
+    )
 
     # --- Charts ---
     if not args.no_charts:
