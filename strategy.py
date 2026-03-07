@@ -361,6 +361,22 @@ def _entry_gated(tf: TokenFeatures, cfg: Config,
             return False, f"low_accel(Down,accel={-ret_accel:.6f}<{cfg.ENTRY_MIN_RET_ACCEL})", diag
         accepted_reasons.append("accel_ok")
 
+    # -- Condition 7: 60s momentum gate (sweep best: require |ret_60s| >= 0.03%) --
+    if cfg.ENTRY_MIN_RET_60S > 0:
+        bin_ret_60s = abs(tf.ret_60s or 0)
+        if bin_ret_60s < cfg.ENTRY_MIN_RET_60S:
+            return False, f"ret_60s_gate(|ret_60s|={bin_ret_60s:.6f}<{cfg.ENTRY_MIN_RET_60S})", diag
+        accepted_reasons.append("ret_60s_ok")
+
+    # -- Compute seconds to resolution (used by gates below) --
+    seconds_to_resolution = 900 - sec_from_q
+
+    # -- Condition 8: minimum seconds to resolution gate --
+    if cfg.ENTRY_MIN_SECONDS_TO_RESOLUTION > 0:
+        if seconds_to_resolution < cfg.ENTRY_MIN_SECONDS_TO_RESOLUTION:
+            return False, f"min_sec_to_res(sec={seconds_to_resolution}<{cfg.ENTRY_MIN_SECONDS_TO_RESOLUTION})", diag
+        accepted_reasons.append("sec_to_res_ok")
+
     # -- Risk gates --
     if not exposure_ok:
         return False, "exposure_cap", diag
@@ -368,7 +384,6 @@ def _entry_gated(tf: TokenFeatures, cfg: Config,
         return False, "cash_reserve", diag
 
     # -- Prevent buying late in 15-min window --
-    seconds_to_resolution = 900 - sec_from_q
     if seconds_to_resolution < (900 - cfg.ENTRY_LATE_CUTOFF_SEC):
         return False, f"late_entry_gate(sec_to_res={seconds_to_resolution})", diag
     accepted_reasons.append("time_window_ok")
