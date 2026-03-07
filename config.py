@@ -147,8 +147,8 @@ class Config:
     ENTRY_PREFER_SPREAD_PCTL: float = 0.92  # preferred spread pctl (soft bonus)
     ENTRY_MIN_ABS_RET_30S: float = 0.0   # disabled: wallet median ret_30s=0.0 (was 0.0002)
     ENTRY_MIN_RET_30S: float = 0.0       # legacy alias (synced)
-    ENTRY_MIN_RET_60S: float = 0.0003    # sweep best: require |ret_60s| >= 0.03% (new gate)
-    ENTRY_MIN_SECONDS_TO_RESOLUTION: float = 60.0  # sweep best: skip entries < 60s to resolution (new gate)
+    ENTRY_MIN_RET_60S: float = 0.0005    # refined sweep best: require |ret_60s| >= 0.05%
+    ENTRY_MIN_SECONDS_TO_RESOLUTION: float = 0.0   # refined sweep: disabled (no benefit)
     ENTRY_LATE_CUTOFF_SEC: int = 600     # stop entering after 10 min
     ENTRY_AVG_UP_TOLERANCE: float = 0.005 # max 0.5¢ above avg cost
 
@@ -320,8 +320,8 @@ def load_config() -> Config:
         ENTRY_PREFER_SPREAD_PCTL=_env_float("ENTRY_PREFER_SPREAD_PCTL", 0.92),
         ENTRY_MIN_ABS_RET_30S=_env_float("ENTRY_MIN_ABS_RET_30S", 0.0),
         ENTRY_MIN_RET_30S=_env_float("ENTRY_MIN_RET_30S", 0.0),
-        ENTRY_MIN_RET_60S=_env_float("ENTRY_MIN_RET_60S", 0.0003),
-        ENTRY_MIN_SECONDS_TO_RESOLUTION=_env_float("ENTRY_MIN_SECONDS_TO_RESOLUTION", 60.0),
+        ENTRY_MIN_RET_60S=_env_float("ENTRY_MIN_RET_60S", 0.0005),
+        ENTRY_MIN_SECONDS_TO_RESOLUTION=_env_float("ENTRY_MIN_SECONDS_TO_RESOLUTION", 0.0),
         ENTRY_LATE_CUTOFF_SEC=_env_int("ENTRY_LATE_CUTOFF_SEC", 600),
         ENTRY_AVG_UP_TOLERANCE=_env_float("ENTRY_AVG_UP_TOLERANCE", 0.005),
         ENTRY_MIN_IMBALANCE=_env_float("ENTRY_MIN_IMBALANCE", 0.0),

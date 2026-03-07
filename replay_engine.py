@@ -147,9 +147,9 @@ class StrategyParams:
     quiet_hours_et: tuple = (3, 5, 7, 8)   # hours in ET to suppress entries (<16% match rate)
     # -- Time-to-resolution filter --
     entry_max_seconds_to_resolution: float = 0.0  # 0=disabled; skip entries when >N seconds remain
-    entry_min_seconds_to_resolution: float = 60.0  # sweep best: 60s (was 0.0)
+    entry_min_seconds_to_resolution: float = 0.0   # refined sweep: disabled (no benefit)
     # -- 60s return filter --
-    entry_min_ret_60s: float = 0.0003      # sweep best: 0.03% (was 0.0)
+    entry_min_ret_60s: float = 0.0005      # refined sweep best: 0.05%
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2357,6 +2357,109 @@ def parameter_sweep(
     return df
 
 
+# Per-asset sweep: wider grid since each asset runs independently (fewer states → faster)
+PER_ASSET_SWEEP_RANGES = {
+    "entry_min_spread_pctl": [0.75, 0.80, 0.85, 0.90, 0.95],
+    "entry_min_spread_cents": [0.5, 1.0, 2.0],
+    "entry_min_ret_30s": [0.0, 0.0003],
+    "entry_min_imbalance": [0.0, 0.2, 0.42],
+    "imbalance_directional": [False],
+    "entry_cooldown_sec": [5.0, 10.0, 15.0],
+    "quiet_hours_et": [(), (3, 5, 7, 8)],
+    "entry_min_ret_60s": [0.0, 0.0003, 0.0005, 0.0008],
+    "entry_min_seconds_to_resolution": [0.0, 60.0],
+    "entry_max_seconds_to_resolution": [0.0],
+    "tolerance_sec": [7.0],
+}
+
+
+def per_asset_sweep(
+    states: List[MarketState],
+    wallet_trades: pd.DataFrame,
+    sweep_ranges: Optional[Dict] = None,
+    tolerance_sec: float = 7.0,
+    offset_sec: float = 0.0,
+) -> Dict[str, pd.DataFrame]:
+    """Run independent parameter sweeps for each crypto asset.
+
+    Filters states and wallet trades by asset, then runs a full grid search
+    for each. Returns dict of asset -> results DataFrame.
+    """
+    ranges = sweep_ranges or dict(PER_ASSET_SWEEP_RANGES)
+
+    # Identify unique assets
+    all_assets = sorted(set(ms.asset for ms in states if ms.asset))
+    print(f"\n  Per-asset sweep for: {', '.join(all_assets)}")
+
+    # Pre-compute wallet asset column for filtering
+    wt = wallet_trades.copy()
+    wt["_resolved_asset"] = wt.apply(_resolve_wallet_asset, axis=1)
+
+    asset_results: Dict[str, pd.DataFrame] = {}
+
+    for asset in all_assets:
+        # Filter states for this asset
+        asset_states = [ms for ms in states if ms.asset == asset]
+        # Filter wallet trades for this asset
+        asset_wallet = wt[wt["_resolved_asset"] == asset].drop(columns=["_resolved_asset"])
+
+        if not asset_states:
+            print(f"\n  {asset}: no market states, skipping")
+            continue
+
+        wallet_count = len(asset_wallet)
+        print(f"\n  {'═' * 60}")
+        print(f"  {asset}: {len(asset_states):,} states, {wallet_count} wallet trades")
+        print(f"  {'═' * 60}")
+
+        if wallet_count == 0:
+            print(f"  {asset}: no wallet trades to match against, skipping")
+            continue
+
+        # Run sweep with a copy of ranges (parameter_sweep pops tolerance_sec)
+        asset_ranges = dict(ranges)
+        df = parameter_sweep(
+            asset_states, asset_wallet,
+            sweep_ranges=asset_ranges,
+            tolerance_sec=tolerance_sec,
+            offset_sec=offset_sec,
+        )
+        asset_results[asset] = df
+
+        # Print top 5 for this asset
+        if not df.empty:
+            print(f"\n  TOP 5 for {asset}:")
+            print(df.head(5).to_string(index=False))
+            best = df.iloc[0]
+            print(f"\n  {asset} BEST: F1={best['similarity']:.4f}  "
+                  f"matched={best['matched']}  missed={best['missed']}  "
+                  f"false={best['false_entries']}")
+
+    # Print combined summary
+    print(f"\n\n{'═' * 70}")
+    print("  PER-ASSET SWEEP SUMMARY")
+    print(f"{'═' * 70}")
+    print(f"  {'Asset':<6} {'Best F1':>8} {'Matched':>8} {'Missed':>8} {'False':>8}  Best Params")
+    print(f"  {'─' * 90}")
+    for asset in all_assets:
+        if asset not in asset_results or asset_results[asset].empty:
+            print(f"  {asset:<6} {'N/A':>8}")
+            continue
+        best = asset_results[asset].iloc[0]
+        # Collect non-default params
+        param_strs = []
+        for col in best.index:
+            if col in ("tolerance_sec", "similarity", "matched", "missed",
+                       "false_entries", "lag_median_ms", "lag_p90_ms"):
+                continue
+            param_strs.append(f"{col}={best[col]}")
+        print(f"  {asset:<6} {best['similarity']:>8.4f} {best['matched']:>8} "
+              f"{best['missed']:>8} {best['false_entries']:>8}  "
+              f"{', '.join(param_strs)}")
+
+    return asset_results
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # SECTION 6 -- OUTPUT REPORT
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2826,6 +2929,8 @@ def main() -> None:
                         help="Run focused sweep (momentum + spread + imbalance grid)")
     parser.add_argument("--no-deep-diag", action="store_true",
                         help="Skip deep diagnostics (saves time)")
+    parser.add_argument("--per-asset-sweep", action="store_true",
+                        help="Run independent parameter sweep per crypto asset (BTC/ETH/SOL/XRP)")
     args = parser.parse_args()
 
     data_dir = args.data_dir or find_data_dir()
@@ -2927,8 +3032,19 @@ def main() -> None:
             sweep_ranges=FOCUSED_SWEEP_RANGES,
             tolerance_sec=args.tolerance_sec, offset_sec=offset_sec,
         )
+    elif getattr(args, 'per_asset_sweep', False):
+        print("\n[7/9] Running PER-ASSET parameter sweep ...")
+        asset_results = per_asset_sweep(
+            states, engine.wallet_trades,
+            tolerance_sec=args.tolerance_sec, offset_sec=offset_sec,
+        )
+        # Use the first non-empty result as sweep_results for the report
+        for _a, _df in asset_results.items():
+            if not _df.empty:
+                sweep_results = _df
+                break
     else:
-        print("\n[7/9] Skipping parameter sweep (use --optimize or --focused-sweep)")
+        print("\n[7/9] Skipping parameter sweep (use --optimize, --focused-sweep, or --per-asset-sweep)")
 
     # --- Step 8: Report ---
     print_report(comparison, signal_dist, sweep_results)
