@@ -147,9 +147,9 @@ class StrategyParams:
     quiet_hours_et: tuple = (3, 5, 7, 8)   # hours in ET to suppress entries (<16% match rate)
     # -- Time-to-resolution filter --
     entry_max_seconds_to_resolution: float = 0.0  # 0=disabled; skip entries when >N seconds remain
-    entry_min_seconds_to_resolution: float = 60.0  # sweep best: 60s (was 0.0)
+    entry_min_seconds_to_resolution: float = 0.0   # refined sweep: disabled (no benefit)
     # -- 60s return filter --
-    entry_min_ret_60s: float = 0.0003      # sweep best: 0.03% (was 0.0)
+    entry_min_ret_60s: float = 0.0005      # refined sweep best: 0.05%
 
 
 # ═══════════════════════════════════════════════════════════════════════════
