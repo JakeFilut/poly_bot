@@ -327,19 +327,21 @@ def _entry_gated(tf: TokenFeatures, cfg: Config,
     accepted_reasons.append("momentum_ok")
 
     # -- Condition 4: directional imbalance gate --
+    # f247 data: BUY sweet spot is imbalance 0.4-0.7 (+1.5c to +2.3c markout)
+    # imbalance > 0.7 (chasing) = -0.3c markout; imbalance 0.3-0.5 = +0.09c (marginal)
     ob_imbalance = _compute_ob_imbalance(tf)
     if cfg.ENTRY_IMBALANCE_ENABLED and ob_imbalance is not None:
         if cfg.ENTRY_IMBALANCE_DIRECTIONAL and direction:
-            # Directional: buying Up requires imbalance >= threshold (bids dominant)
-            #              buying Down requires imbalance <= (1 - threshold) (asks dominant)
             if direction == "Up" and ob_imbalance < cfg.ENTRY_MIN_IMBALANCE:
                 return False, f"imbalance_dir(Up,imb={ob_imbalance:.3f}<{cfg.ENTRY_MIN_IMBALANCE})", diag
             if direction == "Down" and ob_imbalance > (1.0 - cfg.ENTRY_MIN_IMBALANCE):
                 return False, f"imbalance_dir(Down,imb={ob_imbalance:.3f}>{1.0 - cfg.ENTRY_MIN_IMBALANCE:.3f})", diag
         else:
-            # Non-directional: simple minimum
             if ob_imbalance < cfg.ENTRY_MIN_IMBALANCE:
                 return False, f"ob_imbalance({ob_imbalance:.3f}<{cfg.ENTRY_MIN_IMBALANCE})", diag
+        # Band filter: reject when imbalance too high (chasing into bid-heavy book)
+        if cfg.OB_IMBALANCE_BAND_ENABLED and ob_imbalance > cfg.OB_IMBALANCE_MAX:
+            return False, f"ob_imbalance_high({ob_imbalance:.3f}>{cfg.OB_IMBALANCE_MAX})", diag
         accepted_reasons.append("imbalance_ok")
 
     # -- Condition 5: book depth gate (reject thin books) --
@@ -424,15 +426,17 @@ def _entry_price(tf: TokenFeatures, cfg: Config) -> tuple[float, str]:
 
     Wallet-copy rules:
       - Default: passive at best_bid
-      - Cross ONLY when |ret_30s| >= 0.003 AND spread_pctl >= 0.95
+      - Cross ONLY when CROSS_ENABLED=True AND |ret_30s| >= 0.003 AND spread_pctl >= 0.95
+    f247 data: crossing trades average -2.5c markout; disabled by default.
     Returns (price, entry_style).
     """
-    bin_ret_30s = abs(tf.ret_30s or 0)
-
-    # Cross only on extreme momentum + wide spread
-    if (bin_ret_30s >= cfg.CROSS_MIN_RET_30S
-            and tf.spread_pctl_60s >= cfg.CROSS_MIN_SPREAD_PCTL):
-        return tf.best_ask, "cross"
+    # f247 data: PASSIVE trades = +2.9c markout, CROSS trades = -2.5c markout
+    # Only cross if explicitly enabled and conditions are extreme
+    if cfg.CROSS_ENABLED:
+        bin_ret_30s = abs(tf.ret_30s or 0)
+        if (bin_ret_30s >= cfg.CROSS_MIN_RET_30S
+                and tf.spread_pctl_60s >= cfg.CROSS_MIN_SPREAD_PCTL):
+            return tf.best_ask, "cross"
 
     # Default: passive at best_bid
     return tf.best_bid, "passive"
@@ -441,7 +445,14 @@ def _entry_price(tf: TokenFeatures, cfg: Config) -> tuple[float, str]:
 # ═══════════════════════════════════════════════════════════════════════════
 # 9.5  Entry Sizing (Discrete Ladder)
 # ═══════════════════════════════════════════════════════════════════════════
-_ASSET_SIZE_MULT = {"BTC": 1.2, "ETH": 1.1, "SOL": 0.9, "XRP": 0.9}
+def _get_asset_size_mult(cfg: Config, asset: str) -> float:
+    """Get per-asset size multiplier from config (f247 data-driven)."""
+    return {
+        "BTC": cfg.CLIP_SIZE_MULT_BTC,
+        "ETH": cfg.CLIP_SIZE_MULT_ETH,
+        "SOL": cfg.CLIP_SIZE_MULT_SOL,
+        "XRP": cfg.CLIP_SIZE_MULT_XRP,
+    }.get(asset, 1.0)
 
 
 def _entry_size_usd(cfg: Config, buy_weight: float,
@@ -458,8 +469,8 @@ def _entry_size_usd(cfg: Config, buy_weight: float,
     else:
         score *= 0.8
 
-    # Asset multiplier
-    score *= _ASSET_SIZE_MULT.get(asset, 1.0)
+    # Per-asset multiplier from config (f247 data: SOL/XRP outperform)
+    score *= _get_asset_size_mult(cfg, asset)
 
     # Cap score so multipliers don't always push to max ladder rung
     score = min(1.0, score)
@@ -483,6 +494,25 @@ def _usd_to_shares(usd: float, price: float) -> float:
 # ═══════════════════════════════════════════════════════════════════════════
 # 9.6  Exit Logic (SELL shaving)
 # ═══════════════════════════════════════════════════════════════════════════
+def _get_tp_mult(cfg: Config, slug: str) -> float:
+    """Get per-asset TP multiplier based on slug (f247 data-driven).
+
+    f247 data: BTC fades at 60s → take profit faster (0.8x)
+               ETH improves at 60s → let it run (1.3x)
+               SOL steady → slight premium (1.1x)
+    """
+    slug_lower = slug.lower()
+    if "bitcoin" in slug_lower:
+        return cfg.TP_MULT_BTC
+    elif "ethereum" in slug_lower:
+        return cfg.TP_MULT_ETH
+    elif "solana" in slug_lower:
+        return cfg.TP_MULT_SOL
+    elif "xrp" in slug_lower:
+        return cfg.TP_MULT_XRP
+    return 1.0
+
+
 def _exit_actions(cfg: Config, inv: InventoryEntry, tf: TokenFeatures,
                   sell_weight: float) -> TradeAction | None:
     """Determine if we should sell, and how much.
@@ -494,11 +524,16 @@ def _exit_actions(cfg: Config, inv: InventoryEntry, tf: TokenFeatures,
 
     edge_vs_cost = tf.best_bid - inv.avg_cost
 
+    # Per-asset TP scaling (f247: BTC fades at 60s, ETH improves)
+    tp_mult = _get_tp_mult(cfg, inv.slug)
+    effective_tp_min = cfg.TP_CENTS_MIN * tp_mult
+    effective_tp_max = cfg.TP_CENTS_MAX * tp_mult
+
     # -- Take profit --
-    if edge_vs_cost >= cfg.TP_CENTS_MIN:
+    if edge_vs_cost >= effective_tp_min:
         # Scale sell fraction by how deep into TP band we are
-        tp_progress = min(1.0, (edge_vs_cost - cfg.TP_CENTS_MIN) /
-                          max(0.001, cfg.TP_CENTS_MAX - cfg.TP_CENTS_MIN))
+        tp_progress = min(1.0, (edge_vs_cost - effective_tp_min) /
+                          max(0.001, effective_tp_max - effective_tp_min))
         base_frac = cfg.SELL_FRAC_MED + tp_progress * (cfg.SELL_FRAC_MAX - cfg.SELL_FRAC_MED)
 
         # Cadence factor: respect cadence unless edge is very large

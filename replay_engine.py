@@ -131,25 +131,31 @@ class ComparisonResult:
 class StrategyParams:
     """Tunable strategy parameters for the sweep.
 
-    Defaults aligned to wallet signal distributions from replay analysis.
+    Defaults aligned to f247 wallet signal distributions (2,637 trades, 5h session).
     """
     entry_min_spread_pctl: float = 0.85
     entry_min_spread_cents: float = 1.0     # wallet median spread=1¢
     entry_min_ret_30s: float = 0.0          # disabled: wallet median ret_30s=0.0
     entry_min_imbalance: float = 0.0        # sweep best: disabled (was 0.42)
+    entry_max_imbalance: float = 0.70       # f247: imb>0.7 = chasing (-0.3c markout)
+    imbalance_band_enabled: bool = True     # use min/max band
     # -- Directional imbalance --
     imbalance_directional: bool = False     # wallet doesn't strongly filter on directional imbalance
     # -- One-shot conditions --
     spread_pctl_delta_min: float = 0.0      # pctl_now - pctl_60s_ago >= this
     ret_accel_min: float = 0.0              # |ret_30s - ret_120s| >= this
-    entry_cooldown_sec: float = 10.0        # sweep best: 10s (was 5.0)
+    entry_cooldown_sec: float = 5.0         # f247: wallet bursts every 2s; lowered from 10s
     # -- Time-of-day filter --
     quiet_hours_et: tuple = (3, 5, 7, 8)   # hours in ET to suppress entries (<16% match rate)
     # -- Time-to-resolution filter --
-    entry_max_seconds_to_resolution: float = 0.0  # 0=disabled; skip entries when >N seconds remain
-    entry_min_seconds_to_resolution: float = 0.0   # refined sweep: disabled (no benefit)
+    entry_max_seconds_to_resolution: float = 0.0  # 0=disabled
+    entry_min_seconds_to_resolution: float = 0.0   # disabled
     # -- 60s return filter --
     entry_min_ret_60s: float = 0.0005      # refined sweep best: 0.05%
+    # -- Crossing control --
+    cross_enabled: bool = False             # f247: crossing = -2.5c markout; disabled
+    # -- Size cap --
+    entry_max_size_shares: float = 30.0     # f247: 30-60 marginal, 60+ negative
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -484,7 +490,6 @@ class Strategy:
 
         # --- Directional imbalance gate ---
         if p.imbalance_directional:
-            # Direction from momentum cascade (consistent with entry direction)
             direction = _pick_direction_cascade(ms) or "Up"
             if direction == "Up" and ms.orderbook_imbalance < p.entry_min_imbalance:
                 return self._no_action(ms, "imbalance_dir below threshold (Up)"), "imbalance"
@@ -493,6 +498,9 @@ class Strategy:
         else:
             if ms.orderbook_imbalance < p.entry_min_imbalance:
                 return self._no_action(ms, "imbalance below threshold"), "imbalance"
+        # f247 data: imbalance > 0.7 = chasing (-0.3c markout at 10s)
+        if p.imbalance_band_enabled and ms.orderbook_imbalance > p.entry_max_imbalance:
+            return self._no_action(ms, "imbalance too high (chasing)"), "imbalance_high"
         accepted_reasons.append("imbalance_ok")
 
         # --- New condition: spread percentile delta ---

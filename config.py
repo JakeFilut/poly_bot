@@ -102,22 +102,39 @@ class Config:
     VOL_MIN_RET_120S: float = 0.0     # disabled; wallet doesn't require momentum
 
     # -- Orderbook imbalance gate --
-    OB_IMBALANCE_MIN: float = 0.50    # tightened from 0.42; require stronger bid dominance
+    OB_IMBALANCE_MIN: float = 0.40    # f247 data: BUY sweet spot is 0.4-0.7; lowered from 0.50
+    OB_IMBALANCE_MAX: float = 0.70    # f247 data: imb>0.7 = chasing (-0.3c markout); cap it
+    OB_IMBALANCE_BAND_ENABLED: bool = True  # use min/max band instead of just min
 
     # -- Take-profit / stop-loss (in cents i.e. 0.06 = 6¢) --
-    TP_CENTS_MIN: float = 0.10
-    TP_CENTS_TARGET: float = 0.14
-    TP_CENTS_MAX: float = 0.22
+    # f247 data: wallet markout grows from +0.9c(2s) to +1.1c(30s) to +1.0c(60s)
+    # wallet median hold=64s, mean=190s — it lets winners run
+    TP_CENTS_MIN: float = 0.08         # lowered: start taking profit earlier (was 0.10)
+    TP_CENTS_TARGET: float = 0.12      # lowered: wallet avg markout is ~1c (was 0.14)
+    TP_CENTS_MAX: float = 0.20         # slightly lower max (was 0.22)
     SL_CENTS: float = 0.04
+    # Per-asset TP adjustments (multiplier on TP_CENTS_TARGET)
+    TP_MULT_BTC: float = 0.8   # f247: BTC fades at 60s, take profit faster
+    TP_MULT_ETH: float = 1.3   # f247: ETH markout grows to +1.25c at 60s, let it run
+    TP_MULT_SOL: float = 1.1   # f247: SOL steady +1.4c, slight premium
+    TP_MULT_XRP: float = 1.0   # f247: XRP steady +1.0c, baseline
 
     # -- Sell sizing --
-    SELL_FRAC_MED: float = 0.036
-    SELL_FRAC_MAX: float = 0.15
+    # f247: wallet sells are 64% passive, avg reduce size=15.9 shares
+    # REDUCE trades have +1.2c markout — wallet is good at timing exits
+    SELL_FRAC_MED: float = 0.05       # bumped: wallet shaves more aggressively (was 0.036)
+    SELL_FRAC_MAX: float = 0.20       # bumped: allow larger exit clips (was 0.15)
     SELL_MIN_SHARES: float = 5.0  # Minimum sell clip to avoid dust
 
     # -- Buy sizing --
     CLIP_UNIT_USD: float = 1.10
     CLIP_LADDER_MULTS: List[int] = field(default_factory=lambda: [1, 3, 8, 10, 12])
+    # f247 data: wallet avg size=16 shares, sweet spot 5-15 shares
+    # SOL/XRP have +1.3c markout vs BTC +0.7c at 60s → bump SOL/XRP allocation
+    CLIP_SIZE_MULT_BTC: float = 0.9    # BTC fades at 60s (+0.7c), slightly less
+    CLIP_SIZE_MULT_ETH: float = 1.0    # ETH needs longer hold but decent
+    CLIP_SIZE_MULT_SOL: float = 1.3    # SOL best performer (+1.4c), more size
+    CLIP_SIZE_MULT_XRP: float = 1.2    # XRP solid (+1.0c at 60s), bump up
 
     # -- Inventory laddering (BUY side) --
     LADDER_LEVELS: int = 2                       # 2-level passive ladder (wallet style)
@@ -137,6 +154,9 @@ class Config:
     CROSS_PROB_1C: float = 0.0   # never cross at 1¢ spread (wallet is passive)
     CROSS_MIN_RET_30S: float = 0.003   # only cross on very strong momentum
     CROSS_MIN_SPREAD_PCTL: float = 0.95  # only cross when spread pctl >= 0.95
+    CROSS_ENABLED: bool = False  # f247 data: crossing trades are -2.5c markout; disable by default
+    # When CROSS_ENABLED=True, only cross if size <= this (big crosses are worst)
+    CROSS_MAX_SIZE_SHARES: float = 15.0  # f247: 60+ share trades = -3.8c markout
 
     # -- Entry quality gates --
     ENTRY_MIN_EDGE_CENTS: float = 0.04   # require at least 4¢ expected edge
@@ -151,6 +171,7 @@ class Config:
     ENTRY_MIN_SECONDS_TO_RESOLUTION: float = 0.0   # refined sweep: disabled (no benefit)
     ENTRY_LATE_CUTOFF_SEC: int = 600     # stop entering after 10 min
     ENTRY_AVG_UP_TOLERANCE: float = 0.005 # max 0.5¢ above avg cost
+    ENTRY_MAX_SIZE_SHARES: float = 30.0  # f247: 30-60 marginal, 60+ negative; cap at 30
 
     # -- Directional imbalance gate --
     ENTRY_MIN_IMBALANCE: float = 0.0     # sweep best: 0.0 (was 0.42); imbalance gate effectively disabled
@@ -187,7 +208,9 @@ class Config:
     STATE_FLUSH_SEC: int = 10
 
     # -- Per-token cooldown (after a fill, wait before placing another order) --
-    PER_TOKEN_COOLDOWN_SEC: float = 10.0  # sweep best: 10s (was 5.0); reduces false entries
+    # f247: 56% of trades within 2s of previous (burst trading), median gap=2s
+    # but wallet bursts are on SAME slug; cross-slug cooldown should be shorter
+    PER_TOKEN_COOLDOWN_SEC: float = 5.0   # lowered: wallet trades every 2s in bursts (was 10.0)
     MIN_CANCEL_REPLACE_INTERVAL_SEC: float = 0.5  # min time between cancel/replace ops
     MAX_CANCEL_REPLACE_PER_SEC: int = 4  # global cap on cancel/replace ops per second
     MIN_PRICE_CHANGE_FOR_REPLACE: float = 0.01  # 1¢ minimum price change to justify replace
@@ -291,17 +314,27 @@ def load_config() -> Config:
         SPREAD_MAX_SANE=_env_float("SPREAD_MAX_SANE", 0.08),
         BIN_RET30_THRESHOLD=_env_float("BIN_RET30_THRESHOLD", 0.0),
         VOL_MIN_RET_30S=_env_float("VOL_MIN_RET_30S", 0.0),
-        OB_IMBALANCE_MIN=_env_float("OB_IMBALANCE_MIN", 0.50),
+        OB_IMBALANCE_MIN=_env_float("OB_IMBALANCE_MIN", 0.40),
+        OB_IMBALANCE_MAX=_env_float("OB_IMBALANCE_MAX", 0.70),
+        OB_IMBALANCE_BAND_ENABLED=_env_bool("OB_IMBALANCE_BAND_ENABLED", True),
         VOL_MIN_RET_120S=_env_float("VOL_MIN_RET_120S", 0.0),
-        TP_CENTS_MIN=_env_float("TP_CENTS_MIN", 0.10),
-        TP_CENTS_TARGET=_env_float("TP_CENTS_TARGET", 0.14),
-        TP_CENTS_MAX=_env_float("TP_CENTS_MAX", 0.22),
+        TP_CENTS_MIN=_env_float("TP_CENTS_MIN", 0.08),
+        TP_CENTS_TARGET=_env_float("TP_CENTS_TARGET", 0.12),
+        TP_CENTS_MAX=_env_float("TP_CENTS_MAX", 0.20),
         SL_CENTS=_env_float("SL_CENTS", 0.04),
-        SELL_FRAC_MED=_env_float("SELL_FRAC_MED", 0.036),
-        SELL_FRAC_MAX=_env_float("SELL_FRAC_MAX", 0.15),
+        TP_MULT_BTC=_env_float("TP_MULT_BTC", 0.8),
+        TP_MULT_ETH=_env_float("TP_MULT_ETH", 1.3),
+        TP_MULT_SOL=_env_float("TP_MULT_SOL", 1.1),
+        TP_MULT_XRP=_env_float("TP_MULT_XRP", 1.0),
+        SELL_FRAC_MED=_env_float("SELL_FRAC_MED", 0.05),
+        SELL_FRAC_MAX=_env_float("SELL_FRAC_MAX", 0.20),
         SELL_MIN_SHARES=_env_float("SELL_MIN_SHARES", 5.0),
         CLIP_UNIT_USD=_env_float("CLIP_UNIT_USD", 1.10),
         CLIP_LADDER_MULTS=_env_list_int("CLIP_LADDER_MULTS", [1, 3, 8, 10, 12]),
+        CLIP_SIZE_MULT_BTC=_env_float("CLIP_SIZE_MULT_BTC", 0.9),
+        CLIP_SIZE_MULT_ETH=_env_float("CLIP_SIZE_MULT_ETH", 1.0),
+        CLIP_SIZE_MULT_SOL=_env_float("CLIP_SIZE_MULT_SOL", 1.3),
+        CLIP_SIZE_MULT_XRP=_env_float("CLIP_SIZE_MULT_XRP", 1.2),
         LADDER_LEVELS=_env_int("LADDER_LEVELS", 2),
         LADDER_STEP_CENTS=_env_float("LADDER_STEP_CENTS", 1.0),
         LADDER_SPLIT=_env_list_float("LADDER_SPLIT", [0.625, 0.375]),
@@ -312,6 +345,8 @@ def load_config() -> Config:
         CROSS_PROB_1C=_env_float("CROSS_PROB_1C", 0.0),
         CROSS_MIN_RET_30S=_env_float("CROSS_MIN_RET_30S", 0.003),
         CROSS_MIN_SPREAD_PCTL=_env_float("CROSS_MIN_SPREAD_PCTL", 0.95),
+        CROSS_ENABLED=_env_bool("CROSS_ENABLED", False),
+        CROSS_MAX_SIZE_SHARES=_env_float("CROSS_MAX_SIZE_SHARES", 15.0),
         ENTRY_MIN_EDGE_CENTS=_env_float("ENTRY_MIN_EDGE_CENTS", 0.04),
         ENTRY_MIN_EDGE_BPS=_env_float("ENTRY_MIN_EDGE_BPS", 400.0),
         ENTRY_MAX_OFFSET_FROM_BID=_env_float("ENTRY_MAX_OFFSET_FROM_BID", 0.005),
@@ -324,6 +359,7 @@ def load_config() -> Config:
         ENTRY_MIN_SECONDS_TO_RESOLUTION=_env_float("ENTRY_MIN_SECONDS_TO_RESOLUTION", 0.0),
         ENTRY_LATE_CUTOFF_SEC=_env_int("ENTRY_LATE_CUTOFF_SEC", 600),
         ENTRY_AVG_UP_TOLERANCE=_env_float("ENTRY_AVG_UP_TOLERANCE", 0.005),
+        ENTRY_MAX_SIZE_SHARES=_env_float("ENTRY_MAX_SIZE_SHARES", 30.0),
         ENTRY_MIN_IMBALANCE=_env_float("ENTRY_MIN_IMBALANCE", 0.0),
         ENTRY_IMBALANCE_DIRECTIONAL=_env_bool("ENTRY_IMBALANCE_DIRECTIONAL", False),
         ENTRY_IMBALANCE_ENABLED=_env_bool("ENTRY_IMBALANCE_ENABLED", True),
@@ -343,7 +379,7 @@ def load_config() -> Config:
         UNIVERSE_DEBUG=_env_bool("UNIVERSE_DEBUG", False),
         STATE_DB_PATH=_env("STATE_DB_PATH", "/home/ubuntu/github/logs/poly_bot/state.db"),
         STATE_FLUSH_SEC=_env_int("STATE_FLUSH_SEC", 10),
-        PER_TOKEN_COOLDOWN_SEC=_env_float("PER_TOKEN_COOLDOWN_SEC", 10.0),
+        PER_TOKEN_COOLDOWN_SEC=_env_float("PER_TOKEN_COOLDOWN_SEC", 5.0),
         MIN_CANCEL_REPLACE_INTERVAL_SEC=_env_float("MIN_CANCEL_REPLACE_INTERVAL_SEC", 0.5),
         MAX_CANCEL_REPLACE_PER_SEC=_env_int("MAX_CANCEL_REPLACE_PER_SEC", 4),
         MIN_PRICE_CHANGE_FOR_REPLACE=_env_float("MIN_PRICE_CHANGE_FOR_REPLACE", 0.01),
