@@ -136,20 +136,20 @@ class StrategyParams:
     entry_min_spread_pctl: float = 0.85
     entry_min_spread_cents: float = 1.0     # wallet median spread=1¢
     entry_min_ret_30s: float = 0.0          # disabled: wallet median ret_30s=0.0
-    entry_min_imbalance: float = 0.42       # wallet p25=0.432
+    entry_min_imbalance: float = 0.0        # sweep best: disabled (was 0.42)
     # -- Directional imbalance --
     imbalance_directional: bool = False     # wallet doesn't strongly filter on directional imbalance
     # -- One-shot conditions --
     spread_pctl_delta_min: float = 0.0      # pctl_now - pctl_60s_ago >= this
     ret_accel_min: float = 0.0              # |ret_30s - ret_120s| >= this
-    entry_cooldown_sec: float = 5.0         # per (slug, outcome, side) cooldown (matches live)
+    entry_cooldown_sec: float = 10.0        # sweep best: 10s (was 5.0)
     # -- Time-of-day filter --
     quiet_hours_et: tuple = (3, 5, 7, 8)   # hours in ET to suppress entries (<16% match rate)
     # -- Time-to-resolution filter --
     entry_max_seconds_to_resolution: float = 0.0  # 0=disabled; skip entries when >N seconds remain
-    entry_min_seconds_to_resolution: float = 0.0  # 0=disabled; skip entries when <N seconds remain
+    entry_min_seconds_to_resolution: float = 60.0  # sweep best: 60s (was 0.0)
     # -- 60s return filter --
-    entry_min_ret_60s: float = 0.0         # 0=disabled; require |ret_60s| >= threshold
+    entry_min_ret_60s: float = 0.0003      # sweep best: 0.03% (was 0.0)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2279,20 +2279,20 @@ DEFAULT_SWEEP_RANGES = {
 #   - wallet doesn't use directional imbalance strongly
 #   - hours 3,5,7,8 ET have <16% match rate → quiet hours help
 FOCUSED_SWEEP_RANGES = {
+    # --- Locked from previous sweep (converged) ---
     "entry_min_ret_30s": [0.0],
-    "entry_min_spread_pctl": [0.80, 0.85, 0.90],
-    "entry_min_spread_cents": [0.5, 1.0],
-    "entry_min_imbalance": [0.0, 0.40, 0.42, 0.45],
+    "entry_min_spread_pctl": [0.85],
+    "entry_min_spread_cents": [1.0],
     "imbalance_directional": [False],
-    "quiet_hours_et": [(), (3, 5, 7, 8)],
-    "entry_cooldown_sec": [5.0, 10.0],
-    # New gates: time-to-resolution window
-    "entry_max_seconds_to_resolution": [0.0, 600, 450],     # 0=disabled, 10min, 7.5min
-    "entry_min_seconds_to_resolution": [0.0, 60, 120],      # 0=disabled, 1min, 2min
-    # New gate: 60s return magnitude
-    "entry_min_ret_60s": [0.0, 0.0003, 0.0007],             # 0=disabled, small, medium
-    # Comparison tolerance (not a strategy param)
-    "tolerance_sec": [3.0, 5.0, 7.0],
+    "quiet_hours_et": [(3, 5, 7, 8)],
+    "entry_cooldown_sec": [10.0],
+    "entry_max_seconds_to_resolution": [0.0],
+    # --- Refine these (new/changed params) ---
+    "entry_min_imbalance": [0.0, 0.1, 0.2],
+    "entry_min_seconds_to_resolution": [0, 30, 45, 60, 90, 120],
+    "entry_min_ret_60s": [0.0001, 0.0002, 0.0003, 0.0004, 0.0005, 0.0007],
+    # Comparison tolerance
+    "tolerance_sec": [7.0],
 }
 
 

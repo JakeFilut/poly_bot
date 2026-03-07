@@ -41,6 +41,7 @@ class TokenFeatures:
     # Binance momentum
     ret_5s: float | None = None
     ret_30s: float | None = None
+    ret_60s: float | None = None
     ret_120s: float | None = None
 
     # Book snapshot (for execution)
@@ -63,6 +64,7 @@ class SlugFeatures:
     down: TokenFeatures | None = None
     ret_5s: float | None = None
     ret_30s: float | None = None
+    ret_60s: float | None = None
     ret_120s: float | None = None
 
 
@@ -97,18 +99,19 @@ class FeatureEngine:
             # Binance returns (shared for both outcomes)
             sf.ret_5s = self._binance.ret_5s(pair.asset)
             sf.ret_30s = self._binance.ret_30s(pair.asset)
+            sf.ret_60s = self._binance.ret_60s(pair.asset)
             sf.ret_120s = self._binance.ret_120s(pair.asset)
 
             # Up token features
             sf.up = self._compute_token(
                 slug, "Up", pair.up_token_id, pair.asset,
-                sf.ret_5s, sf.ret_30s, sf.ret_120s, now,
+                sf.ret_5s, sf.ret_30s, sf.ret_60s, sf.ret_120s, now,
             )
 
             # Down token features
             sf.down = self._compute_token(
                 slug, "Down", pair.down_token_id, pair.asset,
-                sf.ret_5s, sf.ret_30s, sf.ret_120s, now,
+                sf.ret_5s, sf.ret_30s, sf.ret_60s, sf.ret_120s, now,
             )
 
             result[slug] = sf
@@ -117,12 +120,12 @@ class FeatureEngine:
         return result
 
     def _compute_token(self, slug: str, outcome: str, token_id: str,
-                       asset: str, ret_5s, ret_30s, ret_120s,
+                       asset: str, ret_5s, ret_30s, ret_60s, ret_120s,
                        now: float) -> TokenFeatures:
         """Compute features for one token."""
         tf = TokenFeatures(
             slug=slug, outcome=outcome, token_id=token_id, asset=asset,
-            ret_5s=ret_5s, ret_30s=ret_30s, ret_120s=ret_120s,
+            ret_5s=ret_5s, ret_30s=ret_30s, ret_60s=ret_60s, ret_120s=ret_120s,
         )
 
         # Get orderbook (with cache)

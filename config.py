@@ -147,11 +147,13 @@ class Config:
     ENTRY_PREFER_SPREAD_PCTL: float = 0.92  # preferred spread pctl (soft bonus)
     ENTRY_MIN_ABS_RET_30S: float = 0.0   # disabled: wallet median ret_30s=0.0 (was 0.0002)
     ENTRY_MIN_RET_30S: float = 0.0       # legacy alias (synced)
+    ENTRY_MIN_RET_60S: float = 0.0003    # sweep best: require |ret_60s| >= 0.03% (new gate)
+    ENTRY_MIN_SECONDS_TO_RESOLUTION: float = 60.0  # sweep best: skip entries < 60s to resolution (new gate)
     ENTRY_LATE_CUTOFF_SEC: int = 600     # stop entering after 10 min
     ENTRY_AVG_UP_TOLERANCE: float = 0.005 # max 0.5¢ above avg cost
 
     # -- Directional imbalance gate --
-    ENTRY_MIN_IMBALANCE: float = 0.42    # aligned: wallet p25=0.432 (was 0.50)
+    ENTRY_MIN_IMBALANCE: float = 0.0     # sweep best: 0.0 (was 0.42); imbalance gate effectively disabled
     ENTRY_IMBALANCE_DIRECTIONAL: bool = False  # disabled: sweep confirmed non-directional is better
     ENTRY_IMBALANCE_ENABLED: bool = True  # set False to disable imbalance gate entirely
 
@@ -185,7 +187,7 @@ class Config:
     STATE_FLUSH_SEC: int = 10
 
     # -- Per-token cooldown (after a fill, wait before placing another order) --
-    PER_TOKEN_COOLDOWN_SEC: float = 5.0  # seconds after fill before new order (raised from 2.0; matches replay cooldown)
+    PER_TOKEN_COOLDOWN_SEC: float = 10.0  # sweep best: 10s (was 5.0); reduces false entries
     MIN_CANCEL_REPLACE_INTERVAL_SEC: float = 0.5  # min time between cancel/replace ops
     MAX_CANCEL_REPLACE_PER_SEC: int = 4  # global cap on cancel/replace ops per second
     MIN_PRICE_CHANGE_FOR_REPLACE: float = 0.01  # 1¢ minimum price change to justify replace
@@ -318,9 +320,11 @@ def load_config() -> Config:
         ENTRY_PREFER_SPREAD_PCTL=_env_float("ENTRY_PREFER_SPREAD_PCTL", 0.92),
         ENTRY_MIN_ABS_RET_30S=_env_float("ENTRY_MIN_ABS_RET_30S", 0.0),
         ENTRY_MIN_RET_30S=_env_float("ENTRY_MIN_RET_30S", 0.0),
+        ENTRY_MIN_RET_60S=_env_float("ENTRY_MIN_RET_60S", 0.0003),
+        ENTRY_MIN_SECONDS_TO_RESOLUTION=_env_float("ENTRY_MIN_SECONDS_TO_RESOLUTION", 60.0),
         ENTRY_LATE_CUTOFF_SEC=_env_int("ENTRY_LATE_CUTOFF_SEC", 600),
         ENTRY_AVG_UP_TOLERANCE=_env_float("ENTRY_AVG_UP_TOLERANCE", 0.005),
-        ENTRY_MIN_IMBALANCE=_env_float("ENTRY_MIN_IMBALANCE", 0.42),
+        ENTRY_MIN_IMBALANCE=_env_float("ENTRY_MIN_IMBALANCE", 0.0),
         ENTRY_IMBALANCE_DIRECTIONAL=_env_bool("ENTRY_IMBALANCE_DIRECTIONAL", False),
         ENTRY_IMBALANCE_ENABLED=_env_bool("ENTRY_IMBALANCE_ENABLED", True),
         ENTRY_MIN_BOOK_DEPTH=_env_float("ENTRY_MIN_BOOK_DEPTH", 50.0),
@@ -339,7 +343,7 @@ def load_config() -> Config:
         UNIVERSE_DEBUG=_env_bool("UNIVERSE_DEBUG", False),
         STATE_DB_PATH=_env("STATE_DB_PATH", "/home/ubuntu/github/logs/poly_bot/state.db"),
         STATE_FLUSH_SEC=_env_int("STATE_FLUSH_SEC", 10),
-        PER_TOKEN_COOLDOWN_SEC=_env_float("PER_TOKEN_COOLDOWN_SEC", 5.0),
+        PER_TOKEN_COOLDOWN_SEC=_env_float("PER_TOKEN_COOLDOWN_SEC", 10.0),
         MIN_CANCEL_REPLACE_INTERVAL_SEC=_env_float("MIN_CANCEL_REPLACE_INTERVAL_SEC", 0.5),
         MAX_CANCEL_REPLACE_PER_SEC=_env_int("MAX_CANCEL_REPLACE_PER_SEC", 4),
         MIN_PRICE_CHANGE_FOR_REPLACE=_env_float("MIN_PRICE_CHANGE_FOR_REPLACE", 0.01),

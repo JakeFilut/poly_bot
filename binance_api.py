@@ -115,6 +115,10 @@ class BinanceAPI:
         """30-second return for the asset."""
         return self._ret(asset, 30.0)
 
+    def ret_60s(self, asset: str) -> float | None:
+        """60-second return for the asset."""
+        return self._ret(asset, 60.0)
+
     def ret_120s(self, asset: str) -> float | None:
         """120-second return for the asset."""
         return self._ret(asset, 120.0)
