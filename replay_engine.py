@@ -136,7 +136,7 @@ class StrategyParams:
     entry_min_spread_pctl: float = 0.85
     entry_min_spread_cents: float = 1.0     # wallet median spread=1¢
     entry_min_ret_30s: float = 0.0          # disabled: wallet median ret_30s=0.0
-    entry_min_imbalance: float = 0.0        # sweep best: disabled (was 0.42)
+    entry_min_imbalance: float = 0.1        # focused sweep best: 0.1
     entry_max_imbalance: float = 0.70       # f247: imb>0.7 = chasing (-0.3c markout)
     imbalance_band_enabled: bool = True     # use min/max band
     # -- Directional imbalance --
@@ -149,9 +149,9 @@ class StrategyParams:
     quiet_hours_et: tuple = (3, 5, 7, 8)   # hours in ET to suppress entries (<16% match rate)
     # -- Time-to-resolution filter --
     entry_max_seconds_to_resolution: float = 0.0  # 0=disabled
-    entry_min_seconds_to_resolution: float = 0.0   # disabled
+    entry_min_seconds_to_resolution: float = 120.0  # focused sweep best: 120s
     # -- 60s return filter --
-    entry_min_ret_60s: float = 0.0005      # refined sweep best: 0.05%
+    entry_min_ret_60s: float = 0.0004      # focused sweep best: 0.04%
     # -- Crossing control --
     cross_enabled: bool = False             # f247: crossing = -2.5c markout; disabled
     # -- Size cap --
