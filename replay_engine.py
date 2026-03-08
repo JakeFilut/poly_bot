@@ -2328,10 +2328,10 @@ FOCUSED_SWEEP_RANGES = {
     "quiet_hours_et": [(3, 5, 7, 8)],
     "entry_cooldown_sec": [10.0],
     "entry_max_seconds_to_resolution": [0.0],
-    # --- Refine these (new/changed params) ---
-    "entry_min_imbalance": [0.0, 0.1, 0.2],
-    "entry_min_seconds_to_resolution": [0, 30, 45, 60, 90, 120],
-    "entry_min_ret_60s": [0.0001, 0.0002, 0.0003, 0.0004, 0.0005, 0.0007],
+    # --- Locked from focused sweep (converged) ---
+    "entry_min_imbalance": [0.1],
+    "entry_min_seconds_to_resolution": [120],
+    "entry_min_ret_60s": [0.0004],
     # Comparison tolerance
     "tolerance_sec": [7.0],
 }

@@ -167,14 +167,14 @@ class Config:
     ENTRY_PREFER_SPREAD_PCTL: float = 0.92  # preferred spread pctl (soft bonus)
     ENTRY_MIN_ABS_RET_30S: float = 0.0   # disabled: wallet median ret_30s=0.0 (was 0.0002)
     ENTRY_MIN_RET_30S: float = 0.0       # legacy alias (synced)
-    ENTRY_MIN_RET_60S: float = 0.0005    # refined sweep best: require |ret_60s| >= 0.05%
-    ENTRY_MIN_SECONDS_TO_RESOLUTION: float = 0.0   # refined sweep: disabled (no benefit)
+    ENTRY_MIN_RET_60S: float = 0.0004    # focused sweep best: require |ret_60s| >= 0.04%
+    ENTRY_MIN_SECONDS_TO_RESOLUTION: float = 120.0  # focused sweep best: require 2min+ to resolution
     ENTRY_LATE_CUTOFF_SEC: int = 600     # stop entering after 10 min
     ENTRY_AVG_UP_TOLERANCE: float = 0.005 # max 0.5¢ above avg cost
     ENTRY_MAX_SIZE_SHARES: float = 30.0  # f247: 30-60 marginal, 60+ negative; cap at 30
 
     # -- Directional imbalance gate --
-    ENTRY_MIN_IMBALANCE: float = 0.0     # sweep best: 0.0 (was 0.42); imbalance gate effectively disabled
+    ENTRY_MIN_IMBALANCE: float = 0.1     # focused sweep best: light imbalance filter cuts false entries
     ENTRY_IMBALANCE_DIRECTIONAL: bool = False  # disabled: sweep confirmed non-directional is better
     ENTRY_IMBALANCE_ENABLED: bool = True  # set False to disable imbalance gate entirely
 
@@ -355,12 +355,12 @@ def load_config() -> Config:
         ENTRY_PREFER_SPREAD_PCTL=_env_float("ENTRY_PREFER_SPREAD_PCTL", 0.92),
         ENTRY_MIN_ABS_RET_30S=_env_float("ENTRY_MIN_ABS_RET_30S", 0.0),
         ENTRY_MIN_RET_30S=_env_float("ENTRY_MIN_RET_30S", 0.0),
-        ENTRY_MIN_RET_60S=_env_float("ENTRY_MIN_RET_60S", 0.0005),
-        ENTRY_MIN_SECONDS_TO_RESOLUTION=_env_float("ENTRY_MIN_SECONDS_TO_RESOLUTION", 0.0),
+        ENTRY_MIN_RET_60S=_env_float("ENTRY_MIN_RET_60S", 0.0004),
+        ENTRY_MIN_SECONDS_TO_RESOLUTION=_env_float("ENTRY_MIN_SECONDS_TO_RESOLUTION", 120.0),
         ENTRY_LATE_CUTOFF_SEC=_env_int("ENTRY_LATE_CUTOFF_SEC", 600),
         ENTRY_AVG_UP_TOLERANCE=_env_float("ENTRY_AVG_UP_TOLERANCE", 0.005),
         ENTRY_MAX_SIZE_SHARES=_env_float("ENTRY_MAX_SIZE_SHARES", 30.0),
-        ENTRY_MIN_IMBALANCE=_env_float("ENTRY_MIN_IMBALANCE", 0.0),
+        ENTRY_MIN_IMBALANCE=_env_float("ENTRY_MIN_IMBALANCE", 0.1),
         ENTRY_IMBALANCE_DIRECTIONAL=_env_bool("ENTRY_IMBALANCE_DIRECTIONAL", False),
         ENTRY_IMBALANCE_ENABLED=_env_bool("ENTRY_IMBALANCE_ENABLED", True),
         ENTRY_MIN_BOOK_DEPTH=_env_float("ENTRY_MIN_BOOK_DEPTH", 50.0),
