@@ -133,10 +133,10 @@ class StrategyParams:
 
     Defaults aligned to f247 wallet signal distributions (2,637 trades, 5h session).
     """
-    entry_min_spread_pctl: float = 0.85
+    entry_min_spread_pctl: float = 0.90      # baseline; overridden per-asset
     entry_min_spread_cents: float = 1.0     # wallet median spread=1¢
     entry_min_ret_30s: float = 0.0          # disabled: wallet median ret_30s=0.0
-    entry_min_imbalance: float = 0.1        # focused sweep best: 0.1
+    entry_min_imbalance: float = 0.0        # per-asset sweep: 0.0 best for BTC/SOL/XRP
     entry_max_imbalance: float = 0.70       # f247: imb>0.7 = chasing (-0.3c markout)
     imbalance_band_enabled: bool = True     # use min/max band
     # -- Directional imbalance --
@@ -144,18 +144,71 @@ class StrategyParams:
     # -- One-shot conditions --
     spread_pctl_delta_min: float = 0.0      # pctl_now - pctl_60s_ago >= this
     ret_accel_min: float = 0.0              # |ret_30s - ret_120s| >= this
-    entry_cooldown_sec: float = 5.0         # f247: wallet bursts every 2s; lowered from 10s
+    entry_cooldown_sec: float = 15.0        # per-asset sweep best: 15s across all assets
     # -- Time-of-day filter --
     quiet_hours_et: tuple = (3, 5, 7, 8)   # hours in ET to suppress entries (<16% match rate)
     # -- Time-to-resolution filter --
     entry_max_seconds_to_resolution: float = 0.0  # 0=disabled
-    entry_min_seconds_to_resolution: float = 120.0  # focused sweep best: 120s
+    entry_min_seconds_to_resolution: float = 0.0  # per-asset sweep: 0.0 best for most; SOL uses 60s override
     # -- 60s return filter --
-    entry_min_ret_60s: float = 0.0004      # focused sweep best: 0.04%
+    entry_min_ret_60s: float = 0.0          # per-asset sweep: 0.0 best for BTC/SOL; ETH/XRP use 0.0005 override
     # -- Crossing control --
     cross_enabled: bool = False             # f247: crossing = -2.5c markout; disabled
     # -- Size cap --
     entry_max_size_shares: float = 30.0     # f247: 30-60 marginal, 60+ negative
+
+    # -- Per-asset overrides --
+    # Keys are asset names (e.g. "BTC", "ETH"), values are dicts of param overrides.
+    # Example: {"BTC": {"entry_min_spread_pctl": 0.95, "entry_min_ret_60s": 0.0}}
+    asset_overrides: dict = None  # type: ignore[assignment]
+
+    def __post_init__(self):
+        if self.asset_overrides is None:
+            # Per-asset sweep best params (from per_asset_sweep results)
+            self.asset_overrides = {
+                "BTC": {
+                    "entry_min_spread_pctl": 0.95,
+                    "entry_min_ret_30s": 0.0,
+                    "entry_min_imbalance": 0.0,
+                    "entry_min_ret_60s": 0.0,
+                    "entry_min_seconds_to_resolution": 0.0,
+                },
+                "ETH": {
+                    "entry_min_spread_pctl": 0.80,
+                    "entry_min_ret_30s": 0.0,
+                    "entry_min_imbalance": 0.2,
+                    "entry_min_ret_60s": 0.0005,
+                    "entry_min_seconds_to_resolution": 0.0,
+                },
+                "SOL": {
+                    "entry_min_spread_pctl": 0.95,
+                    "entry_min_ret_30s": 0.0003,
+                    "entry_min_imbalance": 0.0,
+                    "entry_min_ret_60s": 0.0,
+                    "entry_min_seconds_to_resolution": 60.0,
+                },
+                "XRP": {
+                    "entry_min_spread_pctl": 0.85,
+                    "entry_min_ret_30s": 0.0,
+                    "entry_min_imbalance": 0.0,
+                    "entry_min_ret_60s": 0.0005,
+                    "entry_min_seconds_to_resolution": 0.0,
+                },
+            }
+
+    def for_asset(self, asset: str) -> "StrategyParams":
+        """Return a copy of this StrategyParams with asset-specific overrides applied."""
+        overrides = self.asset_overrides.get(asset)
+        if not overrides:
+            return self
+        import copy
+        p = copy.copy(self)
+        for k, v in overrides.items():
+            if hasattr(p, k):
+                object.__setattr__(p, k, v)
+        # Clear asset_overrides on the copy to avoid nested lookups
+        object.__setattr__(p, 'asset_overrides', {})
+        return p
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -468,7 +521,8 @@ class Strategy:
 
         gate_that_failed is '' if all gates pass, otherwise the name of the first failing gate.
         """
-        p = self.params
+        # Apply per-asset overrides if available
+        p = self.params.for_asset(ms.asset) if self.params.asset_overrides else self.params
         accepted_reasons: List[str] = []
 
         # --- Gate 0: quiet hours ---
@@ -587,7 +641,7 @@ class Strategy:
         Unlike evaluate_market_state which short-circuits on first failure,
         this evaluates every gate for full attribution.
         """
-        p = self.params
+        p = self.params.for_asset(ms.asset) if self.params.asset_overrides else self.params
         results = []
         quiet_ok = not p.quiet_hours_et or ms.hour_et not in p.quiet_hours_et
         results.append(("quiet_hour", float(ms.hour_et), 0.0, quiet_ok))
@@ -2333,7 +2387,7 @@ def parameter_sweep(
     t_start = _time.monotonic()
     done = 0
     for combo in strategy_grid:
-        params = StrategyParams(**dict(zip(keys, combo)))
+        params = StrategyParams(**dict(zip(keys, combo)), asset_overrides={})
         decisions = run_replay(states, params)
         for tol in tolerance_values:
             cr = compare_to_wallet(decisions, wallet_trades, tol, offset_sec=offset_sec)
