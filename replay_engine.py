@@ -88,6 +88,18 @@ class MarketState:
     hour_et: int = 0              # hour of day in ET (0-23) for quiet-hour gate
     # Market type (derived from slug)
     market_type: str = ""     # "hourly" or "15m" or ""
+    # --- v3: Extended market data ---
+    binance_ret_300s: float = 0.0   # 5-minute return
+    binance_ret_900s: float = 0.0   # 15-minute return
+    realized_vol_5m: float = 0.0    # rolling realized volatility (σ of 30s rets over 5min)
+    binance_spread_bps: float = 0.0 # Binance bid-ask spread in bps
+    binance_volume_24h: float = 0.0 # 24h quote volume on Binance
+    bid_depth_delta_1s: float = 0.0 # book bid depth change vs 1s ago
+    ask_depth_delta_1s: float = 0.0 # book ask depth change vs 1s ago
+    imbalance_delta_1s: float = 0.0 # imbalance change vs 1s ago
+    bid_depth_near_mid: float = 0.0 # cumulative bid depth within 2¢ of mid
+    ask_depth_near_mid: float = 0.0 # cumulative ask depth within 2¢ of mid
+    poly_binance_price: float = 0.0 # raw Binance price at this tick (for divergence)
 
 
 @dataclass
@@ -242,7 +254,9 @@ class MarketReplayEngine:
     def build_binance_returns(self) -> Dict[str, pd.DataFrame]:
         """Pre-compute rolling Binance returns per symbol (vectorized).
 
-        Returns dict: symbol -> DataFrame with columns [ts, price, ret_5s, ret_30s, ret_60s, ret_120s].
+        Returns dict: symbol -> DataFrame with columns
+        [ts, price, ret_5s, ret_30s, ret_60s, ret_120s, ret_300s, ret_900s,
+         realized_vol_5m, binance_spread_bps, volume_24h, quote_volume_24h].
         """
         result: Dict[str, pd.DataFrame] = {}
         if self.binance_tape.empty:
@@ -257,15 +271,13 @@ class MarketReplayEngine:
             if g.empty:
                 continue
 
-            # Vectorized returns using merge_asof for time-based lookback
-            # For ~1Hz data, shift(N) approximates N-second lookback
             ts_arr = g["ts"].values
             px_arr = g["price"].values
 
-            # Build a lookup: for each target lag, find the closest index
-            # via searchsorted (vectorized)
+            # Returns at multiple horizons (vectorized)
             for lag, col, tol in [(5, "ret_5s", 1.5), (30, "ret_30s", 2.0),
-                                   (60, "ret_60s", 2.0), (120, "ret_120s", 2.0)]:
+                                   (60, "ret_60s", 2.0), (120, "ret_120s", 2.0),
+                                   (300, "ret_300s", 5.0), (900, "ret_900s", 10.0)]:
                 target_ts = ts_arr - lag
                 idx = np.searchsorted(ts_arr, target_ts, side="right") - 1
                 idx = np.clip(idx, 0, len(ts_arr) - 1)
@@ -275,6 +287,25 @@ class MarketReplayEngine:
                 valid = (dt <= tol) & (past_px > 0)
                 ret = np.where(valid, px_arr / past_px - 1, 0.0)
                 g[col] = ret
+
+            # Realized volatility: rolling σ of 30s log returns over 5min window
+            # For each row, compute std of log(px[t]/px[t-30]) over last 300s
+            log_ret_30 = np.zeros(len(g))
+            target_30 = ts_arr - 30
+            idx_30 = np.searchsorted(ts_arr, target_30, side="right") - 1
+            idx_30 = np.clip(idx_30, 0, len(ts_arr) - 1)
+            valid_30 = (np.abs(ts_arr[idx_30] - target_30) <= 2.0) & (px_arr[idx_30] > 0)
+            log_ret_30 = np.where(valid_30, np.log(np.maximum(px_arr, 1e-12) / np.maximum(px_arr[idx_30], 1e-12)), 0.0)
+            # Rolling std with ~10 samples (300s / 30s)
+            rvol = pd.Series(log_ret_30).rolling(window=10, min_periods=3).std().fillna(0).values
+            g["realized_vol_5m"] = rvol
+
+            # Pass through existing tape columns if available
+            for col_name in ["binance_spread_bps", "volume_24h", "quote_volume_24h"]:
+                if col_name in g.columns:
+                    g[col_name] = pd.to_numeric(g[col_name], errors="coerce").fillna(0)
+                else:
+                    g[col_name] = 0.0
 
             result[str(sym)] = g
 
@@ -341,11 +372,29 @@ class MarketReplayEngine:
         # Timestamps
         ts_arr = bt["ts"].values.astype(np.float64)
 
+        # --- v3: New book tape columns (graceful fallback if missing) ---
+        def _safe_col(df, col_name):
+            if col_name in df.columns:
+                return pd.to_numeric(df[col_name], errors="coerce").fillna(0).values
+            return np.zeros(len(df))
+
+        bid_delta_1s_arr = _safe_col(bt, "bid_depth_delta_1s")
+        ask_delta_1s_arr = _safe_col(bt, "ask_depth_delta_1s")
+        imb_delta_1s_arr = _safe_col(bt, "imbalance_delta_1s")
+        bid_near_mid_arr = _safe_col(bt, "bid_depth_within_2c")
+        ask_near_mid_arr = _safe_col(bt, "ask_depth_within_2c")
+        poly_bn_price_arr = _safe_col(bt, "poly_binance_divergence_bps")
+
         # --- Binance return lookups (vectorized per asset) ---
         r5_arr = np.zeros(len(bt))
         r30_arr = np.zeros(len(bt))
         r60_arr = np.zeros(len(bt))
         r120_arr = np.zeros(len(bt))
+        r300_arr = np.zeros(len(bt))
+        r900_arr = np.zeros(len(bt))
+        rvol_arr = np.zeros(len(bt))
+        bn_spread_arr = np.zeros(len(bt))
+        bn_vol_arr = np.zeros(len(bt))
 
         unique_assets = np.unique(assets)
         for ua in unique_assets:
@@ -359,10 +408,19 @@ class MarketReplayEngine:
             mask = assets == ua
             asset_ts = ts_arr[mask]
             b_ts = bdf["ts"].values
-            b_r5 = bdf["ret_5s"].values if "ret_5s" in bdf.columns else np.zeros(len(bdf))
-            b_r30 = bdf["ret_30s"].values if "ret_30s" in bdf.columns else np.zeros(len(bdf))
-            b_r60 = bdf["ret_60s"].values if "ret_60s" in bdf.columns else np.zeros(len(bdf))
-            b_r120 = bdf["ret_120s"].values if "ret_120s" in bdf.columns else np.zeros(len(bdf))
+
+            def _get_col(name):
+                return bdf[name].values if name in bdf.columns else np.zeros(len(bdf))
+
+            b_r5 = _get_col("ret_5s")
+            b_r30 = _get_col("ret_30s")
+            b_r60 = _get_col("ret_60s")
+            b_r120 = _get_col("ret_120s")
+            b_r300 = _get_col("ret_300s")
+            b_r900 = _get_col("ret_900s")
+            b_rvol = _get_col("realized_vol_5m")
+            b_spread = _get_col("binance_spread_bps")
+            b_vol = _get_col("quote_volume_24h")
 
             idx = np.searchsorted(b_ts, asset_ts, side="right") - 1
             idx = np.clip(idx, 0, len(b_ts) - 1)
@@ -373,6 +431,11 @@ class MarketReplayEngine:
             r30_arr[mask] = np.where(within_tol, b_r30[idx], 0.0)
             r60_arr[mask] = np.where(within_tol, b_r60[idx], 0.0)
             r120_arr[mask] = np.where(within_tol, b_r120[idx], 0.0)
+            r300_arr[mask] = np.where(within_tol, b_r300[idx], 0.0)
+            r900_arr[mask] = np.where(within_tol, b_r900[idx], 0.0)
+            rvol_arr[mask] = np.where(within_tol, b_rvol[idx], 0.0)
+            bn_spread_arr[mask] = np.where(within_tol, b_spread[idx], 0.0)
+            bn_vol_arr[mask] = np.where(within_tol, b_vol[idx], 0.0)
 
         # --- Timing-inside-window features (vectorized) ---
         # Convert epoch seconds to ET minute/second
@@ -418,6 +481,18 @@ class MarketReplayEngine:
                 seconds_to_resolution=int(str_arr[i]),
                 hour_et=int(hour_et_arr[i]),
                 market_type=str(mtypes[i]),
+                # v3: extended fields
+                binance_ret_300s=float(r300_arr[i]),
+                binance_ret_900s=float(r900_arr[i]),
+                realized_vol_5m=float(rvol_arr[i]),
+                binance_spread_bps=float(bn_spread_arr[i]),
+                binance_volume_24h=float(bn_vol_arr[i]),
+                bid_depth_delta_1s=float(bid_delta_1s_arr[i]),
+                ask_depth_delta_1s=float(ask_delta_1s_arr[i]),
+                imbalance_delta_1s=float(imb_delta_1s_arr[i]),
+                bid_depth_near_mid=float(bid_near_mid_arr[i]),
+                ask_depth_near_mid=float(ask_near_mid_arr[i]),
+                poly_binance_price=float(poly_bn_price_arr[i]),
             ))
 
         # Backfill spread_pctl_prev: for each (slug, outcome) track pctl ~60s ago

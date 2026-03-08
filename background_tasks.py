@@ -81,6 +81,7 @@ async def poll_binance(
     while True:
         try:
             await binance.async_refresh_all()
+            await binance.async_refresh_ticker()
             heartbeats.binance = time.time()
         except asyncio.CancelledError:
             raise

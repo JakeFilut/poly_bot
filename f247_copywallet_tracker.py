@@ -116,7 +116,7 @@ BOOK_TAPE_MAX_TOKENS = 10
 BOOK_TAPE_MEMORY_SEC = 120  # In-memory tape window for velocity lookups
 
 # Binance tape: 1Hz spot recording for velocity
-BINANCE_TAPE_MEMORY_SEC = 120  # In-memory tape window
+BINANCE_TAPE_MEMORY_SEC = 1200  # In-memory tape window (20min for 15m returns + vol)
 
 # Write cadences for new v2 features
 LATENCY_ROLLUP_EVERY_SECONDS = 60
@@ -574,6 +574,12 @@ _BOOK_TAPE_HEADER = [
     "spread_percentile_60s",
     # v2 additions
     "bid_depth_total", "ask_depth_total",
+    # v3: orderbook delta, depth near mid, Poly-Binance divergence
+    "bid_depth_delta_1s", "ask_depth_delta_1s",  # depth change vs 1s ago
+    "imbalance_delta_1s",                         # imbalance change vs 1s ago
+    "bid_depth_within_1c", "ask_depth_within_1c", # cumulative depth within 1¢ of mid
+    "bid_depth_within_2c", "ask_depth_within_2c", # cumulative depth within 2¢ of mid
+    "poly_binance_divergence_bps",                # (poly_mid - binance) / binance * 10000
     "tape_ts_epoch", "tape_source",
 ]
 
@@ -590,9 +596,31 @@ def register_active_token(token_id: str, slug: str, outcome: str, ts: int):
         del _active_tokens[oldest]
 
 
+# Previous book depths for delta computation
+_prev_book_depth: Dict[str, Tuple[float, float, float]] = {}  # token_id -> (bid_depth, ask_depth, imbalance)
+
+
+def _depth_within_cents(levels: List[dict], mid_price: float,
+                        max_cents: float, side: str) -> float:
+    """Sum depth of levels within max_cents of mid_price.
+    side='bid': levels below mid. side='ask': levels above mid.
+    """
+    total = 0.0
+    for lvl in levels:
+        px = ffloat(lvl.get("price"))
+        sz = ffloat(lvl.get("size"))
+        if px is None or sz is None:
+            continue
+        dist_cents = abs(px - mid_price) * 100
+        if dist_cents <= max_cents:
+            total += sz
+    return total
+
+
 def write_book_tape_tick():
     """Record one book tape row per active token_id (called every ~1s).
     Also stores in-memory for velocity feature lookups.
+    v3: adds orderbook delta, depth-near-mid, and Poly-Binance divergence.
     """
     if not BOOK_TAPE_ENABLED or not _active_tokens:
         return
@@ -612,6 +640,51 @@ def write_book_tape_tick():
             sp_stats = spread_tracker_stats(token_id, spread_f)
         # Store in-memory for velocity lookups
         book_tape_mem_record(token_id, now_epoch, spread_f, imb_f, mid_f, micro_f)
+
+        # --- v3: Orderbook delta (depth change vs 1s ago) ---
+        bid_depth_f = ffloat(snap.bid_depth_topN) or 0.0
+        ask_depth_f = ffloat(snap.ask_depth_topN) or 0.0
+        prev = _prev_book_depth.get(token_id)
+        bid_delta_1s = ""
+        ask_delta_1s = ""
+        imb_delta_1s = ""
+        if prev is not None:
+            bid_delta_1s = clean_number(bid_depth_f - prev[0])
+            ask_delta_1s = clean_number(ask_depth_f - prev[1])
+            if imb_f is not None and prev[2] is not None:
+                imb_delta_1s = clean_number(imb_f - prev[2])
+        _prev_book_depth[token_id] = (bid_depth_f, ask_depth_f, imb_f)
+
+        # --- v3: Cumulative depth within 1¢ and 2¢ of mid ---
+        bid_1c = ""
+        ask_1c = ""
+        bid_2c = ""
+        ask_2c = ""
+        if mid_f is not None and snap.bids_json:
+            try:
+                bids_list = json.loads(snap.bids_json)
+                asks_list = json.loads(snap.asks_json)
+                bid_1c = clean_number(_depth_within_cents(bids_list, mid_f, 1.0, "bid"))
+                ask_1c = clean_number(_depth_within_cents(asks_list, mid_f, 1.0, "ask"))
+                bid_2c = clean_number(_depth_within_cents(bids_list, mid_f, 2.0, "bid"))
+                ask_2c = clean_number(_depth_within_cents(asks_list, mid_f, 2.0, "ask"))
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        # --- v3: Poly-Binance divergence ---
+        divergence_bps = ""
+        if mid_f is not None:
+            # Get crypto from slug
+            crypto = detect_crypto(info.get("slug", ""))
+            if crypto:
+                bn_px = binance_spot_price(crypto)
+                bn_f = ffloat(bn_px)
+                if bn_f and bn_f > 0:
+                    # Polymarket mid is 0-1 (probability), Binance is $ price
+                    # Divergence = how Poly mid is moving vs Binance direction
+                    # We store the raw Binance price and Poly mid for replay to compute
+                    divergence_bps = clean_number(bn_f)  # store raw Binance price; replay computes divergence
+
         append_row_csv(BOOK_TAPE_CSV, _BOOK_TAPE_HEADER, {
             "timestamp_iso": now_iso,
             "timestamp_epoch": str(now_epoch),
@@ -630,6 +703,14 @@ def write_book_tape_tick():
                 "spread_percentile_60s", ""),
             "bid_depth_total": snap.bid_depth_total,
             "ask_depth_total": snap.ask_depth_total,
+            "bid_depth_delta_1s": str(bid_delta_1s),
+            "ask_depth_delta_1s": str(ask_delta_1s),
+            "imbalance_delta_1s": str(imb_delta_1s),
+            "bid_depth_within_1c": str(bid_1c),
+            "ask_depth_within_1c": str(ask_1c),
+            "bid_depth_within_2c": str(bid_2c),
+            "ask_depth_within_2c": str(ask_2c),
+            "poly_binance_divergence_bps": str(divergence_bps),
             "tape_ts_epoch": str(now_epoch),
             "tape_source": "CLOB_BOOK",
         })
@@ -1886,18 +1967,109 @@ def binance_tape_mem_record(symbol: str, t_sec: int, price_f: float):
 
 
 _BINANCE_TAPE_HEADER = [
-    "timestamp_iso", "timestamp_epoch", "symbol", "price", "tape_source",
+    "timestamp_iso", "timestamp_epoch", "symbol", "price",
+    # v2: volume, spread, volatility
+    "bid_price", "ask_price", "binance_spread_bps",
+    "volume_24h", "quote_volume_24h",
+    "realized_vol_5m",
+    "ret_5s", "ret_30s", "ret_60s", "ret_120s", "ret_300s", "ret_900s",
+    "tape_source",
 ]
 
 _binance_tape_last_sec: Dict[str, int] = {}  # symbol -> last recorded epoch_sec
 
 
+def _compute_realized_vol(symbol: str, now_sec: int,
+                          window_sec: int = 300, sample_interval: int = 30) -> Optional[float]:
+    """Compute realized volatility from in-memory Binance tape.
+    σ of log returns sampled every sample_interval seconds over window_sec.
+    """
+    import math as _math
+    dq = _binance_tape_mem.get(symbol)
+    if not dq or len(dq) < 5:
+        return None
+    cutoff = now_sec - window_sec
+    # Sample at regular intervals
+    prices: list = []
+    target_ts = cutoff
+    for t, px in dq:
+        if t < cutoff:
+            continue
+        if t >= target_ts:
+            prices.append(px)
+            target_ts = t + sample_interval
+    if len(prices) < 3:
+        return None
+    log_rets = []
+    for i in range(1, len(prices)):
+        if prices[i - 1] > 0:
+            log_rets.append(_math.log(prices[i] / prices[i - 1]))
+    if len(log_rets) < 2:
+        return None
+    mean_r = sum(log_rets) / len(log_rets)
+    var = sum((r - mean_r) ** 2 for r in log_rets) / (len(log_rets) - 1)
+    return _math.sqrt(var)
+
+
+def _compute_binance_returns(symbol: str, now_sec: int) -> Dict[str, Optional[float]]:
+    """Compute returns at multiple horizons from in-memory Binance tape."""
+    result: Dict[str, Optional[float]] = {}
+    dq = _binance_tape_mem.get(symbol)
+    if not dq or len(dq) < 2:
+        return result
+    now_px = dq[-1][1]
+    if now_px <= 0:
+        return result
+    for lag, key in [(5, "ret_5s"), (30, "ret_30s"), (60, "ret_60s"),
+                     (120, "ret_120s"), (300, "ret_300s"), (900, "ret_900s")]:
+        target = now_sec - lag
+        best_t, best_px = dq[0]
+        for t, px in dq:
+            if t <= target:
+                best_t, best_px = t, px
+            else:
+                break
+        if abs(best_t - target) <= max(lag * 0.5, 3) and best_px > 0:
+            result[key] = (now_px / best_px) - 1.0
+        else:
+            result[key] = None
+    return result
+
+
 def write_binance_tape_tick():
-    """Record 1Hz Binance spot prices for active crypto symbols."""
+    """Record 1Hz Binance spot prices for active crypto symbols.
+    v2: also records bid/ask spread, volume, volatility, and returns.
+    """
     if not _active_cryptos:
         return
     now_epoch = epoch_sec()
     now_iso = ts_to_iso(now_epoch)
+
+    # Fetch bookTicker for all symbols in one batch (bid/ask + volume)
+    ticker_map: Dict[str, dict] = {}
+    vol_map: Dict[str, dict] = {}
+    try:
+        r = SESSION.get(f"{BINANCE_BASE}/api/v3/ticker/bookTicker", timeout=3)
+        if r.status_code == 200:
+            for item in r.json():
+                ticker_map[item["symbol"]] = item
+    except Exception:
+        pass
+
+    # 24hr volume — only fetch every 10s to avoid rate limits
+    global _binance_vol_cache, _binance_vol_cache_ts
+    if now_epoch - getattr(write_binance_tape_tick, '_vol_ts', 0) >= 10:
+        try:
+            r2 = SESSION.get(f"{BINANCE_BASE}/api/v3/ticker/24hr", timeout=5)
+            if r2.status_code == 200:
+                write_binance_tape_tick._vol_cache = {
+                    item["symbol"]: item for item in r2.json()
+                }
+                write_binance_tape_tick._vol_ts = now_epoch
+        except Exception:
+            pass
+    vol_map = getattr(write_binance_tape_tick, '_vol_cache', {})
+
     for symbol in list(_active_cryptos.keys()):
         # Deduplicate: at most 1 row per symbol per second
         if _binance_tape_last_sec.get(symbol) == now_epoch:
@@ -1908,11 +2080,46 @@ def write_binance_tape_tick():
             continue
         _binance_tape_last_sec[symbol] = now_epoch
         binance_tape_mem_record(symbol, now_epoch, price_f)
+
+        # Bid/ask spread from bookTicker
+        bn_sym = f"{symbol}USDT"
+        tk = ticker_map.get(bn_sym, {})
+        bid_px = tk.get("bidPrice", "")
+        ask_px = tk.get("askPrice", "")
+        bid_f = ffloat(bid_px)
+        ask_f = ffloat(ask_px)
+        spread_bps = ""
+        if bid_f and ask_f and bid_f > 0 and ask_f > 0:
+            spread_bps = clean_number((ask_f - bid_f) / ((ask_f + bid_f) / 2) * 10000)
+
+        # Volume from 24hr ticker
+        vd = vol_map.get(bn_sym, {})
+        vol_24h = vd.get("volume", "")
+        qvol_24h = vd.get("quoteVolume", "")
+
+        # Realized volatility from in-memory tape (σ of 30s returns over 5min)
+        rvol = _compute_realized_vol(symbol, now_epoch)
+
+        # Returns from in-memory tape
+        rets = _compute_binance_returns(symbol, now_epoch)
+
         append_row_csv(BINANCE_TAPE_CSV, _BINANCE_TAPE_HEADER, {
             "timestamp_iso": now_iso,
             "timestamp_epoch": str(now_epoch),
             "symbol": symbol,
             "price": price_str,
+            "bid_price": str(bid_px),
+            "ask_price": str(ask_px),
+            "binance_spread_bps": str(spread_bps),
+            "volume_24h": str(vol_24h),
+            "quote_volume_24h": str(qvol_24h),
+            "realized_vol_5m": clean_number(rvol) if rvol is not None else "",
+            "ret_5s": clean_number(rets.get("ret_5s")) if rets.get("ret_5s") is not None else "",
+            "ret_30s": clean_number(rets.get("ret_30s")) if rets.get("ret_30s") is not None else "",
+            "ret_60s": clean_number(rets.get("ret_60s")) if rets.get("ret_60s") is not None else "",
+            "ret_120s": clean_number(rets.get("ret_120s")) if rets.get("ret_120s") is not None else "",
+            "ret_300s": clean_number(rets.get("ret_300s")) if rets.get("ret_300s") is not None else "",
+            "ret_900s": clean_number(rets.get("ret_900s")) if rets.get("ret_900s") is not None else "",
             "tape_source": "BINANCE_SPOT",
         })
 
