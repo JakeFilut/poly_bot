@@ -1029,6 +1029,7 @@ def compare_to_wallet(
     debug: bool = False,
     offset_sec: float = 0.0,
     buy_only: bool = True,
+    quiet: bool = False,
 ) -> ComparisonResult:
     """Compare bot decisions against wallet trades.
 
@@ -1193,7 +1194,7 @@ def compare_to_wallet(
     missed = total - matched
 
     # --- Matching diagnostics ---
-    if mismatch_reasons:
+    if mismatch_reasons and not quiet:
         print(f"\n  {'─' * 60}")
         print("  MATCHING DIAGNOSTICS -- Top 10 mismatch reasons")
         print(f"  {'─' * 60}")
@@ -1209,7 +1210,7 @@ def compare_to_wallet(
         print(f"    Wallet trades with bot decision within {tolerance_sec}s but wrong key:  {nearby_but_wrong}")
 
     # --- Wrong-key debug dump (first 50) ---
-    if wrong_key_examples:
+    if wrong_key_examples and not quiet:
         print(f"\n  {'═' * 70}")
         print(f"  WRONG-KEY MISMATCH DEBUG DUMP  (first {len(wrong_key_examples)} of "
               f"{mismatch_reasons.get('no_bot_entry_for_key (but bot decision within tolerance)', 0)})")
@@ -1246,7 +1247,7 @@ def compare_to_wallet(
                 else:
                     print(f"      KEY DIFFS: (none -- keys match, possible timestamp issue)")
 
-    if debug and debug_examples:
+    if debug and debug_examples and not quiet:
         print(f"\n  {'─' * 60}")
         print("  DEBUG -- Example unmatched wallet trades")
         print(f"  {'─' * 60}")
@@ -1257,7 +1258,7 @@ def compare_to_wallet(
             print(f"      reason: {ex['reason']}  |  nearest_any_bot_ts={nearest_str} ({lag_str} away)")
 
     # --- Print all unique bot entry keys for cross-reference ---
-    if wrong_key_examples:
+    if wrong_key_examples and not quiet:
         print(f"\n  {'─' * 60}")
         print("  ALL UNIQUE BOT ENTRY KEYS (normalised)")
         print(f"  {'─' * 60}")
@@ -2959,8 +2960,8 @@ def main() -> None:
                         help="Run parameter sweep optimization")
     parser.add_argument("--no-charts", action="store_true",
                         help="Skip chart generation")
-    parser.add_argument("--tolerance-sec", type=float, default=3.0,
-                        help="Matching tolerance in seconds (default: 3.0)")
+    parser.add_argument("--tolerance-sec", type=float, default=7.0,
+                        help="Matching tolerance in seconds (default: 7.0)")
     parser.add_argument("--debug", action="store_true",
                         help="Print debug examples of unmatched wallet trades")
     parser.add_argument("--offset-sec", type=float, default=None,
@@ -3027,7 +3028,7 @@ def main() -> None:
         print("\n[5/8] Comparing to wallet trades ...")
     comparison = compare_to_wallet(
         decisions, engine.wallet_trades, args.tolerance_sec,
-        debug=args.debug, offset_sec=offset_sec,
+        debug=args.debug, offset_sec=offset_sec, quiet=concise,
     )
     if not concise:
         print(f"  F1 score: {comparison.similarity_score:.4f}  (precision={comparison.precision:.4f}, recall={comparison.recall:.4f})")
