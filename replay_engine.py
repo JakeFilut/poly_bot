@@ -144,7 +144,7 @@ class StrategyParams:
     # -- One-shot conditions --
     spread_pctl_delta_min: float = 0.0      # pctl_now - pctl_60s_ago >= this
     ret_accel_min: float = 0.0              # |ret_30s - ret_120s| >= this
-    entry_cooldown_sec: float = 15.0        # per-asset sweep best: 15s across all assets
+    entry_cooldown_sec: float = 5.0          # 15s caused 81% BTC misses; 5s matches wallet burst pattern
     # -- Time-of-day filter --
     quiet_hours_et: tuple = (3, 5, 7, 8)   # hours in ET to suppress entries (<16% match rate)
     # -- Time-to-resolution filter --
@@ -164,35 +164,22 @@ class StrategyParams:
 
     def __post_init__(self):
         if self.asset_overrides is None:
-            # Per-asset sweep best params (from per_asset_sweep results)
+            # Per-asset overrides: only spread_pctl differs meaningfully.
+            # Ret filters (ret_30s, ret_60s) removed — they caused 45-60% of
+            # ETH/SOL/XRP misses when combined with cooldown.
             self.asset_overrides = {
                 "BTC": {
                     "entry_min_spread_pctl": 0.95,
-                    "entry_min_ret_30s": 0.0,
-                    "entry_min_imbalance": 0.0,
-                    "entry_min_ret_60s": 0.0,
-                    "entry_min_seconds_to_resolution": 0.0,
                 },
                 "ETH": {
                     "entry_min_spread_pctl": 0.80,
-                    "entry_min_ret_30s": 0.0,
                     "entry_min_imbalance": 0.2,
-                    "entry_min_ret_60s": 0.0005,
-                    "entry_min_seconds_to_resolution": 0.0,
                 },
                 "SOL": {
                     "entry_min_spread_pctl": 0.95,
-                    "entry_min_ret_30s": 0.0003,
-                    "entry_min_imbalance": 0.0,
-                    "entry_min_ret_60s": 0.0,
-                    "entry_min_seconds_to_resolution": 60.0,
                 },
                 "XRP": {
                     "entry_min_spread_pctl": 0.85,
-                    "entry_min_ret_30s": 0.0,
-                    "entry_min_imbalance": 0.0,
-                    "entry_min_ret_60s": 0.0005,
-                    "entry_min_seconds_to_resolution": 0.0,
                 },
             }
 
