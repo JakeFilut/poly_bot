@@ -144,7 +144,7 @@ class StrategyParams:
     # -- One-shot conditions --
     spread_pctl_delta_min: float = 0.0      # pctl_now - pctl_60s_ago >= this
     ret_accel_min: float = 0.0              # |ret_30s - ret_120s| >= this
-    entry_cooldown_sec: float = 5.0          # 15s caused 81% BTC misses; 5s matches wallet burst pattern
+    entry_cooldown_sec: float = 15.0         # 5s suppresses nothing (data >5s apart); 15s = best sweep F1
     # -- Time-of-day filter --
     quiet_hours_et: tuple = (3, 5, 7, 8)   # hours in ET to suppress entries (<16% match rate)
     # -- Time-to-resolution filter --
