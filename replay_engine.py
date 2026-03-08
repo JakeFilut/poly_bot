@@ -133,10 +133,10 @@ class StrategyParams:
 
     Defaults aligned to f247 wallet signal distributions (2,637 trades, 5h session).
     """
-    entry_min_spread_pctl: float = 0.90      # baseline; overridden per-asset
+    entry_min_spread_pctl: float = 0.95      # best sweep: 0.95 (F1=0.41)
     entry_min_spread_cents: float = 1.0     # wallet median spread=1¢
     entry_min_ret_30s: float = 0.0          # disabled: wallet median ret_30s=0.0
-    entry_min_imbalance: float = 0.0        # per-asset sweep: 0.0 best for BTC/SOL/XRP
+    entry_min_imbalance: float = 0.0        # best sweep: 0.0
     entry_max_imbalance: float = 0.70       # f247: imb>0.7 = chasing (-0.3c markout)
     imbalance_band_enabled: bool = True     # use min/max band
     # -- Directional imbalance --
@@ -164,24 +164,11 @@ class StrategyParams:
 
     def __post_init__(self):
         if self.asset_overrides is None:
-            # Per-asset overrides: only spread_pctl differs meaningfully.
-            # Ret filters (ret_30s, ret_60s) removed — they caused 45-60% of
-            # ETH/SOL/XRP misses when combined with cooldown.
-            self.asset_overrides = {
-                "BTC": {
-                    "entry_min_spread_pctl": 0.95,
-                },
-                "ETH": {
-                    "entry_min_spread_pctl": 0.80,
-                    "entry_min_imbalance": 0.2,
-                },
-                "SOL": {
-                    "entry_min_spread_pctl": 0.95,
-                },
-                "XRP": {
-                    "entry_min_spread_pctl": 0.85,
-                },
-            }
+            # Per-asset overrides disabled by default — the global sweep optimum
+            # (spread_pctl=0.95, cooldown=15s) outperforms per-asset tuning when
+            # combined, because lower per-asset thresholds flood the system.
+            # Use --per-asset-sweep to discover per-asset params, then set manually.
+            self.asset_overrides = {}
 
     def for_asset(self, asset: str) -> "StrategyParams":
         """Return a copy of this StrategyParams with asset-specific overrides applied."""
