@@ -133,10 +133,10 @@ class StrategyParams:
 
     Defaults aligned to f247 wallet signal distributions (2,637 trades, 5h session).
     """
-    entry_min_spread_pctl: float = 0.95      # best sweep: 0.95 (F1=0.41)
+    entry_min_spread_pctl: float = 0.85      # original default; wallet p25=78%
     entry_min_spread_cents: float = 1.0     # wallet median spread=1¢
     entry_min_ret_30s: float = 0.0          # disabled: wallet median ret_30s=0.0
-    entry_min_imbalance: float = 0.0        # best sweep: 0.0
+    entry_min_imbalance: float = 0.1        # original: light imbalance filter
     entry_max_imbalance: float = 0.70       # f247: imb>0.7 = chasing (-0.3c markout)
     imbalance_band_enabled: bool = True     # use min/max band
     # -- Directional imbalance --
@@ -144,14 +144,14 @@ class StrategyParams:
     # -- One-shot conditions --
     spread_pctl_delta_min: float = 0.0      # pctl_now - pctl_60s_ago >= this
     ret_accel_min: float = 0.0              # |ret_30s - ret_120s| >= this
-    entry_cooldown_sec: float = 15.0         # 5s suppresses nothing (data >5s apart); 15s = best sweep F1
+    entry_cooldown_sec: float = 5.0         # original default
     # -- Time-of-day filter --
     quiet_hours_et: tuple = (3, 5, 7, 8)   # hours in ET to suppress entries (<16% match rate)
     # -- Time-to-resolution filter --
     entry_max_seconds_to_resolution: float = 0.0  # 0=disabled
-    entry_min_seconds_to_resolution: float = 0.0  # per-asset sweep: 0.0 best for most; SOL uses 60s override
+    entry_min_seconds_to_resolution: float = 120.0  # original: skip entries >2min from resolution
     # -- 60s return filter --
-    entry_min_ret_60s: float = 0.0          # per-asset sweep: 0.0 best for BTC/SOL; ETH/XRP use 0.0005 override
+    entry_min_ret_60s: float = 0.0004      # original: require 0.04% 60s return
     # -- Crossing control --
     cross_enabled: bool = False             # f247: crossing = -2.5c markout; disabled
     # -- Size cap --
@@ -2193,20 +2193,23 @@ def print_lag_investigation(
     wallet_trades: pd.DataFrame,
     params: StrategyParams,
     tolerance_sec: float = 10.0,
+    quiet: bool = False,
 ) -> float:
     """Investigate timestamp lag and print findings. Returns recommended offset."""
-    print(f"\n  {'═' * 70}")
-    print("  TIMESTAMP LAG INVESTIGATION")
-    print(f"  {'═' * 70}")
+    if not quiet:
+        print(f"\n  {'═' * 70}")
+        print("  TIMESTAMP LAG INVESTIGATION")
+        print(f"  {'═' * 70}")
 
     if wallet_trades.empty or "ts" not in wallet_trades.columns:
-        print("  No wallet trades to analyze.")
+        if not quiet:
+            print("  No wallet trades to analyze.")
         return 0.0
 
     # Check unit consistency
     wt_ts = wallet_trades["ts"].dropna()
     state_ts_vals = [ms.timestamp for ms in states[:100]] if states else []
-    if not wt_ts.empty and state_ts_vals:
+    if not quiet and not wt_ts.empty and state_ts_vals:
         wt_sample = wt_ts.iloc[0]
         st_sample = state_ts_vals[0]
         print(f"\n  Clock/units check:")
@@ -2218,12 +2221,13 @@ def print_lag_investigation(
             print(f"    OK: timestamps appear to be in same units (epoch seconds).")
 
     offset = auto_fit_offset(states, wallet_trades, params, tolerance_sec)
-    print(f"\n  Auto-fit offset: {offset:+.1f}s")
-    print(f"    Interpretation: wallet_ts + {offset:+.1f}s best aligns with bot snapshot_ts")
-    if abs(offset) > 1.0:
-        print(f"    RECOMMENDATION: Apply offset={offset:+.1f}s to wallet timestamps during matching.")
-    else:
-        print(f"    No significant systematic lag detected.")
+    if not quiet:
+        print(f"\n  Auto-fit offset: {offset:+.1f}s")
+        print(f"    Interpretation: wallet_ts + {offset:+.1f}s best aligns with bot snapshot_ts")
+        if abs(offset) > 1.0:
+            print(f"    RECOMMENDATION: Apply offset={offset:+.1f}s to wallet timestamps during matching.")
+        else:
+            print(f"    No significant systematic lag detected.")
 
     return offset
 
@@ -2967,6 +2971,8 @@ def main() -> None:
                         help="Skip deep diagnostics (saves time)")
     parser.add_argument("--per-asset-sweep", action="store_true",
                         help="Run independent parameter sweep per crypto asset (BTC/ETH/SOL/XRP)")
+    parser.add_argument("--concise", action="store_true",
+                        help="Only print final summary, asset breakdown, and gate failures")
     args = parser.parse_args()
 
     data_dir = args.data_dir or find_data_dir()
@@ -2995,63 +3001,75 @@ def main() -> None:
     entry_count = sum(1 for d in decisions if d.action in ("BUY", "SELL"))
     print(f"  Total decisions: {len(decisions):,}  |  Entries: {entry_count:,}")
 
+    concise = getattr(args, 'concise', False)
+
     # --- Step 3b: Diagnose why bot may produce no entries ---
-    print("\n[3b/8] Diagnosing bot entry gate failures ...")
-    diagnose_no_entries(states, engine.wallet_trades, default_params, tolerance_sec=args.tolerance_sec)
+    if not concise:
+        print("\n[3b/8] Diagnosing bot entry gate failures ...")
+        diagnose_no_entries(states, engine.wallet_trades, default_params, tolerance_sec=args.tolerance_sec)
 
     # --- Step 4: Investigate timestamp lag ---
-    print("\n[4/8] Investigating timestamp lag ...")
     if args.offset_sec is not None:
         offset_sec = args.offset_sec
-        print(f"  Using manual offset: {offset_sec:+.1f}s")
+        if not concise:
+            print(f"\n[4/8] Using manual offset: {offset_sec:+.1f}s")
     else:
+        if not concise:
+            print("\n[4/8] Investigating timestamp lag ...")
         offset_sec = print_lag_investigation(
             states, engine.wallet_trades, default_params,
             tolerance_sec=max(args.tolerance_sec, 10.0),
+            quiet=concise,
         )
 
     # --- Step 5: Compare to wallet trades (with offset) ---
-    print("\n[5/8] Comparing to wallet trades ...")
+    if not concise:
+        print("\n[5/8] Comparing to wallet trades ...")
     comparison = compare_to_wallet(
         decisions, engine.wallet_trades, args.tolerance_sec,
         debug=args.debug, offset_sec=offset_sec,
     )
-    print(f"  F1 score: {comparison.similarity_score:.4f}  (precision={comparison.precision:.4f}, recall={comparison.recall:.4f})")
-    if comparison.wallet_trades_matched == 0 or np.isnan(comparison.entry_lag_median):
-        print(f"  Entry lag median: N/A  |  p90: N/A  (no matched trades)")
-    else:
-        print(f"  Entry lag median: {comparison.entry_lag_median * 1000:+.1f}ms  |  p90: {comparison.entry_lag_p90 * 1000:+.1f}ms")
-    if offset_sec != 0:
-        print(f"  (with offset={offset_sec:+.1f}s applied to wallet timestamps)")
+    if not concise:
+        print(f"  F1 score: {comparison.similarity_score:.4f}  (precision={comparison.precision:.4f}, recall={comparison.recall:.4f})")
+        if comparison.wallet_trades_matched == 0 or np.isnan(comparison.entry_lag_median):
+            print(f"  Entry lag median: N/A  |  p90: N/A  (no matched trades)")
+        else:
+            print(f"  Entry lag median: {comparison.entry_lag_median * 1000:+.1f}ms  |  p90: {comparison.entry_lag_p90 * 1000:+.1f}ms")
+        if offset_sec != 0:
+            print(f"  (with offset={offset_sec:+.1f}s applied to wallet timestamps)")
 
     # --- Step 5b: Debug dumps ---
-    print("\n[5b/8] Generating debug dumps ...")
-    miss_reasons = dump_missed_wallet_trades(
-        states, engine.wallet_trades, decisions, default_params,
-        tolerance_sec=args.tolerance_sec, max_rows=50,
-    )
-    dump_false_bot_entries(
-        states, engine.wallet_trades, decisions, default_params,
-        tolerance_sec=args.tolerance_sec, max_rows=50,
-    )
+    miss_reasons = {}
+    if not concise:
+        print("\n[5b/8] Generating debug dumps ...")
+        miss_reasons = dump_missed_wallet_trades(
+            states, engine.wallet_trades, decisions, default_params,
+            tolerance_sec=args.tolerance_sec, max_rows=50,
+        )
+        dump_false_bot_entries(
+            states, engine.wallet_trades, decisions, default_params,
+            tolerance_sec=args.tolerance_sec, max_rows=50,
+        )
 
     # --- Step 5c: Deep diagnostics ---
-    if not args.no_deep_diag:
+    if not concise and not args.no_deep_diag:
         print("\n[5c/8] Running deep diagnostics ...")
         deep_diagnostics(
             states, engine.wallet_trades, decisions, default_params,
             tolerance_sec=args.tolerance_sec, offset_sec=offset_sec,
         )
-    else:
+    elif not concise:
         print("\n[5c/8] Skipping deep diagnostics (--no-deep-diag)")
 
     # --- Step 6: Signal distribution analysis ---
-    print("\n[6/8] Analyzing signal distributions at wallet entry ...")
+    if not concise:
+        print("\n[6/8] Analyzing signal distributions at wallet entry ...")
     signal_dist = analyze_signal_distributions(engine.wallet_trades)
 
     # --- Step 6b: Auto-suggest config ---
-    print("\n[6b/9] Computing recommended config ...")
-    recommend_config(signal_dist, miss_reasons, default_params)
+    if not concise:
+        print("\n[6b/9] Computing recommended config ...")
+        recommend_config(signal_dist, miss_reasons, default_params)
 
     # --- Step 7: Parameter optimization (optional) ---
     sweep_results = None
@@ -3083,7 +3101,17 @@ def main() -> None:
         print("\n[7/9] Skipping parameter sweep (use --optimize, --focused-sweep, or --per-asset-sweep)")
 
     # --- Step 8: Report ---
-    print_report(comparison, signal_dist, sweep_results)
+    if concise:
+        # Concise mode: just the key numbers
+        print("\n" + "=" * 60)
+        print("  RESULTS")
+        print("=" * 60)
+        print(f"  F1={comparison.similarity_score:.4f}  precision={comparison.precision:.4f}  recall={comparison.recall:.4f}")
+        print(f"  matched={comparison.wallet_trades_matched}  missed={comparison.wallet_trades_missed}  false={comparison.bot_false_entries}")
+        if not np.isnan(comparison.entry_lag_median):
+            print(f"  lag: median={comparison.entry_lag_median*1000:+.0f}ms  p90={comparison.entry_lag_p90*1000:+.0f}ms")
+    else:
+        print_report(comparison, signal_dist, sweep_results)
 
     # --- Step 8b: Breakdown report ---
     print("\n[8b] Generating breakdown report (by hour, asset, market type) ...")
@@ -3093,7 +3121,7 @@ def main() -> None:
     )
 
     # --- Charts ---
-    if not args.no_charts:
+    if not args.no_charts and not concise:
         print("\n  Generating charts ...")
         generate_charts(decisions, engine.wallet_trades, signal_dist)
 
