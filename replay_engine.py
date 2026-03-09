@@ -158,7 +158,7 @@ class StrategyParams:
     ret_accel_min: float = 0.0              # |ret_30s - ret_120s| >= this
     entry_cooldown_sec: float = 5.0         # original default
     # -- Time-of-day filter --
-    quiet_hours_et: tuple = (3, 5, 7, 8)   # hours in ET to suppress entries (<16% match rate)
+    quiet_hours_et: tuple = ()              # no quiet hours — trade every hour
     # -- Time-to-resolution filter --
     entry_max_seconds_to_resolution: float = 0.0  # 0=disabled
     entry_min_seconds_to_resolution: float = 120.0  # original: skip entries >2min from resolution
@@ -2395,30 +2395,29 @@ DEFAULT_SWEEP_RANGES = {
 }
 
 # Focused sweep ranges based on replay analysis:
-#   - wallet ret_30s median=0.0 → momentum not needed
-#   - wallet spread_pctl p25=83% → need to test lower pctl values
-#   - wallet imbalance p25=0.432 → need lower imbalance thresholds
-#   - wallet doesn't use directional imbalance strongly
-#   - hours 3,5,7,8 ET have <16% match rate → quiet hours help
+# Sweep v3 analysis:
+#   - ret_60s=0 + skip_direction=True doubled recall (1736→3508) but also false entries (7K→15K)
+#   - Bottleneck shifted to PRECISION (18.6%)
+#   - Hours with worst false/match ratios: 6(15.7x), 2(9x), 4(9.4x), 1(6.5x), 23(5.7x)
+#   - Need wider quiet hours + longer cooldowns + imbalance filtering to cut false entries
 FOCUSED_SWEEP_RANGES = {
-    # --- Locked from previous sweep (converged) ---
+    # --- Locked (converged across sweeps) ---
     "entry_min_ret_30s": [0.0],
-    "entry_min_spread_pctl": [0.80, 0.85, 0.90],
+    "entry_min_spread_pctl": [0.85],       # 0.80/0.85/0.90 gave identical results
     "entry_min_spread_cents": [1.0],
     "imbalance_directional": [False],
-    "quiet_hours_et": [(3, 5, 7, 8)],
-    "entry_cooldown_sec": [5.0, 10.0, 15.0],
     "entry_max_seconds_to_resolution": [0.0],
-    # --- Re-opened: ret_60s is #1 blocker (66.6% of missed trades) ---
-    "entry_min_imbalance": [0.1, 0.3],
+    # --- Locked from v3 sweep ---
+    "entry_min_ret_60s": [0.0],            # disabling = +102% recall; #1 improvement
+    "skip_direction_gate": [True],         # +34% recall; wallet trades both sides
+    # --- No quiet hours: trade every hour ---
+    "quiet_hours_et": [()],                # empty tuple = no suppression
+    # --- Now sweeping: false-entry reduction ---
+    # Cooldown: longer = fewer false entries per (slug,outcome)
+    "entry_cooldown_sec": [10.0, 15.0, 20.0, 30.0, 45.0],
+    # Imbalance: tighter band to filter noise entries
+    "entry_min_imbalance": [0.1, 0.2, 0.3, 0.4],
     "entry_min_seconds_to_resolution": [60, 120],
-    # CRITICAL: ret_60s=0.0004 blocks 66% of wallet trades where ret_60s≈0
-    # Test disabling it (0.0) and softer thresholds
-    "entry_min_ret_60s": [0.0, 0.0001, 0.0002, 0.0004],
-    # --- v3: direction cascade mode ---
-    # skip_direction_gate=True: don't require outcome to match momentum direction
-    # (f247 wallet trades both sides; 40% of matched entries have "wrong" direction)
-    "skip_direction_gate": [False, True],
     # Comparison tolerance
     "tolerance_sec": [7.0],
 }
