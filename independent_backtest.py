@@ -109,7 +109,7 @@ def build_features(book: pd.DataFrame, binance: pd.DataFrame) -> pd.DataFrame:
     book["spread_chg_5s"] = book["spread"] - book["spread_lag_5s"]
 
     # Forward mid (for PnL calculation)
-    for fwd in [10, 30, 60]:
+    for fwd in [10, 30, 60, 90, 120]:
         book[f"mid_fwd_{fwd}s"] = grp["mid"].shift(-fwd)
 
     # Extract asset from slug
@@ -364,13 +364,14 @@ def print_results(trades: List[Trade], params: ConvergenceParams, label: str = "
 # ---------------------------------------------------------------------------
 
 SWEEP_RANGES = {
-    "mid_buy_thresh":  [0.55, 0.60, 0.65, 0.70],
-    "mid_sell_thresh": [0.45, 0.40, 0.35, 0.30],
-    "min_dip_cents":   [0.0, 0.5, 1.0],
-    "min_imb_change":  [0.0, 0.02, 0.03, 0.05],
-    "hold_sec":        [30, 60],
-    "cooldown_sec":    [15, 30],
-    "entry_mode":      ["passive", "cross"],
+    "mid_buy_thresh":  [0.55, 0.60, 0.62, 0.65, 0.68, 0.70, 0.75],
+    "mid_sell_thresh": [0.40, 0.35, 0.32, 0.30, 0.25],
+    "min_dip_cents":   [0.0],
+    "min_imb_change":  [0.0],
+    "hold_sec":        [30, 60, 90, 120],
+    "cooldown_sec":    [5, 10, 15],
+    "entry_mode":      ["passive"],
+    "lookback_sec":    [5, 10],
     "fee_pct":         [0.0],       # run at 0 fee; add 0.005 separately to see impact
 }
 
@@ -444,7 +445,7 @@ def main():
     parser.add_argument("--sweep", action="store_true", help="Run parameter sweep")
     parser.add_argument("--fee", type=float, default=None, help="Override fee pct (e.g. 0.005 for 0.5%%)")
     parser.add_argument("--entry-mode", choices=["passive", "cross"], default="passive")
-    parser.add_argument("--hold", type=int, default=30, choices=[10, 30, 60])
+    parser.add_argument("--hold", type=int, default=30, choices=[10, 30, 60, 90, 120])
     parser.add_argument("--cooldown", type=float, default=30.0)
     args = parser.parse_args()
 
@@ -467,16 +468,11 @@ def main():
         # Run the best config with full report
         best = rdf.iloc[0]
         print(f"\n[4] Detailed report for best config ...")
-        best_params = ConvergenceParams(
-            mid_buy_thresh=best["mid_buy_thresh"],
-            mid_sell_thresh=best["mid_sell_thresh"],
-            min_dip_cents=best["min_dip_cents"],
-            min_imb_change=best["min_imb_change"],
-            hold_sec=int(best["hold_sec"]),
-            cooldown_sec=best["cooldown_sec"],
-            entry_mode=best["entry_mode"],
-            fee_pct=best["fee_pct"],
-        )
+        best_kv = {k: best[k] for k in SWEEP_RANGES.keys()}
+        best_kv["hold_sec"] = int(best_kv["hold_sec"])
+        if "lookback_sec" in best_kv:
+            best_kv["lookback_sec"] = int(best_kv["lookback_sec"])
+        best_params = ConvergenceParams(**best_kv)
         trades = run_backtest(df, best_params)
         print_results(trades, best_params, label="BEST SWEEP")
 
