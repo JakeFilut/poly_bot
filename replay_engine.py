@@ -164,6 +164,10 @@ class StrategyParams:
     entry_min_seconds_to_resolution: float = 120.0  # original: skip entries >2min from resolution
     # -- 60s return filter --
     entry_min_ret_60s: float = 0.0004      # original: require 0.04% 60s return
+    # -- Direction gate --
+    # When True, skip the direction check (enter on any outcome regardless of momentum)
+    # f247 wallet trades both sides; 40% of matched entries have "wrong" direction
+    skip_direction_gate: bool = False
     # -- Crossing control --
     cross_enabled: bool = False             # f247: crossing = -2.5c markout; disabled
     # -- Size cap --
@@ -634,13 +638,14 @@ class Strategy:
 
         # All gates passed -- pick direction via momentum cascade
         # (mirrors live _pick_buy_direction: ret_30s → ret_5s → ret_120s → imbalance)
-        preferred_outcome = _pick_direction_cascade(ms)
-        if preferred_outcome is None:
-            return self._no_action(ms, "no_direction_signal"), "direction"
+        if not p.skip_direction_gate:
+            preferred_outcome = _pick_direction_cascade(ms)
+            if preferred_outcome is None:
+                return self._no_action(ms, "no_direction_signal"), "direction"
 
-        # Only enter on the outcome matching the chosen direction
-        if ms.outcome != preferred_outcome:
-            return self._no_action(ms, f"wrong_outcome({ms.outcome}!={preferred_outcome})"), "direction"
+            # Only enter on the outcome matching the chosen direction
+            if ms.outcome != preferred_outcome:
+                return self._no_action(ms, f"wrong_outcome({ms.outcome}!={preferred_outcome})"), "direction"
 
         # Wallet-copy: entries are always BUYs (buying outcome tokens)
         action = "BUY"
@@ -2384,7 +2389,8 @@ DEFAULT_SWEEP_RANGES = {
     "entry_cooldown_sec": [0.0, 5.0, 15.0],
     "entry_max_seconds_to_resolution": [0.0, 600],
     "entry_min_seconds_to_resolution": [0.0, 60],
-    "entry_min_ret_60s": [0.0, 0.0005],
+    "entry_min_ret_60s": [0.0, 0.0002, 0.0004],
+    "skip_direction_gate": [False, True],
     "tolerance_sec": [3.0, 5.0, 7.0],
 }
 
@@ -2397,16 +2403,22 @@ DEFAULT_SWEEP_RANGES = {
 FOCUSED_SWEEP_RANGES = {
     # --- Locked from previous sweep (converged) ---
     "entry_min_ret_30s": [0.0],
-    "entry_min_spread_pctl": [0.85],
+    "entry_min_spread_pctl": [0.80, 0.85, 0.90],
     "entry_min_spread_cents": [1.0],
     "imbalance_directional": [False],
     "quiet_hours_et": [(3, 5, 7, 8)],
-    "entry_cooldown_sec": [10.0],
+    "entry_cooldown_sec": [5.0, 10.0, 15.0],
     "entry_max_seconds_to_resolution": [0.0],
-    # --- Locked from focused sweep (converged) ---
-    "entry_min_imbalance": [0.1],
-    "entry_min_seconds_to_resolution": [120],
-    "entry_min_ret_60s": [0.0004],
+    # --- Re-opened: ret_60s is #1 blocker (66.6% of missed trades) ---
+    "entry_min_imbalance": [0.1, 0.3],
+    "entry_min_seconds_to_resolution": [60, 120],
+    # CRITICAL: ret_60s=0.0004 blocks 66% of wallet trades where ret_60s≈0
+    # Test disabling it (0.0) and softer thresholds
+    "entry_min_ret_60s": [0.0, 0.0001, 0.0002, 0.0004],
+    # --- v3: direction cascade mode ---
+    # skip_direction_gate=True: don't require outcome to match momentum direction
+    # (f247 wallet trades both sides; 40% of matched entries have "wrong" direction)
+    "skip_direction_gate": [False, True],
     # Comparison tolerance
     "tolerance_sec": [7.0],
 }
