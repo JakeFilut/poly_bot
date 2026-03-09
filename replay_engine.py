@@ -158,7 +158,7 @@ class StrategyParams:
     ret_accel_min: float = 0.0              # |ret_30s - ret_120s| >= this
     entry_cooldown_sec: float = 5.0         # original default
     # -- Time-of-day filter --
-    quiet_hours_et: tuple = (3, 5, 7, 8)   # hours in ET to suppress entries (<16% match rate)
+    quiet_hours_et: tuple = ()              # no quiet hours — trade every hour
     # -- Time-to-resolution filter --
     entry_max_seconds_to_resolution: float = 0.0  # 0=disabled
     entry_min_seconds_to_resolution: float = 120.0  # original: skip entries >2min from resolution
@@ -2410,19 +2410,14 @@ FOCUSED_SWEEP_RANGES = {
     # --- Locked from v3 sweep ---
     "entry_min_ret_60s": [0.0],            # disabling = +102% recall; #1 improvement
     "skip_direction_gate": [True],         # +34% recall; wallet trades both sides
+    # --- No quiet hours: trade every hour ---
+    "quiet_hours_et": [()],                # empty tuple = no suppression
     # --- Now sweeping: false-entry reduction ---
-    # Quiet hours: test aggressively silencing low-match-rate hours
-    "quiet_hours_et": [
-        (3, 5, 7, 8),                      # baseline (current)
-        (1, 2, 3, 4, 5, 6, 7, 8),          # add worst false/match hours
-        (1, 2, 3, 4, 5, 6, 7, 8, 23),      # + hour 23
-        (0, 1, 2, 3, 4, 5, 6, 7, 8, 23),   # + hour 0
-    ],
     # Cooldown: longer = fewer false entries per (slug,outcome)
-    "entry_cooldown_sec": [15.0, 20.0, 30.0, 45.0],
+    "entry_cooldown_sec": [10.0, 15.0, 20.0, 30.0, 45.0],
     # Imbalance: tighter band to filter noise entries
-    "entry_min_imbalance": [0.1, 0.2, 0.3],
-    "entry_min_seconds_to_resolution": [120],
+    "entry_min_imbalance": [0.1, 0.2, 0.3, 0.4],
+    "entry_min_seconds_to_resolution": [60, 120],
     # Comparison tolerance
     "tolerance_sec": [7.0],
 }
