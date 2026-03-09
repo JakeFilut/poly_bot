@@ -148,7 +148,7 @@ class StrategyParams:
     entry_min_spread_pctl: float = 0.85      # original default; wallet p25=78%
     entry_min_spread_cents: float = 1.0     # wallet median spread=1¢
     entry_min_ret_30s: float = 0.0          # disabled: wallet median ret_30s=0.0
-    entry_min_imbalance: float = 0.1        # original: light imbalance filter
+    entry_min_imbalance: float = 0.1        # v4 winner: loosest imbalance
     entry_max_imbalance: float = 0.70       # f247: imb>0.7 = chasing (-0.3c markout)
     imbalance_band_enabled: bool = True     # use min/max band
     # -- Directional imbalance --
@@ -156,7 +156,7 @@ class StrategyParams:
     # -- One-shot conditions --
     spread_pctl_delta_min: float = 0.0      # pctl_now - pctl_60s_ago >= this
     ret_accel_min: float = 0.0              # |ret_30s - ret_120s| >= this
-    entry_cooldown_sec: float = 5.0         # original default
+    entry_cooldown_sec: float = 15.0        # v4 winner: 15s beats 10/20/30/45
     # -- Time-of-day filter --
     quiet_hours_et: tuple = ()              # no quiet hours — trade every hour
     # -- Time-to-resolution filter --
@@ -2395,31 +2395,33 @@ DEFAULT_SWEEP_RANGES = {
 }
 
 # Focused sweep ranges based on replay analysis:
-# Sweep v3 analysis:
-#   - ret_60s=0 + skip_direction=True doubled recall (1736→3508) but also false entries (7K→15K)
-#   - Bottleneck shifted to PRECISION (18.6%)
-#   - Hours with worst false/match ratios: 6(15.7x), 2(9x), 4(9.4x), 1(6.5x), 23(5.7x)
-#   - Need wider quiet hours + longer cooldowns + imbalance filtering to cut false entries
+# Sweep v4 analysis (no quiet hours):
+#   - Removing quiet hours doubled recall (2140→4354), F1 +16% (0.2525→0.2926)
+#   - Locked: cooldown=15s, imbalance=0.1, sec_to_res=120
+#   - Precision still 18.5% with 19K false entries — need more filters
+#   - Unused gates: entry_max_imbalance, spread_pctl_delta, ret_accel
 FOCUSED_SWEEP_RANGES = {
-    # --- Locked (converged across sweeps) ---
+    # --- Locked (converged across sweeps v1-v4) ---
     "entry_min_ret_30s": [0.0],
-    "entry_min_spread_pctl": [0.85],       # 0.80/0.85/0.90 gave identical results
+    "entry_min_spread_pctl": [0.85],
     "entry_min_spread_cents": [1.0],
     "imbalance_directional": [False],
     "entry_max_seconds_to_resolution": [0.0],
-    # --- Locked from v3 sweep ---
-    "entry_min_ret_60s": [0.0],            # disabling = +102% recall; #1 improvement
-    "skip_direction_gate": [True],         # +34% recall; wallet trades both sides
-    # --- No quiet hours: trade every hour ---
-    "quiet_hours_et": [()],                # empty tuple = no suppression
-    # --- Now sweeping: false-entry reduction ---
-    # Cooldown: longer = fewer false entries per (slug,outcome)
-    "entry_cooldown_sec": [10.0, 15.0, 20.0, 30.0, 45.0],
-    # Imbalance: tighter band to filter noise entries
-    "entry_min_imbalance": [0.1, 0.2, 0.3, 0.4],
-    "entry_min_seconds_to_resolution": [60, 120],
-    # Comparison tolerance
-    "tolerance_sec": [7.0],
+    "entry_min_ret_60s": [0.0],
+    "skip_direction_gate": [True],
+    "quiet_hours_et": [()],
+    "entry_cooldown_sec": [15.0],
+    "entry_min_imbalance": [0.1],
+    "entry_min_seconds_to_resolution": [120],
+    # --- Now sweeping: precision improvement via unused gates ---
+    # Max imbalance cap: entries with imb > 0.7 may be chasing
+    "entry_max_imbalance": [0.60, 0.70, 0.80, 1.0],
+    # Spread percentile delta: require spread to be widening
+    "spread_pctl_delta_min": [0.0, 0.05, 0.10],
+    # Return acceleration: |ret_30s - ret_120s| must exceed this
+    "ret_accel_min": [0.0, 0.0001, 0.0003],
+    # Tolerance: tighter match window may cut false positives
+    "tolerance_sec": [5.0, 7.0],
 }
 
 
