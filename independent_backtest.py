@@ -60,6 +60,8 @@ class ConvergenceParams:
     cooldown_sec: float = 30.0         # min seconds between trades on same market
     # --- Fee ---
     fee_pct: float = 0.0              # one-way fee as decimal (0.005 = 0.5%)
+    # --- Filters ---
+    exclude_assets: tuple = ()        # assets to skip (e.g. ("ETH",))
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +167,10 @@ def run_backtest(df: pd.DataFrame, params: ConvergenceParams) -> List[Trade]:
     # Only rows with all needed columns
     required = ["mid", mid_chg_col, "imb_chg_5s", fwd_col, "bestBid", "bestAsk"]
     valid = df[df[required].notna().all(axis=1)].copy()
+
+    # Asset exclusion
+    if params.exclude_assets:
+        valid = valid[~valid["symbol"].isin(params.exclude_assets)]
 
     dip_thresh = -params.min_dip_cents / 100  # negative for dips
     rip_thresh = params.min_dip_cents / 100   # positive for rips
@@ -278,6 +284,8 @@ def print_results(trades: List[Trade], params: ConvergenceParams, label: str = "
     print(f"  Cooldown:  {params.cooldown_sec:.0f}s per market")
     print(f"  Filters:   mid_buy>{params.mid_buy_thresh}, mid_sell<{params.mid_sell_thresh}, "
           f"dip>={params.min_dip_cents}c, imb_chg>={params.min_imb_change}")
+    if params.exclude_assets:
+        print(f"  Skip assets: {params.exclude_assets}")
     print("─" * 72)
     print(f"  Total trades:    {n_trades}")
     print(f"  BUY_UP:          {(tdf['side'] == 'BUY_UP').sum()}")
@@ -376,63 +384,101 @@ SWEEP_RANGES = {
 }
 
 
+def _eval_params(df, params):
+    """Run backtest and return summary dict."""
+    trades = run_backtest(df, params)
+    if trades:
+        tdf = pd.DataFrame([t.__dict__ for t in trades])
+        total_pnl = tdf["pnl_net"].sum()
+        duration_h = max((tdf["timestamp"].max() - tdf["timestamp"].min()) / 3600, 0.01)
+        win_rate = (tdf["pnl_net"] > 0).mean()
+    else:
+        total_pnl = 0.0
+        duration_h = 1.0
+        win_rate = 0.0
+    return {
+        "n_trades": len(trades),
+        "total_pnl": total_pnl,
+        "pnl_per_hour": total_pnl / duration_h,
+        "win_rate": win_rate,
+    }
+
+
+# Asset-exclusion sets to test in phase 2
+ASSET_EXCLUSION_COMBOS = [
+    (),
+    ("ETH",),
+    ("BTC",),
+    ("ETH", "BTC"),
+]
+
+
 def run_sweep(df: pd.DataFrame) -> pd.DataFrame:
-    """Grid search over strategy parameters."""
+    """Two-phase grid search: base params then hour/asset exclusions."""
+
+    # --- Phase 1: base parameter sweep ---
     keys = list(SWEEP_RANGES.keys())
     values = list(SWEEP_RANGES.values())
     combos = list(product(*values))
-    print(f"\n  Parameter sweep: {len(combos)} combinations")
+    print(f"\n  Phase 1: {len(combos)} base parameter combinations")
 
     results = []
     for i, combo in enumerate(combos):
         kv = dict(zip(keys, combo))
 
-        # hold_sec must match a forward column we computed
         hold = kv["hold_sec"]
         fwd_col = f"mid_fwd_{hold}s"
         if fwd_col not in df.columns:
             continue
-
-        # mid_sell_thresh must be < mid_buy_thresh
         if kv["mid_sell_thresh"] >= kv["mid_buy_thresh"]:
             continue
 
         p = ConvergenceParams(**kv)
-        trades = run_backtest(df, p)
-
-        if trades:
-            tdf = pd.DataFrame([t.__dict__ for t in trades])
-            total_pnl = tdf["pnl_net"].sum()
-            duration_h = max((tdf["timestamp"].max() - tdf["timestamp"].min()) / 3600, 0.01)
-            win_rate = (tdf["pnl_net"] > 0).mean()
-        else:
-            total_pnl = 0.0
-            duration_h = 1.0
-            win_rate = 0.0
-
-        results.append({
-            **kv,
-            "n_trades": len(trades),
-            "total_pnl": total_pnl,
-            "pnl_per_hour": total_pnl / duration_h,
-            "win_rate": win_rate,
-        })
+        res = _eval_params(df, p)
+        results.append({**kv, **res})
 
         if (i + 1) % 50 == 0:
             print(f"    ... {i + 1}/{len(combos)} done")
 
-    rdf = pd.DataFrame(results).sort_values("pnl_per_hour", ascending=False)
+    rdf = pd.DataFrame(results).sort_values("total_pnl", ascending=False)
 
     print("\n" + "=" * 72)
-    print("  TOP 15 PARAMETER SETS (by PnL/hour)")
+    print("  PHASE 1 — TOP 15 BASE CONFIGS (by total PnL)")
     print("=" * 72)
     display_cols = keys + ["n_trades", "total_pnl", "pnl_per_hour", "win_rate"]
     print(rdf[display_cols].head(15).to_string(index=False))
 
-    print("\n  WORST 5:")
-    print(rdf[display_cols].tail(5).to_string(index=False))
+    # --- Phase 2: test hour/asset exclusions on top 10 base configs ---
+    top_n = min(10, len(rdf))
+    top_bases = rdf.head(top_n)
+    print(f"\n  Phase 2: testing {len(ASSET_EXCLUSION_COMBOS)} asset-exclusion sets on top {top_n} configs")
 
-    return rdf
+    phase2_results = []
+    for _, base_row in top_bases.iterrows():
+        base_kv = {k: base_row[k] for k in keys}
+        base_kv["hold_sec"] = int(base_kv["hold_sec"])
+        if "lookback_sec" in base_kv:
+            base_kv["lookback_sec"] = int(base_kv["lookback_sec"])
+
+        for exc_assets in ASSET_EXCLUSION_COMBOS:
+            p = ConvergenceParams(**base_kv,
+                                  exclude_assets=exc_assets)
+            res = _eval_params(df, p)
+            phase2_results.append({
+                **base_kv,
+                "exclude_assets": str(exc_assets) if exc_assets else "none",
+                **res,
+            })
+
+    p2df = pd.DataFrame(phase2_results).sort_values("total_pnl", ascending=False)
+
+    print("\n" + "=" * 72)
+    print("  PHASE 2 — TOP 20 WITH ASSET EXCLUSIONS (by total PnL)")
+    print("=" * 72)
+    p2_cols = keys + ["exclude_assets", "n_trades", "total_pnl", "pnl_per_hour", "win_rate"]
+    print(p2df[p2_cols].head(20).to_string(index=False))
+
+    return p2df
 
 
 # ---------------------------------------------------------------------------
@@ -472,6 +518,10 @@ def main():
         best_kv["hold_sec"] = int(best_kv["hold_sec"])
         if "lookback_sec" in best_kv:
             best_kv["lookback_sec"] = int(best_kv["lookback_sec"])
+        # Restore exclude params from phase 2
+        exc_a = best.get("exclude_assets", "none")
+        if exc_a != "none" and exc_a:
+            best_kv["exclude_assets"] = tuple(x.strip().strip("'\"") for x in exc_a.strip("()").split(",") if x.strip())
         best_params = ConvergenceParams(**best_kv)
         trades = run_backtest(df, best_params)
         print_results(trades, best_params, label="BEST SWEEP")
