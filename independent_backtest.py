@@ -56,6 +56,9 @@ class ConvergenceParams:
     entry_mode: str = "passive"        # "passive" (buy at bid) or "cross" (buy at ask)
     hold_sec: int = 120                # seconds to hold position
     position_size: float = 10.0        # shares per trade
+    # --- Stop loss / take profit (cents, 0 = disabled) ---
+    stop_loss_cents: float = 0.0       # sell if position down this many cents
+    take_profit_cents: float = 0.0     # sell if position up this many cents
     # --- Cooldown ---
     cooldown_sec: float = 5.0          # min seconds between trades on same market
     # --- Fee ---
@@ -111,7 +114,7 @@ def build_features(book: pd.DataFrame, binance: pd.DataFrame) -> pd.DataFrame:
     book["spread_chg_5s"] = book["spread"] - book["spread_lag_5s"]
 
     # Forward mid (for PnL calculation)
-    for fwd in [10, 30, 60, 90, 120]:
+    for fwd in [10, 30, 60, 90, 120, 300]:
         book[f"mid_fwd_{fwd}s"] = grp["mid"].shift(-fwd)
 
     # Extract asset from slug
@@ -158,14 +161,67 @@ class Trade:
     signal: str        # description of why we entered
 
 
+def _find_exit_price(ts_series: np.ndarray, bid_series: np.ndarray,
+                     entry_ts: float, entry_price: float, is_buy: bool,
+                     hold_sec: int, stop_loss: float, take_profit: float
+                     ) -> Tuple[float, str]:
+    """Walk tick-by-tick through the hold window to find the exit price.
+
+    Returns (exit_price, exit_reason).
+    Checks stop loss / take profit at each tick; falls back to time exit.
+    """
+    end_ts = entry_ts + hold_sec
+    sl_price = stop_loss / 100 if stop_loss > 0 else 0
+    tp_price = take_profit / 100 if take_profit > 0 else 0
+
+    # Find ticks within the hold window
+    mask = (ts_series > entry_ts) & (ts_series <= end_ts)
+    window_bids = bid_series[mask]
+    window_ts = ts_series[mask]
+
+    for i in range(len(window_bids)):
+        bid = window_bids[i]
+        if is_buy:
+            edge = bid - entry_price
+        else:
+            edge = entry_price - bid
+
+        # Stop loss: edge is negative and exceeds threshold
+        if sl_price > 0 and edge <= -sl_price:
+            return bid, "STOP_LOSS"
+
+        # Take profit: edge is positive and exceeds threshold
+        if tp_price > 0 and edge >= tp_price:
+            return bid, "TAKE_PROFIT"
+
+    # Time exit: use the last bid at or after end_ts
+    after_mask = ts_series >= end_ts
+    if after_mask.any():
+        return bid_series[after_mask][0], "TIME_EXIT"
+
+    # Fallback: use last available bid in window
+    if len(window_bids) > 0:
+        return window_bids[-1], "TIME_EXIT"
+
+    return entry_price, "NO_DATA"
+
+
 def run_backtest(df: pd.DataFrame, params: ConvergenceParams) -> List[Trade]:
-    """Run the convergence strategy on enriched book data (vectorized)."""
+    """Run the convergence strategy on enriched book data.
+
+    When stop_loss_cents or take_profit_cents are set, walks through ticks
+    during the hold window to find early exits. Otherwise uses vectorized
+    forward-looking mid for speed.
+    """
 
     mid_chg_col = f"mid_chg_{params.lookback_sec}s"
+    use_pathwise = params.stop_loss_cents > 0 or params.take_profit_cents > 0
     fwd_col = f"mid_fwd_{params.hold_sec}s"
 
     # Only rows with all needed columns
-    required = ["mid", mid_chg_col, "imb_chg_5s", fwd_col, "bestBid", "bestAsk"]
+    required = ["mid", mid_chg_col, "imb_chg_5s", "bestBid", "bestAsk"]
+    if not use_pathwise:
+        required.append(fwd_col)
     valid = df[df[required].notna().all(axis=1)].copy()
 
     # Asset exclusion
@@ -217,17 +273,49 @@ def run_backtest(df: pd.DataFrame, params: ConvergenceParams) -> List[Trade]:
     if signals.empty:
         return []
 
-    # --- Vectorized PnL calculation ---
+    # --- Entry prices ---
     is_buy = signals["side"] == "BUY_UP"
     if params.entry_mode == "passive":
         entry = np.where(is_buy, signals["bestBid"], signals["bestAsk"])
     else:
         entry = np.where(is_buy, signals["bestAsk"], signals["bestBid"])
 
-    exit_price = signals[fwd_col].values
     size = params.position_size
-    pnl_gross = np.where(is_buy, (exit_price - entry) * size, (entry - exit_price) * size)
-    fee = (entry + exit_price) * size * params.fee_pct
+
+    if use_pathwise:
+        # --- Path-wise exit: walk ticks to check SL/TP ---
+        # Pre-index bid series per (slug, outcome) for fast lookup
+        bid_cache: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+        for (slug, outcome), grp in df.groupby(["slug", "outcome"]):
+            sorted_grp = grp.sort_values("timestamp_epoch")
+            bid_cache[f"{slug}|{outcome}"] = (
+                sorted_grp["timestamp_epoch"].values,
+                sorted_grp["bestBid"].values,
+            )
+
+        exit_prices = np.empty(len(signals))
+        exit_reasons = []
+        for i, (idx, row) in enumerate(signals.iterrows()):
+            cache_key = f"{row['slug']}|{row['outcome']}"
+            ts_arr, bid_arr = bid_cache.get(cache_key, (np.array([]), np.array([])))
+            ep, reason = _find_exit_price(
+                ts_arr, bid_arr,
+                entry_ts=row["timestamp_epoch"],
+                entry_price=entry[i],
+                is_buy=(row["side"] == "BUY_UP"),
+                hold_sec=params.hold_sec,
+                stop_loss=params.stop_loss_cents,
+                take_profit=params.take_profit_cents,
+            )
+            exit_prices[i] = ep
+            exit_reasons.append(reason)
+    else:
+        # --- Vectorized exit (original fast path) ---
+        exit_prices = signals[fwd_col].values
+        exit_reasons = ["TIME_EXIT"] * len(signals)
+
+    pnl_gross = np.where(is_buy, (exit_prices - entry) * size, (entry - exit_prices) * size)
+    fee = (entry + exit_prices) * size * params.fee_pct
     pnl_net = pnl_gross - fee
 
     # --- Build trade objects ---
@@ -237,10 +325,10 @@ def run_backtest(df: pd.DataFrame, params: ConvergenceParams) -> List[Trade]:
         trades.append(Trade(
             timestamp=row["timestamp_epoch"], slug=row["slug"],
             outcome=row["outcome"], asset=row.get("symbol", ""),
-            side=row["side"], entry_price=entry[i], exit_price=exit_price[i],
+            side=row["side"], entry_price=entry[i], exit_price=exit_prices[i],
             size=size, pnl_gross=pnl_gross[i], pnl_net=pnl_net[i],
             hour_et=int(row.get("hour_et", 0)),
-            signal=f"mid={row['mid']:.3f} chg={mid_chg*100:.1f}c imb_chg={row['imb_chg_5s']:.3f}"
+            signal=f"mid={row['mid']:.3f} chg={mid_chg*100:.1f}c imb_chg={row['imb_chg_5s']:.3f} exit={exit_reasons[i]}"
         ))
 
     return trades
@@ -280,6 +368,9 @@ def print_results(trades: List[Trade], params: ConvergenceParams, label: str = "
     print("=" * 72)
     print(f"  Strategy:  Convergence dip-buy / rip-sell")
     print(f"  Entry:     {params.entry_mode}  |  Hold: {params.hold_sec}s  |  Size: {params.position_size} shares")
+    sl_str = f"{params.stop_loss_cents:.0f}c" if params.stop_loss_cents > 0 else "off"
+    tp_str = f"{params.take_profit_cents:.0f}c" if params.take_profit_cents > 0 else "off"
+    print(f"  Stop loss: {sl_str}  |  Take profit: {tp_str}")
     print(f"  Fee:       {params.fee_pct * 100:.2f}% per side")
     print(f"  Cooldown:  {params.cooldown_sec:.0f}s per market")
     print(f"  Filters:   mid_buy>{params.mid_buy_thresh}, mid_sell<{params.mid_sell_thresh}, "
@@ -303,6 +394,21 @@ def print_results(trades: List[Trade], params: ConvergenceParams, label: str = "
         print(f"  Avg winner:      ${winners.mean():>10.4f}")
     if len(losers) > 0:
         print(f"  Avg loser:       ${losers.mean():>10.4f}")
+
+    # --- Exit reason breakdown ---
+    if params.stop_loss_cents > 0 or params.take_profit_cents > 0:
+        print()
+        print("─" * 72)
+        print("  EXIT REASONS")
+        print("─" * 72)
+        for reason in ["STOP_LOSS", "TAKE_PROFIT", "TIME_EXIT", "NO_DATA"]:
+            reason_trades = tdf[tdf["signal"].str.contains(f"exit={reason}")]
+            if len(reason_trades) > 0:
+                r_pnl = reason_trades["pnl_net"].sum()
+                r_wr = (reason_trades["pnl_net"] > 0).mean()
+                print(f"  {reason:<15} {len(reason_trades):>5} trades  "
+                      f"PnL=${r_pnl:>8.2f}  WR={r_wr:.1%}  "
+                      f"Avg=${reason_trades['pnl_net'].mean():>8.4f}")
 
     # --- Per-hour breakdown ---
     print()
@@ -372,15 +478,17 @@ def print_results(trades: List[Trade], params: ConvergenceParams, label: str = "
 # ---------------------------------------------------------------------------
 
 SWEEP_RANGES = {
-    "mid_buy_thresh":  [0.55, 0.60, 0.62, 0.65, 0.68, 0.70, 0.75],
-    "mid_sell_thresh": [0.40, 0.35, 0.32, 0.30, 0.25],
-    "min_dip_cents":   [0.0],
-    "min_imb_change":  [0.0],
-    "hold_sec":        [30, 60, 90, 120],
-    "cooldown_sec":    [5, 10, 15],
-    "entry_mode":      ["passive"],
-    "lookback_sec":    [5, 10],
-    "fee_pct":         [0.0],       # run at 0 fee; add 0.005 separately to see impact
+    "mid_buy_thresh":   [0.48, 0.50, 0.52, 0.55, 0.60, 0.65, 0.70],
+    "mid_sell_thresh":  [0.50, 0.48, 0.45, 0.40, 0.35, 0.30],
+    "stop_loss_cents":  [3, 5, 7, 10, 0],           # 0 = disabled
+    "take_profit_cents":[5, 8, 12, 15, 20, 0],      # 0 = disabled
+    "hold_sec":         [30, 60, 90, 120, 300],
+    "cooldown_sec":     [5, 10, 15],
+    "entry_mode":       ["cross"],
+    "lookback_sec":     [5, 10],
+    "min_dip_cents":    [0.0],
+    "min_imb_change":   [0.0],
+    "fee_pct":          [0.0],
 }
 
 
@@ -426,12 +534,15 @@ def run_sweep(df: pd.DataFrame) -> pd.DataFrame:
     for i, combo in enumerate(combos):
         kv = dict(zip(keys, combo))
 
-        hold = kv["hold_sec"]
-        fwd_col = f"mid_fwd_{hold}s"
-        if fwd_col not in df.columns:
-            continue
         if kv["mid_sell_thresh"] >= kv["mid_buy_thresh"]:
             continue
+        # When no SL/TP, we need the forward-looking column
+        has_sl_tp = kv.get("stop_loss_cents", 0) > 0 or kv.get("take_profit_cents", 0) > 0
+        if not has_sl_tp:
+            hold = kv["hold_sec"]
+            fwd_col = f"mid_fwd_{hold}s"
+            if fwd_col not in df.columns:
+                continue
 
         p = ConvergenceParams(**kv)
         res = _eval_params(df, p)
@@ -490,9 +601,11 @@ def main():
     parser.add_argument("--data-dir", type=str, default=None)
     parser.add_argument("--sweep", action="store_true", help="Run parameter sweep")
     parser.add_argument("--fee", type=float, default=None, help="Override fee pct (e.g. 0.005 for 0.5%%)")
-    parser.add_argument("--entry-mode", choices=["passive", "cross"], default="passive")
-    parser.add_argument("--hold", type=int, default=30, choices=[10, 30, 60, 90, 120])
-    parser.add_argument("--cooldown", type=float, default=30.0)
+    parser.add_argument("--entry-mode", choices=["passive", "cross"], default="cross")
+    parser.add_argument("--hold", type=int, default=120)
+    parser.add_argument("--cooldown", type=float, default=5.0)
+    parser.add_argument("--stop-loss", type=float, default=5.0, help="Stop loss in cents (0=off)")
+    parser.add_argument("--take-profit", type=float, default=12.0, help="Take profit in cents (0=off)")
     args = parser.parse_args()
 
     data_dir = args.data_dir or find_data_dir()
@@ -515,9 +628,9 @@ def main():
         best = rdf.iloc[0]
         print(f"\n[4] Detailed report for best config ...")
         best_kv = {k: best[k] for k in SWEEP_RANGES.keys()}
-        best_kv["hold_sec"] = int(best_kv["hold_sec"])
-        if "lookback_sec" in best_kv:
-            best_kv["lookback_sec"] = int(best_kv["lookback_sec"])
+        for int_key in ("hold_sec", "lookback_sec"):
+            if int_key in best_kv:
+                best_kv[int_key] = int(best_kv[int_key])
         # Restore exclude params from phase 2
         exc_a = best.get("exclude_assets", "none")
         if exc_a != "none" and exc_a:
@@ -537,6 +650,8 @@ def main():
             entry_mode=args.entry_mode,
             hold_sec=args.hold,
             cooldown_sec=args.cooldown,
+            stop_loss_cents=args.stop_loss,
+            take_profit_cents=args.take_profit,
         )
         if args.fee is not None:
             params.fee_pct = args.fee
