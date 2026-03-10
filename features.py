@@ -64,6 +64,12 @@ class TokenFeatures:
     ask_depth_delta: float = 0.0
     imbalance_delta: float = 0.0
 
+    # Convergence strategy features (mid change, imbalance change)
+    mid_chg_5s: float = 0.0     # mid price change over last 5 seconds
+    mid_chg_10s: float = 0.0    # mid price change over last 10 seconds
+    imb_chg_5s: float = 0.0     # orderbook imbalance change over last 5 seconds
+    imbalance_topN: float = 0.0 # current orderbook imbalance (bid / (bid + ask))
+
     # Poly-Binance divergence
     # Direction: positive = Poly mid rising faster than Binance (or Binance lagging)
     poly_binance_div_bps: float | None = None
@@ -119,6 +125,15 @@ class FeatureEngine:
 
         # Previous tick depth for delta computation
         self._prev_depth: Dict[str, tuple] = {}  # token_id -> (bid_size, ask_size, imbalance)
+
+        # Convergence strategy: rolling mid price & imbalance tapes per token
+        from state import RollingTape
+        self._mid_tapes: Dict[str, RollingTape] = defaultdict(
+            lambda: RollingTape(15.0)  # 15s window for lookback up to 10s
+        )
+        self._imb_tapes: Dict[str, RollingTape] = defaultdict(
+            lambda: RollingTape(10.0)  # 10s window for 5s imbalance change
+        )
 
     def compute_all(self) -> Dict[str, SlugFeatures]:
         """Compute features for all active slugs.  Returns slug -> SlugFeatures."""
@@ -199,18 +214,42 @@ class FeatureEngine:
         # Compute spread percentile over last 60s
         tf.spread_pctl_60s = self._spread_percentile(token_id, book.spread, now)
 
+        # Current orderbook imbalance
+        total_size = book.bid_size + book.ask_size
+        current_imb = book.bid_size / max(total_size, 1e-9) if total_size > 0 else 0.5
+        tf.imbalance_topN = current_imb
+
+        # Convergence strategy: track mid and imbalance over time
+        self._mid_tapes[token_id].add(now, book.mid)
+        self._imb_tapes[token_id].add(now, current_imb)
+
+        # Compute mid change over lookback periods
+        mid_tape = self._mid_tapes[token_id]
+        imb_tape = self._imb_tapes[token_id]
+        for entry_ts, entry_val in mid_tape._buf:
+            age = now - entry_ts
+            if 4.5 <= age <= 5.5:
+                tf.mid_chg_5s = book.mid - entry_val
+                break
+        for entry_ts, entry_val in mid_tape._buf:
+            age = now - entry_ts
+            if 9.5 <= age <= 10.5:
+                tf.mid_chg_10s = book.mid - entry_val
+                break
+        # Compute imbalance change over 5s
+        for entry_ts, entry_val in imb_tape._buf:
+            age = now - entry_ts
+            if 4.5 <= age <= 5.5:
+                tf.imb_chg_5s = current_imb - entry_val
+                break
+
         # Orderbook delta vs previous tick
         prev = self._prev_depth.get(token_id)
         if prev is not None:
             tf.bid_depth_delta = book.bid_size - prev[0]
             tf.ask_depth_delta = book.ask_size - prev[1]
-            total_now = book.bid_size + book.ask_size
-            imb_now = book.bid_size / max(total_now, 1e-9) if total_now > 0 else 0.5
-            tf.imbalance_delta = imb_now - prev[2]
-        self._prev_depth[token_id] = (
-            book.bid_size, book.ask_size,
-            book.bid_size / max(book.bid_size + book.ask_size, 1e-9)
-        )
+            tf.imbalance_delta = current_imb - prev[2]
+        self._prev_depth[token_id] = (book.bid_size, book.ask_size, current_imb)
 
         # Poly-Binance divergence
         binance_px = self._binance.last_price(asset)
