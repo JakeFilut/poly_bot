@@ -88,6 +88,10 @@ class Strategy:
         # Cooldown tracking: (slug, outcome) -> last_trade_epoch
         self._last_trade_ts: Dict[str, float] = {}
 
+        # Hourly budget tracking: $100/hr cap, sells refund the budget
+        self._hourly_budget_spent: float = 0.0  # USD spent this hour
+        self._hourly_budget_hour: int = -1       # current hour (ET)
+
         # Entry quality tracking
         self._entry_quality: Dict[str, list] = {
             "buy_prices": [],
@@ -123,6 +127,25 @@ class Strategy:
     def record_sell_pnl(self, pnl: float) -> None:
         """Record a sell fill PnL for entry quality tracking."""
         self._entry_quality["profit_per_sell"].append(pnl)
+
+    def _get_hourly_budget_remaining(self, now_utc: datetime) -> float:
+        """Return how much USD we can still spend this hour. Resets each ET hour."""
+        hour_et = now_utc.astimezone(_ET).hour
+        if hour_et != self._hourly_budget_hour:
+            # New hour — reset budget
+            self._hourly_budget_spent = 0.0
+            self._hourly_budget_hour = hour_et
+            self.log.info("hourly_budget_reset", hour_et=hour_et,
+                          budget_usd=self.cfg.CONV_HOURLY_BUDGET_USD)
+        return self.cfg.CONV_HOURLY_BUDGET_USD - self._hourly_budget_spent
+
+    def _spend_budget(self, usd: float) -> None:
+        """Record USD spent against the hourly budget."""
+        self._hourly_budget_spent += usd
+
+    def _refund_budget(self, usd: float) -> None:
+        """Refund USD to the hourly budget (on sell). Budget can't go below 0 spent."""
+        self._hourly_budget_spent = max(0.0, self._hourly_budget_spent - usd)
 
     def _cooldown_ok(self, key: str, now: float) -> bool:
         """Check if cooldown has elapsed for a market."""
@@ -209,6 +232,9 @@ class Strategy:
                         entry_style="passive",
                     ))
 
+                    # Refund the sell proceeds back to hourly budget
+                    self._refund_budget(sell_usd)
+
                     # Clear entry time after exit
                     self._entry_times.pop(entry_key, None)
 
@@ -284,13 +310,24 @@ class Strategy:
                 skips["already_holding"] = skips.get("already_holding", 0) + 1
                 continue
 
-            # --- Risk gate ---
+            # --- Hourly budget check ---
+            budget_remaining = self._get_hourly_budget_remaining(now_utc)
             position_size = cfg.CONV_POSITION_SIZE
             price = tf.best_bid  # passive entry
             if price <= 0:
                 continue
             desired_usd = position_size * price
 
+            if desired_usd > budget_remaining:
+                skips = self._entry_quality["skips_by_gate"]
+                skips["hourly_budget"] = skips.get("hourly_budget", 0) + 1
+                self.log.decision(
+                    action="SKIP", reason=f"hourly_budget(need=${desired_usd:.2f},remaining=${budget_remaining:.2f})",
+                    slug=slug, outcome=direction, asset=sf.asset,
+                )
+                continue
+
+            # --- Risk gate ---
             buy_ok, buy_reason = risk_allows_buy(slug, direction, desired_usd)
             if not buy_ok:
                 skips = self._entry_quality["skips_by_gate"]
@@ -321,6 +358,9 @@ class Strategy:
                 entry_style="passive",
                 intent_timestamp=intent_ts,
             )
+
+            # Spend against hourly budget
+            self._spend_budget(actual_usd)
 
             # Track entry quality
             self._entry_quality["buy_prices"].append(price)

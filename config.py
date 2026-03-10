@@ -259,6 +259,7 @@ class Config:
     CONV_MIN_IMB_CHANGE: float = 0.0     # imbalance change threshold (0 = disabled)
     CONV_HOLD_SEC: int = 120             # seconds to hold before time-based exit
     CONV_POSITION_SIZE: float = 10.0     # shares per trade
+    CONV_HOURLY_BUDGET_USD: float = 100.0  # max USD to invest per hour (sells refund budget)
 
     # -- Fee simulation --
     SIM_FEE_BPS: float = 0.0  # Simulated fee in basis points (e.g., 5.0 = 5 bps = 0.05%)
@@ -411,6 +412,7 @@ def load_config() -> Config:
         CONV_MIN_IMB_CHANGE=_env_float("CONV_MIN_IMB_CHANGE", 0.0),
         CONV_HOLD_SEC=_env_int("CONV_HOLD_SEC", 120),
         CONV_POSITION_SIZE=_env_float("CONV_POSITION_SIZE", 10.0),
+        CONV_HOURLY_BUDGET_USD=_env_float("CONV_HOURLY_BUDGET_USD", 100.0),
         SIM_FEE_BPS=_env_float("SIM_FEE_BPS", 0.0),
         TRACK_F247_WALLET=_env_bool("TRACK_F247_WALLET", True),
         DEBUG_LOG_ORDERS=_env_bool("DEBUG_LOG_ORDERS", False),
