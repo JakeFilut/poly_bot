@@ -101,6 +101,7 @@ class StrategyEngine:
         self.risk = RiskManager(cfg, self.state, log)
         self.strategy = Strategy(cfg, self.state, log)
         self.execution = ExecutionEngine(cfg, self.pm_api, self.state, log)
+        self.execution._on_sell_fill_budget = self.strategy._refund_budget
 
         # -- Analytics --
         self.analytics = AnalyticsTracker()
