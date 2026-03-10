@@ -145,7 +145,12 @@ class Strategy:
 
     def _refund_budget(self, usd: float) -> None:
         """Refund USD to the hourly budget (on sell). Budget can't go below 0 spent."""
+        before = self._hourly_budget_spent
         self._hourly_budget_spent = max(0.0, self._hourly_budget_spent - usd)
+        self.log.log("INFO", msg="budget_refund",
+                     refund_usd=round(usd, 2),
+                     spent_before=round(before, 2),
+                     spent_after=round(self._hourly_budget_spent, 2))
 
     def budget_snapshot(self) -> dict:
         """Return current hourly budget status."""
@@ -368,7 +373,7 @@ class Strategy:
                 intent_timestamp=intent_ts,
             )
 
-            # Spend against hourly budget
+            # Spend against hourly budget (reservation for gating within tick)
             self._spend_budget(actual_usd)
 
             # Track entry quality
