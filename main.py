@@ -321,7 +321,11 @@ class Bot:
             self._last_portfolio_log = now_mono
             try:
                 status = self.engine.portfolio_status()
+                print(flush=True)
+                print(flush=True)
                 self.log.log("PORTFOLIO_STATUS", **status)
+                print(flush=True)
+                print(flush=True)
             except Exception:
                 pass  # never let status logging break the main loop
 
