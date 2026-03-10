@@ -252,8 +252,8 @@ class Config:
     TRACK_F247_WALLET: bool = False  # Disabled: no longer using wallet-copy strategy
 
     # -- Convergence strategy params (from independent_backtest sweep) --
-    CONV_MID_BUY_THRESH: float = 0.55    # buy Up when Up-token mid > this
-    CONV_MID_SELL_THRESH: float = 0.35   # sell Up (buy Down) when Up-token mid < this
+    CONV_MID_BUY_THRESH: float = 0.48    # buy Up when Up-token mid > this
+    CONV_MID_SELL_THRESH: float = 0.42   # sell Up (buy Down) when Up-token mid < this
     CONV_LOOKBACK_SEC: int = 5           # seconds to look back for dip/rip detection
     CONV_MIN_DIP_CENTS: float = 0.0      # minimum dip in cents to trigger (0 = disabled)
     CONV_MIN_IMB_CHANGE: float = 0.0     # imbalance change threshold (0 = disabled)
@@ -405,8 +405,8 @@ def load_config() -> Config:
         MAX_CAPITAL_PER_ASSET_USD=_env_float("MAX_CAPITAL_PER_ASSET_USD", 150.0),
         MAX_CROSS_NOTIONAL_PER_HOUR_USD=_env_float("MAX_CROSS_NOTIONAL_PER_HOUR_USD", 100.0),
         PAUSE_MINUTES_ON_DD=_env_int("PAUSE_MINUTES_ON_DD", 45),
-        CONV_MID_BUY_THRESH=_env_float("CONV_MID_BUY_THRESH", 0.55),
-        CONV_MID_SELL_THRESH=_env_float("CONV_MID_SELL_THRESH", 0.35),
+        CONV_MID_BUY_THRESH=_env_float("CONV_MID_BUY_THRESH", 0.48),
+        CONV_MID_SELL_THRESH=_env_float("CONV_MID_SELL_THRESH", 0.42),
         CONV_LOOKBACK_SEC=_env_int("CONV_LOOKBACK_SEC", 5),
         CONV_MIN_DIP_CENTS=_env_float("CONV_MIN_DIP_CENTS", 0.0),
         CONV_MIN_IMB_CHANGE=_env_float("CONV_MIN_IMB_CHANGE", 0.0),

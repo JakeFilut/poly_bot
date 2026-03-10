@@ -243,7 +243,7 @@ class Strategy:
                         reason=reason, urgency=0.9,
                         intent_timestamp=intent_ts,
                         spread_cents=round(tf.spread * 100, 1),
-                        entry_style="passive",
+                        entry_style="cross",
                     ))
 
                     # Budget refund now happens on actual sell fill
@@ -327,7 +327,7 @@ class Strategy:
             # --- Hourly budget check ---
             budget_remaining = self._get_hourly_budget_remaining(now_utc)
             position_size = cfg.CONV_POSITION_SIZE
-            price = tf.best_bid  # passive entry
+            price = tf.best_ask  # cross entry (buy at ask for immediate fill)
             if price <= 0:
                 continue
             desired_usd = position_size * price
@@ -369,7 +369,7 @@ class Strategy:
                 imb_chg=round(imb_chg, 4),
                 ob_imbalance=round(ob_imb, 4),
                 spread_cents=round(tf.spread * 100, 1),
-                entry_style="passive",
+                entry_style="cross",
                 intent_timestamp=intent_ts,
             )
 
@@ -394,7 +394,7 @@ class Strategy:
                 return_5s=round(tf.ret_5s or 0, 8),
                 return_30s=round(tf.ret_30s or 0, 8),
                 orderbook_imbalance=round(ob_imb, 4),
-                entry_style="passive",
+                entry_style="cross",
             ))
 
         return actions
