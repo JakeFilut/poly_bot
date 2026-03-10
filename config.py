@@ -249,7 +249,7 @@ class Config:
     PAUSE_MINUTES_ON_DD: int = 45                # Minutes to pause on drawdown breach
 
     # -- F247 copy-wallet tracker --
-    TRACK_F247_WALLET: bool = True  # Run the F247 wallet tracker in a background thread
+    TRACK_F247_WALLET: bool = False  # Disabled: no longer using wallet-copy strategy
 
     # -- Convergence strategy params (from independent_backtest sweep) --
     CONV_MID_BUY_THRESH: float = 0.55    # buy Up when Up-token mid > this
