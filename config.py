@@ -293,7 +293,7 @@ def load_config() -> Config:
     """Load config from env vars, validate, return frozen Config."""
     cfg = Config(
         MODE=_env("MODE", "DRY_RUN").upper(),
-        DRY_RUN_FILL_MODE=_env("DRY_RUN_FILL_MODE", "instant").lower(),
+        DRY_RUN_FILL_MODE=_env("DRY_RUN_FILL_MODE", "touch").lower(),
         DRY_RUN_SELFTEST=_env_bool("DRY_RUN_SELFTEST", False),
         DRY_RUN_SELFTEST_N=_env_int("DRY_RUN_SELFTEST_N", 10),
         POLYMARKET_API_KEY=_env("POLYMARKET_API_KEY", ""),
@@ -412,7 +412,7 @@ def load_config() -> Config:
         CONV_MIN_IMB_CHANGE=_env_float("CONV_MIN_IMB_CHANGE", 0.0),
         CONV_HOLD_SEC=_env_int("CONV_HOLD_SEC", 120),
         CONV_POSITION_SIZE=_env_float("CONV_POSITION_SIZE", 10.0),
-        CONV_HOURLY_BUDGET_USD=_env_float("CONV_HOURLY_BUDGET_USD", 100.0),
+        CONV_HOURLY_BUDGET_USD=_env_float("CONV_HOURLY_BUDGET_USD", 500.0),
         SIM_FEE_BPS=_env_float("SIM_FEE_BPS", 0.0),
         TRACK_F247_WALLET=_env_bool("TRACK_F247_WALLET", False),
         DEBUG_LOG_ORDERS=_env_bool("DEBUG_LOG_ORDERS", False),
