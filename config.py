@@ -50,7 +50,7 @@ def _env_list_int(key: str, default: List[int]) -> List[int]:
 class Config:
     # -- Mode --
     MODE: str = ""  # DRY_RUN | LIVE
-    DRY_RUN_FILL_MODE: str = "touch"  # none | probabilistic | instant | touch
+    DRY_RUN_FILL_MODE: str = "probabilistic"  # none | probabilistic | instant | touch
     DRY_RUN_SELFTEST: bool = False   # Force-fill next N orders to prove pipeline
     DRY_RUN_SELFTEST_N: int = 10     # Number of orders to force-fill in selftest
 
@@ -293,7 +293,7 @@ def load_config() -> Config:
     """Load config from env vars, validate, return frozen Config."""
     cfg = Config(
         MODE=_env("MODE", "DRY_RUN").upper(),
-        DRY_RUN_FILL_MODE=_env("DRY_RUN_FILL_MODE", "touch").lower(),
+        DRY_RUN_FILL_MODE=_env("DRY_RUN_FILL_MODE", "probabilistic").lower(),
         DRY_RUN_SELFTEST=_env_bool("DRY_RUN_SELFTEST", False),
         DRY_RUN_SELFTEST_N=_env_int("DRY_RUN_SELFTEST_N", 10),
         POLYMARKET_API_KEY=_env("POLYMARKET_API_KEY", ""),
