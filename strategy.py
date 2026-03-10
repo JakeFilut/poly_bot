@@ -200,6 +200,14 @@ class Strategy:
                     self._entry_times.pop((slug, outcome), None)
                     continue
 
+                # Skip if we already have a pending SELL order for this position
+                has_pending_sell = any(
+                    o.slug == slug and o.outcome == outcome and o.side == "SELL"
+                    for o in self.state.open_orders.values()
+                )
+                if has_pending_sell:
+                    continue
+
                 tf = sf.up if outcome == "Up" else sf.down
                 if tf is None or not tf.has_book:
                     continue
