@@ -209,8 +209,9 @@ class Strategy:
                 entry_ts = self._entry_times.get(entry_key)
                 if entry_ts is None:
                     # Position exists but we don't have entry time (e.g. after restart)
-                    # Use a conservative approach: exit immediately
-                    entry_ts = 0
+                    # Start the clock now; will exit after CONV_HOLD_SEC from this point
+                    entry_ts = now
+                    self._entry_times[entry_key] = now
 
                 held_sec = now - entry_ts
                 if held_sec >= cfg.CONV_HOLD_SEC:

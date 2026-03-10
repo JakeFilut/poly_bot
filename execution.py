@@ -537,12 +537,15 @@ class ExecutionEngine:
             elif self.cfg.DRY_RUN_FILL_MODE == "touch":
                 self._store_shadow_order(order)
             elif self.cfg.DRY_RUN_FILL_MODE == "none":
-                # Log-only: track order but do NOT mutate inventory
-                # Immediately refund BUY budget reservation since no fill will happen
+                # Log-only for buys; simulate fill for sells to clear stale inventory
                 if action.action == "BUY" and self._on_sell_fill_budget:
                     self._on_sell_fill_budget(action.size_usd)
+                if action.action == "SELL":
+                    # Must clear inventory or strategy loops forever on stale positions
+                    self._simulate_fill(order, reason="none_mode_sell_cleanup",
+                                        fill_mode="instant")
                 self.log.info(
-                    "DRY_RUN_FILL_MODE=none; order tracked but no inventory mutation",
+                    "DRY_RUN_FILL_MODE=none; order tracked",
                     order_id=order.order_id,
                     slug=action.slug,
                     outcome=action.outcome,
@@ -1052,7 +1055,7 @@ class ExecutionEngine:
                 self.log.info(
                     "cancel_rate_limited",
                     order_id=order.order_id,
-                    msg="cancel/replace rate limit hit, deferring",
+                    detail="cancel/replace rate limit hit, deferring",
                 )
                 break
             try:
