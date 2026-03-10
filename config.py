@@ -258,6 +258,8 @@ class Config:
     CONV_MIN_DIP_CENTS: float = 0.0      # minimum dip in cents to trigger (0 = disabled)
     CONV_MIN_IMB_CHANGE: float = 0.0     # imbalance change threshold (0 = disabled)
     CONV_HOLD_SEC: int = 120             # seconds to hold before time-based exit
+    CONV_STOP_LOSS_CENTS: float = 5.0    # sell immediately if position down this many cents
+    CONV_TAKE_PROFIT_CENTS: float = 12.0 # sell immediately if position up this many cents
     CONV_POSITION_SIZE: float = 10.0     # shares per trade
     CONV_HOURLY_BUDGET_USD: float = 500.0  # max USD to invest per hour (sells refund budget)
 
@@ -411,6 +413,8 @@ def load_config() -> Config:
         CONV_MIN_DIP_CENTS=_env_float("CONV_MIN_DIP_CENTS", 0.0),
         CONV_MIN_IMB_CHANGE=_env_float("CONV_MIN_IMB_CHANGE", 0.0),
         CONV_HOLD_SEC=_env_int("CONV_HOLD_SEC", 120),
+        CONV_STOP_LOSS_CENTS=_env_float("CONV_STOP_LOSS_CENTS", 5.0),
+        CONV_TAKE_PROFIT_CENTS=_env_float("CONV_TAKE_PROFIT_CENTS", 12.0),
         CONV_POSITION_SIZE=_env_float("CONV_POSITION_SIZE", 10.0),
         CONV_HOURLY_BUDGET_USD=_env_float("CONV_HOURLY_BUDGET_USD", 500.0),
         SIM_FEE_BPS=_env_float("SIM_FEE_BPS", 0.0),

@@ -214,44 +214,57 @@ class Strategy:
                     self._entry_times[entry_key] = now
 
                 held_sec = now - entry_ts
-                if held_sec >= cfg.CONV_HOLD_SEC:
-                    # Time to exit — sell full position at bestBid
-                    sell_price = tf.best_bid
-                    if sell_price <= 0:
-                        continue
+                sell_price = tf.best_bid
+                if sell_price <= 0:
+                    continue
 
-                    sell_shares = inv.shares
-                    sell_usd = sell_shares * sell_price
+                # --- Stop loss / take profit check ---
+                edge_cents = (sell_price - inv.avg_cost) * 100
+                stop_triggered = (cfg.CONV_STOP_LOSS_CENTS > 0
+                                  and edge_cents <= -cfg.CONV_STOP_LOSS_CENTS)
+                tp_triggered = (cfg.CONV_TAKE_PROFIT_CENTS > 0
+                                and edge_cents >= cfg.CONV_TAKE_PROFIT_CENTS)
 
-                    sell_ok, sell_reason = risk_allows_sell(slug, outcome)
-                    if not sell_ok:
-                        continue
-
+                if stop_triggered:
+                    reason = f"STOP_LOSS(down={-edge_cents:.1f}c>=limit={cfg.CONV_STOP_LOSS_CENTS:.0f}c)"
+                elif tp_triggered:
+                    reason = f"TAKE_PROFIT(up={edge_cents:.1f}c>=limit={cfg.CONV_TAKE_PROFIT_CENTS:.0f}c)"
+                elif held_sec >= cfg.CONV_HOLD_SEC:
                     reason = f"TIME_EXIT(held={held_sec:.0f}s>={cfg.CONV_HOLD_SEC}s)"
-                    self.log.decision(
-                        action="SELL", reason=reason,
-                        slug=slug, outcome=outcome, asset=sf.asset,
-                        shares=sell_shares, price=sell_price,
-                        held_sec=round(held_sec, 1),
-                        edge_vs_cost=round(sell_price - inv.avg_cost, 4),
-                        spread_cents=round(tf.spread * 100, 1),
-                    )
+                else:
+                    continue  # no exit condition triggered
 
-                    actions.append(TradeAction(
-                        action="SELL", slug=slug, outcome=outcome,
-                        token_id=tf.token_id, price=sell_price,
-                        size_shares=sell_shares, size_usd=sell_usd,
-                        reason=reason, urgency=0.9,
-                        intent_timestamp=intent_ts,
-                        spread_cents=round(tf.spread * 100, 1),
-                        entry_style="cross",
-                    ))
+                sell_shares = inv.shares
+                sell_usd = sell_shares * sell_price
 
-                    # Budget refund now happens on actual sell fill
-                    # (via execution._on_sell_fill_budget callback)
+                sell_ok, sell_reason = risk_allows_sell(slug, outcome)
+                if not sell_ok:
+                    continue
 
-                    # Clear entry time after exit
-                    self._entry_times.pop(entry_key, None)
+                self.log.decision(
+                    action="SELL", reason=reason,
+                    slug=slug, outcome=outcome, asset=sf.asset,
+                    shares=sell_shares, price=sell_price,
+                    held_sec=round(held_sec, 1),
+                    edge_vs_cost=round(sell_price - inv.avg_cost, 4),
+                    spread_cents=round(tf.spread * 100, 1),
+                )
+
+                actions.append(TradeAction(
+                    action="SELL", slug=slug, outcome=outcome,
+                    token_id=tf.token_id, price=sell_price,
+                    size_shares=sell_shares, size_usd=sell_usd,
+                    reason=reason, urgency=1.0 if (stop_triggered or tp_triggered) else 0.9,
+                    intent_timestamp=intent_ts,
+                    spread_cents=round(tf.spread * 100, 1),
+                    entry_style="cross",
+                ))
+
+                # Budget refund now happens on actual sell fill
+                # (via execution._on_sell_fill_budget callback)
+
+                # Clear entry time after exit
+                self._entry_times.pop(entry_key, None)
 
             # ==============================================================
             # ENTRY PASS: convergence signals on the Up token
