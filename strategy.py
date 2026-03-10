@@ -218,17 +218,21 @@ class Strategy:
                 if sell_price <= 0:
                     continue
 
-                # --- Stop loss check ---
-                loss_cents = (inv.avg_cost - sell_price) * 100
+                # --- Stop loss / take profit check ---
+                edge_cents = (sell_price - inv.avg_cost) * 100
                 stop_triggered = (cfg.CONV_STOP_LOSS_CENTS > 0
-                                  and loss_cents >= cfg.CONV_STOP_LOSS_CENTS)
+                                  and edge_cents <= -cfg.CONV_STOP_LOSS_CENTS)
+                tp_triggered = (cfg.CONV_TAKE_PROFIT_CENTS > 0
+                                and edge_cents >= cfg.CONV_TAKE_PROFIT_CENTS)
 
                 if stop_triggered:
-                    reason = f"STOP_LOSS(down={loss_cents:.1f}c>=limit={cfg.CONV_STOP_LOSS_CENTS:.0f}c)"
+                    reason = f"STOP_LOSS(down={-edge_cents:.1f}c>=limit={cfg.CONV_STOP_LOSS_CENTS:.0f}c)"
+                elif tp_triggered:
+                    reason = f"TAKE_PROFIT(up={edge_cents:.1f}c>=limit={cfg.CONV_TAKE_PROFIT_CENTS:.0f}c)"
                 elif held_sec >= cfg.CONV_HOLD_SEC:
                     reason = f"TIME_EXIT(held={held_sec:.0f}s>={cfg.CONV_HOLD_SEC}s)"
                 else:
-                    continue  # neither stop loss nor time exit triggered
+                    continue  # no exit condition triggered
 
                 sell_shares = inv.shares
                 sell_usd = sell_shares * sell_price
@@ -250,7 +254,7 @@ class Strategy:
                     action="SELL", slug=slug, outcome=outcome,
                     token_id=tf.token_id, price=sell_price,
                     size_shares=sell_shares, size_usd=sell_usd,
-                    reason=reason, urgency=1.0 if stop_triggered else 0.9,
+                    reason=reason, urgency=1.0 if (stop_triggered or tp_triggered) else 0.9,
                     intent_timestamp=intent_ts,
                     spread_cents=round(tf.spread * 100, 1),
                     entry_style="cross",
