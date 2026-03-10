@@ -63,8 +63,9 @@ class ExecutionEngine:
         # Diagnostics tracker (set externally after construction)
         self.diagnostics: Optional[Diagnostics] = None
 
-        # Budget refund callback (set externally): called on sell fill
-        # with (cost_basis_usd,) so strategy can refund the original buy cost
+        # Budget refund callback (set externally by strategy_engine):
+        # Called on sell fill with cost_basis_usd, or on BUY cancel/expiry
+        # to refund the budget reservation made at action generation time
         self._on_sell_fill_budget = None  # type: Optional[callable]
 
         # Risk manager reference (set externally for ladder per-level checks)
@@ -199,6 +200,15 @@ class ExecutionEngine:
                     success = self.api.cancel_order(ex_order.order_id)
                     now_cancel = time.time()
                     if success:
+                        # Refund budget for replaced BUY (new order will re-spend)
+                        if ex_order.side == "BUY" and self._on_sell_fill_budget:
+                            cancel_usd = ex_order.size * ex_order.price
+                            self._on_sell_fill_budget(cancel_usd)
+                            self.log.info(
+                                "budget_refund_on_replace",
+                                order_id=ex_order.order_id,
+                                refund_usd=round(cancel_usd, 2),
+                            )
                         self.state.remove_order(ex_order.order_id)
                         self.state.remove_shadow_order(ex_order.order_id)
                         # Emit consolidated ORDER_CANCELED
@@ -528,6 +538,9 @@ class ExecutionEngine:
                 self._store_shadow_order(order)
             elif self.cfg.DRY_RUN_FILL_MODE == "none":
                 # Log-only: track order but do NOT mutate inventory
+                # Immediately refund BUY budget reservation since no fill will happen
+                if action.action == "BUY" and self._on_sell_fill_budget:
+                    self._on_sell_fill_budget(action.size_usd)
                 self.log.info(
                     "DRY_RUN_FILL_MODE=none; order tracked but no inventory mutation",
                     order_id=order.order_id,
@@ -628,7 +641,20 @@ class ExecutionEngine:
             realized_this_fill = self.state.realized_pnl - realized_before
             # Refund original cost basis to hourly budget
             if self._on_sell_fill_budget and avg_cost_before > 0:
-                self._on_sell_fill_budget(order.size * avg_cost_before)
+                refund_usd = order.size * avg_cost_before
+                self._on_sell_fill_budget(refund_usd)
+                self.log.info(
+                    "budget_refund_on_sell_fill",
+                    slug=order.slug, outcome=order.outcome,
+                    shares=order.size, avg_cost=round(avg_cost_before, 4),
+                    refund_usd=round(refund_usd, 2),
+                )
+            elif avg_cost_before <= 0:
+                self.log.info(
+                    "budget_refund_skipped_no_cost",
+                    slug=order.slug, outcome=order.outcome,
+                    avg_cost_before=avg_cost_before,
+                )
             # Emit DRY_FILL with same schema as FILL
             fill_entry_style = "UNKNOWN"
             fill_payload = None
@@ -1032,6 +1058,16 @@ class ExecutionEngine:
             try:
                 success = self.api.cancel_order(order.order_id)
                 if success:
+                    # Refund budget reservation for unfilled BUY orders
+                    if order.side == "BUY" and self._on_sell_fill_budget:
+                        cancel_usd = order.size * order.price
+                        self._on_sell_fill_budget(cancel_usd)
+                        self.log.info(
+                            "budget_refund_on_cancel",
+                            order_id=order.order_id,
+                            slug=order.slug, outcome=order.outcome,
+                            refund_usd=round(cancel_usd, 2),
+                        )
                     self.state.remove_order(order.order_id)
                     self.state.remove_shadow_order(order.order_id)
                     # Emit consolidated ORDER_CANCELED
@@ -1148,7 +1184,20 @@ class ExecutionEngine:
                 realized_this_fill = self.state.realized_pnl - realized_before
                 # Refund original cost basis to hourly budget
                 if self._on_sell_fill_budget and avg_cost_before > 0:
-                    self._on_sell_fill_budget(qty * avg_cost_before)
+                    refund_usd = qty * avg_cost_before
+                    self._on_sell_fill_budget(refund_usd)
+                    self.log.info(
+                        "budget_refund_on_sell_fill",
+                        slug=slug, outcome=outcome,
+                        shares=qty, avg_cost=round(avg_cost_before, 4),
+                        refund_usd=round(refund_usd, 2),
+                    )
+                elif avg_cost_before <= 0:
+                    self.log.info(
+                        "budget_refund_skipped_no_cost",
+                        slug=slug, outcome=outcome,
+                        avg_cost_before=avg_cost_before,
+                    )
                 # Emit analytics FILL (canonical event)
                 fill_entry_style = "UNKNOWN"
                 fill_payload = None
@@ -1217,6 +1266,10 @@ class ExecutionEngine:
             order = self.state.open_orders.get(order_id)
             try:
                 self.api.cancel_order(order_id)
+                # Refund budget for unfilled BUY orders on shutdown
+                if order and order.side == "BUY" and self._on_sell_fill_budget:
+                    cancel_usd = order.size * order.price
+                    self._on_sell_fill_budget(cancel_usd)
                 if self.analytics and order:
                     cancel_payload = self.analytics.record_cancel(
                         order_id=order_id,
