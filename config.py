@@ -414,7 +414,7 @@ def load_config() -> Config:
         CONV_POSITION_SIZE=_env_float("CONV_POSITION_SIZE", 10.0),
         CONV_HOURLY_BUDGET_USD=_env_float("CONV_HOURLY_BUDGET_USD", 100.0),
         SIM_FEE_BPS=_env_float("SIM_FEE_BPS", 0.0),
-        TRACK_F247_WALLET=_env_bool("TRACK_F247_WALLET", True),
+        TRACK_F247_WALLET=_env_bool("TRACK_F247_WALLET", False),
         DEBUG_LOG_ORDERS=_env_bool("DEBUG_LOG_ORDERS", False),
         LOG_DECISIONS=_env_bool("LOG_DECISIONS", False),
         DECISION_LOG_SAMPLE_EVERY_N=_env_int("DECISION_LOG_SAMPLE_EVERY_N", 200),
