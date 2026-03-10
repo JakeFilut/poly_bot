@@ -50,7 +50,7 @@ def _env_list_int(key: str, default: List[int]) -> List[int]:
 class Config:
     # -- Mode --
     MODE: str = ""  # DRY_RUN | LIVE
-    DRY_RUN_FILL_MODE: str = "instant"  # none | probabilistic | instant | touch
+    DRY_RUN_FILL_MODE: str = "touch"  # none | probabilistic | instant | touch
     DRY_RUN_SELFTEST: bool = False   # Force-fill next N orders to prove pipeline
     DRY_RUN_SELFTEST_N: int = 10     # Number of orders to force-fill in selftest
 
@@ -259,7 +259,7 @@ class Config:
     CONV_MIN_IMB_CHANGE: float = 0.0     # imbalance change threshold (0 = disabled)
     CONV_HOLD_SEC: int = 120             # seconds to hold before time-based exit
     CONV_POSITION_SIZE: float = 10.0     # shares per trade
-    CONV_HOURLY_BUDGET_USD: float = 100.0  # max USD to invest per hour (sells refund budget)
+    CONV_HOURLY_BUDGET_USD: float = 500.0  # max USD to invest per hour (sells refund budget)
 
     # -- Fee simulation --
     SIM_FEE_BPS: float = 0.0  # Simulated fee in basis points (e.g., 5.0 = 5 bps = 0.05%)
