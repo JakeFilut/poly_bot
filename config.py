@@ -251,6 +251,16 @@ class Config:
     # -- F247 copy-wallet tracker --
     TRACK_F247_WALLET: bool = True  # Run the F247 wallet tracker in a background thread
 
+    # -- Convergence strategy params (from independent_backtest sweep) --
+    CONV_MID_BUY_THRESH: float = 0.55    # buy Up when Up-token mid > this
+    CONV_MID_SELL_THRESH: float = 0.35   # sell Up (buy Down) when Up-token mid < this
+    CONV_LOOKBACK_SEC: int = 5           # seconds to look back for dip/rip detection
+    CONV_MIN_DIP_CENTS: float = 0.0      # minimum dip in cents to trigger (0 = disabled)
+    CONV_MIN_IMB_CHANGE: float = 0.0     # imbalance change threshold (0 = disabled)
+    CONV_HOLD_SEC: int = 120             # seconds to hold before time-based exit
+    CONV_POSITION_SIZE: float = 10.0     # shares per trade
+    CONV_HOURLY_BUDGET_USD: float = 100.0  # max USD to invest per hour (sells refund budget)
+
     # -- Fee simulation --
     SIM_FEE_BPS: float = 0.0  # Simulated fee in basis points (e.g., 5.0 = 5 bps = 0.05%)
 
@@ -395,6 +405,14 @@ def load_config() -> Config:
         MAX_CAPITAL_PER_ASSET_USD=_env_float("MAX_CAPITAL_PER_ASSET_USD", 150.0),
         MAX_CROSS_NOTIONAL_PER_HOUR_USD=_env_float("MAX_CROSS_NOTIONAL_PER_HOUR_USD", 100.0),
         PAUSE_MINUTES_ON_DD=_env_int("PAUSE_MINUTES_ON_DD", 45),
+        CONV_MID_BUY_THRESH=_env_float("CONV_MID_BUY_THRESH", 0.55),
+        CONV_MID_SELL_THRESH=_env_float("CONV_MID_SELL_THRESH", 0.35),
+        CONV_LOOKBACK_SEC=_env_int("CONV_LOOKBACK_SEC", 5),
+        CONV_MIN_DIP_CENTS=_env_float("CONV_MIN_DIP_CENTS", 0.0),
+        CONV_MIN_IMB_CHANGE=_env_float("CONV_MIN_IMB_CHANGE", 0.0),
+        CONV_HOLD_SEC=_env_int("CONV_HOLD_SEC", 120),
+        CONV_POSITION_SIZE=_env_float("CONV_POSITION_SIZE", 10.0),
+        CONV_HOURLY_BUDGET_USD=_env_float("CONV_HOURLY_BUDGET_USD", 100.0),
         SIM_FEE_BPS=_env_float("SIM_FEE_BPS", 0.0),
         TRACK_F247_WALLET=_env_bool("TRACK_F247_WALLET", True),
         DEBUG_LOG_ORDERS=_env_bool("DEBUG_LOG_ORDERS", False),

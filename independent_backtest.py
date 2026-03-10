@@ -43,21 +43,21 @@ import pandas as pd
 class ConvergenceParams:
     """Tunable parameters for the convergence/dip-buy strategy."""
     # --- Entry thresholds ---
-    mid_buy_thresh: float = 0.65       # buy Up when mid > this
+    mid_buy_thresh: float = 0.55       # buy Up when mid > this
     mid_sell_thresh: float = 0.35      # sell Up (buy Down) when mid < this
     # --- Dip detection ---
     lookback_sec: int = 5              # seconds to look back for dip/rip
-    min_dip_cents: float = 0.5         # minimum dip in cents to trigger (0 = disabled)
+    min_dip_cents: float = 0.0         # minimum dip in cents to trigger (0 = disabled)
     # --- Imbalance surge ---
-    min_imb_change: float = 0.03       # imbalance must have risen by this (buy) / fallen (sell)
+    min_imb_change: float = 0.0        # imbalance must have risen by this (buy) / fallen (sell)
     # --- Spread filter ---
     require_spread_widening: bool = False  # require spread to be widening
     # --- Execution ---
     entry_mode: str = "passive"        # "passive" (buy at bid) or "cross" (buy at ask)
-    hold_sec: int = 30                 # seconds to hold position
+    hold_sec: int = 120                # seconds to hold position
     position_size: float = 10.0        # shares per trade
     # --- Cooldown ---
-    cooldown_sec: float = 30.0         # min seconds between trades on same market
+    cooldown_sec: float = 5.0          # min seconds between trades on same market
     # --- Fee ---
     fee_pct: float = 0.0              # one-way fee as decimal (0.005 = 0.5%)
     # --- Filters ---
