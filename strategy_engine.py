@@ -396,6 +396,57 @@ class StrategyEngine:
         return self._estimate_unrealized()
 
     # ------------------------------------------------------------------
+    # Portfolio status (10-second display for user)
+    # ------------------------------------------------------------------
+    def portfolio_status(self) -> dict:
+        """Return a snapshot of positions, budget, and PnL for display."""
+        # Positions
+        positions = []
+        total_cost = 0.0
+        for (slug, outcome), inv in self.state.inventory.items():
+            if inv.shares <= 0:
+                continue
+            # Get mark price
+            pair = self.universe.get_pair(slug)
+            mark = 0.0
+            if pair:
+                tid = pair.up_token_id if outcome == "Up" else pair.down_token_id
+                mark, _ = self._get_mark_for_token(tid)
+            cost = inv.shares * inv.avg_cost
+            market_val = inv.shares * mark
+            pnl = market_val - cost
+            total_cost += cost
+            positions.append({
+                "slug": slug.replace("-up-or-down-", " ").split(" march")[0].upper(),
+                "side": outcome,
+                "shares": round(inv.shares, 1),
+                "avg_cost": round(inv.avg_cost, 3),
+                "mark": round(mark, 3),
+                "cost_usd": round(cost, 2),
+                "value_usd": round(market_val, 2),
+                "pnl_usd": round(pnl, 2),
+            })
+
+        # Unrealized + realized PnL
+        unrealized = self._estimate_unrealized()
+        realized = self.state.realized_pnl
+
+        # Budget from strategy
+        budget = self.strategy.budget_snapshot()
+
+        return {
+            "positions": positions,
+            "position_count": len(positions),
+            "total_cost_usd": round(total_cost, 2),
+            "unrealized_pnl_usd": round(unrealized, 2),
+            "realized_pnl_usd": round(realized, 2),
+            "total_pnl_usd": round(realized + unrealized, 2),
+            "budget_spent_usd": budget["spent_usd"],
+            "budget_remaining_usd": budget["remaining_usd"],
+            "budget_limit_usd": budget["hourly_budget_usd"],
+        }
+
+    # ------------------------------------------------------------------
     # Cache purging
     # ------------------------------------------------------------------
     def _purge_stale_caches(self, removed_token_ids: list[str]) -> None:

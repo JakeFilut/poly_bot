@@ -138,6 +138,7 @@ class Bot:
         self._tick_metrics = TickMetrics()
         self._last_metrics_log = time.monotonic()
         self._last_heartbeat_log = time.monotonic()
+        self._last_portfolio_log = time.monotonic()
 
         # -- Background task handles --
         self._bg_tasks: list[asyncio.Task] = []
@@ -314,6 +315,15 @@ class Bot:
                 hb["total_tokens"] = n
 
             self.log.log("HEARTBEAT", **hb)
+
+        # Portfolio status log (every 10 seconds)
+        if now_mono - self._last_portfolio_log >= 10.0:
+            self._last_portfolio_log = now_mono
+            try:
+                status = self.engine.portfolio_status()
+                self.log.log("PORTFOLIO_STATUS", **status)
+            except Exception:
+                pass  # never let status logging break the main loop
 
         if now_mono - self._last_metrics_log < self.cfg.LOG_ROLLUP_SEC:
             return

@@ -135,8 +135,8 @@ class Strategy:
             # New hour — reset budget
             self._hourly_budget_spent = 0.0
             self._hourly_budget_hour = hour_et
-            self.log.info("hourly_budget_reset", hour_et=hour_et,
-                          budget_usd=self.cfg.CONV_HOURLY_BUDGET_USD)
+            self.log.log("INFO", msg="hourly_budget_reset", hour_et=hour_et,
+                         budget_usd=self.cfg.CONV_HOURLY_BUDGET_USD)
         return self.cfg.CONV_HOURLY_BUDGET_USD - self._hourly_budget_spent
 
     def _spend_budget(self, usd: float) -> None:
@@ -146,6 +146,15 @@ class Strategy:
     def _refund_budget(self, usd: float) -> None:
         """Refund USD to the hourly budget (on sell). Budget can't go below 0 spent."""
         self._hourly_budget_spent = max(0.0, self._hourly_budget_spent - usd)
+
+    def budget_snapshot(self) -> dict:
+        """Return current hourly budget status."""
+        return {
+            "hourly_budget_usd": self.cfg.CONV_HOURLY_BUDGET_USD,
+            "spent_usd": round(self._hourly_budget_spent, 2),
+            "remaining_usd": round(self.cfg.CONV_HOURLY_BUDGET_USD - self._hourly_budget_spent, 2),
+            "budget_hour_et": self._hourly_budget_hour,
+        }
 
     def _cooldown_ok(self, key: str, now: float) -> bool:
         """Check if cooldown has elapsed for a market."""
