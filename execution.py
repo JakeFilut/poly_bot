@@ -63,6 +63,10 @@ class ExecutionEngine:
         # Diagnostics tracker (set externally after construction)
         self.diagnostics: Optional[Diagnostics] = None
 
+        # Budget refund callback (set externally): called on sell fill
+        # with (cost_basis_usd,) so strategy can refund the original buy cost
+        self._on_sell_fill_budget = None  # type: Optional[callable]
+
         # Risk manager reference (set externally for ladder per-level checks)
         self._risk_checker = None  # type: Optional[object]
 
@@ -622,6 +626,9 @@ class ExecutionEngine:
                 fee_bps=self.cfg.SIM_FEE_BPS,
             )
             realized_this_fill = self.state.realized_pnl - realized_before
+            # Refund original cost basis to hourly budget
+            if self._on_sell_fill_budget and avg_cost_before > 0:
+                self._on_sell_fill_budget(order.size * avg_cost_before)
             # Emit DRY_FILL with same schema as FILL
             fill_entry_style = "UNKNOWN"
             fill_payload = None
@@ -1139,6 +1146,9 @@ class ExecutionEngine:
                                                 sell_price=price,
                                                 fee_bps=self.cfg.SIM_FEE_BPS)
                 realized_this_fill = self.state.realized_pnl - realized_before
+                # Refund original cost basis to hourly budget
+                if self._on_sell_fill_budget and avg_cost_before > 0:
+                    self._on_sell_fill_budget(qty * avg_cost_before)
                 # Emit analytics FILL (canonical event)
                 fill_entry_style = "UNKNOWN"
                 fill_payload = None

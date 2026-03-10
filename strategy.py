@@ -241,8 +241,8 @@ class Strategy:
                         entry_style="passive",
                     ))
 
-                    # Refund the sell proceeds back to hourly budget
-                    self._refund_budget(sell_usd)
+                    # Budget refund now happens on actual sell fill
+                    # (via execution._on_sell_fill_budget callback)
 
                     # Clear entry time after exit
                     self._entry_times.pop(entry_key, None)
