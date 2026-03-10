@@ -241,8 +241,8 @@ class Strategy:
                         entry_style="passive",
                     ))
 
-                    # Refund the sell proceeds back to hourly budget
-                    self._refund_budget(sell_usd)
+                    # Refund the original cost basis back to hourly budget
+                    self._refund_budget(sell_shares * inv.avg_cost)
 
                     # Clear entry time after exit
                     self._entry_times.pop(entry_key, None)
