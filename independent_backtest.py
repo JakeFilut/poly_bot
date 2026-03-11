@@ -25,7 +25,9 @@ Usage:
 """
 
 import argparse
+import io
 import sys
+from contextlib import redirect_stdout
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from itertools import product
@@ -620,6 +622,19 @@ def main():
     df = build_features(book, binance)
     print(f"  Enriched rows: {len(df):,}")
 
+    # Capture all results output to also write to file
+    results_buf = io.StringIO()
+
+    def tee_print_results(trades, params, label=""):
+        """Print results to console AND capture to buffer."""
+        capture = io.StringIO()
+        with redirect_stdout(capture):
+            result = print_results(trades, params, label=label)
+        text = capture.getvalue()
+        sys.stdout.write(text)  # still show on console
+        results_buf.write(text)
+        return result
+
     if args.sweep:
         print("\n[3] Running parameter sweep ...")
         rdf = run_sweep(df)
@@ -637,13 +652,13 @@ def main():
             best_kv["exclude_assets"] = tuple(x.strip().strip("'\"") for x in exc_a.strip("()").split(",") if x.strip())
         best_params = ConvergenceParams(**best_kv)
         trades = run_backtest(df, best_params)
-        print_results(trades, best_params, label="BEST SWEEP")
+        tee_print_results(trades, best_params, label="BEST SWEEP")
 
         # Also show with 0.5% fee
         print(f"\n[5] Same config with 0.5% fee ...")
         best_params.fee_pct = 0.005
         trades = run_backtest(df, best_params)
-        print_results(trades, best_params, label="BEST SWEEP + 0.5% FEE")
+        tee_print_results(trades, best_params, label="BEST SWEEP + 0.5% FEE")
     else:
         print("\n[3] Running backtest ...")
         params = ConvergenceParams(
@@ -657,7 +672,7 @@ def main():
             params.fee_pct = args.fee
 
         trades = run_backtest(df, params)
-        print_results(trades, params, label="BASELINE")
+        tee_print_results(trades, params, label="BASELINE")
 
         # Also run with 0.5% fee to show impact
         if params.fee_pct == 0.0:
@@ -674,7 +689,15 @@ def main():
                 position_size=params.position_size,
             )
             trades_fee = run_backtest(df, params_fee)
-            print_results(trades_fee, params_fee, label="WITH 0.5% FEE")
+            tee_print_results(trades_fee, params_fee, label="WITH 0.5% FEE")
+
+    # Write results to file
+    outdir = Path("reports")
+    outdir.mkdir(exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    outfile = outdir / f"backtest_results_{ts}.txt"
+    outfile.write_text(results_buf.getvalue())
+    print(f"\n  Results saved to {outfile}")
 
 
 if __name__ == "__main__":
