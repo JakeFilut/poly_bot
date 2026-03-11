@@ -277,6 +277,10 @@ class Strategy:
             # ==============================================================
             # ENTRY PASS: convergence signals on the Up token
             # ==============================================================
+            # Skip excluded assets
+            if cfg.CONV_EXCLUDE_ASSETS and sf.asset in cfg.CONV_EXCLUDE_ASSETS:
+                continue
+
             # We need the Up token to check mid price thresholds
             up_tf = sf.up
             if up_tf is None or not up_tf.has_book:
