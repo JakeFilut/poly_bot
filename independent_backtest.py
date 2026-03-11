@@ -58,9 +58,10 @@ class ConvergenceParams:
     entry_mode: str = "passive"        # "passive" (buy at bid) or "cross" (buy at ask)
     hold_sec: int = 120                # seconds to hold position
     position_size: float = 10.0        # shares per trade
-    # --- Stop loss / take profit (cents, 0 = disabled) ---
+    # --- Stop loss / take profit / trailing stop (cents, 0 = disabled) ---
     stop_loss_cents: float = 0.0       # sell if position down this many cents
     take_profit_cents: float = 0.0     # sell if position up this many cents
+    trailing_stop_cents: float = 0.0   # sell if price drops this many cents from peak
     # --- Cooldown ---
     cooldown_sec: float = 5.0          # min seconds between trades on same market
     # --- Fee ---
@@ -165,21 +166,26 @@ class Trade:
 
 def _find_exit_price(ts_series: np.ndarray, bid_series: np.ndarray,
                      entry_ts: float, entry_price: float, is_buy: bool,
-                     hold_sec: int, stop_loss: float, take_profit: float
+                     hold_sec: int, stop_loss: float, take_profit: float,
+                     trailing_stop: float = 0.0
                      ) -> Tuple[float, str]:
     """Walk tick-by-tick through the hold window to find the exit price.
 
     Returns (exit_price, exit_reason).
-    Checks stop loss / take profit at each tick; falls back to time exit.
+    Checks stop loss / take profit / trailing stop at each tick;
+    falls back to time exit.
     """
     end_ts = entry_ts + hold_sec
     sl_price = stop_loss / 100 if stop_loss > 0 else 0
     tp_price = take_profit / 100 if take_profit > 0 else 0
+    trail_price = trailing_stop / 100 if trailing_stop > 0 else 0
 
     # Find ticks within the hold window
     mask = (ts_series > entry_ts) & (ts_series <= end_ts)
     window_bids = bid_series[mask]
     window_ts = ts_series[mask]
+
+    peak_edge = 0.0  # track best edge seen so far (for trailing stop)
 
     for i in range(len(window_bids)):
         bid = window_bids[i]
@@ -195,6 +201,13 @@ def _find_exit_price(ts_series: np.ndarray, bid_series: np.ndarray,
         # Take profit: edge is positive and exceeds threshold
         if tp_price > 0 and edge >= tp_price:
             return bid, "TAKE_PROFIT"
+
+        # Trailing stop: track peak, exit if we drop trail_price from peak
+        if trail_price > 0:
+            if edge > peak_edge:
+                peak_edge = edge
+            if peak_edge > 0 and (peak_edge - edge) >= trail_price:
+                return bid, "TRAILING_STOP"
 
     # Time exit: use the last bid at or after end_ts
     after_mask = ts_series >= end_ts
@@ -217,7 +230,8 @@ def run_backtest(df: pd.DataFrame, params: ConvergenceParams) -> List[Trade]:
     """
 
     mid_chg_col = f"mid_chg_{params.lookback_sec}s"
-    use_pathwise = params.stop_loss_cents > 0 or params.take_profit_cents > 0
+    use_pathwise = (params.stop_loss_cents > 0 or params.take_profit_cents > 0
+                    or params.trailing_stop_cents > 0)
     fwd_col = f"mid_fwd_{params.hold_sec}s"
 
     # Only rows with all needed columns
@@ -308,6 +322,7 @@ def run_backtest(df: pd.DataFrame, params: ConvergenceParams) -> List[Trade]:
                 hold_sec=params.hold_sec,
                 stop_loss=params.stop_loss_cents,
                 take_profit=params.take_profit_cents,
+                trailing_stop=params.trailing_stop_cents,
             )
             exit_prices[i] = ep
             exit_reasons.append(reason)
@@ -372,7 +387,8 @@ def print_results(trades: List[Trade], params: ConvergenceParams, label: str = "
     print(f"  Entry:     {params.entry_mode}  |  Hold: {params.hold_sec}s  |  Size: {params.position_size} shares")
     sl_str = f"{params.stop_loss_cents:.0f}c" if params.stop_loss_cents > 0 else "off"
     tp_str = f"{params.take_profit_cents:.0f}c" if params.take_profit_cents > 0 else "off"
-    print(f"  Stop loss: {sl_str}  |  Take profit: {tp_str}")
+    ts_str = f"{params.trailing_stop_cents:.0f}c" if params.trailing_stop_cents > 0 else "off"
+    print(f"  Stop loss: {sl_str}  |  Take profit: {tp_str}  |  Trailing stop: {ts_str}")
     print(f"  Fee:       {params.fee_pct * 100:.2f}% per side")
     print(f"  Cooldown:  {params.cooldown_sec:.0f}s per market")
     print(f"  Filters:   mid_buy>{params.mid_buy_thresh}, mid_sell<{params.mid_sell_thresh}, "
@@ -398,12 +414,12 @@ def print_results(trades: List[Trade], params: ConvergenceParams, label: str = "
         print(f"  Avg loser:       ${losers.mean():>10.4f}")
 
     # --- Exit reason breakdown ---
-    if params.stop_loss_cents > 0 or params.take_profit_cents > 0:
+    if params.stop_loss_cents > 0 or params.take_profit_cents > 0 or params.trailing_stop_cents > 0:
         print()
         print("─" * 72)
         print("  EXIT REASONS")
         print("─" * 72)
-        for reason in ["STOP_LOSS", "TAKE_PROFIT", "TIME_EXIT", "NO_DATA"]:
+        for reason in ["STOP_LOSS", "TAKE_PROFIT", "TRAILING_STOP", "TIME_EXIT", "NO_DATA"]:
             reason_trades = tdf[tdf["signal"].str.contains(f"exit={reason}")]
             if len(reason_trades) > 0:
                 r_pnl = reason_trades["pnl_net"].sum()
@@ -482,8 +498,9 @@ def print_results(trades: List[Trade], params: ConvergenceParams, label: str = "
 SWEEP_RANGES = {
     "mid_buy_thresh":   [0.48, 0.50, 0.52, 0.55, 0.60, 0.65, 0.70],
     "mid_sell_thresh":  [0.50, 0.48, 0.45, 0.40, 0.35, 0.30],
-    "stop_loss_cents":  [3, 5, 7, 10, 0],           # 0 = disabled
-    "take_profit_cents":[5, 8, 12, 15, 20, 0],      # 0 = disabled
+    "stop_loss_cents":  [3, 5, 7, 10, 0],             # 0 = disabled
+    "take_profit_cents":[5, 8, 12, 15, 20, 0],        # 0 = disabled
+    "trailing_stop_cents": [1, 2, 3, 5, 0],            # 0 = disabled
     "hold_sec":         [30, 60, 90, 120, 300],
     "cooldown_sec":     [5, 10, 15],
     "entry_mode":       ["cross"],
@@ -608,6 +625,7 @@ def main():
     parser.add_argument("--cooldown", type=float, default=5.0)
     parser.add_argument("--stop-loss", type=float, default=5.0, help="Stop loss in cents (0=off)")
     parser.add_argument("--take-profit", type=float, default=12.0, help="Take profit in cents (0=off)")
+    parser.add_argument("--trailing-stop", type=float, default=2.0, help="Trailing stop in cents (0=off)")
     args = parser.parse_args()
 
     data_dir = args.data_dir or find_data_dir()
@@ -667,6 +685,7 @@ def main():
             cooldown_sec=args.cooldown,
             stop_loss_cents=args.stop_loss,
             take_profit_cents=args.take_profit,
+            trailing_stop_cents=args.trailing_stop,
         )
         if args.fee is not None:
             params.fee_pct = args.fee
