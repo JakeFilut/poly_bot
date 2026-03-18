@@ -130,6 +130,14 @@ def build_features(book: pd.DataFrame, binance: pd.DataFrame) -> pd.DataFrame:
     book["dt_et"] = pd.to_datetime(book["timestamp_epoch"], unit="s", utc=True) + ET
     book["hour_et"] = book["dt_et"].dt.hour
 
+    # Seconds to resolution (top of next hour in UTC)
+    # These hourly markets resolve at :00 UTC
+    ts_dt_utc = pd.to_datetime(book["timestamp_epoch"], unit="s", utc=True)
+    sec_into_hour = ts_dt_utc.dt.minute * 60 + ts_dt_utc.dt.second
+    book["seconds_to_resolution"] = 3600 - sec_into_hour
+    # Resolution timestamp = entry + seconds_to_resolution
+    book["resolution_ts"] = book["timestamp_epoch"] + book["seconds_to_resolution"]
+
     # Merge Binance 5s return for optional confirmation
     binance = binance.sort_values(["symbol", "timestamp_epoch"]).copy()
     for sym in binance["symbol"].unique():
@@ -167,15 +175,22 @@ class Trade:
 def _find_exit_price(ts_series: np.ndarray, bid_series: np.ndarray,
                      entry_ts: float, entry_price: float, is_buy: bool,
                      hold_sec: int, stop_loss: float, take_profit: float,
-                     trailing_stop: float = 0.0
+                     trailing_stop: float = 0.0,
+                     resolution_ts: float = 0.0
                      ) -> Tuple[float, str]:
     """Walk tick-by-tick through the hold window to find the exit price.
 
     Returns (exit_price, exit_reason).
-    Checks stop loss / take profit / trailing stop at each tick;
-    falls back to time exit.
+    Checks stop loss / take profit / trailing stop at each tick.
+    If the hold window extends past resolution_ts (market close at :00),
+    the position resolves to $1.00 or $0.00 based on the final price.
     """
+    # Cap hold window at resolution time if market resolves sooner
     end_ts = entry_ts + hold_sec
+    resolves_before_hold = resolution_ts > 0 and resolution_ts < end_ts
+    if resolves_before_hold:
+        end_ts = resolution_ts
+
     sl_price = stop_loss / 100 if stop_loss > 0 else 0
     tp_price = take_profit / 100 if take_profit > 0 else 0
     trail_price = trailing_stop / 100 if trailing_stop > 0 else 0
@@ -209,6 +224,21 @@ def _find_exit_price(ts_series: np.ndarray, bid_series: np.ndarray,
             if peak_edge > 0 and (peak_edge - edge) >= trail_price:
                 return bid, "TRAILING_STOP"
 
+    # --- Market resolution: position held through :00 ---
+    if resolves_before_hold:
+        # Determine resolution outcome from last known price
+        # Near :00, the Up token converges to $1 (Up wins) or $0 (Down wins)
+        last_bid = window_bids[-1] if len(window_bids) > 0 else entry_price
+        # Also check price right at/after resolution
+        after_res = (ts_series >= resolution_ts) & (ts_series <= resolution_ts + 10)
+        if after_res.any():
+            last_bid = bid_series[after_res][0]
+        # Up token resolves to $1.00 or $0.00
+        if last_bid >= 0.50:
+            return 1.00, "RESOLUTION_WIN" if is_buy else "RESOLUTION_LOSE"
+        else:
+            return 0.00, "RESOLUTION_LOSE" if is_buy else "RESOLUTION_WIN"
+
     # Time exit: use the last bid at or after end_ts
     after_mask = ts_series >= end_ts
     if after_mask.any():
@@ -224,20 +254,15 @@ def _find_exit_price(ts_series: np.ndarray, bid_series: np.ndarray,
 def run_backtest(df: pd.DataFrame, params: ConvergenceParams) -> List[Trade]:
     """Run the convergence strategy on enriched book data.
 
-    When stop_loss_cents or take_profit_cents are set, walks through ticks
-    during the hold window to find early exits. Otherwise uses vectorized
-    forward-looking mid for speed.
+    Always uses path-wise tick-by-tick exit to handle:
+      - Market resolution at :00 (binary settle to $1/$0)
+      - Stop loss / take profit / trailing stop
     """
 
     mid_chg_col = f"mid_chg_{params.lookback_sec}s"
-    use_pathwise = (params.stop_loss_cents > 0 or params.take_profit_cents > 0
-                    or params.trailing_stop_cents > 0)
-    fwd_col = f"mid_fwd_{params.hold_sec}s"
 
     # Only rows with all needed columns
     required = ["mid", mid_chg_col, "imb_chg_5s", "bestBid", "bestAsk"]
-    if not use_pathwise:
-        required.append(fwd_col)
     valid = df[df[required].notna().all(axis=1)].copy()
 
     # Asset exclusion
@@ -298,38 +323,34 @@ def run_backtest(df: pd.DataFrame, params: ConvergenceParams) -> List[Trade]:
 
     size = params.position_size
 
-    if use_pathwise:
-        # --- Path-wise exit: walk ticks to check SL/TP ---
-        # Pre-index bid series per (slug, outcome) for fast lookup
-        bid_cache: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
-        for (slug, outcome), grp in df.groupby(["slug", "outcome"]):
-            sorted_grp = grp.sort_values("timestamp_epoch")
-            bid_cache[f"{slug}|{outcome}"] = (
-                sorted_grp["timestamp_epoch"].values,
-                sorted_grp["bestBid"].values,
-            )
+    # --- Path-wise exit: walk ticks with SL/TP/trailing + resolution ---
+    # Pre-index bid series per (slug, outcome) for fast lookup
+    bid_cache: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+    for (slug, outcome), grp in df.groupby(["slug", "outcome"]):
+        sorted_grp = grp.sort_values("timestamp_epoch")
+        bid_cache[f"{slug}|{outcome}"] = (
+            sorted_grp["timestamp_epoch"].values,
+            sorted_grp["bestBid"].values,
+        )
 
-        exit_prices = np.empty(len(signals))
-        exit_reasons = []
-        for i, (idx, row) in enumerate(signals.iterrows()):
-            cache_key = f"{row['slug']}|{row['outcome']}"
-            ts_arr, bid_arr = bid_cache.get(cache_key, (np.array([]), np.array([])))
-            ep, reason = _find_exit_price(
-                ts_arr, bid_arr,
-                entry_ts=row["timestamp_epoch"],
-                entry_price=entry[i],
-                is_buy=(row["side"] == "BUY_UP"),
-                hold_sec=params.hold_sec,
-                stop_loss=params.stop_loss_cents,
-                take_profit=params.take_profit_cents,
-                trailing_stop=params.trailing_stop_cents,
-            )
-            exit_prices[i] = ep
-            exit_reasons.append(reason)
-    else:
-        # --- Vectorized exit (original fast path) ---
-        exit_prices = signals[fwd_col].values
-        exit_reasons = ["TIME_EXIT"] * len(signals)
+    exit_prices = np.empty(len(signals))
+    exit_reasons = []
+    for i, (idx, row) in enumerate(signals.iterrows()):
+        cache_key = f"{row['slug']}|{row['outcome']}"
+        ts_arr, bid_arr = bid_cache.get(cache_key, (np.array([]), np.array([])))
+        ep, reason = _find_exit_price(
+            ts_arr, bid_arr,
+            entry_ts=row["timestamp_epoch"],
+            entry_price=entry[i],
+            is_buy=(row["side"] == "BUY_UP"),
+            hold_sec=params.hold_sec,
+            stop_loss=params.stop_loss_cents,
+            take_profit=params.take_profit_cents,
+            trailing_stop=params.trailing_stop_cents,
+            resolution_ts=row.get("resolution_ts", 0.0),
+        )
+        exit_prices[i] = ep
+        exit_reasons.append(reason)
 
     pnl_gross = np.where(is_buy, (exit_prices - entry) * size, (entry - exit_prices) * size)
     fee = (entry + exit_prices) * size * params.fee_pct
@@ -414,12 +435,16 @@ def print_results(trades: List[Trade], params: ConvergenceParams, label: str = "
         print(f"  Avg loser:       ${losers.mean():>10.4f}")
 
     # --- Exit reason breakdown ---
-    if params.stop_loss_cents > 0 or params.take_profit_cents > 0 or params.trailing_stop_cents > 0:
+    has_exit_types = (params.stop_loss_cents > 0 or params.take_profit_cents > 0
+                      or params.trailing_stop_cents > 0
+                      or tdf["signal"].str.contains("RESOLUTION").any())
+    if has_exit_types:
         print()
         print("─" * 72)
         print("  EXIT REASONS")
         print("─" * 72)
-        for reason in ["STOP_LOSS", "TAKE_PROFIT", "TRAILING_STOP", "TIME_EXIT", "NO_DATA"]:
+        for reason in ["STOP_LOSS", "TAKE_PROFIT", "TRAILING_STOP",
+                        "RESOLUTION_WIN", "RESOLUTION_LOSE", "TIME_EXIT", "NO_DATA"]:
             reason_trades = tdf[tdf["signal"].str.contains(f"exit={reason}")]
             if len(reason_trades) > 0:
                 r_pnl = reason_trades["pnl_net"].sum()
@@ -555,13 +580,6 @@ def run_sweep(df: pd.DataFrame) -> pd.DataFrame:
 
         if kv["mid_sell_thresh"] >= kv["mid_buy_thresh"]:
             continue
-        # When no SL/TP, we need the forward-looking column
-        has_sl_tp = kv.get("stop_loss_cents", 0) > 0 or kv.get("take_profit_cents", 0) > 0
-        if not has_sl_tp:
-            hold = kv["hold_sec"]
-            fwd_col = f"mid_fwd_{hold}s"
-            if fwd_col not in df.columns:
-                continue
 
         p = ConvergenceParams(**kv)
         res = _eval_params(df, p)
