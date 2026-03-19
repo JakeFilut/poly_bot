@@ -176,10 +176,14 @@ class Strategy:
         """Generate trade actions using the convergence dip-buy / rip-sell strategy.
 
         For each slug:
-          1. EXIT PASS: If we hold a position for >= hold_sec, sell it all.
+          1. EXIT PASS: time-based exit + resolution-aware logic.
+             - If market resolves before TIME_EXIT, let it settle to $1/$0.
+             - If market already resolved, settle binary based on last mid.
+             - Otherwise, normal TIME_EXIT / SL / TP.
           2. ENTRY PASS: Check convergence signals on the Up token.
              - mid > buy_thresh + price dipped + imbalance surging → BUY Up token
              - mid < sell_thresh + price rose + imbalance dropping → BUY Down token
+          3. ORPHAN PASS: settle positions whose market left the universe.
         """
         now = time.time()
         now_utc = datetime.now(timezone.utc)
@@ -190,8 +194,13 @@ class Strategy:
         lookback_col = f"mid_chg_{cfg.CONV_LOOKBACK_SEC}s"
 
         for slug, sf in all_features.items():
+            # Compute resolution timestamp for this market
+            resolution_epoch = None
+            if sf.end_date_utc is not None:
+                resolution_epoch = sf.end_date_utc.timestamp()
+
             # ==============================================================
-            # EXIT PASS: time-based exit for all held positions
+            # EXIT PASS: time-based exit + resolution-aware logic
             # ==============================================================
             for outcome in ("Up", "Down"):
                 inv = self.state.get_inventory(slug, outcome)
@@ -225,6 +234,56 @@ class Strategy:
                 sell_price = tf.best_bid
                 if sell_price <= 0:
                     continue
+
+                # --- Resolution-aware exit ---
+                # If the market resolves before TIME_EXIT would fire,
+                # let the position resolve to $1/$0 instead of selling at mid.
+                if resolution_epoch is not None:
+                    secs_to_resolution = resolution_epoch - now
+                    time_exit_would_fire = entry_ts + cfg.CONV_HOLD_SEC
+
+                    # Market already resolved — settle binary
+                    if secs_to_resolution <= 0:
+                        # Determine win/lose from last known Up-token mid
+                        up_tf = sf.up
+                        up_mid = up_tf.mid if (up_tf and up_tf.has_book) else sell_price
+                        if outcome == "Up":
+                            won = up_mid >= 0.50
+                        else:
+                            won = up_mid < 0.50
+                        settle_price = 1.00 if won else 0.00
+                        reason = f"RESOLUTION_{'WIN' if won else 'LOSE'}(up_mid={up_mid:.3f},settle=${settle_price:.2f})"
+
+                        sell_shares = inv.shares
+                        sell_usd = sell_shares * settle_price
+
+                        sell_ok, sell_reason = risk_allows_sell(slug, outcome)
+                        if not sell_ok:
+                            continue
+
+                        self.log.decision(
+                            action="SELL", reason=reason,
+                            slug=slug, outcome=outcome, asset=sf.asset,
+                            shares=sell_shares, price=settle_price,
+                            held_sec=round(held_sec, 1),
+                            edge_vs_cost=round(settle_price - inv.avg_cost, 4),
+                        )
+
+                        actions.append(TradeAction(
+                            action="SELL", slug=slug, outcome=outcome,
+                            token_id=tf.token_id, price=settle_price,
+                            size_shares=sell_shares, size_usd=sell_usd,
+                            reason=reason, urgency=1.0,
+                            intent_timestamp=intent_ts,
+                            entry_style="cross",
+                        ))
+                        self._entry_times.pop(entry_key, None)
+                        continue
+
+                    # Position will be held through resolution — skip TIME_EXIT,
+                    # let it resolve naturally at :00
+                    if time_exit_would_fire >= resolution_epoch:
+                        continue
 
                 # --- Stop loss / take profit check ---
                 edge_cents = (sell_price - inv.avg_cost) * 100
@@ -422,5 +481,46 @@ class Strategy:
                 orderbook_imbalance=round(ob_imb, 4),
                 entry_style="cross",
             ))
+
+        # ==============================================================
+        # ORPHAN RESOLUTION: settle positions whose market left the universe
+        # ==============================================================
+        active_slugs = set(all_features.keys())
+        for (slug, outcome), inv in list(self.state.inventory.items()):
+            if inv.shares <= 0 or slug in active_slugs:
+                continue
+            # Market rolled over — position is orphaned.
+            # The last mid price before rollover determines win/lose.
+            # Conservative: treat as loss (settle at $0) since we can't
+            # know the final state. But avg_cost > 0.50 means we bought
+            # Up expecting it to win, so if cost was high it likely won.
+            # Best heuristic: use avg_cost as proxy for last known direction.
+            if outcome == "Up":
+                won = inv.avg_cost >= 0.50  # we bought Up at high price → likely won
+            else:
+                won = inv.avg_cost >= 0.50  # we bought Down at high price → likely won
+            settle_price = 1.00 if won else 0.00
+            reason = f"ORPHAN_RESOLUTION_{'WIN' if won else 'LOSE'}(cost={inv.avg_cost:.3f},settle=${settle_price:.2f})"
+
+            self.log.decision(
+                action="SELL", reason=reason,
+                slug=slug, outcome=outcome,
+                shares=inv.shares, price=settle_price,
+            )
+
+            # We need a token_id but the market is gone from universe.
+            # Use empty string — execution engine handles DRY_RUN sells
+            # without needing a real token_id.
+            actions.append(TradeAction(
+                action="SELL", slug=slug, outcome=outcome,
+                token_id=inv.token_id,
+                price=settle_price,
+                size_shares=inv.shares,
+                size_usd=inv.shares * settle_price,
+                reason=reason, urgency=1.0,
+                intent_timestamp=intent_ts,
+                entry_style="cross",
+            ))
+            self._entry_times.pop((slug, outcome), None)
 
         return actions

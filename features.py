@@ -102,6 +102,7 @@ class SlugFeatures:
     realized_vol: float | None = None
     binance_spread_bps: float | None = None
     binance_volume_24h: float | None = None
+    end_date_utc: "datetime | None" = None  # market resolution time (top of hour)
 
 
 class FeatureEngine:
@@ -142,7 +143,8 @@ class FeatureEngine:
         result: Dict[str, SlugFeatures] = {}
 
         for slug, pair in self._universe.pairs.items():
-            sf = SlugFeatures(slug=slug, asset=pair.asset)
+            sf = SlugFeatures(slug=slug, asset=pair.asset,
+                              end_date_utc=pair.end_date_utc)
 
             # Binance returns (shared for both outcomes)
             sf.ret_5s = self._binance.ret_5s(pair.asset)
