@@ -262,7 +262,7 @@ class Config:
     CONV_TAKE_PROFIT_CENTS: float = 0.0  # disabled — best sweep had no TP
     CONV_TRAILING_STOP_CENTS: float = 0.0  # disabled — best sweep had no trailing stop
     CONV_POSITION_SIZE: float = 10.0     # shares per trade
-    CONV_HOURLY_BUDGET_USD: float = 50.0  # max USD to invest per hour (sells refund budget)
+    CONV_HOURLY_BUDGET_USD: float = 500.0  # max USD to invest per hour (sells refund budget)
     CONV_EXCLUDE_ASSETS: tuple = ("BTC",)  # exclude BTC (Phase 2: $700 vs $567 without)
 
     # -- Fee simulation --
@@ -419,7 +419,7 @@ def load_config() -> Config:
         CONV_TAKE_PROFIT_CENTS=_env_float("CONV_TAKE_PROFIT_CENTS", 0.0),
         CONV_TRAILING_STOP_CENTS=_env_float("CONV_TRAILING_STOP_CENTS", 0.0),
         CONV_POSITION_SIZE=_env_float("CONV_POSITION_SIZE", 10.0),
-        CONV_HOURLY_BUDGET_USD=_env_float("CONV_HOURLY_BUDGET_USD", 50.0),
+        CONV_HOURLY_BUDGET_USD=_env_float("CONV_HOURLY_BUDGET_USD", 500.0),
         CONV_EXCLUDE_ASSETS=tuple(x.strip() for x in os.environ.get("CONV_EXCLUDE_ASSETS", "BTC").split(",") if x.strip()),
         SIM_FEE_BPS=_env_float("SIM_FEE_BPS", 0.0),
         TRACK_F247_WALLET=_env_bool("TRACK_F247_WALLET", False),
