@@ -511,16 +511,20 @@ class Strategy:
             # We need a token_id but the market is gone from universe.
             # Use empty string — execution engine handles DRY_RUN sells
             # without needing a real token_id.
+            sell_shares = inv.shares
             actions.append(TradeAction(
                 action="SELL", slug=slug, outcome=outcome,
                 token_id=inv.token_id,
                 price=settle_price,
-                size_shares=inv.shares,
-                size_usd=inv.shares * settle_price,
+                size_shares=sell_shares,
+                size_usd=sell_shares * settle_price,
                 reason=reason, urgency=1.0,
                 intent_timestamp=intent_ts,
                 entry_style="cross",
             ))
+            # Immediately settle the position so it's not re-discovered next tick
+            self.state.apply_sell_fill(slug, outcome, sell_shares,
+                                       sell_price=settle_price)
             self._entry_times.pop((slug, outcome), None)
 
         return actions
