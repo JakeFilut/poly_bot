@@ -27,15 +27,12 @@ def _utc_iso() -> str:
 class Logger:
     """Structured JSON logger.  Thread-unsafe (single bot loop)."""
 
-    # Events shown on console in quiet mode
+    # Events shown on console in quiet mode (human-readable format)
     _QUIET_CONSOLE_EVENTS = frozenset({
         "FILL", "DRY_FILL", "PORTFOLIO_STATUS",
         "ERROR", "WARN", "API_ERROR",
-        "HOURLY_PNL", "CONFIG",
+        "HOURLY_PNL",
     })
-
-    # DECISION events with these actions also show on console in quiet mode
-    _QUIET_CONSOLE_DECISION_ACTIONS = frozenset({"BUY", "SELL"})
 
     def __init__(self, log_file: str = "", rollup_sec: int = 60,
                  run_id: str = "",
@@ -104,17 +101,22 @@ class Logger:
     # ------------------------------------------------------------------
     def log(self, event: str, **kwargs) -> None:
         """Emit one structured JSON log line."""
-        record = {"ts": _utc_iso(), "event": event}
+        ts = _utc_iso()
+        record = {"ts": ts, "event": event}
         if self._run_id:
             record["run_id"] = self._run_id
         if kwargs:
             record.update(kwargs)
         line = json.dumps(record, default=str)
-        # Console: skip noisy events in quiet mode
-        if not self._quiet_console or event in self._QUIET_CONSOLE_EVENTS or (
-            event == "DECISION" and kwargs.get("action") in self._QUIET_CONSOLE_DECISION_ACTIONS
-        ):
+
+        # Console output
+        if self._quiet_console:
+            pretty = self._format_console(event, ts, kwargs)
+            if pretty is not None:
+                print(pretty, flush=True)
+        else:
             print(line, flush=True)
+
         # Always write to file
         if self._rotating_handler is not None:
             self._rotating_handler.emit(
@@ -122,6 +124,51 @@ class Logger:
             )
         elif self._fh:
             self._fh.write(line + "\n")
+
+    @staticmethod
+    def _format_console(event: str, ts: str, kw: dict) -> str | None:
+        """Return a human-readable console line, or None to suppress."""
+        t = ts[11:19]  # HH:MM:SS
+
+        if event in ("FILL", "DRY_FILL"):
+            side = kw.get("side", "?")
+            slug = kw.get("slug", "?")
+            outcome = kw.get("outcome", "")
+            price = kw.get("fill_price", kw.get("price", 0))
+            shares = kw.get("fill_shares", kw.get("qty", 0))
+            usd = shares * price if shares and price else 0
+            return f"{t}  {side:<4} {slug} {outcome}  {shares}@${price:.2f} (${usd:.2f})"
+
+        if event == "PORTFOLIO_STATUS":
+            pos = kw.get("position_count", 0)
+            pnl = kw.get("total_pnl_usd", 0)
+            real = kw.get("realized_pnl_usd", 0)
+            unreal = kw.get("unrealized_pnl_usd", 0)
+            spent = kw.get("budget_spent_usd", 0)
+            remaining = kw.get("budget_remaining_usd", 0)
+            parts = [
+                f"{t}  PORTFOLIO  positions={pos}",
+                f"pnl=${pnl:+.2f} (real=${real:+.2f} unreal=${unreal:+.2f})",
+                f"budget=${spent:.0f}/{spent + remaining:.0f}",
+            ]
+            return "  ".join(parts)
+
+        if event == "HOURLY_PNL":
+            hour = kw.get("hour_et", "?")
+            pnl = kw.get("realized_pnl_usd", kw.get("pnl_usd", 0))
+            buys = kw.get("total_buy_fills", kw.get("buys", 0))
+            sells = kw.get("total_sell_fills", kw.get("sells", 0))
+            return f"{t}  HOURLY PNL  hour={hour}  pnl=${pnl:+.2f}  buys={buys} sells={sells}"
+
+        if event in ("ERROR", "API_ERROR"):
+            msg = kw.get("msg", kw.get("error", str(kw)))
+            return f"{t}  ERROR  {msg}"
+
+        if event == "WARN":
+            msg = kw.get("msg", str(kw))
+            return f"{t}  WARN  {msg}"
+
+        return None
 
     # ------------------------------------------------------------------
     # Convenience helpers
