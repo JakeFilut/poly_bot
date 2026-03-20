@@ -523,8 +523,12 @@ class Strategy:
                 entry_style="cross",
             ))
             # Immediately settle the position so it's not re-discovered next tick
+            refund_cost = inv.avg_cost
             self.state.apply_sell_fill(slug, outcome, sell_shares,
                                        sell_price=settle_price)
+            # Refund original cost basis to hourly budget (execution won't
+            # reach its refund path because inventory is already gone).
+            self._refund_budget(sell_shares * refund_cost)
             self._entry_times.pop((slug, outcome), None)
 
         return actions
