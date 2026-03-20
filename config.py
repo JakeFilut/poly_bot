@@ -245,7 +245,7 @@ class Config:
     MAX_DAILY_LOSS_USD: float = 100.0            # Hard daily kill switch threshold
     MAX_INTRADAY_DRAWDOWN_USD: float = 60.0      # Drawdown pause threshold
     MAX_CAPITAL_PER_ASSET_USD: float = 150.0     # Per-asset cost basis cap
-    MAX_CROSS_NOTIONAL_PER_HOUR_USD: float = 100.0  # Hourly crossing/taker budget
+    MAX_CROSS_NOTIONAL_PER_HOUR_USD: float = 50_000.0  # effectively unlimited
     PAUSE_MINUTES_ON_DD: int = 45                # Minutes to pause on drawdown breach
 
     # -- F247 copy-wallet tracker --
@@ -263,7 +263,7 @@ class Config:
     CONV_TRAILING_STOP_CENTS: float = 0.0  # disabled — best sweep had no trailing stop
     CONV_POSITION_SIZE: float = 10.0     # shares per trade
     CONV_HOURLY_BUDGET_USD: float = 500.0  # max USD to invest per hour (sells refund budget)
-    CONV_EXCLUDE_ASSETS: tuple = ("BTC",)  # exclude BTC (Phase 2: $700 vs $567 without)
+    CONV_EXCLUDE_ASSETS: tuple = ()  # no exclusions
 
     # -- Fee simulation --
     SIM_FEE_BPS: float = 0.0  # Simulated fee in basis points (e.g., 5.0 = 5 bps = 0.05%)
@@ -407,7 +407,7 @@ def load_config() -> Config:
         MAX_DAILY_LOSS_USD=_env_float("MAX_DAILY_LOSS_USD", 100.0),
         MAX_INTRADAY_DRAWDOWN_USD=_env_float("MAX_INTRADAY_DRAWDOWN_USD", 60.0),
         MAX_CAPITAL_PER_ASSET_USD=_env_float("MAX_CAPITAL_PER_ASSET_USD", 150.0),
-        MAX_CROSS_NOTIONAL_PER_HOUR_USD=_env_float("MAX_CROSS_NOTIONAL_PER_HOUR_USD", 100.0),
+        MAX_CROSS_NOTIONAL_PER_HOUR_USD=_env_float("MAX_CROSS_NOTIONAL_PER_HOUR_USD", 50_000.0),
         PAUSE_MINUTES_ON_DD=_env_int("PAUSE_MINUTES_ON_DD", 45),
         CONV_MID_BUY_THRESH=_env_float("CONV_MID_BUY_THRESH", 0.60),
         CONV_MID_SELL_THRESH=_env_float("CONV_MID_SELL_THRESH", 0.48),
@@ -420,7 +420,7 @@ def load_config() -> Config:
         CONV_TRAILING_STOP_CENTS=_env_float("CONV_TRAILING_STOP_CENTS", 0.0),
         CONV_POSITION_SIZE=_env_float("CONV_POSITION_SIZE", 10.0),
         CONV_HOURLY_BUDGET_USD=_env_float("CONV_HOURLY_BUDGET_USD", 500.0),
-        CONV_EXCLUDE_ASSETS=tuple(x.strip() for x in os.environ.get("CONV_EXCLUDE_ASSETS", "BTC").split(",") if x.strip()),
+        CONV_EXCLUDE_ASSETS=tuple(x.strip() for x in os.environ.get("CONV_EXCLUDE_ASSETS", "").split(",") if x.strip()),
         SIM_FEE_BPS=_env_float("SIM_FEE_BPS", 0.0),
         TRACK_F247_WALLET=_env_bool("TRACK_F247_WALLET", False),
         DEBUG_LOG_ORDERS=_env_bool("DEBUG_LOG_ORDERS", False),
