@@ -27,13 +27,24 @@ def _utc_iso() -> str:
 class Logger:
     """Structured JSON logger.  Thread-unsafe (single bot loop)."""
 
+    # Events shown on console in quiet mode
+    _QUIET_CONSOLE_EVENTS = frozenset({
+        "FILL", "DRY_FILL", "PORTFOLIO_STATUS",
+        "ERROR", "WARN", "API_ERROR",
+        "HOURLY_PNL", "CONFIG",
+    })
+
+    # DECISION events with these actions also show on console in quiet mode
+    _QUIET_CONSOLE_DECISION_ACTIONS = frozenset({"BUY", "SELL"})
+
     def __init__(self, log_file: str = "", rollup_sec: int = 60,
                  run_id: str = "",
                  log_decisions: bool = False,
                  decision_sample_every_n: int = 200,
                  decision_min_interval_ms: int = 2000,
                  rotate_max_bytes: int = 50_000_000,
-                 rotate_backup_count: int = 5):
+                 rotate_backup_count: int = 5,
+                 quiet_console: bool = False):
         self._fh: Optional[IO] = None
         self._rotating_handler: Optional[RotatingFileHandler] = None
         if log_file:
@@ -49,6 +60,7 @@ class Logger:
         self._rollup_sec = rollup_sec
         self._last_rollup_ts = time.monotonic()
         self._run_id = run_id
+        self._quiet_console = quiet_console
 
         # -- Decision throttling config --
         self._log_decisions = log_decisions
@@ -98,7 +110,12 @@ class Logger:
         if kwargs:
             record.update(kwargs)
         line = json.dumps(record, default=str)
-        print(line, flush=True)
+        # Console: skip noisy events in quiet mode
+        if not self._quiet_console or event in self._QUIET_CONSOLE_EVENTS or (
+            event == "DECISION" and kwargs.get("action") in self._QUIET_CONSOLE_DECISION_ACTIONS
+        ):
+            print(line, flush=True)
+        # Always write to file
         if self._rotating_handler is not None:
             self._rotating_handler.emit(
                 _make_log_record(line)
