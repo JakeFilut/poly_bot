@@ -227,6 +227,7 @@ class Config:
     LOG_FILE: str = "/home/ubuntu/github/logs/poly_bot/bot_log.jsonl"
     LOG_ROLLUP_SEC: int = 60
     DEBUG_LOG_ORDERS: bool = False  # Emit DRY_RUN_ORDER events (verbose; off by default)
+    QUIET_CONSOLE: bool = True  # Only show fills, portfolio, errors, and hourly PnL on console
 
     # -- Decision log throttling --
     LOG_DECISIONS: bool = False  # If True, log every DECISION tick (old behaviour)
@@ -424,6 +425,7 @@ def load_config() -> Config:
         SIM_FEE_BPS=_env_float("SIM_FEE_BPS", 0.0),
         TRACK_F247_WALLET=_env_bool("TRACK_F247_WALLET", False),
         DEBUG_LOG_ORDERS=_env_bool("DEBUG_LOG_ORDERS", False),
+        QUIET_CONSOLE=_env_bool("QUIET_CONSOLE", True),
         LOG_DECISIONS=_env_bool("LOG_DECISIONS", False),
         DECISION_LOG_SAMPLE_EVERY_N=_env_int("DECISION_LOG_SAMPLE_EVERY_N", 200),
         DECISION_LOG_MIN_INTERVAL_MS=_env_int("DECISION_LOG_MIN_INTERVAL_MS", 2000),

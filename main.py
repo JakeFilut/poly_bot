@@ -113,6 +113,7 @@ class Bot:
             decision_min_interval_ms=self.cfg.DECISION_LOG_MIN_INTERVAL_MS,
             rotate_max_bytes=self.cfg.LOG_ROTATE_MAX_BYTES,
             rotate_backup_count=self.cfg.LOG_ROTATE_BACKUP_COUNT,
+            quiet_console=self.cfg.QUIET_CONSOLE,
         )
         self.log.log_config(self.cfg.redacted_dict())
 
@@ -321,11 +322,13 @@ class Bot:
             self._last_portfolio_log = now_mono
             try:
                 status = self.engine.portfolio_status()
-                print(flush=True)
-                print(flush=True)
+                if not self.cfg.QUIET_CONSOLE:
+                    print(flush=True)
+                    print(flush=True)
                 self.log.log("PORTFOLIO_STATUS", **status)
-                print(flush=True)
-                print(flush=True)
+                if not self.cfg.QUIET_CONSOLE:
+                    print(flush=True)
+                    print(flush=True)
             except Exception:
                 pass  # never let status logging break the main loop
 
