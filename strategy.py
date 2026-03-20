@@ -402,13 +402,6 @@ class Strategy:
                 skips["cooldown"] = skips.get("cooldown", 0) + 1
                 continue
 
-            # --- Don't enter if we already hold this position ---
-            inv = self.state.get_inventory(slug, direction)
-            if inv is not None and inv.shares > 0:
-                skips = self._entry_quality["skips_by_gate"]
-                skips["already_holding"] = skips.get("already_holding", 0) + 1
-                continue
-
             # --- Hourly budget check ---
             budget_remaining = self._get_hourly_budget_remaining(now_utc)
             position_size = cfg.CONV_POSITION_SIZE
@@ -464,8 +457,9 @@ class Strategy:
             # Track entry quality
             self._entry_quality["buy_prices"].append(price)
 
-            # Track entry time for time-based exit
-            self._entry_times[(slug, direction)] = now
+            # Track entry time for time-based exit (keep original on stacked entries)
+            if (slug, direction) not in self._entry_times:
+                self._entry_times[(slug, direction)] = now
             self._record_trade(cooldown_key, now)
 
             actions.append(TradeAction(

@@ -245,7 +245,7 @@ class Config:
     MAX_DAILY_LOSS_USD: float = 100.0            # Hard daily kill switch threshold
     MAX_INTRADAY_DRAWDOWN_USD: float = 60.0      # Drawdown pause threshold
     MAX_CAPITAL_PER_ASSET_USD: float = 150.0     # Per-asset cost basis cap
-    MAX_CROSS_NOTIONAL_PER_HOUR_USD: float = 100.0  # Hourly crossing/taker budget
+    MAX_CROSS_NOTIONAL_PER_HOUR_USD: float = 50_000.0  # effectively unlimited
     PAUSE_MINUTES_ON_DD: int = 45                # Minutes to pause on drawdown breach
 
     # -- F247 copy-wallet tracker --
@@ -407,7 +407,7 @@ def load_config() -> Config:
         MAX_DAILY_LOSS_USD=_env_float("MAX_DAILY_LOSS_USD", 100.0),
         MAX_INTRADAY_DRAWDOWN_USD=_env_float("MAX_INTRADAY_DRAWDOWN_USD", 60.0),
         MAX_CAPITAL_PER_ASSET_USD=_env_float("MAX_CAPITAL_PER_ASSET_USD", 150.0),
-        MAX_CROSS_NOTIONAL_PER_HOUR_USD=_env_float("MAX_CROSS_NOTIONAL_PER_HOUR_USD", 100.0),
+        MAX_CROSS_NOTIONAL_PER_HOUR_USD=_env_float("MAX_CROSS_NOTIONAL_PER_HOUR_USD", 50_000.0),
         PAUSE_MINUTES_ON_DD=_env_int("PAUSE_MINUTES_ON_DD", 45),
         CONV_MID_BUY_THRESH=_env_float("CONV_MID_BUY_THRESH", 0.60),
         CONV_MID_SELL_THRESH=_env_float("CONV_MID_SELL_THRESH", 0.48),
